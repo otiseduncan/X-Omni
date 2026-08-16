@@ -1,0 +1,411 @@
+/* ---------- field system cards: ADAS SI + Calibration IQ ---------- */
+
+.field-card.tone-warn {
+  border-color: rgba(255, 184, 77, 0.42);
+}
+
+.field-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 0.66rem;
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  text-align: right;
+  text-transform: none;
+}
+
+.field-card .card-head {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.field-card .card-head > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.field-vehicle {
+  margin: 0 0 8px;
+  color: var(--blue-bright);
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+
+.field-filters {
+  margin: 0 0 9px;
+  font-size: 0.72rem;
+}
+
+/* inline PDF viewer */
+.pdf-frame {
+  position: relative;
+  width: 100%;
+  height: 340px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #0a1220;
+  overflow: hidden;
+  transition: height 0.2s;
+}
+
+.pdf-frame.is-expanded {
+  height: 78vh;
+}
+
+.pdf-frame iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  background: #1b1b1b;
+}
+
+.field-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.field-actions button {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text-soft);
+  font-size: 0.73rem;
+  font-weight: 600;
+}
+
+.field-actions button:hover:not(:disabled) {
+  border-color: var(--blue-bright);
+  color: var(--text);
+}
+
+.field-page {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.field-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  color: var(--blue-bright);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.field-link:hover {
+  text-decoration: underline;
+}
+
+/* search hits */
+.field-hit {
+  border-top: 1px solid rgba(42, 60, 85, 0.42);
+  padding: 7px 0;
+}
+
+.field-hit:first-of-type {
+  border-top: none;
+}
+
+.field-hit summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.82rem;
+}
+
+.field-hit summary strong {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.field-excerpt {
+  max-height: 220px;
+  margin-top: 7px;
+  font-size: 0.73rem;
+}
+
+.field-alts {
+  margin-top: 9px;
+}
+
+.field-alts summary {
+  color: var(--text-muted);
+  font-size: 0.73rem;
+  cursor: pointer;
+}
+
+.field-alts a {
+  display: block;
+  margin-top: 5px;
+  color: var(--blue-bright);
+  font-size: 0.75rem;
+  text-decoration: none;
+}
+
+.field-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(42, 60, 85, 0.34);
+  font-size: 0.8rem;
+}
+
+.field-row:last-child {
+  border-bottom: none;
+}
+
+.field-topics {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 0.71rem;
+  text-align: right;
+}
+
+.field-apps {
+  max-height: 260px;
+  overflow-y: auto;
+  margin-top: 6px;
+}
+
+/* repair-order board
+   Two lines per RO instead of a four-column grid: a 10-digit RO number was
+   wrapping mid-number in a 78px column, which is unreadable on a phone. */
+.ro-list {
+  display: grid;
+  gap: 5px;
+}
+
+.ro-item {
+  padding: 7px 9px;
+  border: 1px solid rgba(40, 120, 255, 0.16);
+  border-radius: 8px;
+  background: rgba(5, 15, 31, 0.5);
+}
+
+.ro-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ro-sub {
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.ro-num {
+  flex: 0 0 auto;
+  color: var(--blue-bright);
+  font-size: 0.78rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;      /* never break an RO number */
+}
+
+.ro-vehicle {
+  min-width: 0;
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ro-vehicle-hero {
+  margin: 0 0 6px;
+  font-size: 1rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.ro-pill {
+  padding: 2px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: rgba(10, 26, 48, 0.8);
+  color: var(--text-soft);
+  font-size: 0.68rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ro-pill.ok {
+  border-color: rgba(53, 232, 138, 0.45);
+  color: var(--success);
+}
+
+.ro-pill.active {
+  border-color: rgba(118, 169, 250, 0.5);
+  color: var(--blue-bright);
+}
+
+.ro-pill.warn {
+  border-color: rgba(255, 184, 77, 0.45);
+  color: var(--warning);
+}
+
+.ro-pill.done {
+  border-color: rgba(166, 174, 181, 0.38);
+  background: rgba(129, 134, 140, 0.12);
+  color: var(--text-muted);
+}
+
+.ro-shop,
+.ro-phase {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .ro-vehicle {
+    white-space: normal;
+  }
+  .pdf-frame {
+    height: 260px;
+  }
+  .pdf-frame.is-expanded {
+    height: 70vh;
+  }
+}
+
+/* ---------- inline page viewer ---------- */
+
+.page-view {
+  position: relative;
+  width: 100%;
+  max-height: 62vh;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #f5f5f5;
+  cursor: zoom-in;
+  -webkit-overflow-scrolling: touch;
+}
+
+.page-view.is-zoomed {
+  max-height: 84vh;
+  cursor: zoom-out;
+}
+
+.page-view img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Zoomed: render wider than the container and let it pan, which is how you
+   actually read a spec sheet on a phone. */
+.page-view.is-zoomed img {
+  width: 190%;
+  max-width: none;
+}
+
+.page-nav {
+  gap: 8px;
+}
+
+.page-nav button {
+  min-width: 34px;
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.page-scrub {
+  flex: 1;
+  min-width: 90px;
+  accent-color: var(--blue-bright);
+}
+
+@media (max-width: 640px) {
+  .page-view {
+    max-height: 54vh;
+  }
+  .page-view.is-zoomed {
+    max-height: 76vh;
+  }
+  /* keep the pager thumb-reachable */
+  .page-nav button {
+    min-height: 34px;
+    min-width: 42px;
+  }
+  .page-scrub {
+    order: 10;
+    flex-basis: 100%;
+  }
+}
+
+/* ---------- Calibration IQ summary: a number you can glance at ---------- */
+
+.ciq-count {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  margin-bottom: 9px;
+}
+
+.ciq-count strong {
+  font-size: 2rem;
+  line-height: 1;
+  color: #f4f8ff;
+  font-variant-numeric: tabular-nums;
+}
+
+.ciq-count span {
+  color: var(--text-soft);
+  font-size: 0.8rem;
+}
+
+.ciq-chips {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 5px;
+  margin-bottom: 4px;
+}
+
+.ciq-chips .ro-pill {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.3;
+}
+
+.ciq-incomplete {
+  margin: 0 0 9px;
+  color: var(--warning);
+  font-weight: 600;
+}
+
+@media (max-width: 430px) {
+  .field-meta {
+    max-width: 100%;
+  }
+
+  .ciq-count {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .ciq-count span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+}

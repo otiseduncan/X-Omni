@@ -1,0 +1,42 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+test("website generation has an accessible XV11-style code and rendered-preview contract", async () => {
+  const cards = await readFile(new URL("../src/components/cards/Cards.jsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../src/styles/app.css", import.meta.url), "utf8");
+
+  assert.match(cards, /website_preview:\s*WebsitePreviewCard/);
+  assert.match(cards, /<section className="card website-card" aria-label=\{`Generated website: \$\{title\}`\}>/);
+  assert.doesNotMatch(cards, /<details className="card inline-disclosure website-disclosure">/);
+  assert.match(cards, /const \[view, setView\] = useState\(\(\) => restoredWebsiteView\(data\)\)/);
+  assert.match(cards, /setView\(persistWebsiteView\(data, nextView\)\)/);
+  assert.match(cards, /className="website-toolbar" role="group" aria-label="Generated website actions"/);
+  assert.match(cards, /className="website-action is-view-toggle"[\s\S]*?type="button"|type="button"[\s\S]*?className="website-action is-view-toggle"/);
+  assert.match(cards, /showingPreview \? "Code" : "Preview"/);
+  assert.match(cards, /showingPreview[\s\S]*?<Code2[\s\S]*?<Eye/);
+  assert.match(cards, /aria-controls=\{panelId\}/);
+  assert.match(cards, /aria-pressed=\{showingPreview\}/);
+  assert.match(cards, /aria-label=\{showingPreview \? "Show generated HTML code" : "Show rendered website preview"\}/);
+  assert.match(cards, /onClick=\{copyCode\}[\s\S]*?Copy code/);
+  assert.match(cards, /onClick=\{downloadHtml\}[\s\S]*?Download HTML/);
+  assert.equal((cards.match(/className="website-action is-view-toggle"/g) || []).length, 1);
+  assert.match(cards, /role="region"[\s\S]*?aria-label=\{`Rendered preview of \$\{title\}`\}/);
+  assert.match(cards, /role="region"[\s\S]*?aria-label=\{`HTML code for \$\{title\}`\}/);
+  assert.match(cards, /srcDoc=\{html\}/);
+  assert.match(cards, /sandbox=""/);
+  assert.match(cards, /referrerPolicy="no-referrer"/);
+  assert.match(cards, /not written or deployed/);
+  assert.match(cards, /Page-initiated downloads inside the sandbox are disabled/);
+  assert.match(cards, /Download requested for \$\{download\.filename\}/);
+  assert.doesNotMatch(cards, /dangerouslySetInnerHTML/);
+  assert.doesNotMatch(cards, /role="dialog"|aria-modal|backdrop/);
+  assert.match(styles, /\.stream\s*\{[\s\S]*?overflow-y:\s*auto/);
+  assert.match(styles, /\.stream\s*>\s*\*\s*\{[\s\S]*?flex-shrink:\s*0/);
+  assert.match(styles, /\.website-action\s*\{[\s\S]*?min-height:\s*44px/);
+  assert.match(styles, /\.website-action:focus-visible\s*\{/);
+  assert.match(styles, /\.website-frame\s*\{[\s\S]*?width:\s*100%[\s\S]*?max-width:\s*100%/);
+  assert.match(styles, /\.website-code-view\s*>\s*\.pre\s*\{[\s\S]*?max-height:\s*440px[\s\S]*?overflow:\s*auto/);
+  assert.match(styles, /@media \(max-width: 480px\)[\s\S]*?\.website-toolbar\s*\{[\s\S]*?grid-template-columns:\s*1fr/);
+  assert.match(styles, /@media \(max-width: 480px\)[\s\S]*?\.website-code-view\s*>\s*\.pre\s*\{[\s\S]*?max-height:\s*360px/);
+});

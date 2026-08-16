@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "provider": "comfyui",
+  "host": "127.0.0.1",
+  "port": 8188,
+  "runtime_root": "X:\\AI_Runtimes\\ComfyUI_windows_portable",
+  "checkpoint": "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors",
+  "output_dir": "data/generated-images",
+  "default_width": 1024,
+  "default_height": 1024,
+  "startup_timeout_seconds": 180,
+  "generation_timeout_seconds": 300,
+  "shutdown_timeout_seconds": 20,
+  "max_output_bytes": 67108864
+}

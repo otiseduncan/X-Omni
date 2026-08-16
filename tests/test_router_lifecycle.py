@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import psutil
+import pytest
+
+from core.models.router import (
+    LiveProof,
+    ModelRouter,
+    ProcessRecord,
+    WorkerConfig,
+    WorkerSwapError,
+    _CrossProcessFileLock,
+    load_workers,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_listener(port: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.1)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                return
+        time.sleep(0.05)
+    raise AssertionError(f"fixture listener on port {port} did not start")
+
+
+def _terminate(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _fixture_creation_flags() -> int:
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _write_fixture_worker(tmp_path: Path) -> Path:
+    package = tmp_path / "fixture_llama"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        """
+import argparse
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument('--alias', required=True)
+parser.add_argument('--host', required=True)
+parser.add_argument('--port', required=True, type=int)
+parser.add_argument('-c', required=True, type=int)
+args, _ = parser.parse_known_args()
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/v1/models':
+            self.send_response(404)
+            self.end_headers()
+            return
+        alias = os.environ.get('FIXTURE_ALIAS', args.alias)
+        context = int(os.environ.get('FIXTURE_CONTEXT', str(args.c)))
+        body = json.dumps({'data': [{'id': alias, 'meta': {'n_ctx': context}}]}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return package
+
+
+def _config(tmp_path: Path, name: str = "omni", port: int | None = None) -> WorkerConfig:
+    # ``python -m fixture_llama`` gives the fixture process the same exact
+    # command-line shape that llama.cpp uses (executable, -m model, flags).
+    # Tests chdir to tmp_path, where this package exists.
+    model_package = Path("fixture_llama")
+    return WorkerConfig(
+        name=name,
+        alias=f"fixture-{name}",
+        # A venv's sys.executable can be a redirector while Process.exe()
+        # truthfully reports the base interpreter. Use the inspected executable
+        # on both sides of this process-identity fixture.
+        executable=Path(psutil.Process(os.getpid()).exe()),
+        model_path=model_package,
+        host="127.0.0.1",
+        port=port or _free_port(),
+        context_tokens=32768,
+        extra_args=("--no-webui",),
+        gpu_indices=(0, 1),
+        gpu_free_thresholds_mib=((0, 15000), (1, 7500)),
+    )
+
+
+def _router(tmp_path: Path, cfg: WorkerConfig, **kwargs) -> ModelRouter:
+    return ModelRouter(
+        {cfg.name: cfg},
+        cfg.name,
+        health_timeout_s=2,
+        vram_timeout_s=0.2,
+        lifecycle_lock_timeout_s=0.2,
+        lifecycle_lock_path=tmp_path / f"lifecycle-{cfg.port}.lock",
+        **kwargs,
+    )
+
+
+def _launch_exact(cfg: WorkerConfig, env: dict[str, str] | None = None) -> subprocess.Popen:
+    return subprocess.Popen(
+        [str(cfg.executable), *cfg.build_args()],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_fixture_creation_flags(),
+    )
+
+
+def _fake_gpu_proof(monkeypatch: pytest.MonkeyPatch, router: ModelRouter) -> None:
+    monkeypatch.setattr(
+        router,
+        "_gpu_indices_for_pid",
+        lambda _pid: {0, 1},
+    )
+    monkeypatch.setattr(router, "_wait_vram_free", lambda _cfg: 0.0)
+
+
+def test_repository_workers_use_dedicated_port_and_both_gpus() -> None:
+    configs, default = load_workers(ROOT / "config" / "workers.json")
+    assert default == "omni"
+    assert {cfg.port for cfg in configs.values()} == {8131}
+    assert all(cfg.gpu_indices == (0, 1) for cfg in configs.values())
+    # GPU1 drives the Windows desktop and has ~7040 MiB free at the clean
+    # no-model baseline. 6500 still decisively distinguishes that state from
+    # the loaded worker (~380 MiB free) without making release impossible.
+    assert all(cfg.gpu_thresholds == {0: 15000, 1: 6500} for cfg in configs.values())
+
+
+def test_exact_listener_is_adopted_only_after_live_alias_context_gpu_and_start_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fixture_worker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    _fake_gpu_proof(monkeypatch, router)
+    process = _launch_exact(cfg)
+    try:
+        _wait_for_listener(cfg.port)
+        result = asyncio.run(router.start_default())
+        assert result["adopted"] is True
+        assert result["pid"] == process.pid
+        assert result["context_tokens"] == 32768
+        assert result["gpu_indices"] == [0, 1]
+        assert router.active_started_at == pytest.approx(psutil.Process(process.pid).create_time())
+
+        health = asyncio.run(router.health())
+        assert health["ready"] is True
+        assert health["process_identity_ok"] is True
+        assert health["process_start_time_ok"] is True
+        assert health["alias_ok"] is True
+        assert health["context_ok"] is True
+        assert health["gpu_ok"] is True
+
+        asyncio.run(router.shutdown())
+        process.wait(timeout=5)
+    finally:
+        _terminate(process)
+
+
+def test_foreign_listener_is_never_adopted_or_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fixture_worker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(cfg.port), "--bind", "127.0.0.1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_fixture_creation_flags(),
+    )
+    try:
+        _wait_for_listener(cfg.port)
+        with pytest.raises(WorkerSwapError, match="will not reuse or stop"):
+            asyncio.run(router.start_default())
+        assert process.poll() is None
+    finally:
+        _terminate(process)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"FIXTURE_ALIAS": "wrong-alias"}, "alias/context"),
+        ({"FIXTURE_CONTEXT": "4096"}, "alias/context"),
+    ],
+)
+def test_exact_process_with_wrong_live_contract_is_not_adopted_or_stopped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, str],
+    message: str,
+) -> None:
+    _write_fixture_worker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    _fake_gpu_proof(monkeypatch, router)
+    env = os.environ.copy()
+    env.update(override)
+    process = _launch_exact(cfg, env=env)
+    try:
+        _wait_for_listener(cfg.port)
+        with pytest.raises(WorkerSwapError, match=message):
+            asyncio.run(router.start_default())
+        assert process.poll() is None
+    finally:
+        _terminate(process)
+
+
+def test_start_time_mismatch_prevents_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fixture_worker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    _fake_gpu_proof(monkeypatch, router)
+    process = _launch_exact(cfg)
+    try:
+        _wait_for_listener(cfg.port)
+        asyncio.run(router.start_default())
+        router.active_started_at = float(router.active_started_at) - 10
+        with pytest.raises(WorkerSwapError, match="start_time_mismatch"):
+            router._stop_active_worker()
+        assert process.poll() is None
+    finally:
+        _terminate(process)
+
+
+def test_readiness_failure_cleans_up_only_exact_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fixture_worker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    _fake_gpu_proof(monkeypatch, router)
+    spawned: list[ProcessRecord] = []
+    original_spawn = router._spawn
+
+    def capture_spawn(worker: WorkerConfig) -> ProcessRecord:
+        record = original_spawn(worker)
+        spawned.append(record)
+        return record
+
+    monkeypatch.setattr(router, "_spawn", capture_spawn)
+    monkeypatch.setattr(
+        router,
+        "_wait_healthy",
+        lambda *_args: (_ for _ in ()).throw(WorkerSwapError("fixture readiness failed")),
+    )
+    monkeypatch.setattr(subprocess, "CREATE_NEW_CONSOLE", 0, raising=False)
+
+    with pytest.raises(WorkerSwapError, match="fixture readiness failed"):
+        asyncio.run(router.start_default())
+    assert len(spawned) == 1
+    assert not psutil.pid_exists(spawned[0].pid)
+
+
+def test_inference_lease_blocks_swap_until_generation_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fixture_worker(tmp_path)
+    port = _free_port()
+    omni = _config(tmp_path, "omni", port)
+    coder = _config(tmp_path, "coder", port)
+    router = ModelRouter(
+        {"omni": omni, "coder": coder},
+        "omni",
+        lifecycle_lock_path=tmp_path / "coordination.lock",
+    )
+    router.active_name = "omni"
+    router.active_pid = 101
+    router.active_started_at = 1000.0
+    events: list[str] = []
+
+    def stop_active() -> WorkerConfig:
+        events.append("stopped")
+        router.active_name = None
+        router.active_pid = None
+        router.active_started_at = None
+        return omni
+
+    monkeypatch.setattr(router, "_stop_active_worker", stop_active)
+    monkeypatch.setattr(router, "_find_pid_on_port", lambda _port: None)
+    monkeypatch.setattr(
+        router,
+        "_spawn",
+        lambda cfg: ProcessRecord(202, cfg.executable, (str(cfg.executable),), 2000.0),
+    )
+    monkeypatch.setattr(
+        router,
+        "_wait_healthy",
+        lambda cfg, *_args: (0.0, LiveProof((cfg.alias,), cfg.context_tokens), (0, 1)),
+    )
+
+    async def scenario() -> dict:
+        async with router.inference_session():
+            task = asyncio.create_task(router.swap_to("coder"))
+            for _ in range(100):
+                if router._coordinator.lifecycle_waiters:
+                    break
+                await asyncio.sleep(0)
+            assert router._coordinator.lifecycle_waiters == 1
+            assert events == []
+            assert not task.done()
+        return await task
+
+    result = asyncio.run(scenario())
+    assert events == ["stopped"]
+    assert result["swapped"] is True
+    assert router.active_name == "coder"
+
+
+def test_vram_release_requires_every_configured_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fixture_worker(tmp_path)
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    snapshots = iter(
+        [
+            {0: (16000, 16311), 1: (7000, 8151)},
+            {0: (16000, 16311), 1: (7000, 8151)},
+            {0: (16000, 16311), 1: (7600, 8151)},
+        ]
+    )
+    calls: list[dict[int, tuple[int, int]]] = []
+
+    def snapshot() -> dict[int, tuple[int, int]]:
+        value = next(snapshots)
+        calls.append(value)
+        return value
+
+    monkeypatch.setattr(router, "_gpu_memory_mib", snapshot)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    router._wait_vram_free(cfg)
+    assert len(calls) == 3
+    assert calls[1][0][0] >= 15000  # GPU0 was free, but GPU1 still blocked release.
+    assert calls[1][1][0] < 7500
+
+
+def test_cross_process_lifecycle_lock_rejects_concurrent_owner(tmp_path: Path) -> None:
+    path = tmp_path / "cross-process.lock"
+    first = _CrossProcessFileLock(path)
+    second = _CrossProcessFileLock(path)
+    first.acquire(0.1)
+    try:
+        with pytest.raises(WorkerSwapError, match="Another X Omni process"):
+            second.acquire(0.1)
+    finally:
+        second.release()
+        first.release()

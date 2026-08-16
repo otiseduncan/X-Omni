@@ -1,0 +1,113 @@
+/* X Omni theme — derived from XV11's palette.
+   Deep navy field, blue-cyan accents, glow borders. */
+
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+
+  --bg-black: #000913;
+  --bg-deep: #010e1e;
+  --panel: #041428;
+  --panel-2: #0f243a;
+  --panel-3: #15243a;
+
+  --border: #1e4f9c;
+  --border-soft: #2a3c55;
+
+  --blue: #2878ff;
+  --blue-bright: #76a9fa;
+  --success: #35e88a;
+  --warning: #ffb84d;
+  --danger: #ff5d5d;
+  --focus: #ffc457;
+  --purple: #7a5cff;
+
+  --text: #dde1e5;
+  --text-soft: #a6aeb5;
+  --text-muted: #81868c;
+
+  --radius: 14px;
+  --radius-sm: 9px;
+
+  /* iPhone notch / home indicator */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  background: var(--bg-black);
+}
+
+body {
+  min-width: 320px;
+  background: radial-gradient(circle at 12% 0%, rgba(40, 120, 255, 0.13), transparent 38%),
+    radial-gradient(circle at 88% 4%, rgba(122, 92, 255, 0.1), transparent 34%),
+    linear-gradient(180deg, var(--bg-deep), var(--bg-black));
+  background-attachment: fixed;
+  color: var(--text);
+  overscroll-behavior-y: none;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+:is(button, input, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-soft);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

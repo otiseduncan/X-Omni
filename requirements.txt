@@ -1,0 +1,12 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
+pydantic>=2.9,<3
+httpx>=0.27,<1
+psutil>=6,<8
+PyYAML>=6,<7
+python-multipart>=0.0.12,<1
+PyJWT[crypto]>=2.10,<3
+Pillow>=11,<13
+# ADAS SI page rendering -- inline document display in chat.
+# Apache-2.0/BSD, prebuilt Windows wheels, no external binaries.
+pypdfium2>=4.30

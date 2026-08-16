@@ -1,0 +1,40 @@
+{
+  "_comment": "Absolute paths to the existing runtime and weights. X Omni reads these; it never writes into that tree. Change these only if you actually move the files.",
+  "workers": {
+    "omni": {
+      "alias": "xoduz-qwen3-omni-30b",
+      "description": "Default. Conversation, planning, operator work, vision, audio, light coding.",
+      "executable": "X:\\XV12\\runtime\\llama.cpp\\llama-server.exe",
+      "model_path": "X:\\XV12\\models\\qwen3-omni-30b-a3b\\Qwen3-Omni-30B-A3B-Instruct-Q4_K_M.gguf",
+      "mmproj": "X:\\XV12\\models\\qwen3-omni-30b-a3b\\mmproj-Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf",
+      "no_mmproj_offload": true,
+      "supports_vision": true,
+      "supports_audio": true,
+      "host": "127.0.0.1",
+      "port": 8131,
+      "context_tokens": 32768,
+      "ngl": 99,
+      "parallel": 1,
+      "gpu_indices": [0, 1],
+      "gpu_free_thresholds_mib": {"0": 15000, "1": 6500},
+      "extra_args": ["--no-webui"]
+    },
+    "coder": {
+      "alias": "xoduz-qwen3-coder-30b",
+      "description": "Swap-in specialist. Substantial implementation, hard debugging, refactors. No vision or audio.",
+      "executable": "X:\\XV12\\runtime\\llama.cpp\\llama-server.exe",
+      "model_path": "X:\\XV12\\models\\qwen3-coder-30b-a3b\\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+      "supports_vision": false,
+      "supports_audio": false,
+      "host": "127.0.0.1",
+      "port": 8131,
+      "context_tokens": 32768,
+      "ngl": 99,
+      "parallel": 1,
+      "gpu_indices": [0, 1],
+      "gpu_free_thresholds_mib": {"0": 15000, "1": 6500},
+      "extra_args": ["--no-webui"]
+    }
+  },
+  "default_worker": "omni"
+}

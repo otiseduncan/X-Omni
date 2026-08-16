@@ -1,0 +1,171 @@
+# X Omni -- capability gateway policy.
+#
+# Every tool call is checked here before it runs. The model never
+# self-authorizes; its output is a *request* to run a tool, never
+# permission to run one.
+#
+# tiers:
+#   read_only        runs immediately, logged
+#   confirm_required surfaces an approval card in chat, waits for you
+#   blocked          never runs, regardless of what asks
+#
+# A tool with no entry here is BLOCKED (fail closed).
+
+roots:
+  # read_file / list_directory are confined to these. Anything outside
+  # is refused even at read_only tier.
+  - "X:\\X Omni"
+  - "X:\\X 11"
+  - "X:\\XV12"
+  - "C:\\Users\\otisd\\Projects"
+  # ADAS SI: the calibration knowledge base. Full read and write -- see
+  # write_roots below.
+  - "X:\\ADAS SI"
+
+# Protected writes are intentionally narrower than reads. XV12 is a reference
+# checkout for X Omni and must never be changed through the file tool, and
+# ADAS SI holds authoritative OEM documents that must never be rewritten.
+write_roots:
+  - "X:\\X Omni"
+  # ADAS SI is Otis's own calibration database, not third-party reference
+  # material -- he has full write access to it. Every overwrite is
+  # approval-gated and backed up to _xomni_backups\ first.
+  - "X:\\ADAS SI"
+
+# The gateway also enforces a non-configurable deny-list for .env* files,
+# SQLite DB/WAL/SHM files, credential/token stores, private keys, and private
+# identity paths. Adding one of those beneath a root never makes it readable.
+
+tools:
+  get_weather:
+    tier: read_only
+    description: "Current conditions and 7-day forecast for the saved location."
+
+  get_calendar:
+    tier: read_only
+    description: "Read upcoming Google Calendar events."
+
+  list_tasks:
+    tier: read_only
+    description: "List open tasks and reminders."
+
+  add_task:
+    tier: confirm_required
+    description: "Add a task or reminder to the local list. Requires approval."
+
+  update_task_status:
+    tier: confirm_required
+    description: "Mark a task open, in progress, done, or abandoned. Requires approval."
+
+  read_file:
+    tier: read_only
+    description: "Read a text file inside an allowed root."
+
+  list_directory:
+    tier: read_only
+    description: "List a directory inside an allowed root."
+
+  search_files:
+    tier: read_only
+    description: "Bounded literal file search inside an allowed read-only root."
+
+  web_research_current:
+    tier: read_only
+    description: "Live public web search with source-visible, untrusted excerpts."
+
+  website_preview_generate:
+    tier: read_only
+    description: "Generate a buffered static website and sandboxed inline chat preview; no files or deployment."
+
+  camera_request:
+    tier: read_only
+    description: "Request an operator-controlled live browser preview in chat; Omni analyzes only explicitly submitted current frames."
+
+  exterior_camera_request:
+    tier: read_only
+    description: "Request the configured local exterior camera inline; returns safe status and starts nothing until the operator uses the card."
+
+  image_generation_status:
+    tier: read_only
+    description: "Non-disruptive configured/live status for the separate local ComfyUI worker."
+
+  assistant_capabilities_read:
+    tier: read_only
+    description: "Truthful catalog of currently wired capabilities and limitations."
+
+  system_status:
+    tier: read_only
+    description: "Active worker, GPU VRAM, health."
+
+  write_file:
+    tier: confirm_required
+    description: "Create or overwrite a file. Requires approval."
+
+  create_calendar_event:
+    tier: confirm_required
+    description: "Write an event to Google Calendar. Requires approval."
+
+  run_powershell:
+    tier: confirm_required
+    description: "Run a PowerShell command. Requires approval."
+
+  image_generate:
+    tier: confirm_required
+    description: "Generate and persist one local inline image after approval; schedules Omni and ComfyUI sequentially."
+
+  # ---- ADAS SI: the source library is read-only; annotations are gated ----
+  adas_si_search:
+    tier: read_only
+    description: "Search the authoritative ADAS SI library for calibration procedures."
+
+  adas_si_inventory:
+    tier: read_only
+    description: "List ADAS SI documents and the vehicle applications they cover."
+
+  adas_si_open:
+    tier: read_only
+    description: "Display an ADAS SI document (the real PDF) inline in chat."
+
+  adas_si_file_write:
+    tier: confirm_required
+    description: "Create or overwrite a file in the ADAS SI library. Backed up first. Requires approval."
+
+  adas_si_records:
+    tier: read_only
+    description: "List operator-written ADAS SI annotation records."
+
+  adas_si_record_write:
+    tier: confirm_required
+    description: "Create an ADAS SI annotation record. OEM originals untouched. Requires approval."
+
+  adas_si_record_modify:
+    tier: confirm_required
+    description: "Update an ADAS SI annotation record. Version-checked. Requires approval."
+
+  # ---- Calibration IQ: live field data, so writes are always gated ----
+  calibration_iq_status:
+    tier: read_only
+    description: "Is Calibration IQ reachable and is the service token accepted."
+
+  calibration_iq_summary:
+    tier: read_only
+    description: "Count active, all, or authoritative terminal repair orders without listing rows."
+
+  calibration_iq_read:
+    tier: read_only
+    description: "List one bounded visible subset from a complete active, all, or terminal result."
+
+  calibration_iq_ro:
+    tier: read_only
+    description: "Display one Calibration IQ repair order in full."
+
+  calibration_iq_update:
+    tier: confirm_required
+    description: >-
+      Change a repair order in Calibration IQ (status, fields, blockers,
+      requirements). Idempotency-keyed and version-checked upstream.
+      Requires approval.
+
+  delete_file:
+    tier: blocked
+    description: "Not available. Deletion stays manual."

@@ -1,0 +1,33 @@
+# Secrets — never commit
+config/.env.local
+
+# Runtime state
+data/
+logs/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local diagnostics and temporary review artifacts
+.benchmarks/
+tmp/
+
+# Node / UI build
+ui/node_modules/
+ui/dist/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
