@@ -89,6 +89,10 @@ tools:
     tier: read_only
     description: "Non-disruptive configured/live status for the separate local ComfyUI worker."
 
+  video_generation_status:
+    tier: read_only
+    description: "Non-disruptive status for bounded source-preserving local video animation."
+
   assistant_capabilities_read:
     tier: read_only
     description: "Truthful catalog of currently wired capabilities and limitations."
@@ -112,6 +116,10 @@ tools:
   image_generate:
     tier: confirm_required
     description: "Generate and persist one local inline image after approval; schedules Omni and ComfyUI sequentially."
+
+  video_generate:
+    tier: confirm_required
+    description: "Create a verified MP4 from a verified generated PNG using an explicitly selected mode: genuine local Wan2.2 image-to-video or the procedural hover-and-pulse treatment."
 
   # ---- ADAS SI: the source library is read-only; annotations are gated ----
   adas_si_search:

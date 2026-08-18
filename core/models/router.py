@@ -37,6 +37,27 @@ class WorkerSwapError(RuntimeError):
     pass
 
 
+class WorkerReadinessError(WorkerSwapError):
+    """A trusted worker's live readiness proof remained transiently unavailable."""
+
+
+class ExternalWorkloadStartError(WorkerSwapError):
+    """The external-workload lease failed before its caller could start work."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        lifecycle: dict,
+        stage: str = "model_handoff",
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.lifecycle = lifecycle
+        self.stage = stage
+        self.retryable = retryable
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     name: str
@@ -443,25 +464,63 @@ class ModelRouter:
 
             started = time.monotonic()
             lease = {
+                "mode": "sequential_exclusive",
                 "workload": workload,
                 "previous_worker": previous_cfg.name,
                 "gpu_indices": list(previous_cfg.gpu_indices),
+                "model_stop_attempted": False,
                 "model_stopped": False,
-                "model_restored": False,
+                "model_restore_required": False,
+                "model_restored": None,
             }
             body_error: Optional[BaseException] = None
+            workload_yielded = False
             self.swapping = True
             self.external_workload = workload
             self._notify({**self.status(), "external_workload": workload})
             try:
-                stopped, stop_cancelled = await self._await_lifecycle_completion(
-                    asyncio.to_thread(self._stop_active_worker)
-                )
+                lease["model_stop_attempted"] = True
+                try:
+                    stopped, stop_cancelled = await self._await_lifecycle_completion(
+                        asyncio.to_thread(self._stop_active_worker)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    stopped_during_failure = (
+                        self.active_name is None
+                        and self.active_pid is None
+                        and self.active_started_at is None
+                    )
+                    lease["model_stopped"] = stopped_during_failure
+                    lease["model_restore_required"] = stopped_during_failure
+                    lease["model_restored"] = False if stopped_during_failure else None
+                    retryable = isinstance(exc, WorkerReadinessError)
+                    raise ExternalWorkloadStartError(
+                        (
+                            "Omni readiness could not be re-proved before the "
+                            "external model hand-off."
+                            if retryable
+                            else (
+                                f"External workload '{workload}' could not start because the "
+                                f"active worker hand-off failed ({type(exc).__name__})"
+                            )
+                        ),
+                        lifecycle=lease,
+                        stage=("model_stop_readiness" if retryable else "model_handoff"),
+                        retryable=retryable,
+                    ) from exc
                 if stopped is None:
-                    raise WorkerSwapError("Verified model worker disappeared before hand-off")
+                    raise ExternalWorkloadStartError(
+                        "Verified model worker disappeared before hand-off",
+                        lifecycle=lease,
+                    )
                 lease["model_stopped"] = True
+                lease["model_restore_required"] = True
+                lease["model_restored"] = False
                 if stop_cancelled:
                     raise asyncio.CancelledError
+                workload_yielded = True
                 yield lease
             except BaseException as exc:
                 body_error = exc
@@ -482,12 +541,30 @@ class ModelRouter:
                 self.swapping = False
                 self._notify(self.status())
                 if restore_error is not None:
+                    log.error(
+                        "External workload %r could not restore worker %r",
+                        workload,
+                        previous_cfg.name,
+                        exc_info=(
+                            type(restore_error),
+                            restore_error,
+                            restore_error.__traceback__,
+                        ),
+                    )
                     message = (
                         f"External workload '{workload}' ended, but verified worker "
-                        f"'{previous_cfg.name}' could not be restored: {restore_error}"
+                        f"'{previous_cfg.name}' could not be restored "
+                        f"({type(restore_error).__name__})"
                     )
                     if body_error is not None:
                         message += f" (the workload also failed: {type(body_error).__name__})"
+                    if not workload_yielded:
+                        raise ExternalWorkloadStartError(
+                            message,
+                            lifecycle=lease,
+                            stage="model_restore",
+                            retryable=False,
+                        ) from restore_error
                     raise WorkerSwapError(message) from restore_error
                 if restore_cancelled:
                     raise asyncio.CancelledError
@@ -779,9 +856,45 @@ class ModelRouter:
                 f"Foreign pid {listener_pid} owns model port {cfg.port}; X Omni will not stop it"
             )
         if listener_pid == pid and require_live_proof:
-            proof = self._model_proof(cfg)
+            proof: Optional[LiveProof] = None
+            last_error: Optional[BaseException] = None
+            for attempt in range(3):
+                # Retrying the idempotent catalog GET is safe only while the
+                # original process identity and listener ownership remain
+                # exact. Never carry proof across a PID/port ownership change.
+                self._require_identity(pid, cfg, started_at)
+                current_listener = self._find_pid_on_port(cfg.port)
+                if current_listener != pid:
+                    raise WorkerSwapError(
+                        f"Refusing to stop pid {pid}: model listener ownership changed "
+                        "during live-proof retry"
+                    )
+                try:
+                    proof = self._model_proof(cfg)
+                    break
+                except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                    last_error = exc
+                    if attempt == 2:
+                        raise WorkerReadinessError(
+                            f"Refusing to stop pid {pid}: live alias/context proof "
+                            f"remained unavailable after 3 attempts ({type(exc).__name__})"
+                        ) from exc
+                    time.sleep(0.25 * (attempt + 1))
+            if proof is None:
+                raise WorkerSwapError(
+                    f"Refusing to stop pid {pid}: live alias/context proof failed"
+                ) from last_error
             if not proof.matches(cfg):
                 raise WorkerSwapError(f"Refusing to stop pid {pid}: live alias/context proof failed")
+            # Close the final race between successful HTTP proof and the
+            # termination signal. A replacement listener is never accepted,
+            # even if it reports the same alias and context.
+            self._require_identity(pid, cfg, started_at)
+            if self._find_pid_on_port(cfg.port) != pid:
+                raise WorkerSwapError(
+                    f"Refusing to stop pid {pid}: model listener ownership changed "
+                    "after live proof"
+                )
 
         try:
             process = psutil.Process(record.pid)

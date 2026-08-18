@@ -1,4 +1,5 @@
 import { ChevronDown, Loader2, ShieldAlert, ShieldCheck, ShieldX } from "lucide-react";
+import { videoFailureDisclosure } from "../lib/videoArtifact.js";
 
 /**
  * Destructive actions stop here. The model can request them; only Otis
@@ -103,9 +104,12 @@ function ReceiptFacts({ receipt }) {
 export default function ApprovalCard({ approval, status = "pending", receipt, onDecide, disabled }) {
   const state = COPY[status] || COPY.pending;
   const Icon = state.Icon;
-  const outcomeMessage = status === "indeterminate"
+  const videoFailure = (approval?.tool === "video_generate" || receipt?.tool_name === "video_generate")
+    ? videoFailureDisclosure(receipt?.result)
+    : null;
+  const outcomeMessage = videoFailure?.message || (status === "indeterminate"
     ? approval.outcome_message || receipt?.outcome_message || receipt?.error || state.message
-    : state.message;
+    : state.message);
 
   if (status === "succeeded" && receipt) {
     return (

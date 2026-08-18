@@ -8,6 +8,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import re
 from typing import Optional
 
 import httpx
@@ -20,6 +21,11 @@ from ..services import camera as camera_svc
 from ..services import calendar as calendar_svc
 from ..services import exterior_camera as exterior_camera_svc
 from ..services.image_generation import ImageGenerationError, generated_image_path
+from ..services.video_generation import (
+    VideoGenerationError,
+    generated_video_path,
+    verify_generated_video_file,
+)
 from ..services import weather as weather_svc
 
 log = logging.getLogger("xomni.routes")
@@ -65,6 +71,7 @@ def create_router(
     require_session,
     *,
     image_config=None,
+    video_config=None,
     exterior_camera=None,
     adas=None,
 ) -> APIRouter:
@@ -170,6 +177,7 @@ def create_router(
             "system_status": "system_status",
             "assistant_capabilities_read": "capabilities",
             "image_generation_status": "image_generation_status",
+            "video_generation_status": "video_generation_status",
             "exterior_camera_request": "exterior_camera_request",
         }.get(tool_name)
         artifact = {"type": card_type, "data": result} if card_type else None
@@ -255,6 +263,111 @@ def create_router(
             path,
             media_type="image/png",
             headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+
+    @api.get("/generated-videos/{filename}")
+    async def generated_video(filename: str, request: Request):
+        """Serve one verified content-addressed MP4 with single-range support."""
+        if video_config is None:
+            raise HTTPException(404, "Video animation is not configured.")
+        try:
+            path = generated_video_path(video_config, filename)
+        except VideoGenerationError as exc:
+            raise HTTPException(404, "Generated video not found.") from exc
+        if not path.is_file():
+            raise HTTPException(404, "Generated video not found.")
+
+        expected_digest = filename.removesuffix(".mp4")
+        try:
+            size, digest = await asyncio.to_thread(
+                verify_generated_video_file,
+                video_config,
+                path,
+                expected_digest,
+            )
+        except (OSError, VideoGenerationError) as exc:
+            raise HTTPException(
+                404, "Generated video failed integrity verification."
+            ) from exc
+
+        common_headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "ETag": f'"{digest}"',
+        }
+        range_header = str(request.headers.get("range") or "").strip()
+        if not range_header:
+            return FileResponse(
+                path,
+                media_type="video/mp4",
+                headers=common_headers,
+            )
+
+        match = (
+            re.fullmatch(r"bytes=(\d{0,20})-(\d{0,20})", range_header)
+            if len(range_header) <= 48
+            else None
+        )
+        if match is None or (not match.group(1) and not match.group(2)):
+            raise HTTPException(
+                416,
+                "Only one valid byte range is supported.",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": f"bytes */{size}",
+                },
+            )
+        start_text, end_text = match.groups()
+        if start_text:
+            start = int(start_text)
+            end = int(end_text) if end_text else size - 1
+            if start >= size or end < start:
+                raise HTTPException(
+                    416,
+                    "Requested byte range is not satisfiable.",
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Range": f"bytes */{size}",
+                    },
+                )
+            end = min(end, size - 1)
+        else:
+            suffix_length = int(end_text)
+            if suffix_length <= 0:
+                raise HTTPException(
+                    416,
+                    "Requested byte range is not satisfiable.",
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Range": f"bytes */{size}",
+                    },
+                )
+            suffix_length = min(suffix_length, size)
+            start = size - suffix_length
+            end = size - 1
+
+        length = end - start + 1
+
+        def stream_range():
+            with path.open("rb") as stream:
+                stream.seek(start)
+                remaining = length
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return StreamingResponse(
+            stream_range(),
+            status_code=206,
+            media_type="video/mp4",
+            headers={
+                **common_headers,
+                "Content-Range": f"bytes {start}-{end}/{size}",
+                "Content-Length": str(length),
+            },
         )
 
     # ---------- ADAS SI documents ----------

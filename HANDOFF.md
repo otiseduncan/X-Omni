@@ -4,7 +4,7 @@ Updated 2026-08-16 on Omega. This file is the current implementation record; `PL
 
 ## Scope and invariants
 
-- Workspace: `X:\X Omni` (not currently a Git repository).
+- Workspace: `X:\X Omni`, Git branch `main`, with private remote `https://github.com/otiseduncan/X-Omni`.
 - `X:\X 11` and `X:\XV12` were reference-only and were not modified.
 - Fixed hardware: RTX 5060 Ti 16GB plus RTX 5060 8GB. No cloud or hardware-upgrade substitution.
 - One 30B worker at a time, 32K context. Omni is default; Coder is a manual swap.
@@ -17,7 +17,7 @@ Updated 2026-08-16 on Omega. This file is the current implementation record; `PL
 - Worker: llama.cpp on X Omni's dedicated `127.0.0.1:8131`.
 - State: SQLite/WAL under `data`, outside the disposable model process.
 - UI: React/Vite PWA served by Core.
-- External services: Open-Meteo weather, RainViewer/CARTO radar, DuckDuckGo/Google News research, Google OAuth/Calendar, and optional browser/Google speech. Model inference, camera-frame vision, website generation, and ComfyUI image synthesis remain on Omega.
+- External services: Open-Meteo weather, RainViewer/CARTO radar, DuckDuckGo/Google News research, Google OAuth/Calendar, and optional browser/Google speech. Model inference, camera-frame vision, website generation, ComfyUI image synthesis, and fixed FFmpeg source animation remain on Omega.
 - Model/runtime/weights remain owned under `X:\XV12`; X Omni reads them by configured absolute path and does not modify the reference tree.
 
 ## Hardened behavior now implemented
@@ -70,6 +70,8 @@ Updated 2026-08-16 on Omega. This file is the current implementation record; `PL
 - The UI discloses browser/Google speech and RainViewer/CARTO network boundaries. Camera requests render an explicit live preview with Start, Analyze current frame, and Stop controls. No recurring upload exists; raw frames are not persisted, and every track is stopped on Stop or unmount.
 - Website generation returns one bounded HTML artifact with an inline Code/Preview flip, Copy code, Download HTML, a network-blocking CSP, and a script-disabled sandboxed preview. It does not silently replace an explicit request to write files or deploy; those still use the approval-gated write/PowerShell path.
 - Image generation is a separate approval-gated ComfyUI workload under an exclusive model lifecycle lease. Only a verified, content-addressed PNG with a matching success receipt and proved Omni restoration renders as success.
+- `video_generate` requires an explicit mode and never substitutes modes. `exact_source_animation` is the approval-gated CPU-only FFmpeg `hover_pulse` treatment. `image_to_video` is a genuine Wan2.2 TI2V-5B diffusion workflow using only fixed built-in ComfyUI nodes, a 704×704 `4n+1` latent sequence, and `ImageFromBatch` to encode exactly the requested 24-fps duration. Wan accepts only a verified source SHA and a bounded prompt/JS-safe seed, runs under the sequential GPU lease, and requires exact official size/SHA model proof plus verified Omni restoration. It is source-conditioned video, not a reusable 3D mesh. All three installed Wan files pass pinned size and SHA-256 proof; failure cannot fall back to FFmpeg. Live proof on 2026-08-16 produced verified MP4 `d12073ab9fe567ff06bef2776fc87cb118dadcc024465a4e16527dd6efdaf270` (704×704, 24 fps, 240 frames, 10.000 seconds), shut down the owned Comfy runtime, restored the exact Omni worker, and played through authenticated Range requests after reload. Quantitative frame analysis showed orb motion 72.3× the adjacent-frame background change, ruling out a whole-frame wobble; visual review also found surface shimmer/morphing, weak hover, and loss of the cyan ring, so do not describe current Wan output as clean rigid 3D rotation or a mesh.
+- External video hand-off now retries only the idempotent Omni `/models` readiness proof, re-proving exact PID, start time, and listener ownership on every attempt and immediately before any signal. `POST /prompt` remains single-shot. Terminal failures distinguish `not_attempted`, `accepted`, and `indeterminate`, retain model/runtime/file cleanup truth, persist the receipt/status card before delivery, and use fixed model-free prose. A pre-stop timeout is `model_stop_readiness`, retryable, explicitly says no Wan job was submitted, and does not produce a second model-call error toast.
 - The service worker caches only versioned shell/static assets. API, auth, WebSocket, and third-party traffic are network-only.
 
 ### Calibration IQ query truth
@@ -98,8 +100,8 @@ npm --prefix ui run build
 
 Confirmed locally:
 
-- `.venv` backend/security/lifecycle/capability suite: 186 passed. Python compilation and dependency consistency passed. Ruff is not installed, so lint was unavailable.
-- Frontend suite: 47 passed. Vite 8.2.1 production build passed.
+- `.venv` backend/security/lifecycle/capability suite: 211 passed. Python compilation and dependency consistency passed. Ruff is not installed, so lint was unavailable.
+- Frontend suite: 51 passed. Vite 8.2.1 production build passed.
 - `setup.ps1` completed using the lockfiles and preserved `.env.local`.
 - Browser reload restored the same persisted timeline with no console warnings/errors. 360/390/430px checks had no horizontal overflow, retained the composer, and kept top targets at least 44px. The versioned service worker was served and registered.
 - The old 8100/8121 runtime was stopped only after exact process/live-model verification. An integrity-checked pre-migration backup is at `data\backups\x_omni-before-hardening-20260815-190702.sqlite`.
@@ -115,6 +117,8 @@ Confirmed locally:
 - PowerShell timeout/nonzero exit now records terminal failure (`executed=true`, `success=false`). An interrupted persisted `executing` claim reopens as terminal indeterminate failure and is never rerun automatically.
 - The signed-in browser exercised the physical-camera path end to end: Start displayed the live webcam inline, Analyze current frame produced one persisted description-only Omni observation, Stop cleared the media source, and reload restored exactly one observation with the camera off.
 - A real approved ComfyUI generation produced a verified 1024×1024 PNG whose SHA-256 matched its content-addressed filename and receipt. The exact spawned ComfyUI runtime stopped, port 8188 was released, both GPUs were proved free, the exact Omni worker was restored healthy on 8131, and reload restored one receipt-matched image card.
+- A real approved `video_generate` call used the verified orb PNG and produced `1b058b5e83a22de4ae1b5b209060312a3c460d3b1b0ed8304764c1eabe005fd6.mp4`: 1,874,219 bytes, SHA-256 equal to its filename, one 1024×1024 H.264/yuv420p stream, 24 fps, 240 frames, and exactly 10.0 seconds. The signed-in browser loaded it through authenticated 206 Range responses, played it to completion, and restored the same receipt-bound player after reload; a signed-out Range request returned 401 with `Cache-Control: no-store`.
+- After one transient pre-stop readiness timeout, a separate approved retry completed as verified Wan MP4 `4538a59b5c432ff940dd259ef96964ab89d742f5a954b576799657bf944a108b.mp4`: 961,036 bytes, SHA-256 equal to its filename, one 704×704 H.264/yuv420p stream, 24 fps, 240 frames, and exactly 10.0 seconds. The owned Comfy runtime and port 8188 were gone afterward, exact Omni was restored healthy on 8131, and signed-in reload showed one receipt-bound player while clearing the stale workload banner.
 - Live browser delivery used service-worker cache v6 and the rebuilt assets. The Tim's Towing card defaulted to bounded Code, Preview rendered its real `srcDoc` page in an empty sandbox, the same toggle returned to Code, Copy completed, Download reported a request, and the restored baseball PNG occupied a visible 776px card instead of being flex-clipped to 28px.
 - Calibration IQ's guarded Production launcher restored its stopped PostgreSQL process without changing source or reseeding records. Fresh authoritative API paging reported Macon as 59 total records: 50 active and 9 `Calibration Complete`; Macon phase 5 reported 15 active: 9 New Arrival, 5 Waiting On Prerequisites, and 1 Repair In Progress, with zero duplicates.
 - A fresh signed-in X Omni conversation ran `How many cars are active in Macon?`, `How many are in Macon phase 5?`, and `Show me those.` The stored calls were summary `{shop: Macon}`, summary `{shop: Macon, phase: 5}`, and read `{shop: Macon, phase: 5}`. Text/card totals were 50, 15, and all 15 rows respectively; exactly one card persisted per prompt and reload restored two summary cards plus one list card.
@@ -126,7 +130,8 @@ Not yet proved and must stay labeled as such:
 - Live receipt-backed Calendar write.
 - Phone behavior over the intended Tailscale route.
 - Local Omni audio transcription through this application path.
+- Ownership-manifest-backed cleanup of request-scoped Wan staging/output/temp files after an ungraceful Core crash. Startup currently reconciles the exact state-backed Comfy process, but deliberately does not perform a broad prefix sweep.
 
 One non-fatal Windows `WinError 10054` Proactor callback was logged during expected Coder load polling; the swap completed healthy and it did not recur on the Omni return. Treat it as diagnostic noise unless it repeats outside lifecycle turnover.
 
-Observed Tailscale state during this work proxied `/` to port 8084 and `:8443` to port 8120, not X Omni port 8100. Re-check before relying on it because external routing state can drift.
+The shared-node Tailscale contract is now explicit: `https://omega.<tailnet>.ts.net/` (port 443) proxies Calibration IQ on loopback 8084, while `https://omega.<tailnet>.ts.net:8443/` proxies X Omni on loopback 8100. `scripts\tailscale-serve.ps1` changes only 8443 and deliberately preserves Calibration IQ's 443 handler. Re-check live Serve status before relying on it because external routing state can drift.

@@ -113,6 +113,30 @@ _CIQ_PHASE_WORDS = {
     "ten": "10",
 }
 _CIQ_CONTEXT_STRING_FILTERS = ("shop", "phase", "status", "insurance", "q")
+_EXPLICIT_WEB_RESEARCH_RE = re.compile(
+    r"\b(?:search|browse)\s+(?:the\s+)?(?:web|internet)\b"
+    r"|\b(?:search|look\s+up|find)\b.{0,120}\b(?:online|on\s+the\s+(?:web|internet))\b"
+    r"|\b(?:where|where's|wheres|were)\s+can\s+i\s+find\b.{0,120}\bonline\b"
+    r"|\blook\s+(?:it|this|that)\s+up\b"
+    r"|\bgoogle\s+(?:it|this|that|for)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_CURRENT_INFORMATION_RE = re.compile(
+    r"\b(?:current(?:ly)?|latest|newest|recent|breaking|right\s+now|today(?:'s)?|as\s+of\s+today)\b",
+    re.IGNORECASE,
+)
+_CURRENT_INFORMATION_SUBJECT_RE = re.compile(
+    r"\b(?:news|release|version|price|stock|market|office(?:holder)?|president|"
+    r"governor|mayor|ceo|election|law|regulation|conflict|war|recall|score|"
+    r"standings|public\s+schedule)\b",
+    re.IGNORECASE,
+)
+_SPECIALIZED_CURRENT_LANE_RE = re.compile(
+    r"\b(?:weather|forecast|temperature|radar|calendar|appointment|my\s+schedule|"
+    r"repair\s+orders?|calibration\s+iq|adas)\b",
+    re.IGNORECASE,
+)
+
 
 
 def _safe_calibration_filters(raw: Any, *, result: Any = None) -> dict[str, Any]:
@@ -335,6 +359,25 @@ def deterministic_read_tool(user_message: object) -> Optional[str]:
         return "exterior_camera_request"
     return "website_preview_generate" if website_intent else None
 
+
+
+
+def web_research_fallback_summary(result: Any) -> str:
+    """Replace a false capability denial after Core already ran live research."""
+    payload = result if isinstance(result, dict) else {}
+    sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    if sources:
+        count = len(sources)
+        noun = "source result" if count == 1 else "source results"
+        return (
+            f"I searched the live public web and found {count} {noun}. "
+            "The source-linked research card contains the returned excerpts and links."
+        )
+    return (
+        "I searched the live public web, but the configured providers returned no source "
+        "results for that query. That is a search-result limitation, not a lack of web access."
+    )
+
 # Tool name -> card type the UI knows how to render.
 ARTIFACT_FOR_TOOL = {
     "get_weather": "weather",
@@ -351,6 +394,8 @@ ARTIFACT_FOR_TOOL = {
     "exterior_camera_request": "exterior_camera_request",
     "image_generation_status": "image_generation_status",
     "image_generate": "generated_image",
+    "video_generation_status": "video_generation_status",
+    "video_generate": "generated_video",
     "assistant_capabilities_read": "capabilities",
     "read_file": "file",
     "run_powershell": "shell_result",
@@ -416,9 +461,108 @@ def tool_result_for_model(name: str, result: Any) -> Any:
 
 
 def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
-    """Choose a success card only when image-result truth is self-consistent."""
-    if name != "image_generate":
+    """Choose media success cards only when result truth is self-consistent."""
+    if name not in {"image_generate", "video_generate"}:
         return ARTIFACT_FOR_TOOL.get(name)
+    if name == "video_generate":
+        if not isinstance(result, dict):
+            return "video_generation_status"
+        lifecycle = result.get("lifecycle") or {}
+        digest = str(result.get("sha256") or "")
+        source_digest = str(result.get("source_sha256") or "")
+        expected_url = f"/api/generated-videos/{digest}.mp4"
+        common_verified = (
+            result.get("ok") is True
+            and result.get("status") == "completed"
+            and result.get("executed") is True
+            and result.get("success") is True
+            and result.get("actual_video") is True
+            and result.get("verified") is True
+            and result.get("source_verified") is True
+            and result.get("mime_type") == "video/mp4"
+            and result.get("codec") == "h264"
+            and result.get("pixel_format") == "yuv420p"
+            and type(result.get("fps")) is int
+            and result.get("fps") == 24
+            and type(result.get("duration_seconds")) is int
+            and 2 <= result.get("duration_seconds") <= 10
+            and type(result.get("frame_count")) is int
+            and result.get("frame_count") == result.get("duration_seconds") * 24
+            and type(result.get("bytes")) is int
+            and result.get("bytes") > 0
+            and all(
+                type(result.get(key)) is int
+                and 64 <= result.get(key) <= 4096
+                and result.get(key) % 2 == 0
+                for key in ("width", "height")
+            )
+            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+            and re.fullmatch(r"[0-9a-f]{64}", source_digest) is not None
+            and result.get("video_url") == expected_url
+            and result.get("target") == expected_url
+        )
+        mode = result.get("mode")
+        procedural_verified = (
+            mode == "exact_source_animation"
+            and result.get("actual_generation") is False
+            and result.get("source_preserved") is True
+            and result.get("source_conditioned") is False
+            and result.get("provider") == "ffmpeg-exact-local"
+            and result.get("render_kind") == "deterministic_exact_source_animation"
+            and result.get("profile") == "hover_pulse"
+            and lifecycle.get("mode") == "bounded_cpu_subprocess"
+            and lifecycle.get("model_remained_available") is True
+        )
+        seed = result.get("seed")
+        expected_wan_assets = {
+            "wan2.2_ti2v_5B_fp16.safetensors": (
+                9999658848,
+                "456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e",
+            ),
+            "umt5_xxl_fp8_e4m3fn_scaled.safetensors": (
+                6735906897,
+                "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
+            ),
+            "wan2.2_vae.safetensors": (
+                1409400960,
+                "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156",
+            ),
+        }
+        wan_assets = result.get("model_assets")
+        wan_assets_verified = (
+            isinstance(wan_assets, dict)
+            and set(wan_assets) == set(expected_wan_assets)
+            and all(
+                isinstance(wan_assets.get(filename), dict)
+                and wan_assets[filename].get("verified") is True
+                and wan_assets[filename].get("bytes") == expected[0]
+                and wan_assets[filename].get("sha256") == expected[1]
+                for filename, expected in expected_wan_assets.items()
+            )
+        )
+        generative_verified = (
+            mode == "image_to_video"
+            and result.get("actual_generation") is True
+            and result.get("source_preserved") is False
+            and result.get("source_conditioned") is True
+            and result.get("provider") == "comfyui-wan2.2-ti2v-5b-local"
+            and result.get("render_kind") == "generative_image_to_video"
+            and result.get("model_id") == "Wan2.2-TI2V-5B"
+            and result.get("width") == 704
+            and result.get("height") == 704
+            and type(seed) is int
+            and 0 <= seed < 2**53
+            and re.fullmatch(r"[0-9a-f]{64}", str(result.get("prompt_sha256") or ""))
+            is not None
+            and lifecycle.get("mode") == "sequential_exclusive"
+            and lifecycle.get("model_stopped") is True
+            and lifecycle.get("model_restored") is True
+            and type(lifecycle.get("gpu_indices")) is list
+            and bool(lifecycle.get("gpu_indices"))
+            and wan_assets_verified
+        )
+        verified = common_verified and (procedural_verified or generative_verified)
+        return "generated_video" if verified else "video_generation_status"
     if not isinstance(result, dict):
         return "image_generation_status"
     lifecycle = result.get("lifecycle") or {}
@@ -431,6 +575,49 @@ def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
         and lifecycle.get("model_restored") is True
     )
     return "generated_image" if verified else "image_generation_status"
+
+
+def video_failure_summary(result: Any) -> str:
+    """Return fixed, receipt-grounded prose for a failed protected video run."""
+    if not isinstance(result, dict):
+        return "Video generation failed. No verified playable video is being claimed."
+
+    generation = result.get("generation")
+    lifecycle = result.get("lifecycle")
+    generation = generation if isinstance(generation, dict) else {}
+    lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+    submit_state = generation.get("submit_state")
+    may_have_generated = generation.get("may_have_generated")
+
+    if submit_state == "not_attempted" and may_have_generated is False:
+        if (
+            result.get("stage") == "model_stop_readiness"
+            and result.get("retryable") is True
+            and lifecycle.get("model_stop_attempted") is True
+            and lifecycle.get("model_stopped") is False
+        ):
+            return (
+                "Video generation did not start because Omni's readiness check could not "
+                "be completed. No video job was submitted, and Omni was not stopped."
+            )
+        return (
+            "Video generation did not start. No video job was submitted, and no video "
+            "is being claimed."
+        )
+
+    if submit_state == "indeterminate" or may_have_generated is True:
+        if result.get("actual_video") is True and result.get("verified") is True:
+            return (
+                "A video file was generated, but final lifecycle verification failed. "
+                "The receipt preserves that partial result; no playable success card is "
+                "being claimed."
+            )
+        return (
+            "Video generation may have begun, but no verified playable result is being "
+            "claimed. The receipt records the cleanup and restoration outcome."
+        )
+
+    return "Video generation failed. No verified playable video is being claimed."
 
 
 class Orchestrator:
@@ -572,6 +759,27 @@ class Orchestrator:
         artifacts: list[dict] = []
         full_text = ""
 
+       
+            message_id = self.store.add_message(
+                conversation_id,
+                "assistant",
+                summary,
+                worker_used=self.router.active_name,
+                artifacts=[],
+            )
+            if len(history) <= 1:
+                self.store.touch_conversation(
+                    conversation_id, title=user_message[:60]
+                )
+            yield {"type": "token", "text": summary}
+            yield {
+                "type": "done",
+                "message_id": message_id,
+                "worker": self.router.active_name,
+                "artifacts": [],
+            }
+            return
+
         # Qwen's tool choice can occasionally answer an explicit camera request
         # from stale conversational context. Pre-route only this high-confidence
         # read-only intent through the same Registry/_execute boundary used by
@@ -585,7 +793,16 @@ class Orchestrator:
             if not approved_tool and base_routed_tool is None
             else None
         )
-        routed_tool = base_routed_tool or (ciq_request[0] if ciq_request else None)
+        web_request = (
+            web_research_request(user_message)
+            if not approved_tool and base_routed_tool is None and ciq_request is None
+            else None
+        )
+        routed_tool = (
+            base_routed_tool
+            or (ciq_request[0] if ciq_request else None)
+            or ("web_research_current" if web_request else None)
+        )
         advertised_names = {
             str(item.get("function", {}).get("name") or "") for item in tools
         }
@@ -597,6 +814,8 @@ class Orchestrator:
             "calibration_iq_summary",
             "calibration_iq_read",
         }
+        routed_is_web = routed_tool == "web_research_current"
+        routed_result = None
         if (
             routed_tool
             and routed_tool in advertised_names
@@ -604,6 +823,8 @@ class Orchestrator:
         ):
             if routed_is_ciq and ciq_request:
                 routed_args = dict(ciq_request[1])
+            elif routed_is_web and web_request:
+                routed_args = dict(web_request)
             else:
                 routed_args = {"prompt": str(user_message or "")[:2000]}
                 if routed_is_website_update:
@@ -623,7 +844,6 @@ class Orchestrator:
                     },
                 }],
             })
-            routed_result = None
             routed_events: list[dict] = []
             async for event in self._execute(
                 routed_tool,
@@ -775,16 +995,103 @@ class Orchestrator:
                     {"result": result, "execution_receipt": receipt}, default=str
                 )[:12000],
             })
-            yield {"type": "tool_result", "name": name, "result": result,
-                   "receipt": receipt}
+            approved_events = [{
+                "type": "tool_result",
+                "name": name,
+                "result": result,
+                "receipt": receipt,
+            }]
             receipt_artifact = {"type": "execution_receipt", "data": receipt}
             artifacts.append(receipt_artifact)
-            yield {"type": "artifact", "artifact": receipt_artifact}
+            approved_events.append({"type": "artifact", "artifact": receipt_artifact})
             card_type = artifact_type_for_tool(name, result)
             if card_type and isinstance(result, dict):
                 artifact = {"type": card_type, "data": result}
                 artifacts.append(artifact)
-                yield {"type": "artifact", "artifact": artifact}
+                approved_events.append({"type": "artifact", "artifact": artifact})
+
+            # A verified protected video result is already the full answer.
+            # Persist the receipt/card before exposing either, then emit fixed
+            # prose so the model cannot invent an absolute media URL or recast
+            # one video mode as the other.
+            verified_video = (
+                name == "video_generate"
+                and card_type == "generated_video"
+                and isinstance(result, dict)
+                and receipt.get("tool_name") == "video_generate"
+                and receipt.get("status") == "succeeded"
+                and receipt.get("executed") is True
+                and receipt.get("success") is True
+                and receipt.get("result") == result
+            )
+            if verified_video:
+                summary = (
+                    "The verified generative image-to-video clip is ready in the chat card."
+                    if result.get("mode") == "image_to_video"
+                    else "The verified procedural source animation is ready in the chat card."
+                )
+                message_id = self.store.add_message(
+                    conversation_id,
+                    "assistant",
+                    summary,
+                    worker_used=self.router.active_name,
+                    artifacts=artifacts,
+                )
+                if len(history) <= 1:
+                    self.store.touch_conversation(
+                        conversation_id, title=user_message[:60]
+                    )
+                for approved_event in approved_events:
+                    yield approved_event
+                yield {"type": "token", "text": summary}
+                yield {
+                    "type": "done",
+                    "message_id": message_id,
+                    "worker": self.router.active_name,
+                    "artifacts": artifacts,
+                }
+                return
+
+            # A failed protected video result is also the full answer. Persist
+            # its receipt/status card before emitting anything and use fixed
+            # receipt-grounded prose. A second model call can otherwise invent
+            # success or produce a misleading transport-error toast after the
+            # authoritative failure has already been recorded.
+            failed_video = (
+                name == "video_generate"
+                and card_type == "video_generation_status"
+                and isinstance(result, dict)
+                and receipt.get("tool_name") == "video_generate"
+                and receipt.get("status") == "failed"
+                and receipt.get("success") is False
+                and receipt.get("result") == result
+            )
+            if failed_video:
+                summary = video_failure_summary(result)
+                message_id = self.store.add_message(
+                    conversation_id,
+                    "assistant",
+                    summary,
+                    worker_used=self.router.active_name,
+                    artifacts=artifacts,
+                )
+                if len(history) <= 1:
+                    self.store.touch_conversation(
+                        conversation_id, title=user_message[:60]
+                    )
+                for approved_event in approved_events:
+                    yield approved_event
+                yield {"type": "token", "text": summary}
+                yield {
+                    "type": "done",
+                    "message_id": message_id,
+                    "worker": self.router.active_name,
+                    "artifacts": artifacts,
+                }
+                return
+
+            for approved_event in approved_events:
+                yield approved_event
 
         for round_index in range(MAX_TOOL_ROUNDS):
             tool_calls: list[dict] = []
@@ -808,11 +1115,21 @@ class Orchestrator:
                 call.get("name") == "website_preview_generate"
                 for call in tool_calls
             )
-            if not website_call_in_round:
+            false_web_denial = bool(
+                routed_is_web
+                and not tool_calls
+                and _WEB_ACCESS_DENIAL_RE.search(round_text)
+            )
+            if not website_call_in_round and not false_web_denial:
                 for token_event in sealed_round_tokens:
                     yield token_event
 
-            full_text += round_text
+            if false_web_denial:
+                guarded_text = web_research_fallback_summary(routed_result)
+                yield {"type": "token", "text": guarded_text}
+                full_text += guarded_text
+            else:
+                full_text += round_text
 
             if not tool_calls:
                 break

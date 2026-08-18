@@ -39,6 +39,7 @@ export default function Avatar({ state = "idle", worker, swapTarget, externalWor
 
   let caption = CAPTIONS[state] || "";
   if (state === "swapping" && externalWorkload === "image_generation") caption = "generating image";
+  else if (state === "swapping" && externalWorkload === "video_generation") caption = "rendering video";
   else if (state === "swapping" && swapTarget) caption = `switching to ${swapTarget}`;
   else if (state === "idle" && worker) caption = worker;
   if (state === "idle" && swapSeconds) caption = `${worker} · swapped in ${swapSeconds}s`;

@@ -23,7 +23,7 @@ test("successful execution and research details are collapsed native stream disc
   assert.doesNotMatch(`${cards}\n${approval}`, /<details[^>]*\sopen(?:=|\s|>)/);
   assert.match(app, /receiptUpdateFromArtifact\(event\.artifact\)/);
   assert.match(app, /receiptMatchesArtifact\(lastExecutionReceiptRef\.current, liveArtifact\?\.type\)/);
-  assert.match(app, /\["shell_result", "generated_image", "image_generation_status"\]\.includes/);
+  assert.match(app, /\[[\s\S]{0,180}"shell_result",[\s\S]{0,180}"generated_image",[\s\S]{0,180}"image_generation_status",[\s\S]{0,180}"generated_video",[\s\S]{0,180}"video_generation_status",[\s\S]{0,80}\]\.includes/);
 
   assert.match(styles, /\.disclosure-summary\s*\{[\s\S]*?minmax\(0, 1fr\)[\s\S]*?min-height:\s*44px;/);
   assert.match(styles, /\.disclosure-summary:focus-visible\s*\{/);
@@ -37,6 +37,9 @@ test("failure, uncertainty, truncation, and research warnings stay visible in di
 
   assert.match(cards, /PowerShell failed · exit \$\{exitCode\}/);
   assert.match(cards, /PowerShell timed out · outcome indeterminate/);
+  assert.match(approval, /videoFailureDisclosure\(receipt\?\.result\)/);
+  assert.match(approval, /const outcomeMessage = videoFailure\?\.message/);
+  assert.match(cards, /role=\{warning \? "alert" : "status"\}/);
   assert.match(cards, /PowerShell completed · output truncated/);
   assert.match(cards, /No matching successful execution receipt/);
   assert.doesNotMatch(cards, /exit \$\{data\?\.exit_code\}/);

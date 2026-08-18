@@ -7,6 +7,7 @@ import {
   receiptMatchesArtifact,
   receiptState,
   receiptUpdateFromArtifact,
+  terminalMediaWorkload,
   timelineFromHistory,
   upsertTimelineItem,
   updateApproval,
@@ -59,6 +60,37 @@ test("never treats approval or a success label without receipt proof as executed
   const pending = timelineFromHistory([{ id: 2, role: "assistant", content: "", artifacts: [request] }]);
   const claimed = updateApproval(pending, "approve-1", { status: "succeeded" });
   assert.notEqual(claimed[0].status, "succeeded");
+});
+
+test("only terminal media receipts settle an external workload", () => {
+  const imageReceipt = {
+    tool_name: "image_generate",
+    status: "failed",
+    executed: true,
+    success: false,
+  };
+  const videoReceipt = {
+    tool_name: "video_generate",
+    status: "succeeded",
+    executed: true,
+    success: true,
+  };
+  const uncertainVideoReceipt = {
+    tool_name: "video_generate",
+    status: "failed",
+    executed: false,
+    success: false,
+    result: { execution_state: "indeterminate", may_have_executed: true },
+  };
+
+  assert.equal(terminalMediaWorkload(imageReceipt), "image_generation");
+  assert.equal(terminalMediaWorkload(videoReceipt), "video_generation");
+  assert.equal(terminalMediaWorkload(uncertainVideoReceipt), "video_generation");
+  assert.equal(terminalMediaWorkload({ ...videoReceipt, status: "executing" }), null);
+  assert.equal(terminalMediaWorkload({ ...videoReceipt, status: "approved" }), null);
+  assert.equal(terminalMediaWorkload({ ...videoReceipt, status: "pending" }), null);
+  assert.equal(terminalMediaWorkload({ ...videoReceipt, tool_name: "run_powershell" }), null);
+  assert.equal(terminalMediaWorkload(null), null);
 });
 
 test("applies the WebSocket executing then receipt lifecycle", () => {
@@ -160,6 +192,40 @@ test("live and restored generated images carry only the image_generate receipt",
   assert.equal(image.artifact.type, "generated_image");
   assert.equal(image.artifact.receipt.tool_name, "image_generate");
   assert.equal(image.artifact.receipt.result.sha256, digest);
+});
+
+test("live and restored generated videos carry only the video_generate receipt", () => {
+  const digest = "c".repeat(64);
+  const videoResult = {
+    status: "completed",
+    verified: true,
+    actual_video: true,
+    actual_generation: false,
+    sha256: digest,
+    video_url: `/api/generated-videos/${digest}.mp4`,
+    target: `/api/generated-videos/${digest}.mp4`,
+  };
+  const videoReceipt = {
+    ...receipt,
+    tool_name: "video_generate",
+    result: videoResult,
+  };
+  assert.equal(receiptMatchesArtifact(videoReceipt, "generated_video"), true);
+  assert.equal(receiptMatchesArtifact(videoReceipt, "generated_image"), false);
+
+  const timeline = timelineFromHistory([{
+    id: 6,
+    role: "assistant",
+    content: "",
+    artifacts: [
+      { type: "execution_receipt", data: videoReceipt },
+      { type: "generated_video", data: videoResult },
+    ],
+  }]);
+  const video = timeline.find((item) => item.kind === "artifact");
+  assert.equal(video.artifact.type, "generated_video");
+  assert.equal(video.artifact.receipt.tool_name, "video_generate");
+  assert.equal(video.artifact.receipt.result.sha256, digest);
 });
 
 test("folds terminal denial and failure receipts into the request", () => {

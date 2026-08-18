@@ -141,6 +141,25 @@ export function receiptDisplayState(receipt) {
   return null;
 }
 
+const MEDIA_WORKLOAD_BY_TOOL = Object.freeze({
+  image_generate: "image_generation",
+  video_generate: "video_generation",
+});
+
+/**
+ * Identify only a terminal receipt for a model-owning media action. Pending or
+ * merely approved requests are intentionally excluded: they have not started
+ * an external workload and must not keep (or clear) the swap indicator.
+ */
+export function terminalMediaWorkload(receipt) {
+  const workload = MEDIA_WORKLOAD_BY_TOOL[receipt?.tool_name];
+  if (!workload) return null;
+  const state = receiptDisplayState(receipt);
+  return ["succeeded", "failed", "denied", "expired", "indeterminate"].includes(state)
+    ? workload
+    : null;
+}
+
 /** Convert a live stored-artifact-shaped receipt into the same update used by
  * approval_receipt WebSocket events. */
 export function receiptUpdateFromArtifact(artifact) {
@@ -160,6 +179,7 @@ export function receiptUpdateFromArtifact(artifact) {
 export function receiptToolForArtifact(type) {
   if (type === "shell_result") return "run_powershell";
   if (type === "generated_image") return "image_generate";
+  if (type === "generated_video") return "video_generate";
   return null;
 }
 

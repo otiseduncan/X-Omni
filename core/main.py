@@ -35,6 +35,7 @@ from .services import calendar as calendar_svc
 from .services import exterior_camera as exterior_camera_svc
 from .services import image_generation as image_svc
 from .services import research as research_svc
+from .services import video_generation as video_svc
 from .services import website as website_svc
 from .services import weather as weather_svc
 from .state.db import Store
@@ -75,6 +76,19 @@ def build_app(settings: Settings) -> FastAPI:
         image_generation = image_svc.ImageGenerationService(router, image_provider)
     except (OSError, ValueError, image_svc.ImageGenerationError) as exc:
         log.warning("Image generation is not configured: %s", type(exc).__name__)
+    video_config = None
+    video_generation = None
+    try:
+        video_config = video_svc.VideoGenerationConfig.from_file(
+            settings.root / "config" / "video_generation.json", settings.root
+        )
+        video_generation = video_svc.VideoGenerationService(
+            video_config,
+            router=router,
+            comfy_provider=image_provider if image_generation is not None else None,
+        )
+    except (OSError, ValueError, video_svc.VideoGenerationError) as exc:
+        log.warning("Video animation is not configured: %s", type(exc).__name__)
 
     # --- wire tool handlers ---
     registry.register("read_file", builtin.make_read_file(registry))
@@ -99,6 +113,9 @@ def build_app(settings: Settings) -> FastAPI:
     if image_generation is not None:
         registry.register("image_generation_status", image_generation.status)
         registry.register("image_generate", image_generation.generate)
+    if video_generation is not None:
+        registry.register("video_generation_status", video_generation.status)
+        registry.register("video_generate", video_generation.generate)
     registry.register("run_powershell", builtin.make_run_powershell())
 
     list_tasks, add_task, update_task_status = builtin.make_task_tools(store)
@@ -210,6 +227,8 @@ def build_app(settings: Settings) -> FastAPI:
     app.state.exterior_camera = exterior_camera
     app.state.image_generation = image_generation
     app.state.image_generation_config = image_config
+    app.state.video_generation = video_generation
+    app.state.video_generation_config = video_config
 
     # Vite dev server runs on 5173 during development. Production serves the
     # built UI from this same origin, where CORS is irrelevant.
@@ -250,6 +269,7 @@ def build_app(settings: Settings) -> FastAPI:
         core_routes.create_router(
             settings, store, router, registry, require_session,
             image_config=image_config,
+            video_config=video_config,
             exterior_camera=exterior_camera,
             adas=adas,
         )

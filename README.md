@@ -52,14 +52,14 @@ For first-time setup you can set `XOMNI_AUTH_ENABLED=0` in `config\.env.local`. 
 .\scripts\tailscale-serve.ps1
 ```
 
-This uses `tailscale serve`, which is **tailnet-private**. It deliberately does not use `tailscale funnel` — that publishes to the open internet, and X Omni can read files and run PowerShell on Omega.
+This uses `tailscale serve`, which is **tailnet-private**. It deliberately does not use `tailscale funnel` — that publishes to the open internet, and X Omni can read files and run PowerShell on Omega. On this shared node, Calibration IQ keeps the normal HTTPS endpoint on port 443 and X Omni uses HTTPS port 8443, so each application has an independent browser origin.
 
 HTTPS is not cosmetic here. Browser microphone access requires a secure context, so **voice input silently fails over plain HTTP**. Tailscale's automatic cert is what makes voice work on the phone.
 
 The script prints your tailnet origin. Put it in `config\.env.local`:
 
 ```
-XOMNI_PUBLIC_ORIGIN=https://omega.your-tailnet.ts.net
+XOMNI_PUBLIC_ORIGIN=https://omega.your-tailnet.ts.net:8443
 ```
 
 Before proxying port 8100, configure Google and turn auth on. Then open the HTTPS URL on your phone and use "Add to Home Screen". The service worker caches only the versioned app shell/static assets; API, auth, WebSocket, and third-party traffic are network-only.
@@ -73,7 +73,7 @@ In [Google Cloud Console](https://console.cloud.google.com/apis/credentials):
 1. Create an **OAuth 2.0 Client ID**, type **Web application**
 2. Add both authorized redirect URIs:
    - `http://127.0.0.1:8100/api/auth/callback`
-   - `https://omega.your-tailnet.ts.net/api/auth/callback`
+   - `https://omega.your-tailnet.ts.net:8443/api/auth/callback`
 3. Enable the **Google Calendar API** for the project
 4. At the literal local URL, open the header account control and save the client ID and secret. X Omni atomically updates `config\.env.local`, enables auth, and tells you when Core must be restarted. The same values can still be entered in the file manually.
 5. Restart Core, then choose **Sign in with Google and become Owner** locally. Once signed in, the header account control provides **Sign out** for the current browser session.
@@ -143,7 +143,8 @@ core\
     chat.py            chat WebSocket
     routes.py          REST + voice transcription
   services\            weather, calendar, research, Google auth, camera vision,
-                       website preview, sequential image generation
+                       website preview, sequential image generation, bounded
+                       procedural video, sequential Wan image-to-video
   state\               SQLite schema and access
   tools\               capability gateway, builtin tools
 ui\                    React + Vite, mobile-first PWA
@@ -176,18 +177,18 @@ Model weights and the llama.cpp runtime stay where they are under `X:\XV12\...`.
 
 ## What isn't built
 
-Arbitrary URL fetching/full-page extraction, arbitrary image attachments, finance quotes, RTSP/IP security-camera feeds, autonomous continuous camera interpretation, image-to-image editing, and automatic model routing are not built. The PC webcam has an operator-controlled live in-chat preview, but Omni analyzes only explicitly submitted current frames. Current web search is deliberately source-snippet bounded. Routing remains manual because a model swap is a real, visible 15–20 second operation.
+Arbitrary URL fetching/full-page extraction, arbitrary image attachments, finance quotes, autonomous continuous camera interpretation, image-to-image editing, reusable 3D-mesh reconstruction, and automatic model routing are not built. The PC webcam and configured exterior camera have operator-controlled live in-chat previews, but Omni analyzes only explicitly submitted current frames. Video creation has two explicit non-interchangeable modes: the proved deterministic `exact_source_animation` treatment and an `image_to_video` Wan2.2 TI2V-5B diffusion path. The Wan path is source-conditioned 2D video with depth-like motion, not a reusable 3D object; its three installed official model files pass pinned size and SHA-256 proof. A live 10-second, 240-frame Wan run completed on Omega with authenticated in-chat playback and verified Omni restoration. Frame analysis proved localized generative orb motion against a stable background rather than a whole-frame wobble, while also showing the current quality limitation: surface shimmer/morphing can replace fine source details and is not the same as a clean rigid 3D rotation. A Wan failure never falls back to procedural motion. Current web search is deliberately source-snippet bounded. Routing remains manual because a model swap is a real, visible operation.
 
 ---
 
 ## Verified vs. not
 
-Validated on Omega in the project `.venv`: 186 backend/security/lifecycle/capability tests and 47 frontend tests pass; Python compilation and the Vite 8.2.1 production build pass; and `pip check` is clean. Tests cover the live camera stream lifecycle and cleanup, raw bounded frame transport, website integrity/sandboxing, website copy/download controls, generated-image layout/error handling, image-runtime ownership/cancellation/model restoration, receipt pairing, reload continuity, and Calibration IQ summary/list pagination, terminal filtering, deduplication, contextual follow-ups, and compact field-card rendering. Existing browser checks at 360, 390, and 430px showed no horizontal overflow, retained the composer, and kept top controls at least 44px.
+Validated on Omega in the project `.venv`: 224 backend/security/lifecycle/capability tests and 56 frontend tests pass; Python compilation and the Vite 8.2.1 production build pass; and `pip check` is clean. Tests cover the live camera stream lifecycle and cleanup, raw bounded frame transport, website integrity/sandboxing, website copy/download controls, generated-image layout/error handling, image-runtime ownership/cancellation/model restoration, digest-only video sources, bounded FFmpeg cleanup, the fixed 241-to-240-frame Wan graph, official model size/SHA proof, Wan cancellation/release/restore partial truth, bounded pre-stop readiness retries with exact ownership re-proof, single-shot indeterminate prompt submission, durable model-free failure reporting, strict MP4/receipt proof, authenticated Range playback, receipt pairing, reload continuity, and Calibration IQ summary/list pagination, terminal filtering, deduplication, contextual follow-ups, and compact field-card rendering. Existing browser checks at 360, 390, and 430px showed no horizontal overflow, retained the composer, and kept top controls at least 44px.
 
 The lifecycle test suite proves foreign-listener refusal, exact process/start-time ownership, live alias plus 32K context checks, two-GPU readiness/release, cross-process locking, failure cleanup, and swap exclusion during inference. `/healthz` is 200 only with the complete live model contract; degraded Core liveness is reported separately with HTTP 503.
 
 Real-hardware proof also passed: hardened Omni cold-started on dedicated port 8131 in 18.3s and streamed an exact reply; Omni→Coder swapped in 18.2s and streamed from the Coder alias; Coder→Omni returned in 21.5s and streamed again. Every ready state proved exact process/start time, alias, 32K context, and both GPUs. A live protected write produced one tool-call row and one immutable successful receipt; submitting the same approval again returned that receipt with `replayed=true` and did not execute again. Browser reload rendered the persisted receipt-backed Succeeded card. The capability migration restarted only verified Core, adopted the same verified Omni worker, and live chat invoked DuckDuckGo plus Google News before returning and persisting a cited research card.
 
-The live camera path was also exercised in the signed-in browser: Start displayed the physical webcam stream inline, Analyze current frame sent one bounded frame to Omni and persisted one description-only observation, and Stop cleared the media source. Reload restored exactly one observation and left the camera off. A real approved ComfyUI run generated and hash-verified a 1024×1024 PNG, stopped the exact spawned image runtime, proved both GPUs released, restored the exact Omni worker, and rendered one receipt-matched image after reload. The signed-in browser also flipped the Tim's Towing artifact from bounded Code to a real sandboxed iframe and back, copied the exact HTML, dispatched the HTML download, and visibly rendered the restored baseball image at its full reserved card height.
+The live camera path was also exercised in the signed-in browser: Start displayed the physical webcam stream inline, Analyze current frame sent one bounded frame to Omni and persisted one description-only observation, and Stop cleared the media source. Reload restored exactly one observation and left the camera off. A real approved ComfyUI run generated and hash-verified a 1024×1024 PNG, stopped the exact spawned image runtime, proved both GPUs released, restored the exact Omni worker, and rendered one receipt-matched image after reload. A later approved `video_generate` call animated that exact orb image into a verified 10-second, 1024×1024, 24 fps H.264/yuv420p MP4 with 240 frames. A second source-conditioned Wan run produced a separately verified 704×704, 240-frame, 10-second MP4 after a prior request stopped at the pre-handoff readiness proof; ComfyUI shut down, Omni restored, and reload retained exactly one success player while clearing the stale workload state. The signed-in browser decoded the authenticated Range stream and retained its download link. The signed-in browser also flipped the Tim's Towing artifact from bounded Code to a real sandboxed iframe and back, copied the exact HTML, dispatched the HTML download, and visibly rendered the restored baseball image at its full reserved card height.
 
 Still requiring external/live proof: Calendar write, phone/Tailscale behavior, and local Omni audio transcription. Google OAuth/Owner binding and Calendar read are live; those do not prove the remaining paths.

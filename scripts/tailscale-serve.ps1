@@ -16,7 +16,11 @@
     Write-Host "=== Tailscale serve for X Omni ===" -ForegroundColor Cyan
 
     try {
-        $statusJson = tailscale status --json | ConvertFrom-Json
+        $statusRaw = tailscale status --json
+        if ($LASTEXITCODE -ne 0) {
+            throw "tailscale status failed with exit code $LASTEXITCODE."
+        }
+        $statusJson = $statusRaw | ConvertFrom-Json
     } catch {
         throw "Tailscale is not installed or not on PATH. Install it from https://tailscale.com/download and sign in."
     }
@@ -24,14 +28,19 @@
     $dnsName = $statusJson.Self.DNSName
     if (-not $dnsName) { throw "Could not read this machine's tailnet DNS name. Is Tailscale signed in?" }
     $host_ = $dnsName.TrimEnd('.')
-    $origin = "https://$host_"
+    # Port 443 is reserved for Calibration IQ on this shared Tailscale node.
+    # A distinct HTTPS port gives X Omni its own browser origin without
+    # rewriting Calibration IQ's existing Serve handler.
+    $httpsPort = 8443
+    $origin = "https://${host_}:$httpsPort"
 
     Write-Host "Tailnet host : $host_"
     Write-Host ""
 
     # HTTPS certs must be enabled for the tailnet in the admin console
     # (DNS -> HTTPS Certificates). Without it, serve has no cert to use.
-    Write-Host "Starting serve on 443 -> 127.0.0.1:8100 ..." -ForegroundColor Cyan
+    Write-Host "Starting X Omni on ${httpsPort} -> 127.0.0.1:8100 ..." -ForegroundColor Cyan
+    Write-Host "Port 443 is left untouched for Calibration IQ." -ForegroundColor DarkGray
     Write-Host "(If this errors about certificates, enable HTTPS for your tailnet at" -ForegroundColor Yellow
     Write-Host " https://login.tailscale.com/admin/dns -> HTTPS Certificates, then re-run.)" -ForegroundColor Yellow
     Write-Host ""
@@ -39,10 +48,32 @@
     # CLI syntax has shifted between Tailscale releases; try the current
     # form first and fall back to the older one.
     try {
-        tailscale serve --bg --https=443 http://127.0.0.1:8100
+        tailscale serve --bg --https=$httpsPort http://127.0.0.1:8100
+        if ($LASTEXITCODE -ne 0) {
+            throw "tailscale serve failed with exit code $LASTEXITCODE."
+        }
     } catch {
         Write-Host "Newer syntax failed, trying legacy form..." -ForegroundColor Yellow
-        tailscale serve https:443 / http://127.0.0.1:8100
+        tailscale serve "https:$httpsPort" / http://127.0.0.1:8100
+        if ($LASTEXITCODE -ne 0) {
+            throw "Legacy tailscale serve failed with exit code $LASTEXITCODE."
+        }
+    }
+
+    $serveStatusRaw = tailscale serve status --json
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not verify Tailscale Serve state (exit code $LASTEXITCODE)."
+    }
+    $serveStatus = $serveStatusRaw | ConvertFrom-Json
+    $serveKey = "${host_}:$httpsPort"
+    $serveEntry = $serveStatus.Web.PSObject.Properties[$serveKey].Value
+    $proxy = if ($serveEntry) {
+        $serveEntry.Handlers.PSObject.Properties['/'].Value.Proxy
+    } else {
+        $null
+    }
+    if ($proxy -ne 'http://127.0.0.1:8100') {
+        throw "Tailscale Serve verification failed for X Omni HTTPS port $httpsPort."
     }
 
     Write-Host ""
@@ -57,5 +88,5 @@
     Write-Host "  2. Add this to your Google OAuth client's authorized redirect URIs:"
     Write-Host "         $origin/api/auth/callback"
     Write-Host ""
-    Write-Host "Then restart Core. Stop serving with:  tailscale serve --https=443 off"
+    Write-Host "Then restart Core. Stop only X Omni serving with:  tailscale serve --https=$httpsPort off"
 }

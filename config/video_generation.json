@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "provider": "ffmpeg-exact-local",
+  "ffmpeg_path": "C:\\Users\\otisd\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1.1-full_build\\bin\\ffmpeg.exe",
+  "ffprobe_path": "C:\\Users\\otisd\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1.1-full_build\\bin\\ffprobe.exe",
+  "source_dir": "data/generated-images",
+  "output_dir": "data/generated-videos",
+  "default_duration_seconds": 10,
+  "fps": 24,
+  "timeout_seconds": 300,
+  "max_source_bytes": 67108864,
+  "max_output_bytes": 134217728,
+  "image_to_video": {
+    "enabled": true,
+    "generation_timeout_seconds": 7200
+  }
+}

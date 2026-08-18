@@ -11,6 +11,7 @@ import {
   Download,
   Eye,
   FileText,
+  Film,
   FolderOpen,
   Globe2,
   LayoutTemplate,
@@ -35,6 +36,7 @@ import {
   restoredWebsiteView,
   websiteArtifactIdentity,
 } from "../../lib/websiteArtifact.js";
+import { verifiedVideoMedia, videoFailureDisclosure } from "../../lib/videoArtifact.js";
 import { FIELD_CARDS } from "./FieldCards.jsx";
 
 /* Inline chat cards. Everything X Omni surfaces renders here, inside the
@@ -1342,6 +1344,130 @@ function ImageGenerationStatusCard({ data }) {
   );
 }
 
+function GeneratedVideoCard({ data, receipt }) {
+  const [videoLoadFailed, setVideoLoadFailed] = useState(false);
+  const media = verifiedVideoMedia(data, receipt);
+  useEffect(() => setVideoLoadFailed(false), [data?.video_url]);
+
+  if (!media) {
+    return (
+      <Card icon={Film} title="Video result unverified" className="video-generation-warning">
+        <p className="card-note" role="alert">
+          No matching successful video-generation receipt and verified local MP4 are attached. The video is not displayed.
+        </p>
+      </Card>
+    );
+  }
+
+  const generative = data.mode === "image_to_video";
+  const description = generative
+    ? "Source-conditioned Wan 2.2 image-to-video clip"
+    : "Hover-and-pulse animation of the verified source image";
+  const availableTitle = generative
+    ? "AI-generated source-conditioned video"
+    : "Procedural source animation";
+  const unavailableTitle = generative
+    ? "AI-generated video unavailable"
+    : "Procedural animation unavailable";
+  const dimensions = data?.width && data?.height ? `${data.width} × ${data.height}` : "";
+  const duration = Number.isFinite(Number(data?.duration_seconds))
+    ? `${Number(data.duration_seconds).toLocaleString()} seconds`
+    : "";
+  const details = [dimensions, duration, data?.fps ? `${data.fps} fps` : ""].filter(Boolean).join(" · ");
+
+  return (
+    <figure className={`card generated-video-card${generative ? " is-generative" : ""}${videoLoadFailed ? " video-generation-warning" : ""}`}>
+      <div className="card-head">
+        <Film size={14} aria-hidden="true" />
+        <span>{videoLoadFailed ? unavailableTitle : availableTitle}</span>
+      </div>
+      <p className="card-note video-generation-boundary">
+        {generative
+          ? "Wan 2.2 generated new source-conditioned motion with apparent 3D/depth movement. This is not a reusable 3D mesh and is not pixel-exact to the source image."
+          : "Deterministic local motion and light effects applied to the exact source image. This is not generative video."}
+      </p>
+      {videoLoadFailed ? (
+        <div className="generated-video-load-error" role="alert">
+          <strong>The verified MP4 could not be played.</strong>
+          <span>The browser failed to load the same-origin video file. Playback and download are hidden; no successful display is being claimed.</span>
+        </div>
+      ) : (
+        <video
+          className="generated-video"
+          src={media.src}
+          poster={media.poster}
+          controls
+          playsInline
+          preload="metadata"
+          aria-label={`${generative ? "AI-generated source-conditioned video" : "Procedural animation"}: ${description}`}
+          onError={() => setVideoLoadFailed(true)}
+        />
+      )}
+      <figcaption>
+        <p className="generated-video-prompt">{description}</p>
+        {details && (
+          <p className="card-note">
+            {details} · H.264 MP4 · {generative ? displayText(data.model_id) : displayText(data.provider)}
+          </p>
+        )}
+        {!videoLoadFailed && (
+          <a className="generated-video-download" href={media.src} download={media.filename}>
+            <Download size={14} aria-hidden="true" />
+            Download verified MP4
+          </a>
+        )}
+      </figcaption>
+    </figure>
+  );
+}
+
+function VideoGenerationStatusCard({ data }) {
+  const failure = videoFailureDisclosure(data);
+  const hasModeRecords = data?.modes && typeof data.modes === "object";
+  const proceduralAvailable = hasModeRecords
+    ? data.modes?.exact_source_animation?.generation_available === true
+    : data?.exact_source_animation_available === true || data?.generation_available === true;
+  const generativeAvailable = hasModeRecords
+    ? data.modes?.image_to_video?.generation_available === true
+    : data?.image_to_video_available === true || data?.true_generation_available === true;
+  const title = failure?.title || (
+    generativeAvailable && proceduralAvailable
+      ? "Generative video and procedural animation available"
+      : generativeAvailable
+        ? "Generative video available"
+        : proceduralAvailable
+          ? "Procedural video animation available"
+          : "Video generation unavailable"
+  );
+  const warning = Boolean(failure) || (!proceduralAvailable && !generativeAvailable);
+
+  return (
+    <Card icon={Film} title={title} className={warning ? "video-generation-warning" : ""}>
+      <p className="card-note" role={warning ? "alert" : "status"}>
+        {failure?.message || displayText(
+          data?.message,
+          generativeAvailable
+            ? "X Omni can create genuine source-conditioned Wan 2.2 video after approval."
+            : proceduralAvailable
+              ? "X Omni can create a deterministic MP4 from an exact source image after approval."
+              : "No verified local video renderer is currently available."
+        )}
+      </p>
+      {!failure && generativeAvailable && (
+        <p className="card-note video-generation-boundary">
+          Wan 2.2 creates new source-conditioned motion with apparent 3D/depth movement.
+          It does not create a reusable 3D mesh and is not pixel-exact to the source image.
+        </p>
+      )}
+      {!failure && proceduralAvailable && (
+        <p className="card-note video-generation-boundary">
+          Procedural mode applies deterministic hover-and-pulse effects and is not AI-generated image-to-video.
+        </p>
+      )}
+    </Card>
+  );
+}
+
 function WebsitePreviewCard({ data }) {
   const artifactIdentity = websiteArtifactIdentity(data);
   const [view, setView] = useState(() => restoredWebsiteView(data));
@@ -1502,6 +1628,8 @@ const REGISTRY = {
   camera_observation: CameraObservationCard,
   generated_image: GeneratedImageCard,
   image_generation_status: ImageGenerationStatusCard,
+  generated_video: GeneratedVideoCard,
+  video_generation_status: VideoGenerationStatusCard,
   website_preview: WebsitePreviewCard,
   // Otis's field systems: ADAS SI documents and Calibration IQ repair orders.
   ...FIELD_CARDS,

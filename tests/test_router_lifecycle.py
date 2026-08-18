@@ -5,13 +5,16 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
+import httpx
 import psutil
 import pytest
 
 from core.models.router import (
+    ExternalWorkloadStartError,
     LiveProof,
     ModelRouter,
     ProcessRecord,
@@ -266,6 +269,242 @@ def test_start_time_mismatch_prevents_stop(
         assert process.poll() is None
     finally:
         _terminate(process)
+
+
+def test_stop_retries_transient_model_catalog_timeout_with_identity_reproof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fixture_worker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    _fake_gpu_proof(monkeypatch, router)
+    process = _launch_exact(cfg)
+    try:
+        _wait_for_listener(cfg.port)
+        asyncio.run(router.start_default())
+        original_proof = router._model_proof
+        attempts = 0
+
+        def transient_proof(worker: WorkerConfig) -> LiveProof:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectTimeout("transient loopback timeout")
+            return original_proof(worker)
+
+        monkeypatch.setattr(router, "_model_proof", transient_proof)
+        stopped = router._stop_active_worker()
+
+        assert stopped == cfg
+        assert attempts == 2
+        assert process.poll() is not None
+    finally:
+        _terminate(process)
+
+
+def test_exhausted_stop_proof_keeps_original_worker_and_pre_stop_truth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_fixture_worker(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    _fake_gpu_proof(monkeypatch, router)
+    process = _launch_exact(cfg)
+    try:
+        _wait_for_listener(cfg.port)
+        asyncio.run(router.start_default())
+        attempts = 0
+
+        def unavailable_proof(_worker: WorkerConfig) -> LiveProof:
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ConnectTimeout("persistent loopback timeout")
+
+        monkeypatch.setattr(router, "_model_proof", unavailable_proof)
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+        async def scenario() -> ExternalWorkloadStartError:
+            with pytest.raises(ExternalWorkloadStartError) as captured:
+                async with router.external_workload_session("video_generation"):
+                    raise AssertionError("failed hand-off must never yield")
+            return captured.value
+
+        failure = asyncio.run(scenario())
+
+        assert attempts == 3
+        assert process.poll() is None
+        assert router.active_pid == process.pid
+        assert failure.lifecycle["model_stop_attempted"] is True
+        assert failure.lifecycle["model_stopped"] is False
+        assert failure.lifecycle["model_restore_required"] is False
+        assert failure.lifecycle["model_restored"] is None
+        assert failure.stage == "model_stop_readiness"
+        assert failure.retryable is True
+        assert "Wan" not in str(failure)
+    finally:
+        _terminate(process)
+
+
+def test_stop_retry_refuses_listener_owner_change_without_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    pid = 101
+    started_at = 1000.0
+    record = ProcessRecord(pid, cfg.executable, (str(cfg.executable),), started_at)
+    listeners = iter((pid, pid, 202))
+    model_calls = 0
+    signal_attempted = False
+
+    monkeypatch.setattr(router, "_require_identity", lambda *_args: record)
+    monkeypatch.setattr(router, "_find_pid_on_port", lambda _port: next(listeners))
+
+    def transient_proof(_worker: WorkerConfig) -> LiveProof:
+        nonlocal model_calls
+        model_calls += 1
+        raise httpx.ConnectTimeout("transient loopback timeout")
+
+    def forbidden_process(_pid: int):
+        nonlocal signal_attempted
+        signal_attempted = True
+        raise AssertionError("replacement ownership must prevent any signal")
+
+    monkeypatch.setattr(router, "_model_proof", transient_proof)
+    monkeypatch.setattr("core.models.router.psutil.Process", forbidden_process)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(WorkerSwapError, match="ownership changed"):
+        router._terminate_exact(
+            cfg, pid, started_at, require_live_proof=True
+        )
+
+    assert model_calls == 1
+    assert signal_attempted is False
+
+
+def test_external_workload_restores_after_post_stop_vram_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    router.active_name = cfg.name
+    router.active_pid = 101
+    router.active_started_at = 1000.0
+    restored = False
+
+    def stop_then_fail() -> WorkerConfig:
+        router.active_name = None
+        router.active_pid = None
+        router.active_started_at = None
+        raise WorkerSwapError("fixture VRAM release failed after stop")
+
+    async def restore(_cfg: WorkerConfig, lease: dict) -> None:
+        nonlocal restored
+        restored = True
+        lease["model_restored"] = True
+
+    monkeypatch.setattr(router, "_stop_active_worker", stop_then_fail)
+    monkeypatch.setattr(router, "_restore_external_worker", restore)
+
+    async def scenario() -> ExternalWorkloadStartError:
+        with pytest.raises(ExternalWorkloadStartError) as captured:
+            async with router.external_workload_session("video_generation"):
+                raise AssertionError("failed hand-off must never yield")
+        return captured.value
+
+    failure = asyncio.run(scenario())
+
+    assert restored is True
+    assert failure.lifecycle["model_stop_attempted"] is True
+    assert failure.lifecycle["model_stopped"] is True
+    assert failure.lifecycle["model_restore_required"] is True
+    assert failure.lifecycle["model_restored"] is True
+
+
+def test_external_workload_retains_stopped_truth_when_restore_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    router.active_name = cfg.name
+    router.active_pid = 101
+    router.active_started_at = 1000.0
+
+    def stop_then_fail() -> WorkerConfig:
+        router.active_name = None
+        router.active_pid = None
+        router.active_started_at = None
+        raise WorkerSwapError("fixture VRAM release failed after stop")
+
+    async def restore_failure(_cfg: WorkerConfig, _lease: dict) -> None:
+        raise WorkerSwapError(r"Model file not found: X:\private\secret.gguf")
+
+    monkeypatch.setattr(router, "_stop_active_worker", stop_then_fail)
+    monkeypatch.setattr(router, "_restore_external_worker", restore_failure)
+
+    async def scenario() -> ExternalWorkloadStartError:
+        with pytest.raises(ExternalWorkloadStartError) as captured:
+            async with router.external_workload_session("video_generation"):
+                raise AssertionError("failed hand-off must never yield")
+        return captured.value
+
+    failure = asyncio.run(scenario())
+
+    assert failure.lifecycle["model_stop_attempted"] is True
+    assert failure.lifecycle["model_stopped"] is True
+    assert failure.lifecycle["model_restore_required"] is True
+    assert failure.lifecycle["model_restored"] is False
+    assert "X:\\private" not in str(failure)
+    assert "secret.gguf" not in str(failure)
+
+
+def test_pre_yield_cancellation_with_restore_failure_keeps_lifecycle_truth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    router.active_name = cfg.name
+    router.active_pid = 101
+    router.active_started_at = 1000.0
+    stop_started = threading.Event()
+    allow_stop = threading.Event()
+
+    def delayed_stop() -> WorkerConfig:
+        router.active_name = None
+        router.active_pid = None
+        router.active_started_at = None
+        stop_started.set()
+        assert allow_stop.wait(timeout=5)
+        return cfg
+
+    async def restore_failure(_cfg: WorkerConfig, _lease: dict) -> None:
+        raise WorkerSwapError("fixture restore failed")
+
+    monkeypatch.setattr(router, "_stop_active_worker", delayed_stop)
+    monkeypatch.setattr(router, "_restore_external_worker", restore_failure)
+
+    async def enter_workload() -> None:
+        async with router.external_workload_session("video_generation"):
+            raise AssertionError("cancelled hand-off must never yield")
+
+    async def scenario() -> ExternalWorkloadStartError:
+        task = asyncio.create_task(enter_workload())
+        assert await asyncio.to_thread(stop_started.wait, 5)
+        task.cancel()
+        allow_stop.set()
+        with pytest.raises(ExternalWorkloadStartError) as captured:
+            await task
+        return captured.value
+
+    failure = asyncio.run(scenario())
+
+    assert failure.lifecycle["model_stop_attempted"] is True
+    assert failure.lifecycle["model_stopped"] is True
+    assert failure.lifecycle["model_restore_required"] is True
+    assert failure.lifecycle["model_restored"] is False
 
 
 def test_readiness_failure_cleans_up_only_exact_spawn(

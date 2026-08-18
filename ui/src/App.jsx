@@ -35,8 +35,10 @@ import {
   receiptMatchesArtifact,
   receiptState,
   receiptUpdateFromArtifact,
+  terminalMediaWorkload,
   updateApproval,
 } from "./lib/conversationTimeline.js";
+import { settledWorkerHealth } from "./lib/workerState.js";
 import "./styles/theme.css";
 import "./styles/app.css";
 import "./styles/field-cards.css";
@@ -196,6 +198,26 @@ export default function App() {
       );
   }, [refreshAuth]);
 
+  const refreshSettledWorkerState = useCallback(async () => {
+    try {
+      const response = await fetch("/healthz", {
+        credentials: "include",
+        cache: "no-store",
+      });
+      const truth = settledWorkerHealth(await response.json().catch(() => null));
+      if (!response.ok || !truth) return false;
+      setWorker(truth.worker);
+      setSwapping(false);
+      setSwapTarget(null);
+      setExternalWorkload(null);
+      return true;
+    } catch {
+      // A failed health read cannot prove a workload settled. Preserve the
+      // socket state until Core supplies authoritative evidence.
+      return false;
+    }
+  }, []);
+
   // ---------- voice ----------
   const voice = useVoice({
     onTranscript: (text) => {
@@ -266,6 +288,9 @@ export default function App() {
           if (event.receipt?.approval_id) {
             lastExecutionReceiptRef.current = event.receipt;
           }
+          if (terminalMediaWorkload(event.receipt)) {
+            void refreshSettledWorkerState();
+          }
           break;
 
         case "artifact": {
@@ -275,6 +300,9 @@ export default function App() {
             setItems((previous) =>
               updateApproval(previous, receiptUpdate.id, receiptUpdate)
             );
+            if (terminalMediaWorkload(receiptUpdate.receipt)) {
+              void refreshSettledWorkerState();
+            }
             break;
           }
           let liveArtifact = event.artifact;
@@ -301,7 +329,13 @@ export default function App() {
               ? { ...liveArtifact, receipt: matchingReceipt }
               : liveArtifact,
           });
-          if (["shell_result", "generated_image", "image_generation_status"].includes(liveArtifact?.type)) {
+          if ([
+            "shell_result",
+            "generated_image",
+            "image_generation_status",
+            "generated_video",
+            "video_generation_status",
+          ].includes(liveArtifact?.type)) {
             lastExecutionReceiptRef.current = null;
           }
           break;
@@ -342,6 +376,9 @@ export default function App() {
           if (terminal && terminal !== "succeeded") {
             setThinking(false);
             setActiveTool(null);
+          }
+          if (terminalMediaWorkload(event.receipt)) {
+            void refreshSettledWorkerState();
           }
           break;
         }
@@ -392,7 +429,7 @@ export default function App() {
           break;
       }
     },
-    [adoptConversation, push, reconcile, setItems, voice, worker]
+    [adoptConversation, push, reconcile, refreshSettledWorkerState, setItems, voice, worker]
   );
 
   const socketEnabled = authorised && historyReady;
@@ -406,8 +443,15 @@ export default function App() {
   // after a write without trusting a partial client-only stream.
   useEffect(() => {
     if (!connected || connectionEpoch < 1) return;
-    reconcile();
-  }, [connected, connectionEpoch, reconcile]);
+    let active = true;
+    void (async () => {
+      await reconcile();
+      if (active) await refreshSettledWorkerState();
+    })();
+    return () => {
+      active = false;
+    };
+  }, [connected, connectionEpoch, reconcile, refreshSettledWorkerState]);
 
   useEffect(() => {
     if (connected || connectionEpoch < 1) return;
@@ -712,6 +756,9 @@ export default function App() {
 
   const otherWorker = worker === "coder" ? "omni" : "coder";
   const imageWorkload = externalWorkload === "image_generation";
+  const videoWorkload = externalWorkload === "video_generation";
+  const mediaWorkload = imageWorkload || videoWorkload;
+  const workloadLabel = videoWorkload ? "rendering video" : "generating image";
 
   return (
     <div className="shell">
@@ -740,12 +787,12 @@ export default function App() {
             className={`worker-pill${swapping ? " is-swapping" : ""}`}
             onClick={() => requestSwap(otherWorker)}
             disabled={swapping || thinking || !connected}
-            title={imageWorkload ? "Generating image; success requires verified Omni restoration" : swapping ? "Switching model…" : `Switch to ${otherWorker} (~15-20s)`}
-            aria-label={imageWorkload ? "Generating image locally; success requires verified model restoration" : swapping ? `Switching model to ${swapTarget}` : `Switch model to ${otherWorker}`}
+            title={mediaWorkload ? (videoWorkload ? "Rendering local video; the conversation model may temporarily unload, and any unload must be verified restored" : "Generating image; success requires verified Omni restoration") : swapping ? "Switching model…" : `Switch to ${otherWorker} (~15-20s)`}
+            aria-label={mediaWorkload ? (videoWorkload ? "Rendering local video; the conversation model may temporarily unload, and any unload must be verified restored" : "Generating image locally; success requires verified model restoration") : swapping ? `Switching model to ${swapTarget}` : `Switch model to ${otherWorker}`}
           >
             <span className={`dot ${swapping ? "warn" : worker ? "" : "off"}`} />
             <span className="worker-label">
-              {imageWorkload ? "generating image" : swapping ? `→ ${swapTarget || "model"}` : worker || "no worker"}
+              {mediaWorkload ? workloadLabel : swapping ? `→ ${swapTarget || "model"}` : worker || "no worker"}
             </span>
           </button>
 
@@ -912,6 +959,8 @@ export default function App() {
             <Cpu size={12} style={{ verticalAlign: "-2px", marginRight: 5 }} />
             {imageWorkload ? (
               <>Generating the image locally. Omni is temporarily unloaded; Core will attempt to restore it, and success is shown only after that restoration is verified.</>
+            ) : videoWorkload ? (
+              <>Rendering the video locally. Depending on the selected mode, the conversation model may temporarily unload. If it unloads, success is shown only after the required runtime and model-restoration proofs pass.</>
             ) : (
               <>Switching to {swapTarget || "the requested model"}. This takes 15–20 seconds — the model process fully restarts, but your conversation is kept.</>
             )}

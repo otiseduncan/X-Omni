@@ -256,6 +256,78 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["prompt"],
         },
     },
+    "video_generation_status": {
+        "description": (
+            "Report procedural animation and genuine Wan2.2 image-to-video readiness "
+            "separately. This check starts no process and changes no model state."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    "video_generate": {
+        "description": (
+            "Create a verified MP4 from one content-addressed generated PNG. Select "
+            "image_to_video for genuine Wan2.2 diffusion motion, or explicitly select "
+            "exact_source_animation for the non-generative hover_pulse treatment. "
+            "Never substitute one mode for the other. Requires approval."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source_sha256": {
+                    "type": "string",
+                    "description": (
+                        "Lowercase 64-character SHA-256 of the verified generated PNG; "
+                        "Core enforces the exact digest shape."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["image_to_video", "exact_source_animation"],
+                    "description": (
+                        "Required explicit mode. Use image_to_video when the user asks "
+                        "for real generated motion; exact_source_animation is procedural."
+                    ),
+                },
+                "duration_seconds": {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 10,
+                    "description": "Whole-second duration from 2 through 10. Default 10.",
+                },
+                "profile": {
+                    "type": "string",
+                    "enum": ["hover_pulse"],
+                    "description": "Fixed procedural profile. Default hover_pulse.",
+                },
+                "prompt": {
+                    "type": "string",
+                    # llama.cpp b9906 cannot compile a tool grammar when
+                    # maxLength is combined with sibling numeric fields. The
+                    # service enforces nonempty/control-free/2,000 chars before
+                    # any GPU lifecycle action.
+                    "description": (
+                        "Optional Wan motion prompt for image_to_video; Core limits it "
+                        "to 2,000 characters."
+                    ),
+                },
+                "seed": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Optional deterministic Wan seed for image_to_video; Core "
+                        "enforces the JavaScript-safe maximum."
+                    ),
+                },
+            },
+            "required": ["source_sha256", "mode"],
+            "additionalProperties": False,
+        },
+    },
     "assistant_capabilities_read": {
         "description": "Read the truthful live capability catalog, policies, worker modes, and known unavailable features.",
         "parameters": {"type": "object", "properties": {}, "required": []},
@@ -672,6 +744,19 @@ class Registry:
         if name == "image_generate":
             prompt = str(args.get("prompt") or "").strip().replace("\n", " ")
             return f"Generate and save local image: {prompt[:180]}"
+        if name == "video_generate":
+            digest = str(args.get("source_sha256") or "")
+            duration = args.get("duration_seconds", 10)
+            mode = str(args.get("mode") or "")
+            if mode == "image_to_video":
+                return (
+                    f"Generate {duration}-second Wan2.2 image-to-video clip from "
+                    f"verified image {digest[:12]}…; Omni will unload and be restored"
+                )
+            return (
+                f"Create {duration}-second procedural hover_pulse animation from "
+                f"verified image {digest[:12]}…"
+            )
         if name == "calibration_iq_update":
             # Spell out the real-world effect: this writes to live field data.
             inner = args.get("arguments") or {}
@@ -722,11 +807,17 @@ class Registry:
 
         receipt_result = (receipt or {}).get("result")
         if isinstance(receipt_result, dict) and (
-            receipt_result.get("execution_state") == "indeterminate"
+            receipt_result.get("execution_state") in {"cancelled", "indeterminate"}
             or receipt_result.get("may_have_executed") is True
         ):
+            explicit_state = receipt_result.get("execution_state")
+            public_state = (
+                explicit_state
+                if explicit_state in {"cancelled", "indeterminate"}
+                else "indeterminate"
+            )
             public.update({
-                "execution_state": "indeterminate",
+                "execution_state": public_state,
                 "may_have_executed": True,
                 "outcome_message": str(
                     receipt_result.get("message")
@@ -789,7 +880,9 @@ class Registry:
                 "mime_type": "image/png",
             }
             for key, expected in required_truth.items():
-                if result.get(key) != expected:
+                actual = result.get(key)
+                mismatch = actual is not expected if isinstance(expected, bool) else actual != expected
+                if mismatch:
                     return str(
                         result.get("message")
                         or f"Image generation did not provide verified {key} proof."
@@ -816,6 +909,152 @@ class Registry:
                 and lifecycle.get("gpu_indices")
             ):
                 return "Image generation did not prove sequential model restoration."
+            return None
+        if name == "video_generate":
+            if not isinstance(result, dict):
+                return "Video creation returned an invalid execution result."
+            common_truth = {
+                "ok": True,
+                "status": "completed",
+                "executed": True,
+                "success": True,
+                "actual_video": True,
+                "verified": True,
+                "source_verified": True,
+                "mime_type": "video/mp4",
+                "codec": "h264",
+                "pixel_format": "yuv420p",
+                "fps": 24,
+            }
+            for key, expected in common_truth.items():
+                actual = result.get(key)
+                mismatch = actual is not expected if isinstance(expected, bool) else actual != expected
+                if mismatch:
+                    return str(
+                        result.get("message")
+                        or f"Video creation did not provide verified {key} proof."
+                    )
+            mode = result.get("mode")
+            lifecycle = result.get("lifecycle") or {}
+            if mode == "exact_source_animation":
+                procedural_truth = {
+                    "actual_generation": False,
+                    "source_preserved": True,
+                    "source_conditioned": False,
+                    "provider": "ffmpeg-exact-local",
+                    "render_kind": "deterministic_exact_source_animation",
+                    "profile": "hover_pulse",
+                }
+                for key, expected in procedural_truth.items():
+                    actual = result.get(key)
+                    mismatch = actual is not expected if isinstance(expected, bool) else actual != expected
+                    if mismatch:
+                        return f"Procedural video did not provide verified {key} proof."
+                if not (
+                    lifecycle.get("mode") == "bounded_cpu_subprocess"
+                    and lifecycle.get("model_remained_available") is True
+                ):
+                    return "Procedural video did not prove its bounded CPU lifecycle."
+            elif mode == "image_to_video":
+                generative_truth = {
+                    "actual_generation": True,
+                    "source_preserved": False,
+                    "source_conditioned": True,
+                    "provider": "comfyui-wan2.2-ti2v-5b-local",
+                    "render_kind": "generative_image_to_video",
+                    "model_id": "Wan2.2-TI2V-5B",
+                }
+                for key, expected in generative_truth.items():
+                    actual = result.get(key)
+                    mismatch = actual is not expected if isinstance(expected, bool) else actual != expected
+                    if mismatch:
+                        return f"Generative video did not provide verified {key} proof."
+                if not (
+                    lifecycle.get("mode") == "sequential_exclusive"
+                    and lifecycle.get("model_stopped") is True
+                    and lifecycle.get("model_restored") is True
+                    and type(lifecycle.get("gpu_indices")) is list
+                    and lifecycle.get("gpu_indices")
+                ):
+                    return "Generative video did not prove sequential model restoration."
+                seed = result.get("seed")
+                if (
+                    isinstance(seed, bool)
+                    or not isinstance(seed, int)
+                    or not 0 <= seed < 2**53
+                    or re.fullmatch(r"[0-9a-f]{64}", str(result.get("prompt_sha256") or "")) is None
+                ):
+                    return "Generative video returned invalid prompt or seed proof."
+                if result.get("width") != 704 or result.get("height") != 704:
+                    return "Generative video returned invalid fixed workflow dimensions."
+                expected_assets = {
+                    "wan2.2_ti2v_5B_fp16.safetensors": (
+                        9999658848,
+                        "456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e",
+                    ),
+                    "umt5_xxl_fp8_e4m3fn_scaled.safetensors": (
+                        6735906897,
+                        "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
+                    ),
+                    "wan2.2_vae.safetensors": (
+                        1409400960,
+                        "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156",
+                    ),
+                }
+                assets = result.get("model_assets")
+                if not isinstance(assets, dict) or set(assets) != set(expected_assets):
+                    return "Generative video returned incomplete official model-asset proof."
+                for filename, (size, digest_value) in expected_assets.items():
+                    item = assets.get(filename)
+                    if not (
+                        isinstance(item, dict)
+                        and item.get("verified") is True
+                        and item.get("bytes") == size
+                        and item.get("sha256") == digest_value
+                    ):
+                        return "Generative video returned invalid official model-asset proof."
+            else:
+                return "Video creation did not identify an explicit verified mode."
+            digest = str(result.get("sha256") or "")
+            source_digest = str(result.get("source_sha256") or "")
+            video_url = str(result.get("video_url") or "")
+            expected_url = f"/api/generated-videos/{digest}.mp4"
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or re.fullmatch(r"[0-9a-f]{64}", source_digest) is None
+                or video_url != expected_url
+                or result.get("target") != expected_url
+            ):
+                return "Video creation returned an invalid content-addressed target."
+            if (
+                isinstance(result.get("bytes"), bool)
+                or not isinstance(result.get("bytes"), int)
+                or result["bytes"] <= 0
+            ):
+                return "Video creation returned no verified file size."
+            duration = result.get("duration_seconds")
+            frame_count = result.get("frame_count")
+            fps = result.get("fps")
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, int)
+                or not 2 <= duration <= 10
+                or isinstance(frame_count, bool)
+                or not isinstance(frame_count, int)
+                or frame_count != duration * 24
+                or isinstance(fps, bool)
+                or not isinstance(fps, int)
+                or fps != 24
+            ):
+                return "Video creation returned invalid timing proof."
+            if not all(
+                isinstance(result.get(key), int)
+                and not isinstance(result.get(key), bool)
+                and 64 <= result[key] <= 4096
+                and result[key] % 2 == 0
+                for key in ("width", "height")
+            ):
+                return "Video creation returned invalid dimensions."
             return None
         if name != "run_powershell":
             return None
@@ -957,17 +1196,29 @@ class Registry:
             if self.tier(name) != "confirm_required" or name not in self._handlers:
                 raise ToolBlocked(f"'{name}' is no longer an executable approval-gated tool.")
             result = await self._invoke_handler(name, args)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             # The handler owns cancellation cleanup (including model restore)
             # before propagating this signal. Close the claimed approval now so
             # it cannot remain indefinitely executable or be retried. Because
             # cancellation can arrive after a side effect, retain that truth.
-            payload = {
-                "status": "error",
-                "execution_state": "cancelled",
-                "may_have_executed": True,
-                "message": "Execution was cancelled after it started; it will not be run again.",
-            }
+            structured = getattr(exc, "receipt_result", None)
+            if isinstance(structured, dict):
+                payload = {
+                    **structured,
+                    "ok": False,
+                    "status": "failed",
+                    "executed": True,
+                    "success": False,
+                    "execution_state": "cancelled",
+                    "may_have_executed": True,
+                }
+            else:
+                payload = {
+                    "status": "error",
+                    "execution_state": "cancelled",
+                    "may_have_executed": True,
+                    "message": "Execution was cancelled after it started; it will not be run again.",
+                }
             self.store.complete_approval(
                 approval_id,
                 success=False,

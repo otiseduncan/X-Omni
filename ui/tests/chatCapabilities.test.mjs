@@ -15,6 +15,8 @@ test("new capabilities render only as existing chat-stream artifacts", async () 
   assert.match(cards, /capabilities:\s*CapabilitiesCard/);
   assert.match(cards, /generated_image:\s*GeneratedImageCard/);
   assert.match(cards, /image_generation_status:\s*ImageGenerationStatusCard/);
+  assert.match(cards, /generated_video:\s*GeneratedVideoCard/);
+  assert.match(cards, /video_generation_status:\s*VideoGenerationStatusCard/);
   assert.match(cards, /className="generated-image"[\s\S]{0,240}width=\{data\.width\}[\s\S]{0,100}height=\{data\.height\}[\s\S]{0,100}loading="eager"/);
   assert.doesNotMatch(cards, /className="generated-image"[\s\S]{0,320}loading="lazy"/);
   assert.match(cards, /onError=\{\(\) => setImageLoadFailed\(true\)\}/);
@@ -27,6 +29,11 @@ test("new capabilities render only as existing chat-stream artifacts", async () 
   assert.doesNotMatch(cards, /<span>Image chat<\/span>[\s\S]{0,100}not available/);
   assert.match(app, /receiptMatchesArtifact\(lastExecutionReceiptRef\.current, liveArtifact\?\.type\)/);
   assert.match(app, /externalWorkload === "image_generation"/);
+  assert.match(app, /terminalMediaWorkload\(event\.receipt\)/);
+  assert.match(app, /fetch\("\/healthz",\s*\{[\s\S]{0,140}cache: "no-store"/);
+  assert.match(app, /settledWorkerHealth\(await response\.json\(\)\.catch\(\(\) => null\)\)/);
+  assert.match(app, /setSwapping\(false\);[\s\S]{0,100}setExternalWorkload\(null\)/);
+  assert.match(app, /await reconcile\(\);[\s\S]{0,100}await refreshSettledWorkerState\(\)/);
   assert.match(app, /generating image/);
   assert.match(app, /Omni is temporarily unloaded; Core will attempt to restore it/);
   assert.match(app, /success is shown only after that restoration is verified/);
