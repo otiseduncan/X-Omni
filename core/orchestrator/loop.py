@@ -59,6 +59,13 @@ _WEBSITE_CREATE_ACTION_RE = re.compile(
     r"\b(?:create|build|generate|design|render|display|make|show)\b",
     re.IGNORECASE,
 )
+_IMAGE_GENERATION_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:generate|create|make|render)\s+"
+    r"(?:(?:an?\s+)?(?:image|picture|illustration|artwork|painting|portrait|drawing|"
+    r"photograph)\b|(?=[^.!?\n]{0,120}\b(?:image|picture|illustration|artwork|painting|"
+    r"portrait|drawing|photograph|figure\s+study)\b))",
+    re.IGNORECASE,
+)
 _CIQ_COUNT_RE = re.compile(r"\b(?:how\s+many|count)\b", re.IGNORECASE)
 _CIQ_LIST_RE = re.compile(
     r"\b(?:show|list|display|pull\s+up)\b",
@@ -122,6 +129,14 @@ _EXPLICIT_WEB_RESEARCH_RE = re.compile(
     r"|\bgoogle\s+(?:it|this|that|for)\b",
     re.IGNORECASE | re.DOTALL,
 )
+_WEB_SOURCE_REQUEST_RE = re.compile(
+    r"\b(?:what|which)\s+(?:websites?|sites?|online\s+sources?)\b"
+    r".{0,120}\b(?:information|discuss|cover|about)\b"
+    r"|\bfind\s+(?:websites?|sites?|online\s+sources?|sources?)\b"
+    r"|\bwhere\s+can\s+i\s+(?:read|learn)\s+about\b"
+    r"|\bwhat\s+online\s+sources?\s+(?:cover|discuss|have)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 _CURRENT_INFORMATION_RE = re.compile(
     r"\b(?:current(?:ly)?|latest|newest|recent|breaking|right\s+now|today(?:'s)?|as\s+of\s+today)\b",
     re.IGNORECASE,
@@ -142,6 +157,12 @@ _WEB_ACCESS_DENIAL_RE = re.compile(
     r"[^.!?]{0,80}\b(?:access|browse|connect)\b[^.!?]{0,40}"
     r"\b(?:internet|web|external\s+websites?|online)\b"
     r"|\bno\s+(?:real[- ]?time\s+)?(?:internet|web)\s+access\b",
+    re.IGNORECASE,
+)
+_WEB_RESEARCH_REFUSAL_RE = re.compile(
+    r"^\s*(?:(?:i(?:'m|\s+am)\s+sorry|sorry)[,;:]?\s*)?(?:but\s+)?"
+    r"(?:i\s+)?(?:cannot|can't|won't|am\s+unable\s+to)\s+"
+    r"(?:provide|help|assist|comply|share|give|discuss|answer|support)\b",
     re.IGNORECASE,
 )
 
@@ -368,6 +389,14 @@ def deterministic_read_tool(user_message: object) -> Optional[str]:
     return "website_preview_generate" if website_intent else None
 
 
+def image_generation_request(user_message: object) -> Optional[dict[str, Any]]:
+    """Return bounded args for an unmistakable request to create visual media."""
+    prompt = str(user_message or "").strip()
+    if not prompt or not _IMAGE_GENERATION_RE.search(prompt):
+        return None
+    return {"prompt": prompt[:2000]}
+
+
 def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
     """Return bounded arguments for explicit or high-confidence current-web reads."""
     # Architectural invariant: conversation subject matter is runtime input only.
@@ -376,7 +405,10 @@ def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
     text = str(user_message or "").strip()
     if not text:
         return None
-    explicit = bool(_EXPLICIT_WEB_RESEARCH_RE.search(text))
+    explicit = bool(
+        _EXPLICIT_WEB_RESEARCH_RE.search(text)
+        or _WEB_SOURCE_REQUEST_RE.search(text)
+    )
     temporal = bool(
         _CURRENT_INFORMATION_RE.search(text)
         and _CURRENT_INFORMATION_SUBJECT_RE.search(text)
@@ -386,6 +418,19 @@ def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
         return None
     query = text[:400].strip()
     return {"query": query, "max_results": 6} if query else None
+
+
+def web_research_result_is_verified(result: Any) -> bool:
+    """Require a completed bounded external search before guarding synthesis."""
+    payload = result if isinstance(result, dict) else {}
+    sources = payload.get("sources")
+    return bool(
+        payload.get("ok") is True
+        and payload.get("external_network") is True
+        and payload.get("source_bounded") is True
+        and isinstance(sources, list)
+        and sources
+    )
 
 
 def web_research_fallback_summary(result: Any) -> str:
@@ -803,14 +848,25 @@ class Orchestrator:
             if not approved_tool and base_routed_tool is None
             else None
         )
+        image_request = (
+            image_generation_request(user_message)
+            if not approved_tool and base_routed_tool is None and ciq_request is None
+            else None
+        )
         web_request = (
             web_research_request(user_message)
-            if not approved_tool and base_routed_tool is None and ciq_request is None
+            if (
+                not approved_tool
+                and base_routed_tool is None
+                and ciq_request is None
+                and image_request is None
+            )
             else None
         )
         routed_tool = (
             base_routed_tool
             or (ciq_request[0] if ciq_request else None)
+            or ("image_generate" if image_request else None)
             or ("web_research_current" if web_request else None)
         )
         advertised_names = {
@@ -824,15 +880,22 @@ class Orchestrator:
             "calibration_iq_summary",
             "calibration_iq_read",
         }
+        routed_is_image = routed_tool == "image_generate"
         routed_is_web = routed_tool == "web_research_current"
         routed_result = None
+        routed_tier = self.registry.tier(routed_tool) if routed_tool else None
         if (
             routed_tool
             and routed_tool in advertised_names
-            and self.registry.tier(routed_tool) == "read_only"
+            and (
+                routed_tier == "read_only"
+                or (routed_is_image and routed_tier == "confirm_required")
+            )
         ):
             if routed_is_ciq and ciq_request:
                 routed_args = dict(ciq_request[1])
+            elif routed_is_image and image_request:
+                routed_args = dict(image_request)
             elif routed_is_web and web_request:
                 routed_args = dict(web_request)
             else:
@@ -855,6 +918,7 @@ class Orchestrator:
                 }],
             })
             routed_events: list[dict] = []
+            routed_paused = False
             async for event in self._execute(
                 routed_tool,
                 routed_args,
@@ -864,6 +928,8 @@ class Orchestrator:
                 approval_context=approval_context,
                 call_id=routed_call_id,
             ):
+                if event.get("type") == "approval":
+                    routed_paused = True
                 if event.get("type") == "tool_result":
                     routed_result = event.get("result")
                 if event.get("type") == "artifact":
@@ -883,6 +949,22 @@ class Orchestrator:
                 for item in tools
                 if item.get("function", {}).get("name") != routed_tool
             ]
+
+            if routed_paused:
+                message_id = self.store.add_message(
+                    conversation_id,
+                    "assistant",
+                    "",
+                    worker_used=self.router.active_name,
+                    artifacts=artifacts,
+                )
+                yield {
+                    "type": "done",
+                    "message_id": message_id,
+                    "worker": self.router.active_name,
+                    "artifacts": artifacts,
+                }
+                return
 
             # Website revisions are already complete, chat-renderable results.
             # Persist them before any optional prose synthesis so a worker
@@ -1126,16 +1208,25 @@ class Orchestrator:
                 call.get("name") == "website_preview_generate"
                 for call in tool_calls
             )
-            false_web_denial = bool(
+            guarded_web_response = bool(
                 routed_is_web
                 and not tool_calls
-                and _WEB_ACCESS_DENIAL_RE.search(round_text)
+                and (
+                    _WEB_ACCESS_DENIAL_RE.search(round_text)
+                    or (
+                        web_research_result_is_verified(routed_result)
+                        and (
+                            not round_text.strip()
+                            or _WEB_RESEARCH_REFUSAL_RE.search(round_text)
+                        )
+                    )
+                )
             )
-            if not website_call_in_round and not false_web_denial:
+            if not website_call_in_round and not guarded_web_response:
                 for token_event in sealed_round_tokens:
                     yield token_event
 
-            if false_web_denial:
+            if guarded_web_response:
                 guarded_text = web_research_fallback_summary(routed_result)
                 yield {"type": "token", "text": guarded_text}
                 full_text += guarded_text
