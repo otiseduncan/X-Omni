@@ -123,7 +123,12 @@ def build_app(settings: Settings) -> FastAPI:
     registry.register("add_task", add_task)
     registry.register("update_task_status", update_task_status)
 
-    registry.register("get_weather", lambda _a: weather_svc.fetch(store))
+    registry.register(
+        "get_weather",
+        lambda args: weather_svc.fetch(
+            store, user_id=str(args.get("__xomni_user_id") or "local-dev")
+        ),
+    )
 
     async def get_calendar(args: dict) -> dict:
         try:

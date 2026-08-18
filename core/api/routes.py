@@ -87,6 +87,26 @@ def create_router(
             return f"session:{token_hash}"
         return f"local:{session.get('google_sub') or 'local-dev'}"
 
+    def user_id(session: dict) -> str:
+        return str(session.get("user_id") or "local-dev")
+
+    async def require_owner(session: dict = Depends(require_session)) -> dict:
+        if session.get("role", "owner") != "owner":
+            raise HTTPException(403, "Owner authorization is required.")
+        return session
+
+    def require_conversation(conversation_id: int, session: dict) -> None:
+        if not hasattr(store, "conversation_exists"):
+            return
+        try:
+            exists = store.conversation_exists(conversation_id, user_id=user_id(session))
+        except TypeError:
+            # Small route-unit-test stores predate scoped ownership. Production
+            # Store always implements the keyword boundary above.
+            exists = store.conversation_exists(conversation_id)
+        if not exists:
+            raise HTTPException(404, "Conversation does not exist.")
+
     def require_exact_origin(request: Request, message: str) -> None:
         origin = str(request.headers.get("origin") or "").strip().rstrip("/")
         allowed_origins = {
@@ -121,25 +141,34 @@ def create_router(
     # ---------- system ----------
 
     @api.get("/status")
-    async def status():
+    async def status(session: dict = Depends(require_session)):
         health = await router_.health()
-        weather_loc = weather_svc.get_location(store)
+        weather_loc = weather_svc.get_location(store, user_id=user_id(session))
+        calendar_status = (
+            await calendar_svc.status(settings, store)
+            if session.get("role", "owner") == "owner"
+            else {"connected": False, "reason": "owner_only"}
+        )
         return {
             "worker": router_.status(),
             "model_health": health,
-            "calendar": await calendar_svc.status(settings, store),
+            "calendar": calendar_status,
             "weather_location": weather_loc,
             "auth_enabled": settings.auth_enabled,
         }
 
     @api.get("/tools")
-    async def list_tools():
+    async def list_tools(session: dict = Depends(require_session)):
         """The capability surface, exactly as policy defines it -- including
         the blocked entries, so the UI can show what X deliberately cannot
         do rather than quietly omitting it."""
         from ..tools.registry import TOOL_SCHEMAS
         items = []
         for name in sorted(set(TOOL_SCHEMAS) | set(registry.policy)):
+            if hasattr(registry, "role_allows_tool") and not registry.role_allows_tool(
+                str(session.get("role") or "owner"), name
+            ):
+                continue
             entry = registry.policy.get(name) or {}
             items.append({
                 "name": name,
@@ -148,10 +177,19 @@ def create_router(
                 or TOOL_SCHEMAS.get(name, {}).get("description", ""),
                 "implemented": name in registry._handlers,  # noqa: SLF001
             })
-        return {"tools": items, "roots": [str(r) for r in registry.roots]}
+        return {
+            "tools": items,
+            "roots": [str(r) for r in registry.roots]
+            if session.get("role", "owner") == "owner"
+            else [],
+        }
 
     @api.post("/tools/{tool_name}/run")
-    async def run_tool(tool_name: str, request: DirectToolRequest):
+    async def run_tool(
+        tool_name: str,
+        request: DirectToolRequest,
+        session: dict = Depends(require_session),
+    ):
         """Fire a no-argument read-only tool straight from the UI.
 
         Deliberately refuses anything above read_only: approval-gated
@@ -165,9 +203,14 @@ def create_router(
                 "so it goes through the approval flow.",
             )
         try:
-            result = await registry.invoke(
-                tool_name, {}, conversation_id=request.conversation_id
-            )
+            require_conversation(request.conversation_id, session)
+            invoke_context = {"conversation_id": request.conversation_id}
+            if hasattr(registry, "role_allows_tool"):
+                invoke_context.update({
+                    "user_id": user_id(session),
+                    "role": str(session.get("role") or "owner"),
+                })
+            result = await registry.invoke(tool_name, {}, **invoke_context)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(400, f"{type(exc).__name__}: {exc}")
         card_type = {
@@ -206,7 +249,7 @@ def create_router(
         }
 
     @api.post("/worker/swap")
-    async def swap(req: SwapRequest):
+    async def swap(req: SwapRequest, _session: dict = Depends(require_owner)):
         try:
             result = await router_.swap_to(req.worker)
         except WorkerSwapError as exc:
@@ -220,19 +263,20 @@ def create_router(
     # ---------- conversations ----------
 
     @api.get("/conversations")
-    async def conversations():
-        return store.list_conversations()
+    async def conversations(session: dict = Depends(require_session)):
+        return store.list_conversations(user_id=user_id(session))
 
     @api.post("/conversations")
-    async def new_conversation():
-        return {"id": store.create_conversation()}
+    async def new_conversation(session: dict = Depends(require_session)):
+        return {"id": store.create_conversation(user_id=user_id(session))}
 
     @api.get("/conversations/{conversation_id}/messages")
-    async def messages(conversation_id: int):
-        return store.get_messages(conversation_id)
+    async def messages(conversation_id: int, session: dict = Depends(require_session)):
+        require_conversation(conversation_id, session)
+        return store.get_messages(conversation_id, user_id=user_id(session))
 
     @api.get("/generated-images/{filename}")
-    async def generated_image(filename: str):
+    async def generated_image(filename: str, session: dict = Depends(require_session)):
         """Serve only a verified content-addressed image to the Owner session."""
         if image_config is None:
             raise HTTPException(404, "Image generation is not configured.")
@@ -241,6 +285,10 @@ def create_router(
         except ImageGenerationError as exc:
             raise HTTPException(404, "Generated image not found.") from exc
         if not path.is_file():
+            raise HTTPException(404, "Generated image not found.")
+        if hasattr(store, "artifact_belongs_to_user") and not store.artifact_belongs_to_user(
+            filename, user_id(session)
+        ):
             raise HTTPException(404, "Generated image not found.")
 
         def verify() -> bool:
@@ -266,7 +314,9 @@ def create_router(
         )
 
     @api.get("/generated-videos/{filename}")
-    async def generated_video(filename: str, request: Request):
+    async def generated_video(
+        filename: str, request: Request, session: dict = Depends(require_session),
+    ):
         """Serve one verified content-addressed MP4 with single-range support."""
         if video_config is None:
             raise HTTPException(404, "Video animation is not configured.")
@@ -275,6 +325,10 @@ def create_router(
         except VideoGenerationError as exc:
             raise HTTPException(404, "Generated video not found.") from exc
         if not path.is_file():
+            raise HTTPException(404, "Generated video not found.")
+        if hasattr(store, "artifact_belongs_to_user") and not store.artifact_belongs_to_user(
+            filename, user_id(session)
+        ):
             raise HTTPException(404, "Generated video not found.")
 
         expected_digest = filename.removesuffix(".mp4")
@@ -373,7 +427,9 @@ def create_router(
     # ---------- ADAS SI documents ----------
 
     @api.get("/adas-si/document")
-    async def adas_si_document(path: str, download: bool = False):
+    async def adas_si_document(
+        path: str, download: bool = False, _session: dict = Depends(require_owner),
+    ):
         """Stream a document out of the ADAS SI library for inline display.
 
         The service resolves and confines the path to the library root, so a
@@ -406,7 +462,10 @@ def create_router(
         )
 
     @api.get("/adas-si/page")
-    async def adas_si_page(path: str, page: int = 1, width: int = 1100):
+    async def adas_si_page(
+        path: str, page: int = 1, width: int = 1100,
+        _session: dict = Depends(require_owner),
+    ):
         """Render one page of an ADAS SI document as a PNG.
 
         This is the inline display path. Mobile browsers will not render a
@@ -437,13 +496,17 @@ def create_router(
     # ---------- weather ----------
 
     @api.get("/weather")
-    async def weather():
-        return weather_svc.fetch(store)
+    async def weather(session: dict = Depends(require_session)):
+        return weather_svc.fetch(store, user_id=user_id(session))
 
     @api.post("/weather/location")
-    async def set_location(req: LocationRequest):
+    async def set_location(
+        req: LocationRequest, session: dict = Depends(require_session),
+    ):
         try:
-            loc = weather_svc.save_location(store, req.model_dump(exclude_none=True))
+            loc = weather_svc.save_location(
+                store, req.model_dump(exclude_none=True), user_id=user_id(session)
+            )
         except ValueError as exc:
             # Bad or unresolvable input -- the caller can fix this.
             raise HTTPException(400, str(exc))
@@ -456,12 +519,15 @@ def create_router(
                 "Could not reach the geocoding service to look that up. "
                 "Check the network and try again, or give exact coordinates.",
             )
-        return {"ok": True, "location": loc, "forecast": weather_svc.fetch(store)}
+        return {
+            "ok": True, "location": loc,
+            "forecast": weather_svc.fetch(store, user_id=user_id(session)),
+        }
 
     # ---------- calendar ----------
 
     @api.get("/calendar")
-    async def calendar(days: int = 7):
+    async def calendar(days: int = 7, _session: dict = Depends(require_owner)):
         try:
             return await calendar_svc.upcoming(settings, store, days)
         except calendar_svc.CalendarUnavailable as exc:
@@ -480,7 +546,7 @@ def create_router(
         record = snapshot["approval"]
         if (
             record.get("session_id") != session_id(session)
-            or record.get("user_id") != str(session.get("google_sub") or "local-dev")
+            or record.get("user_id") != user_id(session)
         ):
             raise HTTPException(403, "Approval belongs to a different session or user.")
         return {
@@ -503,7 +569,7 @@ def create_router(
                 decision.approved,
                 conversation_id=int(record["conversation_id"]),
                 session_id=session_id(session),
-                user_id=str(session.get("google_sub") or "local-dev"),
+                user_id=user_id(session),
             )
         except PermissionError as exc:
             raise HTTPException(403, str(exc)) from exc
@@ -518,7 +584,7 @@ def create_router(
     # ---------- local exterior camera ----------
 
     @api.get("/cameras/exterior")
-    async def exterior_camera_status():
+    async def exterior_camera_status(_session: dict = Depends(require_owner)):
         if exterior_camera is None:
             return {
                 "ok": False,
@@ -533,6 +599,7 @@ def create_router(
     @api.post("/cameras/exterior/configure")
     async def configure_exterior_camera(
         request: Request,
+        _session: dict = Depends(require_owner),
     ):
         require_exact_origin(
             request, "Exterior camera configuration requires the exact X Omni origin."
@@ -596,7 +663,7 @@ def create_router(
     async def create_exterior_camera_session(
         request: Request,
         body: ExteriorCameraSessionRequest,
-        session: dict = Depends(require_session),
+        session: dict = Depends(require_owner),
     ):
         require_exact_origin(
             request, "Exterior camera sessions require the exact X Omni origin."
@@ -605,8 +672,7 @@ def create_router(
             raise HTTPException(503, "Exterior camera connector is not available.")
         if body.conversation_id <= 0:
             raise HTTPException(400, "conversation_id must be a positive integer.")
-        if not store.conversation_exists(body.conversation_id):
-            raise HTTPException(404, "Conversation does not exist.")
+        require_conversation(body.conversation_id, session)
         try:
             result = await exterior_camera.create_session(
                 conversation_id=body.conversation_id,
@@ -630,7 +696,7 @@ def create_router(
     @api.get("/cameras/exterior/sessions/{camera_session_id}/stream.mjpg")
     async def exterior_camera_stream(
         camera_session_id: str,
-        session: dict = Depends(require_session),
+        session: dict = Depends(require_owner),
     ):
         if exterior_camera is None:
             raise HTTPException(503, "Exterior camera connector is not available.")
@@ -655,7 +721,7 @@ def create_router(
     async def delete_exterior_camera_session(
         camera_session_id: str,
         request: Request,
-        session: dict = Depends(require_session),
+        session: dict = Depends(require_owner),
     ):
         require_exact_origin(
             request, "Stopping an exterior camera session requires the exact X Omni origin."
@@ -705,8 +771,9 @@ def create_router(
             raise HTTPException(
                 400, "X-XOmni-Conversation-ID must be a positive integer."
             ) from exc
-        if not store.conversation_exists(conversation_id):
-            raise HTTPException(404, "Conversation does not exist.")
+        require_conversation(conversation_id, auth_session)
+        if is_exterior and auth_session.get("role", "owner") != "owner":
+            raise HTTPException(403, "Exterior camera access requires Owner authorization.")
         try:
             bounded_prompt = camera_svc.decode_camera_prompt_header(
                 request.headers.get("x-xomni-camera-prompt-b64")

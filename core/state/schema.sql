@@ -9,9 +9,32 @@ CREATE TABLE IF NOT EXISTS owner (
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Application principals.  `owner` remains the immutable authority record;
+-- this table gives that owner and invited testers one common session/data
+-- boundary without weakening the sole-owner binding above.
+CREATE TABLE IF NOT EXISTS users (
+    id                     TEXT PRIMARY KEY,
+    google_sub             TEXT UNIQUE,
+    email                  TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    display_name           TEXT,
+    avatar_url             TEXT,
+    tailscale_login        TEXT COLLATE NOCASE UNIQUE,
+    role                   TEXT NOT NULL CHECK (role IN ('owner','test_user')),
+    status                 TEXT NOT NULL CHECK (status IN ('pending','active','revoked')),
+    tailscale_invite_url   TEXT,
+    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    last_login_at          TEXT,
+    enrollment_verified_at TEXT,
+    revoked_at             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_users_role_status ON users(role, status);
+
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash  TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     google_sub  TEXT NOT NULL,
+    tailscale_login TEXT,
     user_agent  TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     expires_at  TEXT NOT NULL
@@ -19,6 +42,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE TABLE IF NOT EXISTS conversations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     title       TEXT,
     started_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
@@ -61,6 +85,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_calls_approval
 
 CREATE TABLE IF NOT EXISTS tasks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
     title           TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'open'
@@ -134,12 +159,13 @@ CREATE TABLE IF NOT EXISTS google_tokens (
 
 -- Generic namespaced key/value for small state (weather location, prefs).
 CREATE TABLE IF NOT EXISTS state_records (
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     namespace    TEXT NOT NULL,
     id           TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (namespace, id)
+    PRIMARY KEY (user_id, namespace, id)
 );
 
 -- Append-only. Nothing in this codebase may UPDATE or DELETE from here.

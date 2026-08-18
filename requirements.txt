@@ -7,6 +7,7 @@ PyYAML>=6,<7
 python-multipart>=0.0.12,<1
 PyJWT[crypto]>=2.10,<3
 Pillow>=11,<13
+qrcode[pil]>=8,<9
 # ADAS SI page rendering -- inline document display in chat.
 # Apache-2.0/BSD, prebuilt Windows wheels, no external binaries.
 pypdfium2>=4.30

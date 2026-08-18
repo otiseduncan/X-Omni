@@ -18,17 +18,20 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
+from email.header import decode_header
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
 import jwt
-from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel, SecretStr
 
@@ -48,6 +51,114 @@ class LocalOAuthSetup(BaseModel):
     client_id: str
     client_secret: SecretStr
     public_origin: Optional[str] = None
+
+
+class TestUserInvitation(BaseModel):
+    email: str
+    tailscale_invite_url: Optional[str] = None
+
+
+class TestUserStatusChange(BaseModel):
+    status: str
+
+
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def normalize_email(value: str) -> str:
+    email = str(value or "").strip().casefold()
+    if not 3 <= len(email) <= 320 or not _EMAIL_RE.fullmatch(email):
+        raise ValueError("A valid email address is required.")
+    return email
+
+
+def _decode_identity_header(value: str) -> str:
+    parts: list[str] = []
+    for fragment, charset in decode_header(str(value or "")):
+        if isinstance(fragment, bytes):
+            parts.append(fragment.decode(charset or "utf-8", errors="strict"))
+        else:
+            parts.append(fragment)
+    return "".join(parts).strip()
+
+
+def _request_access(headers, client_host: str, settings) -> tuple[str, Optional[str]]:
+    """Return (local|tailscale, login) for an allowed transport.
+
+    Tailscale Serve removes spoofed identity headers and supplies its own.  Core
+    additionally binds only loopback and accepts those headers solely on the
+    exact configured HTTPS Serve origin. Serve may preserve the originating
+    tailnet address as the ASGI client, so the security boundary is Core's
+    configured loopback listener rather than the reported client address. A
+    header on the direct local origin is never treated as remote identity.
+    """
+    host = str(headers.get("host") or "").strip().casefold()
+    local_hosts = {
+        f"127.0.0.1:{settings.port}".casefold(),
+        f"localhost:{settings.port}".casefold(),
+        f"[::1]:{settings.port}".casefold(),
+    }
+    if host in local_hosts:
+        return "local", None
+    if not settings.public_origin:
+        raise HTTPException(400, "Request host is not an allowed X Omni origin.")
+    public_host = urlparse(settings.public_origin).netloc.casefold()
+    forwarded_proto = str(headers.get("x-forwarded-proto") or "").split(",", 1)[0]
+    if host != public_host or forwarded_proto.strip().casefold() != "https":
+        raise HTTPException(400, "Request host is not an allowed X Omni origin.")
+    del client_host  # Serve can preserve the real tailnet client address here.
+    if str(getattr(settings, "host", "127.0.0.1")).strip().casefold() not in {
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    }:
+        raise HTTPException(503, "Remote identity requires X Omni Core to bind loopback.")
+    raw_login = str(headers.get("tailscale-user-login") or "")
+    if not raw_login:
+        raise HTTPException(403, "Authenticated Tailscale identity is required.")
+    try:
+        return "tailscale", normalize_email(_decode_identity_header(raw_login))
+    except (UnicodeError, ValueError) as exc:
+        raise HTTPException(403, "Tailscale did not provide a usable login identity.") from exc
+
+
+def _public_user(user: Optional[dict]) -> Optional[dict]:
+    if not user:
+        return None
+    return {
+        "id": user.get("id"),
+        "email": user.get("email"),
+        "display_name": user.get("display_name"),
+        "avatar_url": user.get("avatar_url"),
+        "tailscale_login": user.get("tailscale_login"),
+        "role": user.get("role"),
+        "status": user.get("status"),
+        "google_verified": bool(user.get("google_sub")),
+        "tailscale_verified": bool(user.get("tailscale_login")),
+        "profile_created": bool(user.get("google_sub")),
+        "created_at": user.get("created_at"),
+        "last_login_at": user.get("last_login_at"),
+        "enrollment_verified_at": user.get("enrollment_verified_at"),
+        "revoked_at": user.get("revoked_at"),
+        "tailscale_invite_url": user.get("tailscale_invite_url"),
+    }
+
+
+def _validate_invite_url(value: Optional[str]) -> Optional[str]:
+    if value is None or not value.strip():
+        return None
+    url = value.strip()
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "login.tailscale.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or len(url) > 2048
+    ):
+        raise ValueError("Use an HTTPS invitation URL from login.tailscale.com.")
+    return url
 
 
 def _validate_setup_values(request: LocalOAuthSetup) -> tuple[str, str, Optional[str]]:
@@ -206,30 +317,12 @@ def create_router(settings, store) -> APIRouter:
             raise HTTPException(415, "OAuth setup requires an application/json body.")
 
     def _request_origin(request: Request) -> tuple[str, bool]:
-        """Resolve only explicitly configured hosts; never trust arbitrary Host.
-
-        A reverse proxy reaches Core from loopback, so the peer address cannot
-        distinguish a person at Omega from a remote browser.  Exact Host plus
-        HTTPS-forwarding proof is the usable boundary for the configured
-        Tailscale origin, while Owner bootstrap additionally requires a literal
-        loopback Host.
-        """
-        host = str(request.headers.get("host") or "").strip().casefold()
-        local_hosts = {
-            f"127.0.0.1:{settings.port}".casefold(),
-            f"localhost:{settings.port}".casefold(),
-            f"[::1]:{settings.port}".casefold(),
-        }
-        if host in local_hosts:
+        access, _login = _request_access(
+            request.headers, request.client.host if request.client else "", settings
+        )
+        if access == "local":
             return settings.local_origin, True
-        if settings.public_origin:
-            public_host = urlparse(settings.public_origin).netloc.casefold()
-            forwarded_proto = str(
-                request.headers.get("x-forwarded-proto") or ""
-            ).split(",", 1)[0].strip().casefold()
-            if host == public_host and forwarded_proto == "https":
-                return settings.public_origin, False
-        raise HTTPException(400, "Request host is not an allowed X Omni origin.")
+        return settings.public_origin, False
 
     def _redirect_uri(request: Request) -> tuple[str, bool]:
         """Pick the redirect URI matching how this request arrived, so the
@@ -281,12 +374,44 @@ def create_router(settings, store) -> APIRouter:
         owner = store.get_owner()
         token = request.cookies.get(SESSION_COOKIE)
         session = store.get_session(token) if token else None
+        access = "local"
+        tailscale_login = None
+        access_error = None
+        try:
+            access, tailscale_login = _request_access(
+                request.headers, request.client.host if request.client else "", settings
+            )
+        except HTTPException as exc:
+            access = "denied"
+            access_error = str(exc.detail)
+            session = None
+        if session and access == "tailscale":
+            bound = str(session.get("tailscale_login") or "").casefold()
+            if not bound or not hmac.compare_digest(bound, str(tailscale_login)):
+                session = None
+                access_error = "This browser session belongs to a different Tailscale identity."
+        current = store.get_user(session["user_id"]) if session and hasattr(store, "get_user") else None
+        invited = (
+            store.get_user_by_email(tailscale_login)
+            if tailscale_login and hasattr(store, "get_user_by_email")
+            else None
+        )
         return {
             "auth_enabled": settings.auth_enabled,
             "google_configured": settings.google_configured,
             "owner_bound": bool(owner),
-            "signed_in": bool(session) or not settings.auth_enabled,
+            "signed_in": bool(session) or (
+                not settings.auth_enabled and access == "local"
+            ),
             "redirect_uri_count": len(settings.redirect_uris),
+            "access_path": access,
+            "tailscale_identity": tailscale_login,
+            "remote_access_error": access_error,
+            "remote_authorized": bool(
+                access == "tailscale" and invited and invited.get("status") != "revoked"
+            ),
+            "enrollment_status": invited.get("status") if invited else None,
+            "current_user": _public_user(current),
         }
 
     @router.get("/login")
@@ -303,22 +428,49 @@ def create_router(settings, store) -> APIRouter:
         nonce = secrets.token_urlsafe(24)
         binding = secrets.token_urlsafe(32)
         redirect_uri, is_local = _redirect_uri(request)
+        _access, tailscale_login = _request_access(
+            request.headers, request.client.host if request.client else "", settings
+        )
         if not store.get_owner() and not is_local:
             raise HTTPException(
                 403,
                 "The first Owner sign-in must begin locally on Omega. "
                 "Open X Omni at its 127.0.0.1 address for initial binding.",
             )
+        login_kind = "owner"
+        if not is_local:
+            candidate = store.get_user_by_email(tailscale_login)
+            if not candidate:
+                raise HTTPException(
+                    403, "This Tailscale identity has not been authorized for X Omni."
+                )
+            if candidate["status"] == "revoked":
+                raise HTTPException(403, "This X Omni account is revoked.")
+            login_kind = str(candidate["role"])
+        stored_owner_token = (
+            store.get_google_token()
+            if login_kind == "owner" and hasattr(store, "get_google_token")
+            else None
+        )
+        owner_grant_is_durable = bool(
+            stored_owner_token and stored_owner_token.get("refresh_token")
+        )
         _prune_pending_states()
         _pending_states[state] = {
             "redirect_uri": redirect_uri,
             "nonce": nonce,
             "binding_digest": _binding_digest(settings, binding),
             "bootstrap_local": is_local,
+            "login_kind": login_kind,
+            "tailscale_login": tailscale_login,
             "expires_at": int(time.time()) + OAUTH_ATTEMPT_TTL_SECONDS,
         }
         response = RedirectResponse(
-            google_auth.authorization_url(settings, redirect_uri, state, nonce)
+            google_auth.authorization_url(
+                settings, redirect_uri, state, nonce,
+                identity_only=login_kind == "test_user",
+                force_consent=not owner_grant_is_durable,
+            )
         )
         response.set_cookie(
             OAUTH_BINDING_COOKIE,
@@ -356,6 +508,20 @@ def create_router(settings, store) -> APIRouter:
 
         redirect_uri = str(attempt["redirect_uri"])
         nonce = str(attempt["nonce"])
+        login_kind = str(attempt.get("login_kind") or "owner")
+        tailscale_login = attempt.get("tailscale_login")
+        if tailscale_login:
+            try:
+                access, callback_login = _request_access(
+                    request.headers, request.client.host if request.client else "", settings
+                )
+            except HTTPException:
+                return RedirectResponse("/?auth_error=tailscale_identity_missing")
+            if (
+                access != "tailscale"
+                or not hmac.compare_digest(str(tailscale_login), str(callback_login))
+            ):
+                return RedirectResponse("/?auth_error=tailscale_identity_changed")
         if not store.get_owner() and not bool(attempt.get("bootstrap_local")):
             return RedirectResponse("/?auth_error=bootstrap_local_required")
 
@@ -372,35 +538,68 @@ def create_router(settings, store) -> APIRouter:
             return RedirectResponse("/?auth_error=no_subject")
         if info.get("email_verified") is not True:
             return RedirectResponse("/?auth_error=email_not_verified")
+        try:
+            google_email = normalize_email(str(claims.get("email") or ""))
+            info_email = normalize_email(str(info.get("email") or ""))
+        except ValueError:
+            return RedirectResponse("/?auth_error=email_not_verified")
+        if not hmac.compare_digest(google_email, info_email):
+            return RedirectResponse("/?auth_error=google_identity_conflict")
+        if tailscale_login and not hmac.compare_digest(google_email, str(tailscale_login)):
+            store.audit("auth_rejected_identity_mismatch", {"identity_match": False})
+            return RedirectResponse("/?auth_error=identity_mismatch")
 
-        if not token.get("refresh_token"):
+        stored_owner_token = (
+            store.get_google_token()
+            if login_kind == "owner" and hasattr(store, "get_google_token")
+            else None
+        )
+        has_durable_owner_grant = bool(
+            token.get("refresh_token")
+            or (stored_owner_token and stored_owner_token.get("refresh_token"))
+        )
+        if login_kind == "owner" and not has_durable_owner_grant:
             # Without a refresh token the Calendar link silently dies in an
-            # hour. Better to fail loudly at login than mysteriously later.
+            # hour. A returning Owner may legitimately receive no new refresh
+            # token because the stored durable grant remains authoritative.
             log.error("Google returned no refresh_token.")
             return RedirectResponse("/?auth_error=no_refresh_token")
 
         try:
-            owner = store.bind_owner(
-                sub, claims.get("email", ""), claims.get("name", "")
-            )
+            if login_kind == "test_user":
+                user = store.provision_test_user(
+                    google_sub=str(sub), email=google_email,
+                    display_name=str(claims.get("name") or info.get("name") or ""),
+                    avatar_url=claims.get("picture") or info.get("picture"),
+                    tailscale_login=str(tailscale_login),
+                )
+            else:
+                owner = store.bind_owner(
+                    str(sub), google_email, str(claims.get("name") or info.get("name") or "")
+                )
+                user = store.get_user_by_google_sub(str(sub))
+                if tailscale_login:
+                    user = store.bind_owner_tailscale(str(sub), str(tailscale_login))
+                store.save_google_token({
+                    "access_token": token.get("access_token"),
+                    "refresh_token": token.get("refresh_token"),
+                    "scope": token.get("scope"),
+                    "expires_at": token.get("expires_at"),
+                    "account_email": None,
+                })
         except PermissionError:
-            store.audit("auth_rejected_wrong_account", {"account_match": False})
-            return RedirectResponse("/?auth_error=not_owner")
-
-        store.save_google_token({
-            "access_token": token.get("access_token"),
-            "refresh_token": token.get("refresh_token"),
-            "scope": token.get("scope"),
-            "expires_at": token.get("expires_at"),
-            "account_email": None,
-        })
+            store.audit("auth_rejected_identity_conflict", {"login_kind": login_kind})
+            error_code = "enrollment_conflict" if login_kind == "test_user" else "not_owner"
+            return RedirectResponse(f"/?auth_error={error_code}")
 
         session_token = store.create_session(
-            owner["google_sub"],
+            str(sub),
             request.headers.get("user-agent", ""),
             settings.session_ttl_days,
+            user_id=user["id"],
+            tailscale_login=str(tailscale_login) if tailscale_login else None,
         )
-        store.audit("auth_login", {"owner_match": True})
+        store.audit("auth_login", {"role": login_kind, "identity_match": True})
 
         response = RedirectResponse("/")
         secure = redirect_uri.startswith("https://")
@@ -421,12 +620,89 @@ def create_router(settings, store) -> APIRouter:
         response.delete_cookie(SESSION_COOKIE, path="/")
         return response
 
+    async def require_owner(request: Request) -> dict:
+        session = await make_require_session(settings, store)(request)
+        if session.get("role") != "owner":
+            raise HTTPException(403, "Owner authorization is required.")
+        return session
+
+    @router.get("/admin/test-users")
+    async def list_test_users(_session: dict = Depends(require_owner)):
+        return {"users": [_public_user(user) for user in store.list_test_users()]}
+
+    @router.post("/admin/test-users")
+    async def invite_test_user(
+        invitation: TestUserInvitation,
+        _session: dict = Depends(require_owner),
+    ):
+        try:
+            email = normalize_email(invitation.email)
+            invite_url = _validate_invite_url(invitation.tailscale_invite_url)
+            user = store.invite_test_user(email, invite_url)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        store.audit("test_user_invited", {"user_id": user["id"]})
+        return _public_user(user)
+
+    @router.patch("/admin/test-users/{user_id}")
+    async def change_test_user_status(
+        user_id: str,
+        change: TestUserStatusChange,
+        _session: dict = Depends(require_owner),
+    ):
+        status = str(change.status or "").strip().casefold()
+        try:
+            user = store.set_test_user_status(user_id, status)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        store.audit("test_user_status_changed", {"user_id": user_id, "status": status})
+        return _public_user(user)
+
+    @router.get("/admin/test-users/{user_id}/invite-qr.png")
+    async def test_user_invite_qr(
+        user_id: str,
+        _session: dict = Depends(require_owner),
+    ):
+        user = store.get_user(user_id)
+        if not user or user.get("role") != "test_user":
+            raise HTTPException(404, "Unknown test user.")
+        invite_url = user.get("tailscale_invite_url")
+        if not invite_url:
+            raise HTTPException(404, "No Tailscale invitation URL is stored for this tester.")
+        try:
+            import qrcode
+
+            qr = qrcode.QRCode(version=None, box_size=8, border=4)
+            qr.add_data(str(invite_url))
+            qr.make(fit=True)
+            image = qr.make_image(fill_color="black", back_color="white")
+            output = BytesIO()
+            image.save(output, format="PNG")
+        except Exception as exc:  # noqa: BLE001 - do not expose invitation data
+            log.exception("Local invitation QR generation failed")
+            raise HTTPException(500, "Invitation QR generation failed.") from exc
+        return Response(
+            output.getvalue(),
+            media_type="image/png",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'inline; filename="x-omni-invite-{user_id}.png"',
+            },
+        )
+
     return router
 
 
 def make_require_session(settings, store):
     """Dependency for protected routes."""
     async def require_session(request: Request) -> dict:
+        access, tailscale_login = _request_access(
+            request.headers, request.client.host if request.client else "", settings
+        )
         origin = request.headers.get("origin", "").strip()
         if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and origin:
             allowed = {settings.local_origin, f"http://localhost:{settings.port}"}
@@ -435,11 +711,22 @@ def make_require_session(settings, store):
             if origin.rstrip("/") not in allowed:
                 raise HTTPException(403, "Request origin is not allowed.")
         if not settings.auth_enabled:
-            return {"google_sub": "local-dev", "bypass": True}
+            if access != "local":
+                raise HTTPException(403, "Remote access is disabled until authentication is enabled.")
+            return {
+                "user_id": "local-dev", "google_sub": "local-dev",
+                "role": "owner", "status": "active", "bypass": True,
+            }
         token = request.cookies.get(SESSION_COOKIE)
         session = store.get_session(token) if token else None
         if not session:
             raise HTTPException(401, "Not signed in.")
+        if access == "tailscale":
+            bound = str(session.get("tailscale_login") or "").casefold()
+            if not bound or not hmac.compare_digest(bound, str(tailscale_login)):
+                raise HTTPException(403, "Session Tailscale identity does not match this request.")
+        elif session.get("role") != "owner":
+            raise HTTPException(403, "Test users must connect through Tailscale Serve.")
         return session
     return require_session
 
@@ -447,6 +734,14 @@ def make_require_session(settings, store):
 def session_from_websocket(settings, store, websocket) -> Optional[dict]:
     """WebSockets can't use HTTPException-based dependencies cleanly, so
     the chat socket checks the same cookie itself before accepting."""
+    try:
+        access, tailscale_login = _request_access(
+            websocket.headers,
+            websocket.client.host if websocket.client else "",
+            settings,
+        )
+    except HTTPException:
+        return None
     origin = str(websocket.headers.get("origin") or "").rstrip("/")
     allowed = {settings.local_origin, f"http://localhost:{settings.port}"}
     if settings.public_origin:
@@ -454,6 +749,20 @@ def session_from_websocket(settings, store, websocket) -> Optional[dict]:
     if origin and origin not in allowed:
         return None
     if not settings.auth_enabled:
-        return {"google_sub": "local-dev", "bypass": True}
+        if access != "local":
+            return None
+        return {
+            "user_id": "local-dev", "google_sub": "local-dev",
+            "role": "owner", "status": "active", "bypass": True,
+        }
     token = websocket.cookies.get(SESSION_COOKIE)
-    return store.get_session(token) if token else None
+    session = store.get_session(token) if token else None
+    if not session:
+        return None
+    if access == "tailscale":
+        bound = str(session.get("tailscale_login") or "").casefold()
+        if not bound or not hmac.compare_digest(bound, str(tailscale_login)):
+            return None
+    elif session.get("role") != "owner":
+        return None
+    return session

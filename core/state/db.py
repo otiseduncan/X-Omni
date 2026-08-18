@@ -14,6 +14,7 @@ import re
 import secrets
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -59,6 +60,9 @@ CREATE TABLE sessions (
 )
 """
 
+LOCAL_USER_ID = "local-dev"
+LOCAL_USER_EMAIL = "local-dev@xomni.invalid"
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -93,6 +97,7 @@ class Store:
         self._migrate_legacy_approvals()
         self._migrate_tool_calls()
         self.conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self._migrate_identity_model()
         self._migrate_tool_calls()
         self.conn.commit()
         # An approval left in `executing` belongs to an interrupted prior
@@ -124,9 +129,133 @@ class Store:
             try:
                 self.conn.execute("PRAGMA secure_delete=ON")
                 self.conn.execute("DROP TABLE sessions")
-                self.conn.execute(_SESSIONS_SCHEMA_SQL)
                 self.conn.commit()
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def _migrate_identity_model(self) -> None:
+        """Add multi-user ownership without discarding sole-owner state.
+
+        Existing conversations, tasks, preferences and hashed sessions belong
+        to the already-bound owner.  Fresh unowned/test databases use the
+        local development principal until an Owner is bound.
+        """
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                owner = self.conn.execute("SELECT * FROM owner WHERE id = 1").fetchone()
+                principal_id = LOCAL_USER_ID
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO users
+                        (id, email, display_name, role, status)
+                    VALUES (?, ?, ?, 'owner', 'active')
+                    """,
+                    (LOCAL_USER_ID, LOCAL_USER_EMAIL, "Local Owner"),
+                )
+                if owner:
+                    existing = self.conn.execute(
+                        "SELECT id FROM users WHERE google_sub = ?",
+                        (owner["google_sub"],),
+                    ).fetchone()
+                    principal_id = (
+                        str(existing["id"])
+                        if existing
+                        else f"owner-{hashlib.sha256(str(owner['google_sub']).encode()).hexdigest()[:24]}"
+                    )
+                    email = str(owner["email"] or f"{principal_id}@xomni.invalid").casefold()
+                    self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO users
+                            (id, google_sub, email, display_name, role, status,
+                             enrollment_verified_at)
+                        VALUES (?, ?, ?, ?, 'owner', 'active', ?)
+                        """,
+                        (principal_id, owner["google_sub"], email,
+                         owner["display_name"], owner["created_at"]),
+                    )
+
+                session_columns = {
+                    row["name"] for row in self.conn.execute("PRAGMA table_info(sessions)")
+                }
+                if "user_id" not in session_columns:
+                    self.conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+                if "tailscale_login" not in session_columns:
+                    self.conn.execute("ALTER TABLE sessions ADD COLUMN tailscale_login TEXT")
+                if owner:
+                    self.conn.execute(
+                        "UPDATE sessions SET user_id = ? WHERE user_id IS NULL AND google_sub = ?",
+                        (principal_id, owner["google_sub"]),
+                    )
+                self.conn.execute(
+                    "UPDATE sessions SET user_id = ? WHERE user_id IS NULL",
+                    (LOCAL_USER_ID,),
+                )
+
+                for table in ("conversations", "tasks"):
+                    columns = {
+                        row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")
+                    }
+                    if "user_id" not in columns:
+                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
+                    self.conn.execute(
+                        f"UPDATE {table} SET user_id = ? WHERE user_id IS NULL",
+                        (principal_id,),
+                    )
+
+                record_columns = {
+                    row["name"] for row in self.conn.execute("PRAGMA table_info(state_records)")
+                }
+                if "user_id" not in record_columns:
+                    self.conn.execute("ALTER TABLE state_records RENAME TO state_records_legacy")
+                    self.conn.execute(
+                        """
+                        CREATE TABLE state_records (
+                            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            namespace TEXT NOT NULL,
+                            id TEXT NOT NULL,
+                            payload_json TEXT NOT NULL,
+                            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                            PRIMARY KEY (user_id, namespace, id)
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT INTO state_records
+                            (user_id, namespace, id, payload_json, created_at, updated_at)
+                        SELECT ?, namespace, id, payload_json, created_at, updated_at
+                        FROM state_records_legacy
+                        """,
+                        (principal_id,),
+                    )
+                    self.conn.execute("DROP TABLE state_records_legacy")
+
+                if owner:
+                    self.conn.execute(
+                        "UPDATE approvals SET user_id = ? WHERE user_id = ?",
+                        (principal_id, owner["google_sub"]),
+                    )
+                conversation_columns = {
+                    row["name"] for row in self.conn.execute("PRAGMA table_info(conversations)")
+                }
+                if "updated_at" in conversation_columns:
+                    self.conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_conversations_user_updated "
+                        "ON conversations(user_id, updated_at DESC)"
+                    )
+                task_columns = {
+                    row["name"] for row in self.conn.execute("PRAGMA table_info(tasks)")
+                }
+                if {"status", "updated_at"}.issubset(task_columns):
+                    self.conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_tasks_user_status "
+                        "ON tasks(user_id, status, updated_at DESC)"
+                    )
+                self.conn.commit()
             except Exception:
                 self.conn.rollback()
                 raise
@@ -268,8 +397,211 @@ class Store:
                 "INSERT INTO owner (id, google_sub, email, display_name) VALUES (1, ?, ?, ?)",
                 (google_sub, email, display_name),
             )
+            self.conn.execute(
+                """
+                INSERT INTO users
+                    (id, google_sub, email, display_name, role, status,
+                     enrollment_verified_at)
+                VALUES (?, ?, ?, ?, 'owner', 'active', ?)
+                """,
+                (f"owner-{uuid.uuid4().hex}", google_sub, email.casefold(),
+                 display_name, _now_iso()),
+            )
             self.conn.commit()
             return dict(self.conn.execute("SELECT * FROM owner WHERE id = 1").fetchone())
+
+    # ---------- users / invitations ----------
+
+    def get_user(self, user_id: str) -> Optional[dict]:
+        row = self._one("SELECT * FROM users WHERE id = ?", (user_id,))
+        return dict(row) if row else None
+
+    def get_user_by_google_sub(self, google_sub: str) -> Optional[dict]:
+        row = self._one("SELECT * FROM users WHERE google_sub = ?", (google_sub,))
+        return dict(row) if row else None
+
+    def get_user_by_email(self, email: str) -> Optional[dict]:
+        row = self._one("SELECT * FROM users WHERE email = ? COLLATE NOCASE", (email,))
+        return dict(row) if row else None
+
+    def get_user_by_tailscale_login(self, login: str) -> Optional[dict]:
+        row = self._one(
+            "SELECT * FROM users WHERE tailscale_login = ? COLLATE NOCASE", (login,)
+        )
+        return dict(row) if row else None
+
+    def owner_user(self) -> Optional[dict]:
+        row = self._one(
+            """
+            SELECT users.* FROM users
+            JOIN owner ON owner.google_sub = users.google_sub
+            WHERE owner.id = 1 AND users.role = 'owner'
+            """
+        )
+        return dict(row) if row else None
+
+    def list_test_users(self) -> list[dict]:
+        return [
+            dict(row) for row in self._query(
+                """
+                SELECT * FROM users WHERE role = 'test_user'
+                ORDER BY created_at DESC, email ASC
+                """
+            )
+        ]
+
+    def invite_test_user(self, email: str, invite_url: Optional[str] = None) -> dict:
+        email = email.casefold()
+        with self._lock:
+            existing = self.conn.execute(
+                "SELECT * FROM users WHERE email = ? COLLATE NOCASE", (email,)
+            ).fetchone()
+            if existing:
+                if existing["role"] != "test_user":
+                    raise PermissionError("That email belongs to the Owner account.")
+                if existing["status"] == "revoked":
+                    raise PermissionError(
+                        "That tester is revoked; explicitly reactivate the existing record."
+                    )
+                if invite_url is not None:
+                    self.conn.execute(
+                        "UPDATE users SET tailscale_invite_url = ?, updated_at = ? WHERE id = ?",
+                        (invite_url, _now_iso(), existing["id"]),
+                    )
+                    self.conn.commit()
+                return dict(self.conn.execute(
+                    "SELECT * FROM users WHERE id = ?", (existing["id"],)
+                ).fetchone())
+            user_id = f"user-{uuid.uuid4().hex}"
+            self.conn.execute(
+                """
+                INSERT INTO users
+                    (id, email, role, status, tailscale_invite_url)
+                VALUES (?, ?, 'test_user', 'pending', ?)
+                """,
+                (user_id, email, invite_url),
+            )
+            self.conn.commit()
+            return dict(self.conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone())
+
+    def provision_test_user(
+        self, *, google_sub: str, email: str, display_name: str,
+        avatar_url: Optional[str], tailscale_login: str,
+    ) -> dict:
+        email = email.casefold()
+        tailscale_login = tailscale_login.casefold()
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                invited = self.conn.execute(
+                    "SELECT * FROM users WHERE email = ? COLLATE NOCASE", (email,)
+                ).fetchone()
+                if not invited or invited["role"] != "test_user":
+                    raise PermissionError("This Google account has not been invited to X Omni.")
+                if invited["status"] == "revoked":
+                    raise PermissionError("This X Omni tester account is revoked.")
+                sub_owner = self.conn.execute(
+                    "SELECT id FROM users WHERE google_sub = ? AND id <> ?",
+                    (google_sub, invited["id"]),
+                ).fetchone()
+                if sub_owner:
+                    raise PermissionError("That Google identity is already linked to another user.")
+                tail_owner = self.conn.execute(
+                    "SELECT id FROM users WHERE tailscale_login = ? COLLATE NOCASE AND id <> ?",
+                    (tailscale_login, invited["id"]),
+                ).fetchone()
+                if tail_owner:
+                    raise PermissionError("That Tailscale identity is already linked to another user.")
+                if invited["google_sub"] and invited["google_sub"] != google_sub:
+                    raise PermissionError("This account is linked to a different Google identity.")
+                if (
+                    invited["tailscale_login"]
+                    and str(invited["tailscale_login"]).casefold() != tailscale_login
+                ):
+                    raise PermissionError("This account is linked to a different Tailscale identity.")
+                stamp = _now_iso()
+                self.conn.execute(
+                    """
+                    UPDATE users SET google_sub = ?, email = ?, display_name = ?,
+                        avatar_url = ?, tailscale_login = ?, status = 'active',
+                        enrollment_verified_at = COALESCE(enrollment_verified_at, ?),
+                        last_login_at = ?, updated_at = ?, revoked_at = NULL
+                    WHERE id = ?
+                    """,
+                    (google_sub, email, display_name, avatar_url, tailscale_login,
+                     stamp, stamp, stamp, invited["id"]),
+                )
+                self.conn.commit()
+                return dict(self.conn.execute(
+                    "SELECT * FROM users WHERE id = ?", (invited["id"],)
+                ).fetchone())
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def bind_owner_tailscale(self, google_sub: str, tailscale_login: str) -> dict:
+        tailscale_login = tailscale_login.casefold()
+        with self._lock:
+            user = self.conn.execute(
+                "SELECT * FROM users WHERE google_sub = ? AND role = 'owner'", (google_sub,)
+            ).fetchone()
+            if not user:
+                raise PermissionError("Owner application profile is missing.")
+            conflict = self.conn.execute(
+                "SELECT id FROM users WHERE tailscale_login = ? COLLATE NOCASE AND id <> ?",
+                (tailscale_login, user["id"]),
+            ).fetchone()
+            if conflict:
+                raise PermissionError("That Tailscale identity is already linked.")
+            existing = str(user["tailscale_login"] or "").casefold()
+            if existing and existing != tailscale_login:
+                raise PermissionError("Owner is linked to a different Tailscale identity.")
+            stamp = _now_iso()
+            self.conn.execute(
+                "UPDATE users SET tailscale_login = ?, last_login_at = ?, updated_at = ? WHERE id = ?",
+                (tailscale_login, stamp, stamp, user["id"]),
+            )
+            self.conn.commit()
+            return dict(self.conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user["id"],)
+            ).fetchone())
+
+    def set_test_user_status(self, user_id: str, status: str) -> dict:
+        if status not in {"pending", "active", "revoked"}:
+            raise ValueError("Invalid tester status.")
+        with self._lock:
+            user = self.conn.execute(
+                "SELECT * FROM users WHERE id = ? AND role = 'test_user'", (user_id,)
+            ).fetchone()
+            if not user:
+                raise KeyError("Unknown test user.")
+            if status == "active" and not user["google_sub"]:
+                raise ValueError("A pending tester cannot be active before enrollment.")
+            if status == "pending":
+                # Explicit re-enrollment clears both durable identity links.
+                self.conn.execute(
+                    """
+                    UPDATE users SET google_sub = NULL, tailscale_login = NULL,
+                        display_name = NULL, avatar_url = NULL, status = 'pending',
+                        enrollment_verified_at = NULL, last_login_at = NULL,
+                        revoked_at = NULL, updated_at = ? WHERE id = ?
+                    """,
+                    (_now_iso(), user_id),
+                )
+            else:
+                stamp = _now_iso()
+                self.conn.execute(
+                    "UPDATE users SET status = ?, revoked_at = ?, updated_at = ? WHERE id = ?",
+                    (status, stamp if status == "revoked" else None, stamp, user_id),
+                )
+            if status != "active":
+                self.conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            self.conn.commit()
+            return dict(self.conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone())
 
     # ---------- sessions ----------
 
@@ -277,20 +609,44 @@ class Store:
     def _session_token_hash(token: str) -> str:
         return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
 
-    def create_session(self, google_sub: str, user_agent: str, ttl_days: int) -> str:
+    def create_session(
+        self, google_sub: str, user_agent: str, ttl_days: int, *,
+        user_id: Optional[str] = None, tailscale_login: Optional[str] = None,
+    ) -> str:
+        if user_id is None:
+            user = self.get_user_by_google_sub(google_sub)
+            user_id = str((user or {}).get("id") or LOCAL_USER_ID)
         token = secrets.token_urlsafe(40)
         token_hash = self._session_token_hash(token)
         expires = (_utcnow() + timedelta(days=ttl_days)).isoformat()
         self._exec(
-            "INSERT INTO sessions (token_hash, google_sub, user_agent, expires_at) VALUES (?, ?, ?, ?)",
-            (token_hash, google_sub, user_agent[:300], expires),
+            """
+            INSERT INTO sessions
+                (token_hash, user_id, google_sub, tailscale_login, user_agent, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (token_hash, user_id, google_sub,
+             tailscale_login.casefold() if tailscale_login else None,
+             user_agent[:300], expires),
         )
         return token
 
     def get_session(self, token: str) -> Optional[dict]:
         token_hash = self._session_token_hash(token)
-        row = self._one("SELECT * FROM sessions WHERE token_hash = ?", (token_hash,))
+        row = self._one(
+            """
+            SELECT sessions.*, users.role, users.status, users.email,
+                   users.display_name, users.avatar_url,
+                   users.tailscale_login AS user_tailscale_login
+            FROM sessions JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token_hash = ?
+            """,
+            (token_hash,),
+        )
         if not row:
+            return None
+        if row["status"] != "active":
+            self.delete_session(token)
             return None
         try:
             if datetime.fromisoformat(row["expires_at"]) < _utcnow():
@@ -307,19 +663,33 @@ class Store:
 
     # ---------- conversations & messages ----------
 
-    def create_conversation(self, title: Optional[str] = None) -> int:
-        return self._exec("INSERT INTO conversations (title) VALUES (?)", (title,)).lastrowid
+    def create_conversation(
+        self, title: Optional[str] = None, *, user_id: str = LOCAL_USER_ID,
+    ) -> int:
+        return self._exec(
+            "INSERT INTO conversations (user_id, title) VALUES (?, ?)", (user_id, title)
+        ).lastrowid
 
-    def list_conversations(self, limit: int = 50) -> list[dict]:
+    def list_conversations(self, limit: int = 50, *, user_id: str = LOCAL_USER_ID) -> list[dict]:
         rows = self._query(
-            "SELECT * FROM conversations ORDER BY updated_at DESC LIMIT ?", (limit,)
+            "SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
+            (user_id, limit),
         )
         return [dict(r) for r in rows]
 
-    def conversation_exists(self, conversation_id: int) -> bool:
+    def conversation_exists(self, conversation_id: int, *, user_id: Optional[str] = None) -> bool:
+        if user_id is not None:
+            return self._one(
+                "SELECT 1 FROM conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            ) is not None
         return self._one(
             "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)
         ) is not None
+
+    def conversation_user_id(self, conversation_id: int) -> Optional[str]:
+        row = self._one("SELECT user_id FROM conversations WHERE id = ?", (conversation_id,))
+        return str(row["user_id"]) if row else None
 
     def touch_conversation(self, conversation_id: int, title: Optional[str] = None) -> None:
         if title:
@@ -452,7 +822,13 @@ class Store:
                 self.conn.rollback()
                 raise
 
-    def get_messages(self, conversation_id: int, limit: int = 500) -> list[dict]:
+    def get_messages(
+        self, conversation_id: int, limit: int = 500, *, user_id: Optional[str] = None,
+    ) -> list[dict]:
+        if user_id is not None and not self.conversation_exists(
+            conversation_id, user_id=user_id
+        ):
+            return []
         rows = self._query(
             """
             SELECT * FROM (
@@ -1065,49 +1441,94 @@ class Store:
 
     # ---------- generic records ----------
 
-    def get_record(self, namespace: str, record_id: str) -> Optional[dict]:
+    def get_record(
+        self, namespace: str, record_id: str, *, user_id: str = LOCAL_USER_ID,
+    ) -> Optional[dict]:
         row = self._one(
-            "SELECT payload_json FROM state_records WHERE namespace = ? AND id = ?",
-            (namespace, record_id),
+            """
+            SELECT payload_json FROM state_records
+            WHERE user_id = ? AND namespace = ? AND id = ?
+            """,
+            (user_id, namespace, record_id),
         )
         return json.loads(row["payload_json"]) if row else None
 
-    def put_record(self, namespace: str, record_id: str, payload: dict) -> dict:
+    def put_record(
+        self, namespace: str, record_id: str, payload: dict, *,
+        user_id: str = LOCAL_USER_ID,
+    ) -> dict:
         self._exec(
             """
-            INSERT INTO state_records (namespace, id, payload_json, updated_at)
-            VALUES (?, ?, ?, datetime('now'))
-            ON CONFLICT(namespace, id) DO UPDATE SET
+            INSERT INTO state_records (user_id, namespace, id, payload_json, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(user_id, namespace, id) DO UPDATE SET
                 payload_json = excluded.payload_json,
                 updated_at   = excluded.updated_at
             """,
-            (namespace, record_id, json.dumps(payload)),
+            (user_id, namespace, record_id, json.dumps(payload)),
         )
         return payload
 
     # ---------- tasks ----------
 
     def add_task(self, title: str, conversation_id: Optional[int] = None,
-                 due_at: Optional[str] = None) -> int:
+                 due_at: Optional[str] = None, *, user_id: str = LOCAL_USER_ID) -> int:
         return self._exec(
-            "INSERT INTO tasks (conversation_id, title, due_at) VALUES (?, ?, ?)",
-            (conversation_id, title, due_at),
+            "INSERT INTO tasks (user_id, conversation_id, title, due_at) VALUES (?, ?, ?, ?)",
+            (user_id, conversation_id, title, due_at),
         ).lastrowid
 
-    def list_tasks(self, status: Optional[str] = None) -> list[dict]:
+    def list_tasks(
+        self, status: Optional[str] = None, *, user_id: str = LOCAL_USER_ID,
+    ) -> list[dict]:
         if status:
             rows = self._query(
-                "SELECT * FROM tasks WHERE status = ? ORDER BY COALESCE(due_at,'9999'), id", (status,)
+                """
+                SELECT * FROM tasks WHERE user_id = ? AND status = ?
+                ORDER BY COALESCE(due_at,'9999'), id
+                """,
+                (user_id, status),
             )
         else:
-            rows = self._query("SELECT * FROM tasks ORDER BY COALESCE(due_at,'9999'), id")
+            rows = self._query(
+                """
+                SELECT * FROM tasks WHERE user_id = ?
+                ORDER BY COALESCE(due_at,'9999'), id
+                """,
+                (user_id,),
+            )
         return [dict(r) for r in rows]
 
-    def set_task_status(self, task_id: int, status: str) -> None:
+    def set_task_status(
+        self, task_id: int, status: str, *, user_id: str = LOCAL_USER_ID,
+    ) -> None:
         self._exec(
-            "UPDATE tasks SET status = ?, updated_at = datetime('now') WHERE id = ?",
-            (status, task_id),
+            """
+            UPDATE tasks SET status = ?, updated_at = datetime('now')
+            WHERE id = ? AND user_id = ?
+            """,
+            (status, task_id, user_id),
         )
+
+    def artifact_belongs_to_user(self, filename: str, user_id: str) -> bool:
+        """Resolve content-addressed media only through the owner's messages."""
+        rows = self._query(
+            """
+            SELECT messages.artifacts_json FROM messages
+            JOIN conversations ON conversations.id = messages.conversation_id
+            WHERE conversations.user_id = ? AND messages.artifacts_json LIKE ?
+            ORDER BY messages.id DESC LIMIT 100
+            """,
+            (user_id, f"%{filename}%"),
+        )
+        for row in rows:
+            try:
+                artifacts = json.loads(row["artifacts_json"] or "[]")
+            except json.JSONDecodeError:
+                continue
+            if filename in json.dumps(artifacts, ensure_ascii=False):
+                return True
+        return False
 
     # ---------- audit ----------
 

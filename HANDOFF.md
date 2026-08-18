@@ -1,6 +1,6 @@
 # X Omni engineering handoff
 
-Updated 2026-08-16 on Omega. This file is the current implementation record; `PLAN.md` retains planning context and is not proof of shipped behavior.
+Updated 2026-08-18 on Omega. This file is the current implementation record; `PLAN.md` retains planning context and is not proof of shipped behavior.
 
 ## Scope and invariants
 
@@ -28,6 +28,16 @@ Updated 2026-08-16 on Omega. This file is the current implementation record; `PL
 - `POST /api/auth/setup` is a one-time, JSON-only credential bootstrap restricted to the literal loopback Host and matching local Origin. It rejects forwarding headers, closes permanently after Owner binding, atomically preserves unrelated `.env.local` entries, and never returns or logs the client secret.
 - After setup and restart, the configured-but-unowned UI routes directly to **Sign in with Google and become Owner**; it cannot resubmit the setup form.
 - First Owner binding retains the signed Google ID-token, issuer, audience, expiry, nonce, state, verified-email, and local-bootstrap checks. Logout removes only the current browser session.
+
+### Remote tester identity and isolation
+
+- Tailscale Serve is the private network/access gate; Google OIDC is application identity; the X Omni user UUID is the data boundary. Funnel is not configured or used.
+- Core remains configured on `127.0.0.1`. Tailscale identity headers are accepted only for the exact configured HTTPS Serve Host/protocol while that loopback-only listener configuration remains enforced. Serve may preserve the originating tailnet client address as the ASGI peer, so that address is not required to equal `127.0.0.1`. Serve strips incoming copies before adding `Tailscale-User-Login`; a direct-local header is ignored and a protected remote request without identity fails closed.
+- Owner preauthorization creates a pending `test_user` record. First login requires case-insensitive equality between `Tailscale-User-Login`, the signed Google email claim, and Google userinfo email. The Google `sub` and Tailscale login have separate uniqueness constraints and cannot silently rebind.
+- Tester OAuth requests only `openid email profile`. Owner OAuth retains Calendar scopes and the single Owner token record; tester sign-in never overwrites it.
+- Sessions store a hash, application user ID, and optional Tailscale binding. Every remote request and WebSocket must present the same Tailscale identity as the session. Revocation deletes all sessions for that tester.
+- Conversations/messages, tasks, weather preferences/cache, approvals, and generated media retrieval are user-scoped. Testers receive an explicit small tool allowlist and cannot access Owner administration, Calendar, ADAS, exterior camera, filesystem, PowerShell, model switching, or media-generation capabilities.
+- The Account panel lists pending/active/revoked testers, linked identity states, profile state, and last login. Optional Tailscale invite URLs are converted to QR PNG locally with no external QR service and are omitted from audit detail.
 
 ### Worker lifecycle
 
@@ -100,8 +110,8 @@ npm --prefix ui run build
 
 Confirmed locally:
 
-- `.venv` backend/security/lifecycle/capability suite: 211 passed. Python compilation and dependency consistency passed. Ruff is not installed, so lint was unavailable.
-- Frontend suite: 51 passed. Vite 8.2.1 production build passed.
+- `.venv` backend/security/lifecycle/capability suite: 261 passed. Python compilation and dependency consistency passed. Ruff is not installed, so lint was unavailable.
+- Frontend suite: 56 passed. Vite 8.2.1 production build passed.
 - `setup.ps1` completed using the lockfiles and preserved `.env.local`.
 - Browser reload restored the same persisted timeline with no console warnings/errors. 360/390/430px checks had no horizontal overflow, retained the composer, and kept top targets at least 44px. The versioned service worker was served and registered.
 - The old 8100/8121 runtime was stopped only after exact process/live-model verification. An integrity-checked pre-migration backup is at `data\backups\x_omni-before-hardening-20260815-190702.sqlite`.
@@ -112,6 +122,9 @@ Confirmed locally:
 - A second `start.ps1` launch reused the exact existing Core and model PID/start time. Nothing restarted.
 - Capability-migration runtime snapshot: Core pid 2184 on 8100; Omni pid 11948 on 8131. `/healthz` returned 200 with exact alias, 32768 context, process/start-time identity, and GPU0+GPU1. PIDs are observational and will change on a later restart.
 - Auth is enabled/configured, the Owner is bound, and the live browser session is signed in. Google Calendar read returned HTTP 200 after restart.
+- Before the remote-identity migration, the live SQLite database was copied to `data\backups\x_omni-pre-remote-onboarding-20260818-063623.sqlite`; its integrity check passed and SHA-256 is `08E912B8028393CF412CD9E4B9C5A9FB35FCC8F946A77A27ABE4BA24C1D85A60`. A disposable-copy migration first proved all 47 conversations and five sessions mapped to the Owner with zero unmapped rows.
+- The real migration then preserved those same 47 conversations and five sessions, created exactly one Owner application principal, and passed SQLite integrity and foreign-key checks. Core was stopped only after exact executable/command-line/PID verification; the launcher restored HTTP 200 `/healthz` with the exact Omni alias, 32768 context, and GPU `[0,1]` proof.
+- The signed-in live Owner browser rendered the Authorized test users form and empty enrollment state. At 390×844 the account dialog was 362px wide inside a 390px document with no horizontal overflow; the email, optional invite URL, authorize, status, revocation guidance, and sign-out controls remained available.
 - Live chat called the new current-web tool, reached DuckDuckGo and Google News successfully, produced a cited `web_research` card, and restored exactly one copy after reload. The 1280×720 stream had `overflow-y:auto`, 1240px scroll content in a 580px client area, and a visible composer.
 - New external boundaries reject recognized secret-bearing queries before egress, disable search-provider redirects, require allowed content types, and cap provider responses at 2 MiB. File search caps directories/entries/files/matches and revalidates every candidate against the read roots.
 - PowerShell timeout/nonzero exit now records terminal failure (`executed=true`, `success=false`). An interrupted persisted `executing` claim reopens as terminal indeterminate failure and is never rerun automatically.
@@ -128,7 +141,7 @@ The four live-smoke conversations were removed from the active database after pr
 Not yet proved and must stay labeled as such:
 
 - Live receipt-backed Calendar write.
-- Phone behavior over the intended Tailscale route.
+- Complete spare-account enrollment, repeat-login, isolation, and revocation on a second Tailscale/Google tester identity. The live Serve mapping and local Owner UI are proved, but no spare tester email/invite was supplied for this external acceptance test.
 - Local Omni audio transcription through this application path.
 - Ownership-manifest-backed cleanup of request-scoped Wan staging/output/temp files after an ungraceful Core crash. Startup currently reconciles the exact state-backed Comfy process, but deliberately does not perform a broad prefix sweep.
 

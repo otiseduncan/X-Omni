@@ -88,7 +88,7 @@ def geocode(name: str) -> dict:
     }
 
 
-def save_location(store, payload: dict) -> dict:
+def save_location(store, payload: dict, *, user_id: str = "local-dev") -> dict:
     name = str(payload.get("name") or "").strip()
     lat, lon = payload.get("latitude"), payload.get("longitude")
     if lat is not None and lon is not None:
@@ -102,13 +102,13 @@ def save_location(store, payload: dict) -> dict:
         loc = geocode(name)
     else:
         raise ValueError("Provide a place name, a US ZIP, or latitude/longitude.")
-    store.put_record(SETTINGS_NS, LOCATION_ID, loc)
-    store.put_record(SETTINGS_NS, CACHE_ID, {})  # invalidate stale cache
+    store.put_record(SETTINGS_NS, LOCATION_ID, loc, user_id=user_id)
+    store.put_record(SETTINGS_NS, CACHE_ID, {}, user_id=user_id)  # invalidate stale cache
     return loc
 
 
-def get_location(store) -> Optional[dict]:
-    return store.get_record(SETTINGS_NS, LOCATION_ID)
+def get_location(store, *, user_id: str = "local-dev") -> Optional[dict]:
+    return store.get_record(SETTINGS_NS, LOCATION_ID, user_id=user_id)
 
 
 def _rows(payload: dict) -> list[dict]:
@@ -141,8 +141,8 @@ def summarize(day: dict, location: Optional[dict]) -> str:
     return f"{name}: {temp}, {day.get('condition', 'unsettled')}{rain_txt}."
 
 
-def fetch(store) -> dict:
-    location = get_location(store)
+def fetch(store, *, user_id: str = "local-dev") -> dict:
+    location = get_location(store, user_id=user_id)
     if not location:
         return {
             "ok": False, "status": "not_configured",
@@ -177,10 +177,10 @@ def fetch(store) -> dict:
             "summary": summarize(rows[0] if rows else current, location),
             "updated_at": _now(),
         }
-        store.put_record(SETTINGS_NS, CACHE_ID, result)
+        store.put_record(SETTINGS_NS, CACHE_ID, result, user_id=user_id)
         return result
     except Exception as exc:  # noqa: BLE001
-        cached = store.get_record(SETTINGS_NS, CACHE_ID) or {}
+        cached = store.get_record(SETTINGS_NS, CACHE_ID, user_id=user_id) or {}
         if cached.get("forecast"):
             cached = dict(cached)
             cached["status"] = "cached"

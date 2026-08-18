@@ -1,5 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { ExternalLink, KeyRound, Loader2, LogIn, LogOut, X } from "lucide-react";
+import {
+  Ban,
+  Copy,
+  ExternalLink,
+  KeyRound,
+  Loader2,
+  LogIn,
+  LogOut,
+  QrCode,
+  RotateCcw,
+  ShieldCheck,
+  UserPlus,
+  X,
+} from "lucide-react";
 
 import {
   authPanelMode,
@@ -25,6 +38,9 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
+  const [testUsers, setTestUsers] = useState([]);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteUrl, setInviteUrl] = useState("");
   const firstFieldRef = useRef(null);
   const closeRef = useRef(null);
 
@@ -36,6 +52,20 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
+
+  useEffect(() => {
+    if (!canLogout || auth?.current_user?.role !== "owner") return;
+    let active = true;
+    fetch("/api/auth/admin/test-users", { credentials: "include", cache: "no-store" })
+      .then(readResponse)
+      .then((payload) => {
+        if (active) setTestUsers(Array.isArray(payload.users) ? payload.users : []);
+      })
+      .catch((requestError) => {
+        if (active) setError(`Could not load authorized users: ${requestError.message}`);
+      });
+    return () => { active = false; };
+  }, [canLogout, auth?.current_user?.role]);
 
   async function logout() {
     setBusy(true);
@@ -79,6 +109,58 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
     }
   }
 
+  async function inviteTester(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/auth/admin/test-users", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: inviteEmail.trim(),
+          tailscale_invite_url: inviteUrl.trim() || null,
+        }),
+      });
+      const user = await readResponse(response);
+      setTestUsers((items) => [user, ...items.filter((item) => item.id !== user.id)]);
+      setInviteEmail("");
+      setInviteUrl("");
+    } catch (requestError) {
+      setError(`Could not authorize tester: ${requestError.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function changeTester(userId, status) {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`/api/auth/admin/test-users/${encodeURIComponent(userId)}`, {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      const user = await readResponse(response);
+      setTestUsers((items) => items.map((item) => (item.id === user.id ? user : item)));
+    } catch (requestError) {
+      setError(`Could not update tester: ${requestError.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyInvite(url) {
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      setError("Could not copy the invitation URL. Select and copy it manually.");
+    }
+  }
+
   return (
     <div className="auth-panel-backdrop" onClick={onClose}>
       <section
@@ -93,7 +175,7 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
             <span>Account</span>
             <strong id="auth-panel-title">
               {canLogout
-                ? "Owner session"
+                ? `${auth?.current_user?.role === "owner" ? "Owner" : "Test user"} session`
                 : configurationReady
                   ? "Google Auth ready"
                   : "Google Auth setup"}
@@ -112,9 +194,95 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
         {canLogout ? (
           <div className="auth-session">
             <p>
-              This browser has an authenticated Owner session. Signing out
-              removes only this browser session.
+              Signed in as <strong>{auth?.current_user?.display_name || auth?.current_user?.email}</strong>
+              {auth?.current_user?.email ? <> · {auth.current_user.email}</> : null}. Signing
+              out removes only this browser session.
             </p>
+            {auth?.current_user?.role === "owner" && (
+              <section className="authorized-users" aria-labelledby="authorized-users-title">
+                <div className="authorized-users-head">
+                  <div>
+                    <span>Remote access</span>
+                    <strong id="authorized-users-title">Authorized test users</strong>
+                  </div>
+                  <ShieldCheck size={20} />
+                </div>
+                <form className="tester-invite-form" onSubmit={inviteTester}>
+                  <label className="auth-field">
+                    <span>Tester email</span>
+                    <input
+                      type="email"
+                      value={inviteEmail}
+                      onChange={(event) => setInviteEmail(event.target.value)}
+                      placeholder="testuser@example.com"
+                      required
+                    />
+                  </label>
+                  <label className="auth-field">
+                    <span>Tailscale invitation URL <em>optional</em></span>
+                    <input
+                      type="url"
+                      value={inviteUrl}
+                      onChange={(event) => setInviteUrl(event.target.value)}
+                      placeholder="https://login.tailscale.com/a/..."
+                    />
+                  </label>
+                  <button className="auth-primary" type="submit" disabled={busy || !inviteEmail.trim()}>
+                    {busy ? <Loader2 size={16} className="spin" /> : <UserPlus size={16} />}
+                    Authorize tester
+                  </button>
+                </form>
+                <div className="tester-list">
+                  {testUsers.length === 0 ? (
+                    <p className="auth-private-note">No test users are authorized yet.</p>
+                  ) : testUsers.map((user) => (
+                    <article className="tester-card" key={user.id}>
+                      <div className="tester-card-head">
+                        <strong>{user.display_name || "Test User"}</strong>
+                        <span className={`tester-status ${user.status}`}>{user.status}</span>
+                      </div>
+                      <dl>
+                        <div><dt>Email</dt><dd>{user.email}</dd></div>
+                        <div><dt>Role</dt><dd>Test User</dd></div>
+                        <div><dt>Tailscale</dt><dd>{user.tailscale_verified ? user.tailscale_login : "Pending"}</dd></div>
+                        <div><dt>Google</dt><dd>{user.google_verified ? "Verified" : "Pending"}</dd></div>
+                        <div><dt>X Profile</dt><dd>{user.profile_created ? "Created" : "Pending"}</dd></div>
+                        <div><dt>Last Login</dt><dd>{user.last_login_at || "Never"}</dd></div>
+                      </dl>
+                      {user.tailscale_invite_url && (
+                        <div className="tester-qr">
+                          <img
+                            src={`/api/auth/admin/test-users/${encodeURIComponent(user.id)}/invite-qr.png`}
+                            alt={`Tailscale invitation QR for ${user.email}`}
+                          />
+                          <button type="button" className="auth-secondary" onClick={() => copyInvite(user.tailscale_invite_url)}>
+                            <Copy size={14} /> Copy invite
+                          </button>
+                          <a className="auth-secondary" href={`/api/auth/admin/test-users/${encodeURIComponent(user.id)}/invite-qr.png`} download>
+                            <QrCode size={14} /> Save QR
+                          </a>
+                        </div>
+                      )}
+                      <div className="tester-actions">
+                        {user.status === "revoked" ? (
+                          <button type="button" className="auth-secondary" disabled={busy} onClick={() => changeTester(user.id, "pending")}>
+                            <RotateCcw size={14} /> Require re-enrollment
+                          </button>
+                        ) : (
+                          <button type="button" className="auth-secondary danger" disabled={busy} onClick={() => changeTester(user.id, "revoked")}>
+                            <Ban size={14} /> Revoke X access
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+                <p className="auth-private-note">
+                  Revoking X access invalidates X sessions. Removing a device or user from
+                  the tailnet is a separate Tailscale administrator action.
+                </p>
+              </section>
+            )}
             <button className="auth-primary auth-logout" onClick={logout} disabled={busy}>
               {busy ? <Loader2 size={16} className="spin" /> : <LogOut size={16} />}
               Sign out

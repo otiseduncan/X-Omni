@@ -22,6 +22,7 @@ def test_launcher_preserves_foreign_processes_and_gates_browser_on_health() -> N
     assert "X Omni will not stop it" in script
     assert "StatusCode -eq 200" in script
     assert script.index("StatusCode -eq 200") < script.rindex("Open-XOmni -Port $corePort")
+    assert '-ExecutionPolicy Bypass -File `"$startScript`"' in script
 
 
 def test_installer_creates_a_real_desktop_shortcut_with_app_icon() -> None:

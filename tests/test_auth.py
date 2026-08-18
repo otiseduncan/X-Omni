@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI
 from jwt.algorithms import RSAAlgorithm
 
 from core.api import auth
+from core.services import google_auth
 from core.services.google_auth import GoogleAuthError
 
 
@@ -100,6 +101,29 @@ async def test_google_id_token_requires_matching_nonce_and_verified_email(monkey
     FakeAsyncClient.jwks = jwks
     with pytest.raises(GoogleAuthError, match="verified Google email"):
         await auth.verify_google_id_token(unverified, "expected", auth_settings())
+
+
+@pytest.mark.asyncio
+async def test_google_exchange_network_failure_is_normalized(monkeypatch):
+    class FailingAsyncClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **_kwargs):
+            request = httpx.Request("POST", url)
+            raise httpx.ConnectError("offline", request=request)
+
+    monkeypatch.setattr(google_auth.httpx, "AsyncClient", FailingAsyncClient)
+    with pytest.raises(GoogleAuthError, match="could not reach Google"):
+        await google_auth.exchange_code(
+            auth_settings(), "authorization-code", "https://omega.example.ts.net/callback"
+        )
 
 
 class FakeStore:

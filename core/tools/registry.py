@@ -578,6 +578,17 @@ TOOL_SCHEMAS: dict[str, dict] = {
 }
 
 
+TEST_USER_TOOLS = {
+    "get_weather",
+    "web_research_current",
+    "website_preview_generate",
+    "camera_request",
+    "list_tasks",
+    "add_task",
+    "update_task_status",
+}
+
+
 class Registry:
     def __init__(self, policy_path: str | Path, store=None):
         raw = yaml.safe_load(Path(policy_path).read_text(encoding="utf-8")) or {}
@@ -596,12 +607,18 @@ class Registry:
         entry = self.policy.get(name)
         return (entry or {}).get("tier", "blocked")
 
-    def model_tools(self) -> list[dict]:
+    @staticmethod
+    def role_allows_tool(role: str, name: str) -> bool:
+        return role == "owner" or (role == "test_user" and name in TEST_USER_TOOLS)
+
+    def model_tools(self, role: str = "owner") -> list[dict]:
         """OpenAI-format tool list for whatever is actually allowed and
         implemented right now. Blocked tools are never advertised -- the
         model shouldn't waste turns asking for something it can't have."""
         out = []
         for name, schema in TOOL_SCHEMAS.items():
+            if not self.role_allows_tool(role, name):
+                continue
             if self.tier(name) == "blocked" or name not in self._handlers:
                 continue
             out.append({
@@ -1078,8 +1095,32 @@ class Registry:
         *,
         conversation_id: Optional[int] = None,
         tool_call_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        role: Optional[str] = None,
     ) -> Any:
         tier = self.tier(name)
+
+        if self.store and conversation_id is not None:
+            conversation_user = self.store.conversation_user_id(conversation_id)
+            supplied_principal = self.store.get_user(user_id) if user_id else None
+            legacy_owner_binding = bool(
+                user_id
+                and not supplied_principal
+                and conversation_user == "local-dev"
+            )
+            if not conversation_user or (
+                user_id and conversation_user != user_id and not legacy_owner_binding
+            ):
+                raise ToolBlocked("Tool invocation is bound to a different user conversation.")
+            if not legacy_owner_binding:
+                user_id = conversation_user
+            principal = supplied_principal or self.store.get_user(conversation_user)
+            role = str((principal or {}).get("role") or role or "owner")
+        role = str(role or "owner")
+        if not self.role_allows_tool(role, name):
+            if self.store:
+                self.store.audit("tool_role_blocked", {"tool": name, "role": role})
+            raise ToolBlocked(f"'{name}' is not available to the {role} role.")
 
         if tier == "blocked":
             if self.store:
@@ -1099,6 +1140,9 @@ class Registry:
             raise NeedsApproval(name, args, self.approval_summary(name, args))
 
         handler_args = args
+        if name in {"get_weather", "list_tasks", "add_task", "update_task_status"}:
+            handler_args = dict(args)
+            handler_args["__xomni_user_id"] = user_id or "local-dev"
         if name == "website_preview_generate" and args.get("operation") == "update_latest":
             if isinstance(conversation_id, bool) or not isinstance(conversation_id, int):
                 raise ToolBlocked(
@@ -1162,6 +1206,21 @@ class Registry:
         approval = outcome["approval"]
         name = approval["tool_name"]
         args = approval["args"]
+        principal = self.store.get_user(user_id)
+        # Legacy approvals predate the users table and are already protected by
+        # exact session/user/conversation binding. New tester principals always
+        # resolve here and receive the restricted role.
+        role = str((principal or {}).get("role") or "owner")
+        if not self.role_allows_tool(role, name):
+            completed = self.store.complete_approval(
+                approval_id,
+                success=False,
+                result={"status": "blocked", "message": "Role no longer permits this action."},
+                error="Role no longer permits this action.",
+                executed=False,
+            )
+            self.store.audit("approval_role_blocked", {"id": approval_id, "role": role})
+            return completed
         if on_status:
             try:
                 notified = on_status("executing")
@@ -1195,7 +1254,11 @@ class Registry:
         try:
             if self.tier(name) != "confirm_required" or name not in self._handlers:
                 raise ToolBlocked(f"'{name}' is no longer an executable approval-gated tool.")
-            result = await self._invoke_handler(name, args)
+            handler_args = args
+            if name in {"add_task", "update_task_status"}:
+                handler_args = dict(args)
+                handler_args["__xomni_user_id"] = user_id
+            result = await self._invoke_handler(name, handler_args)
         except asyncio.CancelledError as exc:
             # The handler owns cancellation cleanup (including model restore)
             # before propagating this signal. Close the claimed approval now so

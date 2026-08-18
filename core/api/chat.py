@@ -74,6 +74,12 @@ def create_router(settings, store, router_, client, registry) -> APIRouter:
                 kind = data.get("type")
 
                 if kind == "swap":
+                    if session.get("role") != "owner":
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Model switching requires Owner authorization.",
+                        })
+                        continue
                     await _handle_swap(websocket, router_, store, data.get("worker"))
                     continue
 
@@ -92,14 +98,41 @@ def create_router(settings, store, router_, client, registry) -> APIRouter:
 
                 conversation_id = data.get("conversation_id")
                 if not conversation_id:
-                    conversation_id = store.create_conversation()
+                    conversation_id = store.create_conversation(
+                        user_id=str(session.get("user_id") or "local-dev")
+                    )
                     await websocket.send_json(
                         {"type": "conversation", "conversation_id": conversation_id}
                     )
+                else:
+                    try:
+                        conversation_id = int(conversation_id)
+                    except (TypeError, ValueError):
+                        await websocket.send_json({
+                            "type": "error", "message": "Invalid conversation identifier."
+                        })
+                        continue
+                    if not store.conversation_exists(
+                        conversation_id,
+                        user_id=str(session.get("user_id") or "local-dev"),
+                    ):
+                        await websocket.send_json({
+                            "type": "error", "message": "Conversation does not exist."
+                        })
+                        continue
 
                 # Manual routing override. Deterministic on purpose -- the
                 # model does not get to decide when to spend 15-20 seconds.
                 lowered = text.lower()
+                if (
+                    session.get("role") != "owner"
+                    and any(lowered.startswith(command) for command in SWAP_COMMANDS)
+                ):
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Model switching requires Owner authorization.",
+                    })
+                    continue
                 for command, worker in SWAP_COMMANDS.items():
                     if lowered.startswith(command):
                         text = text[len(command):].strip()
@@ -124,7 +157,8 @@ def create_router(settings, store, router_, client, registry) -> APIRouter:
                     text,
                     approval_context={
                         "session_id": _session_id(session),
-                        "user_id": str(session.get("google_sub") or "local-dev"),
+                        "user_id": str(session.get("user_id") or "local-dev"),
+                        "role": str(session.get("role") or "owner"),
                         "message_id": user_message_id,
                     },
                 ):
@@ -178,7 +212,7 @@ def create_router(settings, store, router_, client, registry) -> APIRouter:
                 approved,
                 conversation_id=supplied_conversation,
                 session_id=_session_id(session),
-                user_id=str(session.get("google_sub") or "local-dev"),
+                user_id=str(session.get("user_id") or "local-dev"),
                 on_status=lambda status: websocket.send_json(
                     {"type": "approval_status", "id": approval_id, "status": status}
                 ),
@@ -231,7 +265,8 @@ def create_router(settings, store, router_, client, registry) -> APIRouter:
             },
             approval_context={
                 "session_id": _session_id(session),
-                "user_id": str(session.get("google_sub") or "local-dev"),
+                "user_id": str(session.get("user_id") or "local-dev"),
+                "role": str(session.get("role") or "owner"),
                 "message_id": int(current["message_id"]),
             },
         ):

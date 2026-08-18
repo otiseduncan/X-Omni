@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,3 +16,4 @@ def test_x_omni_serve_uses_its_own_https_port_without_replacing_calibration_iq()
     assert "$LASTEXITCODE" in script
     assert "serve status --json" in script
     assert "Tailscale Serve verification failed" in script
+    assert not re.search(r"(?im)^\s*(?:&\s*)?tailscale\s+funnel\b", script)

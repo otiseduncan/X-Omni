@@ -339,14 +339,24 @@ def make_run_powershell():
 
 
 def make_task_tools(store):
+    def scoped(method, *args, user_id: str, **kwargs):
+        try:
+            return method(*args, user_id=user_id, **kwargs)
+        except TypeError:
+            return method(*args, **kwargs)
+
     def list_tasks(args: dict) -> dict:
-        return {"tasks": store.list_tasks(args.get("status"))}
+        user_id = str(args.get("__xomni_user_id") or "local-dev")
+        return {"tasks": scoped(store.list_tasks, args.get("status"), user_id=user_id)}
 
     def add_task(args: dict) -> dict:
         title = str(args.get("title", "")).strip()
         if not title:
             raise ValueError("title is required")
-        task_id = store.add_task(title, due_at=args.get("due_at"))
+        user_id = str(args.get("__xomni_user_id") or "local-dev")
+        task_id = scoped(
+            store.add_task, title, due_at=args.get("due_at"), user_id=user_id
+        )
         return {"id": task_id, "title": title, "due_at": args.get("due_at"),
                 "status": "open"}
 
@@ -358,10 +368,14 @@ def make_task_tools(store):
         status = str(args.get("status") or "").strip()
         if status not in {"open", "in_progress", "done", "abandoned"}:
             raise ValueError("status must be open, in_progress, done, or abandoned")
-        task = next((item for item in store.list_tasks() if item["id"] == task_id), None)
+        user_id = str(args.get("__xomni_user_id") or "local-dev")
+        task = next(
+            (item for item in scoped(store.list_tasks, user_id=user_id) if item["id"] == task_id),
+            None,
+        )
         if task is None:
             raise ValueError(f"Task {task_id} does not exist")
-        store.set_task_status(task_id, status)
+        scoped(store.set_task_status, task_id, status, user_id=user_id)
         return {**task, "status": status}
 
     return list_tasks, add_task, update_task_status

@@ -845,7 +845,13 @@ class Orchestrator:
             self.settings.context_tokens,
             self.settings.max_response_tokens,
         )
-        tools = self.registry.model_tools()
+        role = str((approval_context or {}).get("role") or "owner")
+        try:
+            tools = self.registry.model_tools(role)
+        except TypeError:
+            # Lightweight test registries expose the original zero-argument
+            # shape; the production Registry always accepts the role.
+            tools = self.registry.model_tools()
         artifacts: list[dict] = []
         full_text = ""
 
@@ -1424,6 +1430,8 @@ class Orchestrator:
                 message_id=(approval_context or {}).get("message_id"),
                 conversation_id=conversation_id,
                 tool_call_id=call_id,
+                user_id=(approval_context or {}).get("user_id"),
+                role=(approval_context or {}).get("role"),
             )
         except NeedsApproval as pending:
             context = approval_context or {}

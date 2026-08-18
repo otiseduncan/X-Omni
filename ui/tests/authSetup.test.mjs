@@ -52,7 +52,11 @@ test("auth UI uses POST boundaries and has no client-side secret persistence or 
   assert.match(source, /fetch\("\/api\/auth\/setup"/);
   assert.match(source, /fetch\("\/api\/auth\/logout"/);
   assert.match(source, /Sign in with Google and become Owner/);
-  assert.equal((source.match(/method: "POST"/g) || []).length, 2);
+  assert.equal((source.match(/method: "POST"/g) || []).length, 3);
+  assert.equal((source.match(/method: "PATCH"/g) || []).length, 1);
+  assert.match(source, /Authorized test users/);
+  assert.match(source, /invite-qr\.png/);
+  assert.match(source, /Revoke X access/);
   assert.doesNotMatch(source, /localStorage|sessionStorage|console\.(?:log|debug|info|warn|error)\s*\(/);
   assert.match(app, /aria-label=\{[\s\S]*Open account and sign out[\s\S]*Set up Google Auth/);
   assert.match(styles, /\.icon-btn\s*\{[\s\S]*?width:\s*44px;[\s\S]*?height:\s*44px;/);

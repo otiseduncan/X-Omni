@@ -50,6 +50,14 @@ const AUTH_ERRORS = {
   exchange_failed: "Google sign-in failed during the token exchange.",
   invalid_state: "Sign-in session expired. Try again.",
   no_subject: "Google didn't return an account identifier.",
+  email_not_verified: "Google must provide a verified email address.",
+  identity_mismatch:
+    "Use the same email for Google that Tailscale authenticated for this enrollment.",
+  google_identity_conflict: "Google returned conflicting identity information.",
+  enrollment_conflict:
+    "This Google or Tailscale identity is already linked. Ask the Owner to review the tester record.",
+  tailscale_identity_missing: "Return through the private Tailscale Serve URL and try again.",
+  tailscale_identity_changed: "The Tailscale identity changed during sign-in. Start again.",
 };
 
 async function exteriorCameraPayload(response, fallbackMessage) {
@@ -100,14 +108,38 @@ function SignIn({ error, auth, onOpenSetup }) {
     );
   }
 
+  const remoteDenied = auth?.access_path === "denied";
+  const remoteUninvited = auth?.access_path === "tailscale" && !auth?.remote_authorized;
+  if (remoteDenied || remoteUninvited) {
+    return (
+      <div className="signin">
+        <div className="signin-card">
+          <div className="brand-mark">X</div>
+          <h1>X Omni</h1>
+          <p>
+            {remoteDenied
+              ? "Private remote access requires an authenticated Tailscale Serve identity."
+              : "Your Tailscale identity reached X Omni, but it is not authorized for an X profile."}
+          </p>
+          <div className="signin-error">
+            {auth?.remote_access_error || "Ask the X Omni Owner to authorize this exact email first."}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const isRemote = auth?.access_path === "tailscale";
+
   return (
     <div className="signin">
       <div className="signin-card">
         <div className="brand-mark">X</div>
         <h1>X Omni</h1>
         <p>
-          Local operator assistant on Omega. Sign in with the owner Google
-          account to continue.
+          {isRemote
+            ? `Tailscale verified ${auth?.tailscale_identity}. Sign in with that same Google email to ${auth?.enrollment_status === "pending" ? "create" : "open"} your X Omni profile.`
+            : "Local operator assistant on Omega. Sign in with the owner Google account to continue."}
         </p>
         <a className="google-btn" href="/api/auth/login">
           <LogIn size={17} />

@@ -539,7 +539,10 @@ def test_session_cookie_is_hashed_and_legacy_raw_sessions_expire(tmp_path: Path)
     second_identity = f"session:{other_session['token_hash']}"
     assert first_identity != second_identity
     columns = {row["name"] for row in store.conn.execute("PRAGMA table_info(sessions)")}
-    assert columns == {"token_hash", "google_sub", "user_agent", "created_at", "expires_at"}
+    assert columns == {
+        "token_hash", "user_id", "google_sub", "tailscale_login",
+        "user_agent", "created_at", "expires_at",
+    }
     store.close()
 
     for candidate in tmp_path.glob("sessions.sqlite*"):

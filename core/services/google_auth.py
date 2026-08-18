@@ -24,10 +24,14 @@ AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
-SCOPES = [
+IDENTITY_SCOPES = [
     "openid",
     "email",
     "profile",
+]
+
+OWNER_SCOPES = [
+    *IDENTITY_SCOPES,
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
 ]
@@ -37,32 +41,49 @@ class GoogleAuthError(RuntimeError):
     pass
 
 
-def authorization_url(settings, redirect_uri: str, state: str, nonce: str) -> str:
+def authorization_url(
+    settings,
+    redirect_uri: str,
+    state: str,
+    nonce: str,
+    *,
+    identity_only: bool = False,
+    force_consent: bool = True,
+) -> str:
     params = {
         "client_id": settings.google_client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        # offline + consent are what guarantee a refresh_token. Without
-        # them the integration dies silently about an hour after login.
-        "access_type": "offline",
-        "prompt": "consent",
-        "include_granted_scopes": "true",
-        "scope": " ".join(SCOPES),
+        "scope": " ".join(IDENTITY_SCOPES if identity_only else OWNER_SCOPES),
         "state": state,
         "nonce": nonce,
     }
+    if not identity_only:
+        # Owner OAuth also carries Calendar authorization and therefore needs
+        # durable offline access. Returning Owner sign-in can reuse the stored
+        # refresh grant instead of forcing Google's consent screen every time.
+        # Test users receive identity scopes only.
+        params.update({
+            "access_type": "offline",
+            "include_granted_scopes": "true",
+        })
+        if force_consent:
+            params["prompt"] = "consent"
     return f"{AUTH_URL}?{urlencode(params)}"
 
 
 async def exchange_code(settings, code: str, redirect_uri: str) -> dict:
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(TOKEN_URL, data={
-            "code": code,
-            "client_id": settings.google_client_id,
-            "client_secret": settings.google_client_secret,
-            "redirect_uri": redirect_uri,
-            "grant_type": "authorization_code",
-        })
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(TOKEN_URL, data={
+                "code": code,
+                "client_id": settings.google_client_id,
+                "client_secret": settings.google_client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            })
+    except httpx.RequestError as exc:
+        raise GoogleAuthError("Token exchange could not reach Google.") from exc
     if resp.status_code >= 400:
         raise GoogleAuthError(f"Token exchange failed (HTTP {resp.status_code}).")
     token = resp.json()
@@ -73,9 +94,14 @@ async def exchange_code(settings, code: str, redirect_uri: str) -> dict:
 
 
 async def fetch_userinfo(access_token: str) -> dict:
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(USERINFO_URL,
-                                headers={"Authorization": f"Bearer {access_token}"})
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+    except httpx.RequestError as exc:
+        raise GoogleAuthError("Could not reach Google profile service.") from exc
     if resp.status_code >= 400:
         raise GoogleAuthError("Could not read Google profile.")
     return resp.json()

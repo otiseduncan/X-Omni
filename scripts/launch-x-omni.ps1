@@ -257,7 +257,10 @@ try {
         throw "Windows PowerShell was not found at $hostExe"
     }
 
-    $arguments = "-NoLogo -NoProfile -File `"$startScript`""
+    # The launcher is already the trust boundary and start.ps1 is a fixed,
+    # repository-owned path. Allow that one child script to run even when the
+    # interactive Windows PowerShell policy blocks all .ps1 files.
+    $arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$startScript`""
     $process = Start-Process -FilePath $hostExe -ArgumentList $arguments `
         -WorkingDirectory $root -WindowStyle Hidden `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
