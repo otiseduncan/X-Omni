@@ -36,17 +36,19 @@ class ProviderResponseError(RuntimeError):
     pass
 
 
-async def _bounded_get(
+async def _bounded_request(
+    method: str,
     url: str,
     *,
     params: dict[str, str] | None = None,
+    data: dict[str, str] | None = None,
     allowed_content_types: tuple[str, ...],
 ) -> bytes:
     """Read one fixed-provider response without redirects or unbounded buffering."""
     async with httpx.AsyncClient(
         timeout=12, follow_redirects=False, headers=HEADERS
     ) as client:
-        async with client.stream("GET", url, params=params) as response:
+        async with client.stream(method, url, params=params, data=data) as response:
             response.raise_for_status()
             content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
             if not content_type or not any(
@@ -60,6 +62,34 @@ async def _bounded_get(
                 if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
                     raise ProviderResponseError("provider response exceeded the byte limit")
             return bytes(body)
+
+
+async def _bounded_get(
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+    allowed_content_types: tuple[str, ...],
+) -> bytes:
+    return await _bounded_request(
+        "GET",
+        url,
+        params=params,
+        allowed_content_types=allowed_content_types,
+    )
+
+
+async def _bounded_post(
+    url: str,
+    *,
+    data: dict[str, str],
+    allowed_content_types: tuple[str, ...],
+) -> bytes:
+    return await _bounded_request(
+        "POST",
+        url,
+        data=data,
+        allowed_content_types=allowed_content_types,
+    )
 
 
 def _clean_html(value: str) -> str:
@@ -108,6 +138,7 @@ def _parse_duckduckgo(page: str, query: str, limit: int) -> list[dict]:
     patterns = (
         r'<a[^>]*class=["\'][^"\']*result__a[^"\']*["\'][^>]*>.*?</a>',
         r'<a[^>]*data-testid=["\']result-title-a["\'][^>]*>.*?</a>',
+        r'<a[^>]*class=["\'][^"\']*result-link[^"\']*["\'][^>]*>.*?</a>',
     )
     anchors: list[re.Match[str]] = []
     for pattern in patterns:
@@ -129,8 +160,8 @@ def _parse_duckduckgo(page: str, query: str, limit: int) -> list[dict]:
         )
         window = page[match.end():end]
         snippet_match = re.search(
-            r'<(?:a|div)[^>]*class=["\'][^"\']*result__snippet[^"\']*["\'][^>]*>'
-            r'(.*?)</(?:a|div)>',
+            r'<(?:a|div|td)[^>]*class=["\'][^"\']*result(?:__|-)snippet[^"\']*["\'][^>]*>'
+            r'(.*?)</(?:a|div|td)>',
             window,
             flags=re.I | re.S,
         )
@@ -149,9 +180,9 @@ async def _search_duckduckgo(query: str, limit: int) -> tuple[list[dict], dict]:
     endpoints = ("https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/")
     for endpoint in endpoints:
         try:
-            body = await _bounded_get(
+            body = await _bounded_post(
                 endpoint,
-                params={"q": query},
+                data={"q": query},
                 allowed_content_types=("text/html",),
             )
             sources = _parse_duckduckgo(body.decode("utf-8", errors="replace"), query, limit)

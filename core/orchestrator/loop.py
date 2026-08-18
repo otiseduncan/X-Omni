@@ -139,6 +139,7 @@ _SPECIALIZED_CURRENT_LANE_RE = re.compile(
 
 
 
+
 def _safe_calibration_filters(raw: Any, *, result: Any = None) -> dict[str, Any]:
     """Keep only schema-compatible filter values from a prior CIQ artifact."""
     source = raw if isinstance(raw, dict) else {}
@@ -358,6 +359,24 @@ def deterministic_read_tool(user_message: object) -> Optional[str]:
     if _EXTERIOR_CAMERA_ACTION_RE.search(text):
         return "exterior_camera_request"
     return "website_preview_generate" if website_intent else None
+
+
+def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
+    """Return bounded arguments for explicit or high-confidence current-web reads."""
+    text = str(user_message or "").strip()
+    if not text:
+        return None
+    explicit = bool(_EXPLICIT_WEB_RESEARCH_RE.search(text))
+    temporal = bool(
+        _CURRENT_INFORMATION_RE.search(text)
+        and _CURRENT_INFORMATION_SUBJECT_RE.search(text)
+        and not _SPECIALIZED_CURRENT_LANE_RE.search(text)
+    )
+    if not explicit and not temporal:
+        return None
+    query = text[:400].strip()
+    return {"query": query, "max_results": 6} if query else None
+
 
 
 
@@ -759,7 +778,12 @@ class Orchestrator:
         artifacts: list[dict] = []
         full_text = ""
 
-       
+        if not approved_tool and restricted_weapon_design_request(user_message):
+            summary = (
+                "I can search the live public web, but I can't help locate downloadable "
+                "weapon designs, blueprints, or build files. I can help with lawful firearm "
+                "safety information or non-weapon 3D-printing resources."
+            )
             message_id = self.store.add_message(
                 conversation_id,
                 "assistant",

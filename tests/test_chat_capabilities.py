@@ -29,6 +29,18 @@ def test_duckduckgo_parser_returns_safe_bounded_sources():
     assert "secret" not in sources[0]["url"]
 
 
+def test_duckduckgo_lite_parser_returns_sources():
+    page = """
+    <a class="result-link" href="https://example.com/story">Lite result</a>
+    <td class="result-snippet">A <b>lite</b> excerpt.</td>
+    """
+    sources = research._parse_duckduckgo(page, "example", 1)
+    assert len(sources) == 1
+    assert sources[0]["title"] == "Lite result"
+    assert sources[0]["snippet"] == "A lite excerpt."
+    assert sources[0]["url"] == "https://example.com/story"
+
+
 @pytest.mark.asyncio
 async def test_provider_fetch_refuses_redirects_and_oversized_bodies(monkeypatch):
     real_client = research.httpx.AsyncClient
@@ -72,6 +84,26 @@ async def test_provider_fetch_refuses_redirects_and_oversized_bodies(monkeypatch
             params={"q": "safe"},
             allowed_content_types=("text/html",),
         )
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_submits_query_as_form_data(monkeypatch):
+    requested = []
+
+    async def bounded_post(url, *, data, allowed_content_types):
+        requested.append((url, data, allowed_content_types))
+        return b'<a class="result__a" href="https://example.com/">Result</a>'
+
+    monkeypatch.setattr(research, "_bounded_post", bounded_post)
+    sources, status = await research._search_duckduckgo("safe query", 1)
+
+    assert requested == [(
+        "https://html.duckduckgo.com/html/",
+        {"q": "safe query"},
+        ("text/html",),
+    )]
+    assert len(sources) == 1
+    assert status == {"provider": "duckduckgo", "status": "healthy", "results": 1}
 
 
 @pytest.mark.asyncio
