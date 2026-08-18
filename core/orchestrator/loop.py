@@ -696,6 +696,20 @@ def video_failure_summary(result: Any) -> str:
     return "Video generation failed. No verified playable video is being claimed."
 
 
+def image_failure_summary(result: Any) -> str:
+    """Return fixed, receipt-grounded prose for a failed protected image run."""
+    if not isinstance(result, dict):
+        return "Image generation failed. No verified generated image is being claimed."
+
+    if result.get("actual_generation") is True and result.get("verified") is True:
+        return (
+            "An image file was generated and verified, but final lifecycle or receipt "
+            "verification failed. The receipt preserves that partial result; no generated-"
+            "image success card is being claimed."
+        )
+    return "Image generation failed. No verified generated image is being claimed."
+
+
 class Orchestrator:
     def __init__(self, router, client, registry, store, settings):
         self.router = router
@@ -806,8 +820,8 @@ class Orchestrator:
         """Stream one assistant turn.
 
         `approved_tool` contains an already executed, receipt-backed result.
-        The orchestrator only feeds it to the model; it never re-invokes the
-        protected handler.
+        Completed media-generation actions are terminal; other protected-tool
+        results may be fed to the model, but the handler is never re-invoked.
         """
         try:
             async for event in self._run(
@@ -1097,10 +1111,55 @@ class Orchestrator:
             artifacts.append(receipt_artifact)
             approved_events.append({"type": "artifact", "artifact": receipt_artifact})
             card_type = artifact_type_for_tool(name, result)
+            verified_image = (
+                name == "image_generate"
+                and card_type == "generated_image"
+                and isinstance(result, dict)
+                and receipt.get("tool_name") == "image_generate"
+                and receipt.get("status") == "succeeded"
+                and receipt.get("executed") is True
+                and receipt.get("success") is True
+                and receipt.get("result") == result
+            )
+            # A result-shaped success without a matching successful receipt is
+            # not a generated-image card. Keep it visible only as failed status.
+            if name == "image_generate" and not verified_image:
+                card_type = "image_generation_status"
             if card_type and isinstance(result, dict):
                 artifact = {"type": card_type, "data": result}
                 artifacts.append(artifact)
                 approved_events.append({"type": "artifact", "artifact": artifact})
+
+            # Approval-gated media completion seals the turn. In particular,
+            # image completion must never return to Qwen where the verified
+            # image could be treated as permission to launch image-to-video.
+            if name == "image_generate":
+                summary = (
+                    "The verified generated image is ready in the chat card."
+                    if verified_image
+                    else image_failure_summary(result)
+                )
+                message_id = self.store.add_message(
+                    conversation_id,
+                    "assistant",
+                    summary,
+                    worker_used=self.router.active_name,
+                    artifacts=artifacts,
+                )
+                if len(history) <= 1:
+                    self.store.touch_conversation(
+                        conversation_id, title=user_message[:60]
+                    )
+                for approved_event in approved_events:
+                    yield approved_event
+                yield {"type": "token", "text": summary}
+                yield {
+                    "type": "done",
+                    "message_id": message_id,
+                    "worker": self.router.active_name,
+                    "artifacts": artifacts,
+                }
+                return
 
             # A verified protected video result is already the full answer.
             # Persist the receipt/card before exposing either, then emit fixed

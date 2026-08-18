@@ -19,6 +19,7 @@ from core.models.router import (
     ModelRouter,
     ProcessRecord,
     WorkerConfig,
+    WorkerProcessExitedError,
     WorkerSwapError,
     _CrossProcessFileLock,
     load_workers,
@@ -422,6 +423,50 @@ def test_external_workload_restores_after_post_stop_vram_failure(
     assert failure.lifecycle["model_stopped"] is True
     assert failure.lifecycle["model_restore_required"] is True
     assert failure.lifecycle["model_restored"] is True
+
+
+def test_external_workload_restore_retries_one_exact_startup_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    router = _router(tmp_path, cfg)
+    records = [
+        ProcessRecord(201, cfg.executable, (str(cfg.executable),), 2000.0),
+        ProcessRecord(202, cfg.executable, (str(cfg.executable),), 2001.0),
+    ]
+    spawned: list[int] = []
+    cleaned: list[int] = []
+
+    monkeypatch.setattr(router, "_find_pid_on_port", lambda _port: None)
+    monkeypatch.setattr(router, "_wait_vram_free", lambda _cfg: 0.0)
+
+    def spawn(_cfg: WorkerConfig) -> ProcessRecord:
+        record = records[len(spawned)]
+        spawned.append(record.pid)
+        return record
+
+    def wait_healthy(_cfg, pid, _started_at):
+        if pid == 201:
+            raise WorkerProcessExitedError("Process pid 201 no longer exists")
+        return 12.5, LiveProof((cfg.alias,), cfg.context_tokens), (0, 1)
+
+    monkeypatch.setattr(router, "_spawn", spawn)
+    monkeypatch.setattr(router, "_wait_healthy", wait_healthy)
+    monkeypatch.setattr(
+        router,
+        "_cleanup_failed_spawn",
+        lambda _cfg, record: cleaned.append(record.pid),
+    )
+    lease: dict = {}
+
+    asyncio.run(router._restore_external_worker(cfg, lease))
+
+    assert spawned == [201, 202]
+    assert cleaned == [201]
+    assert router.active_name == cfg.name
+    assert router.active_pid == 202
+    assert lease["model_restored"] is True
+    assert lease["restore"]["attempts"] == 2
 
 
 def test_external_workload_retains_stopped_truth_when_restore_also_fails(

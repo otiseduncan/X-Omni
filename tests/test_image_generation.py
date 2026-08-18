@@ -7,12 +7,14 @@ import threading
 import zlib
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from core.models.router import LiveProof, ModelRouter, ProcessRecord, WorkerConfig, WorkerSwapError
-from core.orchestrator.loop import artifact_type_for_tool
+from core.orchestrator import loop as loop_mod
+from core.orchestrator.loop import Orchestrator, artifact_type_for_tool
 from core.services import image_generation as images
 from core.services.image_generation import (
     ComfyProcessRecord,
@@ -23,7 +25,7 @@ from core.services.image_generation import (
     RuntimeHandle,
 )
 from core.state.db import Store
-from core.tools.registry import TOOL_SCHEMAS, Registry
+from core.tools.registry import TOOL_SCHEMAS, NeedsApproval, Registry
 
 
 def test_image_tool_schema_avoids_llama_cpp_multifield_maxlength_grammar_bug():
@@ -143,6 +145,310 @@ def _success_result(digest: str = "a" * 64) -> dict:
             "gpu_indices": [0, 1],
         },
     }
+
+
+class _TerminalMediaStore:
+    def __init__(self) -> None:
+        self.persisted = False
+        self.saved = None
+
+    def get_messages(self, _conversation_id):
+        return []
+
+    def add_message(self, *args, **kwargs):
+        self.persisted = True
+        self.saved = (args, kwargs)
+        return 81
+
+    def touch_conversation(self, *_args, **_kwargs):
+        return None
+
+
+class _NoPostImageModelClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, *_args, **_kwargs):
+        self.calls += 1
+        raise AssertionError("completed image generation must not call the model again")
+        yield  # pragma: no cover
+
+
+class _NoPostImageToolRegistry:
+    def __init__(self) -> None:
+        self.invocations: list[str] = []
+
+    def model_tools(self):
+        return [
+            {"type": "function", "function": {"name": "image_generate"}},
+            {"type": "function", "function": {"name": "video_generate"}},
+        ]
+
+    async def invoke(self, name, *_args, **_kwargs):
+        self.invocations.append(name)
+        raise AssertionError("terminal approved image result must not invoke another tool")
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "generate an image of a brunette woman",
+        "generate an image of a red sports car",
+    ],
+)
+@pytest.mark.asyncio
+async def test_approved_image_success_is_terminal_and_cannot_chain_video(
+    prompt: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _success_result()
+    result["prompt"] = prompt
+    receipt = {
+        "id": "receipt-image-success",
+        "approval_id": "approval-image-success",
+        "tool_name": "image_generate",
+        "status": "succeeded",
+        "executed": True,
+        "success": True,
+        "result": dict(result),
+    }
+    store = _TerminalMediaStore()
+    client = _NoPostImageModelClient()
+    registry = _NoPostImageToolRegistry()
+    monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
+    orchestrator = Orchestrator(
+        SimpleNamespace(active_name="omni"),
+        client,
+        registry,
+        store,
+        SimpleNamespace(context_tokens=32000, max_response_tokens=1000),
+    )
+    approved = {
+        "name": "image_generate",
+        "args": {"prompt": prompt},
+        "result": result,
+        "receipt": receipt,
+        "call_id": "image-success-1",
+    }
+
+    stream = orchestrator._run(1, prompt, approved, None)
+    first = await anext(stream)
+    assert store.persisted is True
+    events = [first, *[event async for event in stream]]
+
+    summary = "The verified generated image is ready in the chat card."
+    assert [event for event in events if event.get("type") == "token"] == [
+        {"type": "token", "text": summary}
+    ]
+    assert [
+        event["artifact"]["type"]
+        for event in events
+        if event.get("type") == "artifact"
+    ] == ["execution_receipt", "generated_image"]
+    assert events[-1]["type"] == "done"
+    assert client.calls == 0
+    assert registry.invocations == []
+    saved_args, saved_kwargs = store.saved
+    assert saved_args[2] == summary
+    assert [item["type"] for item in saved_kwargs["artifacts"]] == [
+        "execution_receipt",
+        "generated_image",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_approved_image_is_terminal_and_cannot_chain_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = {
+        "ok": False,
+        "status": "failed",
+        "executed": True,
+        "success": False,
+        "actual_generation": False,
+        "verified": False,
+        "stage": "generation",
+        "message": "Image generation did not complete.",
+        "lifecycle": {
+            "mode": "sequential_exclusive",
+            "model_stopped": True,
+            "model_restored": True,
+            "gpu_indices": [0, 1],
+        },
+    }
+    receipt = {
+        "id": "receipt-image-failure",
+        "approval_id": "approval-image-failure",
+        "tool_name": "image_generate",
+        "status": "failed",
+        "executed": True,
+        "success": False,
+        "result": dict(result),
+    }
+    store = _TerminalMediaStore()
+    client = _NoPostImageModelClient()
+    registry = _NoPostImageToolRegistry()
+    monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
+    orchestrator = Orchestrator(
+        SimpleNamespace(active_name="omni"),
+        client,
+        registry,
+        store,
+        SimpleNamespace(context_tokens=32000, max_response_tokens=1000),
+    )
+    approved = {
+        "name": "image_generate",
+        "args": {"prompt": "generate an image of a red sports car"},
+        "result": result,
+        "receipt": receipt,
+        "call_id": "image-failure-1",
+    }
+
+    events = [event async for event in orchestrator._run(1, "", approved, None)]
+
+    summary = "Image generation failed. No verified generated image is being claimed."
+    assert [event for event in events if event.get("type") == "token"] == [
+        {"type": "token", "text": summary}
+    ]
+    assert [
+        event["artifact"]["type"]
+        for event in events
+        if event.get("type") == "artifact"
+    ] == ["execution_receipt", "image_generation_status"]
+    assert events[-1]["type"] == "done"
+    assert client.calls == 0
+    assert registry.invocations == []
+
+
+@pytest.mark.asyncio
+async def test_mismatched_image_success_receipt_is_not_a_success_card_and_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _success_result()
+    receipt = {
+        "id": "receipt-image-mismatch",
+        "tool_name": "image_generate",
+        "status": "succeeded",
+        "executed": True,
+        "success": True,
+        "result": {**result, "sha256": "b" * 64},
+    }
+    store = _TerminalMediaStore()
+    client = _NoPostImageModelClient()
+    registry = _NoPostImageToolRegistry()
+    monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
+    orchestrator = Orchestrator(
+        SimpleNamespace(active_name="omni"), client, registry, store,
+        SimpleNamespace(context_tokens=32000, max_response_tokens=1000),
+    )
+
+    events = [event async for event in orchestrator._run(
+        1,
+        "generate an image",
+        {
+            "name": "image_generate",
+            "args": {"prompt": "generate an image"},
+            "result": result,
+            "receipt": receipt,
+            "call_id": "image-mismatch-1",
+        },
+        None,
+    )]
+
+    artifact_types = [
+        event["artifact"]["type"]
+        for event in events
+        if event.get("type") == "artifact"
+    ]
+    assert artifact_types == ["execution_receipt", "image_generation_status"]
+    assert all(event.get("artifact", {}).get("type") != "generated_image" for event in events)
+    assert events[-1]["type"] == "done"
+    assert client.calls == 0
+    assert registry.invocations == []
+
+
+@pytest.mark.asyncio
+async def test_separate_explicit_animation_turn_can_still_request_video_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client:
+        calls = 0
+
+        async def stream(self, *_args, **_kwargs):
+            self.calls += 1
+            yield {
+                "type": "tool_call",
+                "id": "explicit-video-1",
+                "name": "video_generate",
+                "arguments": json.dumps({
+                    "mode": "image_to_video",
+                    "source_sha256": "a" * 64,
+                    "duration_seconds": 10,
+                    "prompt": "animate that image",
+                }),
+            }
+
+    class MediaRegistry:
+        def __init__(self) -> None:
+            self.invocations: list[str] = []
+
+        def model_tools(self):
+            return [{
+                "type": "function",
+                "function": {
+                    "name": "video_generate",
+                    "description": "Generate an explicitly requested video.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }]
+
+        async def invoke(self, name, args, **_kwargs):
+            self.invocations.append(name)
+            raise NeedsApproval(name, args, "Generate the requested video")
+
+        def log_args(self, _name, args):
+            return args
+
+        def public_approval(self, record):
+            return record
+
+    class ApprovalStore(_TerminalMediaStore):
+        def create_approval(self, name, summary, payload, **_kwargs):
+            assert name == "video_generate"
+            assert payload["args"]["duration_seconds"] == 10
+            self.approval = {
+                "id": "approval-explicit-video",
+                "tool": name,
+                "summary": summary,
+                "args": payload["args"],
+                "status": "pending",
+                "action_digest": "digest",
+                "idempotency_key": "key",
+            }
+            return self.approval["id"]
+
+        def get_approval(self, _approval_id):
+            return self.approval
+
+    store = ApprovalStore()
+    registry = MediaRegistry()
+    client = Client()
+    monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
+    orchestrator = Orchestrator(
+        SimpleNamespace(active_name="omni"), client, registry, store,
+        SimpleNamespace(context_tokens=32000, max_response_tokens=1000),
+    )
+
+    events = [event async for event in orchestrator._run(
+        1,
+        "animate that image for 10 seconds",
+        None,
+        {"session_id": "session-1", "user_id": "otis", "message_id": 12},
+    )]
+
+    assert registry.invocations == ["video_generate"]
+    assert client.calls == 1
+    assert [event["type"] for event in events] == ["tool_start", "approval", "done"]
+    assert events[1]["approval"]["tool"] == "video_generate"
 
 
 @pytest.mark.asyncio

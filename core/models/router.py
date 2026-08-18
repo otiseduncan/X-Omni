@@ -37,6 +37,10 @@ class WorkerSwapError(RuntimeError):
     pass
 
 
+class WorkerProcessExitedError(WorkerSwapError):
+    """An exactly identified worker exited before readiness was established."""
+
+
 class WorkerReadinessError(WorkerSwapError):
     """A trusted worker's live readiness proof remained transiently unavailable."""
 
@@ -400,41 +404,61 @@ class ModelRouter:
     async def _restore_external_worker(
         self, previous_cfg: WorkerConfig, lease: dict
     ) -> None:
-        restore_record: Optional[ProcessRecord] = None
-        try:
-            listener = await asyncio.to_thread(
-                self._find_pid_on_port, previous_cfg.port
-            )
-            if listener is not None:
-                raise WorkerSwapError(
-                    f"Cannot restore '{previous_cfg.name}': foreign or unmanaged "
-                    f"pid {listener} owns model port {previous_cfg.port}"
+        # A freshly spawned llama worker can very occasionally exit during
+        # model load even after both GPUs have passed release proof. The exact
+        # failure observed in production recovered on the immediately following
+        # spawn. Retry that narrow failure once while retaining all PID, port,
+        # command-line, model, context, and GPU readiness checks.
+        for attempt in range(2):
+            restore_record: Optional[ProcessRecord] = None
+            try:
+                listener = await asyncio.to_thread(
+                    self._find_pid_on_port, previous_cfg.port
                 )
-            await asyncio.to_thread(self._wait_vram_free, previous_cfg)
-            restore_record = await asyncio.to_thread(self._spawn, previous_cfg)
-            health_s, proof, gpu_indices = await asyncio.to_thread(
-                self._wait_healthy,
-                previous_cfg,
-                restore_record.pid,
-                restore_record.started_at,
-            )
-            self._set_active(previous_cfg, restore_record)
-            lease["model_restored"] = True
-            lease["restore"] = {
-                "worker": previous_cfg.name,
-                "pid": restore_record.pid,
-                "process_started_at": restore_record.started_at,
-                "health_wait_s": round(health_s, 1),
-                "alias": previous_cfg.alias,
-                "context_tokens": proof.context_tokens,
-                "gpu_indices": list(gpu_indices),
-            }
-        except BaseException:
-            if restore_record is not None:
-                await asyncio.to_thread(
-                    self._cleanup_failed_spawn, previous_cfg, restore_record
+                if listener is not None:
+                    raise WorkerSwapError(
+                        f"Cannot restore '{previous_cfg.name}': foreign or unmanaged "
+                        f"pid {listener} owns model port {previous_cfg.port}"
+                    )
+                await asyncio.to_thread(self._wait_vram_free, previous_cfg)
+                restore_record = await asyncio.to_thread(self._spawn, previous_cfg)
+                health_s, proof, gpu_indices = await asyncio.to_thread(
+                    self._wait_healthy,
+                    previous_cfg,
+                    restore_record.pid,
+                    restore_record.started_at,
                 )
-            raise
+                self._set_active(previous_cfg, restore_record)
+                lease["model_restored"] = True
+                lease["restore"] = {
+                    "worker": previous_cfg.name,
+                    "pid": restore_record.pid,
+                    "process_started_at": restore_record.started_at,
+                    "health_wait_s": round(health_s, 1),
+                    "alias": previous_cfg.alias,
+                    "context_tokens": proof.context_tokens,
+                    "gpu_indices": list(gpu_indices),
+                    "attempts": attempt + 1,
+                }
+                return
+            except WorkerProcessExitedError:
+                if restore_record is not None:
+                    await asyncio.to_thread(
+                        self._cleanup_failed_spawn, previous_cfg, restore_record
+                    )
+                if attempt == 0:
+                    log.warning(
+                        "Restored worker %r exited during startup; retrying once",
+                        previous_cfg.name,
+                    )
+                    continue
+                raise
+            except BaseException:
+                if restore_record is not None:
+                    await asyncio.to_thread(
+                        self._cleanup_failed_spawn, previous_cfg, restore_record
+                    )
+                raise
 
     @asynccontextmanager
     async def external_workload_session(self, name: str) -> AsyncIterator[dict]:
@@ -582,7 +606,7 @@ class ModelRouter:
             command_line = tuple(process.cmdline())
             started_at = float(process.create_time())
         except psutil.NoSuchProcess as exc:
-            raise WorkerSwapError(f"Process pid {pid} no longer exists") from exc
+            raise WorkerProcessExitedError(f"Process pid {pid} no longer exists") from exc
         except psutil.AccessDenied as exc:
             raise WorkerSwapError(
                 f"Access denied inspecting listener pid {pid}; ownership is unverified"
