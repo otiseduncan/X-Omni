@@ -33,6 +33,33 @@ def test_image_tool_schema_avoids_llama_cpp_multifield_maxlength_grammar_bug():
     assert parameters["required"] == ["prompt"]
 
 
+def test_adult_artistic_nude_is_not_blanket_blocked() -> None:
+    prompt = "An artistic nude figure study of an adult model in a classical painting style"
+    validated, width, height, seed = ImageGenerationService._validated_args({
+        "prompt": prompt,
+        "width": 512,
+        "height": 512,
+        "seed": 7,
+    })
+    assert (validated, width, height, seed) == (prompt, 512, 512, 7)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Sexualized nude portrait of an underage child",
+        "A nonconsensual sexual assault scene involving adults",
+    ],
+)
+def test_high_risk_image_boundaries_remain_narrow(prompt: str) -> None:
+    with pytest.raises(ImageGenerationError, match="high-risk content boundary"):
+        ImageGenerationService._validated_args({"prompt": prompt})
+
+
+def test_image_generation_remains_approval_gated() -> None:
+    assert Registry("config/tools.yaml").tier("image_generate") == "confirm_required"
+
+
 def _chunk(kind: bytes, payload: bytes) -> bytes:
     crc = zlib.crc32(kind)
     crc = zlib.crc32(payload, crc) & 0xFFFFFFFF

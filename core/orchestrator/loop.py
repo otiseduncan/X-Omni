@@ -116,6 +116,7 @@ _CIQ_CONTEXT_STRING_FILTERS = ("shop", "phase", "status", "insurance", "q")
 _EXPLICIT_WEB_RESEARCH_RE = re.compile(
     r"\b(?:search|browse)\s+(?:the\s+)?(?:web|internet)\b"
     r"|\b(?:search|look\s+up|find)\b.{0,120}\b(?:online|on\s+the\s+(?:web|internet))\b"
+    r"|\b(?:research|find)\b.{0,120}\b(?:sources?|literature|papers?|studies|court\s+cases?)\b"
     r"|\b(?:where|where's|wheres|were)\s+can\s+i\s+find\b.{0,120}\bonline\b"
     r"|\blook\s+(?:it|this|that)\s+up\b"
     r"|\bgoogle\s+(?:it|this|that|for)\b",
@@ -136,8 +137,13 @@ _SPECIALIZED_CURRENT_LANE_RE = re.compile(
     r"repair\s+orders?|calibration\s+iq|adas)\b",
     re.IGNORECASE,
 )
-
-
+_WEB_ACCESS_DENIAL_RE = re.compile(
+    r"\b(?:don't|do\s+not|doesn't|does\s+not|can't|cannot|unable\s+to)\b"
+    r"[^.!?]{0,80}\b(?:access|browse|connect)\b[^.!?]{0,40}"
+    r"\b(?:internet|web|external\s+websites?|online)\b"
+    r"|\bno\s+(?:real[- ]?time\s+)?(?:internet|web)\s+access\b",
+    re.IGNORECASE,
+)
 
 
 def _safe_calibration_filters(raw: Any, *, result: Any = None) -> dict[str, Any]:
@@ -262,7 +268,8 @@ def calibration_iq_result_summary(result: Any, *, listing: bool) -> str:
         ).strip()[:600]
 
     count = int(payload.get("count") or 0)
-    filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+    raw_filters = payload.get("filters")
+    filters = raw_filters if isinstance(raw_filters, dict) else {}
     scope_parts = []
     if filters.get("shop"):
         scope_parts.append(str(filters["shop"]))
@@ -363,6 +370,9 @@ def deterministic_read_tool(user_message: object) -> Optional[str]:
 
 def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
     """Return bounded arguments for explicit or high-confidence current-web reads."""
+    # Architectural invariant: conversation subject matter is runtime input only.
+    # Persistent changes to policies, capabilities, prompts, routing, or source
+    # code require an explicit owner-directed development change.
     text = str(user_message or "").strip()
     if not text:
         return None
@@ -376,9 +386,6 @@ def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
         return None
     query = text[:400].strip()
     return {"query": query, "max_results": 6} if query else None
-
-
-
 
 
 def web_research_fallback_summary(result: Any) -> str:
@@ -490,6 +497,11 @@ def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
         digest = str(result.get("sha256") or "")
         source_digest = str(result.get("source_sha256") or "")
         expected_url = f"/api/generated-videos/{digest}.mp4"
+        duration_seconds = result.get("duration_seconds")
+        frame_count = result.get("frame_count")
+        num_bytes = result.get("bytes")
+        width = result.get("width")
+        height = result.get("height")
         common_verified = (
             result.get("ok") is True
             and result.get("status") == "completed"
@@ -503,18 +515,18 @@ def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
             and result.get("pixel_format") == "yuv420p"
             and type(result.get("fps")) is int
             and result.get("fps") == 24
-            and type(result.get("duration_seconds")) is int
-            and 2 <= result.get("duration_seconds") <= 10
-            and type(result.get("frame_count")) is int
-            and result.get("frame_count") == result.get("duration_seconds") * 24
-            and type(result.get("bytes")) is int
-            and result.get("bytes") > 0
-            and all(
-                type(result.get(key)) is int
-                and 64 <= result.get(key) <= 4096
-                and result.get(key) % 2 == 0
-                for key in ("width", "height")
-            )
+            and type(duration_seconds) is int
+            and 2 <= duration_seconds <= 10
+            and type(frame_count) is int
+            and frame_count == duration_seconds * 24
+            and type(num_bytes) is int
+            and num_bytes > 0
+            and type(width) is int
+            and 64 <= width <= 4096
+            and width % 2 == 0
+            and type(height) is int
+            and 64 <= height <= 4096
+            and height % 2 == 0
             and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
             and re.fullmatch(r"[0-9a-f]{64}", source_digest) is not None
             and result.get("video_url") == expected_url
@@ -778,32 +790,6 @@ class Orchestrator:
         artifacts: list[dict] = []
         full_text = ""
 
-        if not approved_tool and restricted_weapon_design_request(user_message):
-            summary = (
-                "I can search the live public web, but I can't help locate downloadable "
-                "weapon designs, blueprints, or build files. I can help with lawful firearm "
-                "safety information or non-weapon 3D-printing resources."
-            )
-            message_id = self.store.add_message(
-                conversation_id,
-                "assistant",
-                summary,
-                worker_used=self.router.active_name,
-                artifacts=[],
-            )
-            if len(history) <= 1:
-                self.store.touch_conversation(
-                    conversation_id, title=user_message[:60]
-                )
-            yield {"type": "token", "text": summary}
-            yield {
-                "type": "done",
-                "message_id": message_id,
-                "worker": self.router.active_name,
-                "artifacts": [],
-            }
-            return
-
         # Qwen's tool choice can occasionally answer an explicit camera request
         # from stale conversational context. Pre-route only this high-confidence
         # read-only intent through the same Registry/_execute boundary used by
@@ -1049,9 +1035,10 @@ class Orchestrator:
                 and receipt.get("result") == result
             )
             if verified_video:
+                video_mode = result.get("mode") if isinstance(result, dict) else None
                 summary = (
                     "The verified generative image-to-video clip is ready in the chat card."
-                    if result.get("mode") == "image_to_video"
+                    if video_mode == "image_to_video"
                     else "The verified procedural source animation is ready in the chat card."
                 )
                 message_id = self.store.add_message(
