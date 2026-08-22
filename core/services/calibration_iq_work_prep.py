@@ -76,6 +76,17 @@ _QUICK_ACTION_RE = re.compile(
     r"\b(?:collect|retrieve|pull|capture|save|load|import|get|grab|download)\b",
     re.IGNORECASE,
 )
+# Broader than _QUICK_REFERENCE_RE: matches a bare "ADAS" mention (patched by
+# calibration_iq_work_prep_guards for observed field mishearings) without
+# requiring the literal "quick reference" phrase. Combined with an
+# acquisition verb and an explicit reference to the vehicle in front of the
+# tech, "collect the ADAS information for this car" is unambiguously the same
+# request as "collect the ADAS Quick Reference" -- the tech should not have to
+# know that exact phrase. Requiring the vehicle reference keeps this from
+# capturing a generic knowledge question like "get the ADAS calibration
+# steps", which is an ADAS SI search, not an ALLDATA acquisition.
+_ADAS_MARKER_RE = re.compile(r"\b(?:adas|ados|a\s*d\s*a\s*s)\b", re.IGNORECASE)
+_VEHICLE_REFERENCE_RE = re.compile(r"\b(?:this|that)\s+(?:car|vehicle|one)\b", re.IGNORECASE)
 _WEEK_READY_RE = re.compile(
     r"\b(?:prepared|prepare|prep|ready|readiness)\b.{0,90}"
     r"\b(?:week|queue|work|cars?|vehicles?|repair\s+orders?|si|adas)\b|"
@@ -183,6 +194,12 @@ def classify_request(
     ):
         return "alldata_access"
     if _QUICK_REFERENCE_RE.search(value) and _QUICK_ACTION_RE.search(value):
+        return "quick_reference"
+    if (
+        _ADAS_MARKER_RE.search(value)
+        and _QUICK_ACTION_RE.search(value)
+        and _VEHICLE_REFERENCE_RE.search(value)
+    ):
         return "quick_reference"
     if _WEEK_READY_RE.search(value):
         return "week_readiness"
