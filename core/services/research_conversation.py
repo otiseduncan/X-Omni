@@ -19,21 +19,35 @@ _INSTALLED = False
 MAX_CHAT_CHARS = 1800
 
 
+def _compact_finding(finding: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": finding.get("title"),
+        "url": finding.get("url"),
+        "page": finding.get("page"),
+        "excerpt": str(finding.get("excerpt") or "")[:1800],
+        "authority": finding.get("authority"),
+        "finding_kind": finding.get("finding_kind"),
+        "matched_term": finding.get("matched_term"),
+        "text_extraction": finding.get("text_extraction"),
+    }
+
+
 def _distill(result: dict[str, Any]) -> dict[str, Any]:
-    policy_findings = []
     public = result.get("public_oem") if isinstance(result.get("public_oem"), dict) else {}
-    for finding in public.get("policy_findings") or []:
-        if not isinstance(finding, dict):
-            continue
-        policy_findings.append({
-            "title": finding.get("title"),
-            "url": finding.get("url"),
-            "page": finding.get("page"),
-            "excerpt": str(finding.get("excerpt") or "")[:1800],
-            "authority": finding.get("authority"),
-        })
-        if len(policy_findings) >= 4:
-            break
+
+    # Manufacturer findings are the highest-value evidence for these questions.
+    # Preserve policy and calibration-trigger findings separately so the model
+    # does not confuse a service procedure with an OEM collision requirement.
+    policy_findings = [
+        _compact_finding(item)
+        for item in (public.get("policy_findings") or [])[:4]
+        if isinstance(item, dict)
+    ]
+    calibration_findings = [
+        _compact_finding(item)
+        for item in (public.get("calibration_findings") or [])[:6]
+        if isinstance(item, dict)
+    ]
 
     adas_hits = []
     adas = result.get("adas_si") if isinstance(result.get("adas_si"), dict) else {}
@@ -45,8 +59,10 @@ def _distill(result: dict[str, Any]) -> dict[str, Any]:
             "page": hit.get("page"),
             "vehicle": hit.get("vehicle"),
             "excerpt": str(hit.get("excerpt") or "")[:900],
+            "deep_calibration_rule": hit.get("deep_calibration_rule") is True,
+            "matched_rule": hit.get("matched_rule"),
         })
-        if len(adas_hits) >= 3:
+        if len(adas_hits) >= 4:
             break
 
     alldata = result.get("alldata") if isinstance(result.get("alldata"), dict) else {}
@@ -76,9 +92,15 @@ def _distill(result: dict[str, Any]) -> dict[str, Any]:
         "manufacturer": result.get("requested_manufacturer"),
         "source_ledger": result.get("source_ledger") or [],
         "policy_findings": policy_findings,
+        "calibration_findings": calibration_findings,
         "adas_si": adas_hits,
         "alldata": all_data_compact,
         "public_sources": public_sources,
+        "deep_read": {
+            "calibration": public.get("deep_calibration_read") is True,
+            "policy": public.get("deep_policy_read") is True,
+            "metrics": public.get("deep_read_metrics") or {},
+        },
         "captures": [
             {
                 "source": item.get("source"),
@@ -114,7 +136,8 @@ async def conversational_synthesize(orchestrator: Any, question: str, result: di
                 "Answer like a competent coworker, not a report generator. Give the conclusion first, then the key reason. "
                 "Use one or two short paragraphs, normally 80-170 words total. Do not list the research process, source ledger, "
                 "raw excerpts, tool output, result counts, or capture details. Do not use section headings or bullet lists unless absolutely necessary. "
-                "If an official manufacturer policy finding directly answers the question, prioritize it over calibration-service-manual inference. "
+                "Manufacturer collision policy and explicit manufacturer calibration-trigger language outrank inference from a service procedure. "
+                "A calibration requirement may be buried in a sidebar, warning, applicability note, or late PDF page; use deep calibration findings when present. "
                 "Never infer that transferring data from an old module means a recycled module is approved. "
                 "State uncertainty plainly when needed. You may include at most two useful source URLs inline. "
                 "Use ONLY the distilled verified evidence supplied."
@@ -131,17 +154,20 @@ async def conversational_synthesize(orchestrator: Any, question: str, result: di
         answer = ""
 
     if not answer:
-        findings = distilled.get("policy_findings") or []
+        findings = [
+            *(distilled.get("policy_findings") or []),
+            *(distilled.get("calibration_findings") or []),
+        ]
         if findings:
             first = findings[0]
             page = f" page {first.get('page')}" if first.get("page") else ""
             url = f" {first.get('url')}" if first.get("url") else ""
             answer = (
-                f"The strongest manufacturer evidence I found is the collision-repair policy in {first.get('title') or 'the OEM source'}{page}. "
-                f"It directly addresses the repair-method question, so I would rely on that policy rather than infer approval from a calibration procedure.{url}"
+                f"The strongest manufacturer evidence I found is in {first.get('title') or 'the OEM source'}{page}. "
+                f"It directly addresses the repair/calibration requirement, so I would rely on that manufacturer statement rather than infer the answer from a generic procedure.{url}"
             )
         else:
-            answer = "I completed the research, but the verified evidence does not support a confident manufacturer-policy conclusion yet. The source details are available below if you want to inspect them."
+            answer = "I completed the research, but the verified evidence does not support a confident manufacturer conclusion yet. The source details are available below if you want to inspect them."
     return _trim(answer)
 
 
