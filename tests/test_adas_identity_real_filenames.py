@@ -51,3 +51,61 @@ def test_explicit_toyota_filter_drops_hyundai_and_lexus_even_with_compact_filena
     ] == ["Toyota"]
     assert all("Hyundai" not in item["descriptor"]["title"] for item in results)
     assert all("Lexus" not in item["descriptor"]["title"] for item in results)
+
+
+def test_2024_ford_transit_does_not_accept_maverick_or_f150(tmp_path: Path, monkeypatch):
+    root = tmp_path / "ADAS SI"
+    root.mkdir()
+    docs = [
+        _doc(root, "2024 Ford Truck Maverick FWD Front Camera Calibration.pdf"),
+        _doc(root, "2024 Ford Transit Front Camera Calibration.pdf"),
+        _doc(root, "2024 Ford F-150 Front Camera Calibration.pdf"),
+    ]
+    inventory = adas_mod.SourceInventory(root)
+    monkeypatch.setattr(inventory, "documents", lambda: docs)
+
+    results = inventory.matching_documents(
+        "I need the forward facing calibration procedure for a 24 Ford Transit",
+        limit=8,
+    )
+
+    assert results
+    assert [item["descriptor"]["model"] for item in results] == ["Transit"]
+
+
+def test_transit_request_returns_no_same_make_substitute_when_transit_is_absent(
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "ADAS SI"
+    root.mkdir()
+    docs = [
+        _doc(root, "2024 Ford Truck Maverick FWD Front Camera Calibration.pdf"),
+        _doc(root, "2024 Ford F-150 Front Camera Calibration.pdf"),
+    ]
+    inventory = adas_mod.SourceInventory(root)
+    monkeypatch.setattr(inventory, "documents", lambda: docs)
+
+    results = inventory.matching_documents(
+        "2024 Ford Transit forward facing camera calibration",
+        limit=8,
+    )
+    assert results == []
+
+
+def test_cherokee_trim_can_match_base_cherokee_document(tmp_path: Path, monkeypatch):
+    root = tmp_path / "ADAS SI"
+    root.mkdir()
+    docs = [
+        _doc(root, "2021 Jeep Cherokee BSM Calibration.pdf"),
+        _doc(root, "2021 Jeep Grand Cherokee BSM Calibration.pdf"),
+    ]
+    inventory = adas_mod.SourceInventory(root)
+    monkeypatch.setattr(inventory, "documents", lambda: docs)
+
+    results = inventory.matching_documents(
+        "2021 Jeep Cherokee Latitude Luxe BSM calibration procedure",
+        limit=8,
+    )
+    assert results
+    assert [item["descriptor"]["model"] for item in results] == ["Cherokee"]
