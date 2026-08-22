@@ -15,11 +15,13 @@ Provider and procedure follow-ups retain the prior vehicle/system context.
 ALLDATA research follows the documented vehicle-first Repair/Collision workflow,
 with direct Repair entry, Change/New Vehicle handling, YYME/VIN vehicle selection,
 Vehicle Information Search, and ADAS calibration/reset terminology expansion.
-Calibration and policy research deep-read later PDF pages/sidebars and bounded
-same-host OEM web pages, while chat presentation stays concise and conversation-
-first. Calibration IQ RO research remains on its existing verified operator lane
-and inherits the same exact-vehicle deep ADAS PDF search. Final policy and audit
-guards keep execution truthful and fail closed.
+When an exact calibration/reset procedure is missing locally and ALLDATA produces
+a verified exact-vehicle procedure, that source is acquired into ADAS SI with
+URL-based deduplication. Calibration and policy research deep-read later PDF
+pages/sidebars and bounded same-host OEM web pages, while chat presentation stays
+concise and conversation-first. Calibration IQ RO research remains on its existing
+verified operator lane and inherits the same exact-vehicle deep ADAS PDF search.
+Final policy and audit guards keep execution truthful and fail closed.
 """
 
 from . import adas_si as _adas_si
@@ -37,6 +39,7 @@ from . import research_calibration_route as _research_calibration_route
 from . import research_alldata_navigation as _research_alldata_navigation
 from . import research_alldata_contract as _research_alldata_contract
 from . import research_alldata_terms as _research_alldata_terms
+from . import research_auto_acquire as _research_auto_acquire
 from . import research_followup as _research_followup
 from . import research_procedure_followup as _research_procedure_followup
 from . import research_policy_depth as _research_policy_depth
@@ -61,6 +64,7 @@ _research_calibration_route.install()
 _research_alldata_navigation.install()
 _research_alldata_contract.install()
 _research_alldata_terms.install()
+_research_auto_acquire.install()
 _research_followup.install()
 _research_procedure_followup.install()
 _research_policy_depth.install()
