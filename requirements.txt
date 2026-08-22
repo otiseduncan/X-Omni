@@ -18,3 +18,6 @@ pypdf>=6,<7
 # on CPU so reading documents cannot evict or starve X's 30B GPU worker.
 rapidocr>=3.9,<4
 onnxruntime>=1.28,<2
+# Server-side authenticated research browser. Uses the installed Chrome
+# channel first; bundled Chromium is only a fallback if separately installed.
+playwright>=1.62,<2
