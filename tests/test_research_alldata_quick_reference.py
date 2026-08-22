@@ -81,8 +81,11 @@ class _Page:
     def __init__(self, url: str, pdf: bytes):
         self.url = url
         self._pdf = pdf
+        self.goto_calls = []
+        self.pdf_calls = 0
 
     async def goto(self, url, **_kwargs):
+        self.goto_calls.append(url)
         self.url = url
 
     async def title(self):
@@ -93,6 +96,7 @@ class _Page:
         return _Body("2018 Ford F-350 forward facing camera calibration procedure steps and prerequisites " * 5)
 
     async def pdf(self, **_kwargs):
+        self.pdf_calls += 1
         return self._pdf
 
 
@@ -121,6 +125,10 @@ class _Adas:
             "matched_documents": [{"relative_path": self.relative_of(self.last_path)}],
             "results": [],
         }
+
+
+async def _async_value(value):
+    return value
 
 
 @pytest.mark.asyncio
@@ -156,42 +164,62 @@ async def test_capture_skips_identical_hash_without_creating_second_file(tmp_pat
     assert list((root / "Acquired").rglob("*.pdf")) == []
 
 
-async def _async_value(value):
-    return value
-
-
 @pytest.mark.asyncio
-async def test_same_article_url_changed_hash_is_saved_as_revision(tmp_path: Path, monkeypatch):
+async def test_known_canonical_article_is_skipped_before_navigation_or_render(tmp_path: Path):
     root = tmp_path / "ADAS SI"
     root.mkdir()
-    old_pdf = root / "old.pdf"
-    old_pdf.write_bytes(_pdf_bytes(b"O"))
+    existing = root / "existing.pdf"
+    existing.write_bytes(_pdf_bytes(b"O"))
     canonical = "https://my.alldata.com/repair#/article/123"
     dedupe = {
-        "urls": {canonical: {"sidecar": None, "pdf": old_pdf, "data": {}}},
-        "hashes": {hashlib.sha256(old_pdf.read_bytes()).hexdigest(): {"sidecar": None, "pdf": old_pdf, "data": {}}},
+        "urls": {canonical: {"sidecar": None, "pdf": existing, "data": {}}},
+        "hashes": {},
         "title_keys": {},
     }
-    async def selected(*_args, **_kwargs):
-        return {"verified": True, "label": "2018 Ford F-350", "source": "test"}
-    monkeypatch.setattr(quick, "_selected_vehicle_signal", selected)
-
-    new_pdf = _pdf_bytes(b"N")
-    page = _Page("https://my.alldata.com/repair/#/article/123", new_pdf)
+    page = _Page("https://my.alldata.com/repair/#/quick-reference", _pdf_bytes(b"N"))
     adas = _Adas(root)
     result = await quick._capture_one(
         page=page,
         adas=adas,
         vehicle={"year": "2018", "make": "Ford", "model_trim": "F-350", "label": "2018 Ford F-350"},
-        link={"title": "Forward Facing Camera Calibration", "url": page.url},
+        link={"title": "Forward Facing Camera Calibration", "url": canonical},
+        quick_reference_url=page.url,
+        dedupe=dedupe,
+    )
+    assert result["status"] == "duplicate_skipped"
+    assert result["duplicate_reason"] == "canonical_source_url_already_present"
+    assert result["existing_relative_path"] == "existing.pdf"
+    assert page.goto_calls == []
+    assert page.pdf_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_new_procedure_is_captured_ocr_readable_and_search_retrievable(tmp_path: Path, monkeypatch):
+    root = tmp_path / "ADAS SI"
+    root.mkdir()
+    async def selected(*_args, **_kwargs):
+        return {"verified": True, "label": "2018 Ford F-350", "source": "test"}
+    monkeypatch.setattr(quick, "_selected_vehicle_signal", selected)
+
+    page = _Page("https://my.alldata.com/repair/#/quick-reference", _pdf_bytes(b"N"))
+    adas = _Adas(root)
+    dedupe = {"urls": {}, "hashes": {}, "title_keys": {}}
+    result = await quick._capture_one(
+        page=page,
+        adas=adas,
+        vehicle={"year": "2018", "make": "Ford", "model_trim": "F-350", "label": "2018 Ford F-350"},
+        link={
+            "title": "Forward Facing Camera Calibration",
+            "url": "https://my.alldata.com/repair/#/article/123",
+        },
         quick_reference_url="https://my.alldata.com/repair/#/quick-reference",
         dedupe=dedupe,
     )
     assert result["status"] == "captured"
-    assert result["revision"] is True
-    assert result["supersedes_relative_path"] == "old.pdf"
     assert result["retrieval_verified"] is True
+    assert result["readable_pages"] == 1
     assert Path(root / result["relative_path"]).is_file()
+    assert Path(root / result["source_sidecar"]).is_file()
 
 
 @pytest.mark.asyncio
