@@ -19,8 +19,33 @@ def test_canonical_alldata_url_drops_query_but_keeps_spa_article_route():
     value = quick._canonical_alldata_url(
         "https://my.alldata.com/repair/?tracking=1#/article/65779/guid/abc/"
     )
-    assert value == "https://my.alldata.com/repair#/article/65779/guid/abc"
+    assert value == "https://my.alldata.com/repair/#/article/65779/guid/abc"
     assert quick._article_id(value) == "65779"
+
+
+def test_bounded_vehicle_identity_normalizes_model_punctuation():
+    assert quick._identity_matches_text(
+        "2018 Ford Truck F350 4WD V8-6.7L Diesel",
+        {"year": "2018", "make": "Ford", "model_trim": "F-350"},
+    ) is True
+
+
+def test_bounded_vehicle_identity_accepts_known_alldata_make_aliases():
+    assert quick._identity_matches_text(
+        "2018 Chevy Truck Tahoe 4WD V8-5.3L",
+        {"year": "2018", "make": "Chevrolet", "model_trim": "Tahoe"},
+    ) is True
+    assert quick._identity_matches_text(
+        "2021 Nissan-Datsun Versa Sedan L4-1.6L",
+        {"year": "2021", "make": "Nissan", "model_trim": "Versa"},
+    ) is True
+
+
+def test_bounded_vehicle_identity_still_rejects_wrong_model():
+    assert quick._identity_matches_text(
+        "2018 Ford Truck F150 4WD",
+        {"year": "2018", "make": "Ford", "model_trim": "F-350"},
+    ) is False
 
 
 def test_quick_reference_link_filter_accepts_procedure_and_rejects_navigation():
@@ -43,7 +68,7 @@ def test_dedupe_index_covers_sidecar_url_and_whole_library_hash(tmp_path: Path):
     existing = acquired / "2018 Ford F-350 Camera Calibration article-123.pdf"
     existing.write_bytes(_pdf_bytes(b"Z"))
     sidecar = acquired / "2018 Ford F-350 Camera Calibration article-123.source.json"
-    canonical = "https://my.alldata.com/repair#/article/123"
+    canonical = "https://my.alldata.com/repair/#/article/123"
     sidecar.write_text(
         json.dumps(
             {
@@ -170,7 +195,7 @@ async def test_known_canonical_article_is_skipped_before_navigation_or_render(tm
     root.mkdir()
     existing = root / "existing.pdf"
     existing.write_bytes(_pdf_bytes(b"O"))
-    canonical = "https://my.alldata.com/repair#/article/123"
+    canonical = "https://my.alldata.com/repair/#/article/123"
     dedupe = {
         "urls": {canonical: {"sidecar": None, "pdf": existing, "data": {}}},
         "hashes": {},
