@@ -698,13 +698,57 @@ async def _capture_one(
     }
 
 
+_GENERAL_VEHICLE_HEADING_SELECTORS = (
+    *_SELECTED_VEHICLE_SELECTORS,
+    "h1", "h2",
+)
+
+
 async def read_selected_alldata_vehicle(page: Any) -> dict[str, Any]:
     """Best-effort direct read of whatever vehicle is currently selected in
     ALLDATA -- independent of any Calibration IQ repair order. Used by the
     general-reference collection path, where the tech has picked a vehicle
     that may not have a repair order yet.
+
+    nav._current_vehicle_label only trusts text next to a "Change/Selected/
+    Current Vehicle" control, which several ALLDATA sub-pages (e.g. ADAS
+    Systems, Locations, and Calibrations) don't render near the vehicle
+    heading -- that page shows the vehicle as a plain heading instead, and
+    its <title> doesn't contain the vehicle at all. This falls back to the
+    same bounded selector/heading scan already used elsewhere to prove a
+    selected vehicle, still requiring a full year+make+model match so a
+    stray heading elsewhere on the page can't be mistaken for one.
     """
     label = await nav._current_vehicle_label(page)  # noqa: SLF001
+    if not label:
+        frames = [page, *list(getattr(page, "frames", []) or [])]
+        seen_frames: set[int] = set()
+        for frame in frames:
+            if id(frame) in seen_frames:
+                continue
+            seen_frames.add(id(frame))
+            for selector in _GENERAL_VEHICLE_HEADING_SELECTORS:
+                try:
+                    locator = frame.locator(selector)
+                    count = min(await locator.count(), 40)
+                except Exception:
+                    continue
+                for index in range(count):
+                    item = locator.nth(index)
+                    try:
+                        if not await item.is_visible(timeout=100):
+                            continue
+                        text = " ".join((await item.inner_text(timeout=500)).split()).strip()
+                    except Exception:
+                        continue
+                    if not 4 <= len(text) <= 420:
+                        continue
+                    folded = text.casefold()
+                    if "select vehicle" in folded or folded.count("202") >= 4:
+                        continue
+                    candidate = nav.vehicle_from_query(text)
+                    if candidate.get("year") and candidate.get("make") and candidate.get("model_trim"):
+                        return candidate
     if not label:
         try:
             title = await page.title()
