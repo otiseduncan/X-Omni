@@ -24,10 +24,26 @@ _TOPIC_BOUNDARY_RE = re.compile(
 )
 _YEAR_ANY_RE = re.compile(r"(?<!\d)(?P<year>20\d{2}|\d{2})(?!\d)")
 _RANGE_RE = re.compile(r"(?<!\d)(?P<start>20\d{2}|\d{2})\s*[-–]\s*(?P<end>20\d{2}|\d{2})(?!\d)")
+_MODEL_SYSTEM_TOKENS = {
+    "adas", "bsm", "bsd", "ccm", "ipma", "camera", "radar", "sensor",
+    "module", "calibration", "alignment", "adjustment", "aiming", "aim",
+    "initialization", "initialize", "relearn", "reset", "monitor", "parking",
+    "surround", "forward", "front", "rear", "blind", "lane",
+}
 
 
 def _compact(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _model_key(value: object) -> str:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", str(value or ""))
+    kept: list[str] = []
+    for word in words:
+        if word.casefold() in _MODEL_SYSTEM_TOKENS:
+            break
+        kept.append(word)
+    return _compact(" ".join(kept))
 
 
 def _normalize_year(raw: object) -> Optional[int]:
@@ -93,7 +109,6 @@ def explicit_model(query: object, requested_make: Optional[str], adas_mod: Any) 
     if not tail:
         return None
 
-    # A year is sometimes repeated after the make (Ford 2024 Transit).
     tail = re.sub(r"^(?:20\d{2}|\d{2})\b\s*", "", tail).strip()
     words = tail.split()
     while words and words[0].casefold() in getattr(adas_mod, "BODY_PREFIXES", set()):
@@ -102,7 +117,6 @@ def explicit_model(query: object, requested_make: Optional[str], adas_mod: Any) 
     boundary = _TOPIC_BOUNDARY_RE.search(tail)
     if boundary:
         tail = tail[:boundary.start()]
-    # Strip conversational glue that can occur after a short model name.
     tail = re.split(
         r"\b(?:with|that|which|and\s+I|because|after|before|involved)\b",
         tail,
@@ -160,31 +174,24 @@ def descriptor_year_matches(descriptor: dict[str, Any], requested_year: Optional
     for match in _YEAR_ANY_RE.finditer(title):
         if _normalize_year(match.group("year")) == requested_year:
             return True
-    # Unknown year is not proof of a mismatch; keep it eligible for model/make
-    # filtering rather than dropping potentially useful legacy documents.
     return not bool(_YEAR_ANY_RE.search(title) or _RANGE_RE.search(title))
 
 
 def descriptor_model_matches(descriptor: dict[str, Any], requested_model: Optional[str]) -> bool:
     if not requested_model:
         return True
-    query_key = _compact(requested_model)
+    query_key = _model_key(requested_model)
     if not query_key:
         return True
 
     parsed = str(descriptor.get("model") or "").strip()
     if parsed:
-        doc_key = _compact(parsed)
+        doc_key = _model_key(parsed)
         if doc_key:
             return query_key.startswith(doc_key) or doc_key.startswith(query_key)
 
-    # Conservative legacy fallback: after removing year+make, the compact title
-    # must begin with the requested model (or vice versa). This handles compact
-    # filenames without allowing arbitrary topic text to establish identity.
     title_key = _compact(descriptor.get("title"))
     make_key = _compact(descriptor.get("make") or "")
-    if not make_key:
-        make_key = ""
     if make_key:
         pos = title_key.find(make_key)
         if pos >= 0:
