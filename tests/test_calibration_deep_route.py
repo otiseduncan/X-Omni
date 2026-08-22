@@ -25,6 +25,19 @@ def test_what_does_adas_si_say_stays_scoped_to_adas_si():
     ) is False
 
 
+def test_adas_first_then_alldata_and_oem_is_multi_source():
+    assert research_workflow.full_research_request(
+        "Research whether Toyota permits the use of a recycled blind spot monitor module. "
+        "Check ADAS SI first, then ALLDATA, then official Toyota collision sources if necessary."
+    ) is True
+
+
+def test_check_adas_plus_explicit_alldata_is_not_mistaken_for_local_scope():
+    assert research_workflow.full_research_request(
+        "Check ADAS SI, ALLDATA, then official Toyota collision sources."
+    ) is True
+
+
 def test_calibration_iq_ro_research_still_uses_existing_operator_lane():
     assert research_workflow.full_research_request(
         "For Calibration IQ RO 2400911667, research the camera calibration and attach OEM evidence."
