@@ -33,6 +33,12 @@ _EXPLICIT_ADAS_SCOPE_RE = re.compile(
     r"|\b(?:in|from)\s+adas\s+si\b",
     re.IGNORECASE,
 )
+_EXTERNAL_SCOPE_RE = re.compile(
+    r"\b(?:all\s*data|alldata|public\s+oem|official\s+(?:oem|manufacturer|[a-z0-9-]+\s+collision)|"
+    r"manufacturer\s+(?:site|website|source|sources)|collision\s+pros?|oem\s+(?:site|website|source|sources)|"
+    r"web|internet|external\s+(?:source|sources|research))\b",
+    re.IGNORECASE,
+)
 _QUESTION_OR_RESEARCH_RE = re.compile(
     r"\b(?:research|find|verify|check|look\s*up|investigate|what|which|when|where|"
     r"does|do|is|are|should|must|need|needs|required|requirement|requirements)\b",
@@ -52,17 +58,19 @@ def install() -> None:
                 if not text:
                     return False
 
-                # Explicit source boundaries outrank every broader matcher.
-                # The underlying collision-research matcher treats words such
-                # as "check" + "ADAS SI" as research intent, so calling it
-                # first would incorrectly widen "Check ADAS SI only" into an
-                # ALLDATA/public-OEM search. Honor the user's scope before
-                # delegating to any older/broader research matcher.
-                if (
-                    _CIQ_RE.search(text)
-                    or _LOCAL_ONLY_RE.search(text)
-                    or _EXPLICIT_ADAS_SCOPE_RE.search(text)
-                ):
+                # Hard source boundaries always win. "ADAS SI only" and
+                # explicit no-web instructions must never be widened by an
+                # older broad research matcher.
+                if _CIQ_RE.search(text) or _LOCAL_ONLY_RE.search(text):
+                    return False
+
+                # A plain request such as "What does ADAS SI say..." is local
+                # only when the user did not ALSO ask for ALLDATA/OEM/web
+                # research. This distinction matters for prompts like
+                # "Check ADAS SI first, then ALLDATA, then Toyota Collision".
+                explicit_adas_scope = bool(_EXPLICIT_ADAS_SCOPE_RE.search(text))
+                explicit_external_scope = bool(_EXTERNAL_SCOPE_RE.search(text))
+                if explicit_adas_scope and not explicit_external_scope:
                     return False
 
                 if previous(message):
