@@ -65,105 +65,132 @@ function FullResearchResult({ data }) {
   const adasHits = Array.isArray(data?.adas_si?.hits) ? data.adas_si.hits : [];
   const publicSources = Array.isArray(data?.public_oem?.sources) ? data.public_oem.sources : [];
   const publicReads = Array.isArray(data?.public_oem?.read_results) ? data.public_oem.read_results : [];
+  const policyFindings = Array.isArray(data?.public_oem?.policy_findings) ? data.public_oem.policy_findings : [];
   const captures = Array.isArray(data?.captures) ? data.captures : [];
   const allData = data?.alldata && typeof data.alldata === "object" ? data.alldata : {};
-  const externalVerified = data?.external_search_verified === true;
+  const verifiedCount = ledger.filter((row) => row?.verified === true).length;
 
   return (
-    <Card
-      title={externalVerified ? "Post-collision research · source verified" : "Post-collision research · incomplete"}
-      tone={externalVerified ? "" : "warn"}
-    >
-      <p className="card-note research-query">
-        {data?.requested_manufacturer && <strong>{data.requested_manufacturer} · </strong>}
-        {data?.query || "Research request"}
-      </p>
+    <Card title="Research details" tone={data?.external_search_verified === true ? "" : "warn"}>
+      <details className="research-evidence-group research-compact-details">
+        <summary>
+          Research details · {verifiedCount}/{ledger.length || 3} sources verified
+          {captures.length ? ` · ${captures.length} saved` : ""}
+        </summary>
 
-      <p className="rail-sub research-section-title">What X actually searched</p>
-      <SourceLedger rows={ledger} />
+        <p className="card-note research-query">
+          {data?.requested_manufacturer && <strong>{data.requested_manufacturer} · </strong>}
+          {data?.query || "Research request"}
+        </p>
 
-      {adasHits.length > 0 && (
-        <details className="research-evidence-group" open>
-          <summary>ADAS SI evidence · {adasHits.length}</summary>
-          {adasHits.map((hit, index) => (
-            <div className="research-evidence-item" key={`${hit?.title || "adas"}-${hit?.page || index}`}>
-              <div className="research-evidence-title">
-                <strong>{hit?.title || "ADAS SI result"}</strong>
-                {hit?.page != null && <span className="field-page">p.{hit.page}</span>}
-              </div>
-              {hit?.vehicle?.make && (
-                <p className="card-note field-vehicle">
-                  {[hit.vehicle.year, hit.vehicle.make, hit.vehicle.model, hit.vehicle.topic].filter(Boolean).join(" · ")}
-                </p>
-              )}
-              <pre className="pre field-excerpt research-readable-text">{String(hit?.excerpt || "").slice(0, 5000)}</pre>
-            </div>
-          ))}
-        </details>
-      )}
+        <p className="rail-sub research-section-title">What X actually searched</p>
+        <SourceLedger rows={ledger} />
 
-      <details className="research-evidence-group" open={allData?.verified === true}>
-        <summary>ALLDATA evidence</summary>
-        {allData?.verified === true ? (
-          <>
-            <div className="kv research-evidence-kv">
-              <div><span>Query submitted</span><strong>{allData?.query_submitted ? "yes" : "no"}</strong></div>
-              {allData?.title && <div><span>Page</span><strong>{allData.title}</strong></div>}
-              {allData?.relevance_score != null && <div><span>Matched terms</span><strong>{allData.relevance_score}</strong></div>}
-            </div>
-            {allData?.page_text && (
-              <pre className="pre field-excerpt research-readable-text">{String(allData.page_text).slice(0, 10000)}</pre>
-            )}
-          </>
-        ) : (
-          <p className="card-note ciq-incomplete">
-            ALLDATA was not verified as searched{allData?.reason ? ` — ${allData.reason}` : "."}
-          </p>
-        )}
-      </details>
-
-      <details className="research-evidence-group" open={publicSources.length > 0}>
-        <summary>Public OEM / manufacturer sources · {publicSources.length}</summary>
-        {publicSources.length === 0 ? (
-          <p className="card-note">No public OEM source result was returned.</p>
-        ) : (
-          <div className="ro-list research-public-list">
-            {publicSources.map((source, index) => (
-              <div className="ro-item" key={`${source?.url || source?.title}-${index}`}>
-                <div className="research-evidence-title"><strong>{source?.title || source?.url}</strong></div>
-                {source?.snippet && <p className="card-note research-public-snippet">{source.snippet}</p>}
-                {source?.url && (
-                  <a className="field-link research-source-link" href={source.url} target="_blank" rel="noreferrer">
+        {policyFindings.length > 0 && (
+          <details className="research-evidence-group">
+            <summary>Key manufacturer policy findings · {policyFindings.length}</summary>
+            {policyFindings.map((finding, index) => (
+              <div className="research-evidence-item" key={`${finding?.url || finding?.title}-${finding?.page || index}`}>
+                <div className="research-evidence-title">
+                  <strong>{finding?.title || "Manufacturer policy source"}</strong>
+                  {finding?.page != null && <span className="field-page">p.{finding.page}</span>}
+                </div>
+                {finding?.excerpt && (
+                  <pre className="pre field-excerpt research-readable-text">{String(finding.excerpt).slice(0, 5000)}</pre>
+                )}
+                {finding?.url && (
+                  <a className="field-link research-source-link" href={finding.url} target="_blank" rel="noreferrer">
                     <ExternalLink size={12} /> Open source
                   </a>
                 )}
               </div>
             ))}
-          </div>
-        )}
-        {publicReads.map((read, index) => read?.page_text ? (
-          <details className="research-read-result" key={`${read?.url || "read"}-${index}`}>
-            <summary>{read?.title || read?.url || "Read source"}</summary>
-            <pre className="pre field-excerpt research-readable-text">{String(read.page_text).slice(0, 9000)}</pre>
           </details>
-        ) : null)}
-      </details>
+        )}
 
-      {captures.length > 0 && (
+        {adasHits.length > 0 && (
+          <details className="research-evidence-group">
+            <summary>ADAS SI evidence · {adasHits.length}</summary>
+            {adasHits.map((hit, index) => (
+              <div className="research-evidence-item" key={`${hit?.title || "adas"}-${hit?.page || index}`}>
+                <div className="research-evidence-title">
+                  <strong>{hit?.title || "ADAS SI result"}</strong>
+                  {hit?.page != null && <span className="field-page">p.{hit.page}</span>}
+                </div>
+                {hit?.vehicle?.make && (
+                  <p className="card-note field-vehicle">
+                    {[hit.vehicle.year, hit.vehicle.make, hit.vehicle.model, hit.vehicle.topic].filter(Boolean).join(" · ")}
+                  </p>
+                )}
+                <pre className="pre field-excerpt research-readable-text">{String(hit?.excerpt || "").slice(0, 5000)}</pre>
+              </div>
+            ))}
+          </details>
+        )}
+
         <details className="research-evidence-group">
-          <summary>Saved to ADAS SI · {captures.length}</summary>
-          {captures.map((item, index) => (
-            <div className="research-capture-row" key={`${item?.relative_path || item?.url || index}`}>
-              <span className={`ro-pill ${item?.status === "success" ? "ok" : "warn"}`}>{item?.source || "source"}</span>
-              <span>{item?.relative_path || item?.url || item?.error || "Capture result"}</span>
-            </div>
-          ))}
+          <summary>ALLDATA evidence</summary>
+          {allData?.verified === true ? (
+            <>
+              <div className="kv research-evidence-kv">
+                <div><span>Query submitted</span><strong>{allData?.query_submitted ? "yes" : "no"}</strong></div>
+                {allData?.title && <div><span>Page</span><strong>{allData.title}</strong></div>}
+                {allData?.relevance_score != null && <div><span>Matched terms</span><strong>{allData.relevance_score}</strong></div>}
+              </div>
+              {allData?.page_text && (
+                <pre className="pre field-excerpt research-readable-text">{String(allData.page_text).slice(0, 10000)}</pre>
+              )}
+            </>
+          ) : (
+            <p className="card-note ciq-incomplete">
+              ALLDATA was not verified as searched{allData?.reason ? ` — ${allData.reason}` : "."}
+            </p>
+          )}
         </details>
-      )}
 
-      <p className="card-note research-authority-note">
-        {data?.authority_note || "OEM/manufacturer, insurer, and legal/regulatory requirements are separate authorities."}
-      </p>
+        <details className="research-evidence-group">
+          <summary>Public OEM / manufacturer sources · {publicSources.length}</summary>
+          {publicSources.length === 0 ? (
+            <p className="card-note">No public OEM source result was returned.</p>
+          ) : (
+            <div className="ro-list research-public-list">
+              {publicSources.map((source, index) => (
+                <div className="ro-item" key={`${source?.url || source?.title}-${index}`}>
+                  <div className="research-evidence-title"><strong>{source?.title || source?.url}</strong></div>
+                  {source?.snippet && <p className="card-note research-public-snippet">{source.snippet}</p>}
+                  {source?.url && (
+                    <a className="field-link research-source-link" href={source.url} target="_blank" rel="noreferrer">
+                      <ExternalLink size={12} /> Open source
+                    </a>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {publicReads.map((read, index) => read?.page_text ? (
+            <details className="research-read-result" key={`${read?.url || "read"}-${index}`}>
+              <summary>{read?.title || read?.url || "Read source"}</summary>
+              <pre className="pre field-excerpt research-readable-text">{String(read.page_text).slice(0, 9000)}</pre>
+            </details>
+          ) : null)}
+        </details>
+
+        {captures.length > 0 && (
+          <details className="research-evidence-group">
+            <summary>Saved to ADAS SI · {captures.length}</summary>
+            {captures.map((item, index) => (
+              <div className="research-capture-row" key={`${item?.relative_path || item?.url || index}`}>
+                <span className={`ro-pill ${item?.status === "success" ? "ok" : "warn"}`}>{item?.source || "source"}</span>
+                <span>{item?.relative_path || item?.url || item?.error || "Capture result"}</span>
+              </div>
+            ))}
+          </details>
+        )}
+
+        <p className="card-note research-authority-note">
+          {data?.authority_note || "OEM, insurer, and legal/regulatory requirements are separate authorities."}
+        </p>
+      </details>
     </Card>
   );
 }
@@ -180,9 +207,12 @@ function ExternalResults({ data }) {
             </a>
           </p>
         )}
-        <pre className="pre field-excerpt research-readable-text">
-          {String(data?.page_text || data?.message || "No readable source text was returned.").slice(0, 12000)}
-        </pre>
+        <details className="research-evidence-group">
+          <summary>Source text</summary>
+          <pre className="pre field-excerpt research-readable-text">
+            {String(data?.page_text || data?.message || "No readable source text was returned.").slice(0, 12000)}
+          </pre>
+        </details>
       </Card>
     );
   }
@@ -190,26 +220,29 @@ function ExternalResults({ data }) {
   const sources = Array.isArray(data?.sources) ? data.sources : [];
   return (
     <Card title="Post-collision web research" tone={sources.length ? "" : "warn"}>
-      {sources.length === 0 ? (
-        <p className="card-note">{data?.summary || "No public source matched."}</p>
-      ) : (
-        <div className="ro-list">
-          {sources.map((source, index) => (
-            <div className="ro-item" key={`${source.url || source.title}-${index}`}>
-              <div className="ro-line"><strong>{source.title || source.url}</strong></div>
-              {source.snippet && <p className="card-note">{source.snippet}</p>}
-              {source.url && (
-                <a className="field-link" href={source.url} target="_blank" rel="noreferrer">
-                  <ExternalLink size={12} /> Open source
-                </a>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-      <p className="card-note" style={{ marginTop: 8 }}>
-        OEM, insurer, and legal/regulatory requirements are separate authorities.
-      </p>
+      <details className="research-evidence-group">
+        <summary>Research details · {sources.length} source{sources.length === 1 ? "" : "s"}</summary>
+        {sources.length === 0 ? (
+          <p className="card-note">{data?.summary || "No public source matched."}</p>
+        ) : (
+          <div className="ro-list">
+            {sources.map((source, index) => (
+              <div className="ro-item" key={`${source.url || source.title}-${index}`}>
+                <div className="ro-line"><strong>{source.title || source.url}</strong></div>
+                {source.snippet && <p className="card-note">{source.snippet}</p>}
+                {source.url && (
+                  <a className="field-link" href={source.url} target="_blank" rel="noreferrer">
+                    <ExternalLink size={12} /> Open source
+                  </a>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="card-note" style={{ marginTop: 8 }}>
+          OEM, insurer, and legal/regulatory requirements are separate authorities.
+        </p>
+      </details>
     </Card>
   );
 }
@@ -235,9 +268,12 @@ function ExtractResult({ data }) {
         <div><span>Authenticated</span><strong>{data?.authenticated ? "yes" : "not verified"}</strong></div>
         {data?.title && <div><span>Page</span><strong>{data.title}</strong></div>}
       </div>
-      <pre className="pre field-excerpt research-readable-text">
-        {String(data?.page_text || "No page text returned.").slice(0, 12000)}
-      </pre>
+      <details className="research-evidence-group">
+        <summary>Page text</summary>
+        <pre className="pre field-excerpt research-readable-text">
+          {String(data?.page_text || "No page text returned.").slice(0, 12000)}
+        </pre>
+      </details>
     </Card>
   );
 }
