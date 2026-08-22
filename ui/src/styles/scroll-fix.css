@@ -1,0 +1,48 @@
+/* Chat viewport hardening.
+
+The chat stream is the one vertical scroll owner. Large research artifacts must
+never expand the grid track and push scrolling onto the page itself. The
+composer is currently wrapped by one structural div, so the wrapper—not only
+the nested .composer—must occupy the desktop composer grid area.
+*/
+
+.shell {
+  min-width: 0;
+  min-height: 0;
+}
+
+.stream {
+  min-width: 0 !important;
+  min-height: 0 !important;
+  height: 100%;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-gutter: stable;
+}
+
+/* Prevent a large direct child (including a collapsed/expanded research card)
+   from imposing a minimum content height on the scroll viewport. */
+.stream > * {
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+/* The JSX currently wraps .composer in one div. Make that wrapper the actual
+   grid item. :has() is supported by the Chrome runtime used by X Omni. */
+.shell > div:has(> .composer) {
+  min-width: 0;
+  min-height: 0;
+}
+
+@media (min-width: 860px) {
+  .shell > div:has(> .composer) {
+    grid-area: composer;
+  }
+
+  .shell > div:has(> .composer) > .composer {
+    width: 100%;
+  }
+}
