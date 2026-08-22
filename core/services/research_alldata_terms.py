@@ -26,9 +26,10 @@ _OPERATION_RE = re.compile(
 _SYSTEMS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
     (
         re.compile(
-            r"\b(?:forward(?:-facing|\s+facing)?\s+camera|front\s+camera|"
-            r"forward\s+recognition\s+camera|lane\s+(?:keep|keeping|departure).*camera|"
-            r"windshield\s+camera|monocular\s+camera)\b",
+            r"\b(?:forward(?:-facing|\s+facing)(?:\s+(?:camera|system|module))?|"
+            r"front\s+camera|forward\s+recognition\s+camera|"
+            r"lane\s+(?:keep|keeping|departure).*camera|windshield\s+camera|"
+            r"monocular\s+camera)\b",
             re.IGNORECASE,
         ),
         (
@@ -171,15 +172,10 @@ def expanded_topic_variants(topic: str) -> list[str]:
         for alias in aliases:
             add(alias)
 
-    # Generic calibration/reset vocabulary catches OEMs that file the same
-    # operation under initialization/relearn/setup rather than calibration.
     if matched_system or _OPERATION_RE.search(base) or re.search(r"\badas\b", folded):
         for alias in _GENERIC_ADAS_TERMS:
             add(alias)
 
-    # If the user names a system but no operation, still search the standard
-    # operation family because ALLDATA may title the article as Initialization,
-    # Relearn, Adjustment, or Setup instead of Calibration.
     if matched_system and not _OPERATION_RE.search(base):
         add(f"{base} calibration")
         add(f"{base} initialization")
@@ -187,8 +183,6 @@ def expanded_topic_variants(topic: str) -> list[str]:
         add(f"{base} reset")
         add(f"{base} adjustment")
 
-    # Keep provider navigation bounded while giving enough terminology breadth
-    # to survive OEM naming differences.
     return output[:16]
 
 
