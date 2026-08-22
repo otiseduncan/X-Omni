@@ -8,9 +8,11 @@ repair evidence.
 
 The post-collision research operator adds licensed ALLDATA/public-OEM research,
 mobile browser handoff, preservation into ADAS SI, and a verified composite
-workflow that records which sources were actually searched. Calibration IQ RO
-research remains on its existing verified operator lane. Final policy and audit
-guards keep execution truthful and fail closed.
+workflow that records which sources were actually searched. Policy research can
+deep-read later PDF pages/sidebars, while chat presentation stays concise and
+conversation-first. Calibration IQ RO research remains on its existing verified
+operator lane. Final policy and audit guards keep execution truthful and fail
+closed.
 """
 
 from . import adas_si as _adas_si
@@ -22,6 +24,8 @@ from . import research_setup as _research_setup
 from . import research_vault as _research_vault
 from . import research_workflow as _research_workflow
 from . import research_workflow_guard as _research_workflow_guard
+from . import research_policy_depth as _research_policy_depth
+from . import research_conversation as _research_conversation
 from . import research_truth as _research_truth
 from . import research_policy as _research_policy
 from . import research_route_compat as _research_route_compat
@@ -35,5 +39,7 @@ _research_capture.install()
 _research_setup.install()
 _research_workflow.install()
 _research_workflow_guard.install()
+_research_policy_depth.install()
+_research_conversation.install()
 _research_truth.install()
 _research_policy.install()
