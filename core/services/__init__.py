@@ -58,6 +58,7 @@ from . import research_alldata_terms as _research_alldata_terms
 from . import research_auto_acquire as _research_auto_acquire
 from . import research_alldata_quick_reference as _research_alldata_quick_reference
 from . import calibration_iq_work_prep as _calibration_iq_work_prep
+from . import calibration_iq_work_prep_guards as _calibration_iq_work_prep_guards
 from . import research_task_continuity as _research_task_continuity
 from . import research_policy_depth as _research_policy_depth
 from . import research_policy_compat as _research_policy_compat
@@ -84,6 +85,7 @@ _research_alldata_terms.install()
 _research_auto_acquire.install()
 _research_alldata_quick_reference.install()
 _calibration_iq_work_prep.install()
+_calibration_iq_work_prep_guards.install()
 _research_conversation.install()
 _research_task_continuity.install()
 _research_policy_depth.install()
