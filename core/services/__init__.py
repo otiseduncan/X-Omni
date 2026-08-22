@@ -23,11 +23,18 @@ identity, rather than an enumerated table of follow-up phrasings.
 When an exact calibration/reset procedure is missing locally and ALLDATA produces
 a verified exact-vehicle procedure, that source is acquired into ADAS SI with
 URL-based deduplication and a second, independent vehicle-identity check at the
-moment of capture. Calibration and policy research deep-read later PDF
-pages/sidebars and bounded same-host OEM web pages, while chat presentation stays
-concise and conversation-first. Calibration IQ RO research remains on its existing
-verified operator lane and inherits the same exact-vehicle deep ADAS PDF search.
-Final policy and audit guards keep execution truthful and fail closed.
+moment of capture. The cooperative Quick Reference collector provides a separate,
+low-rate path for the weekly Calibration IQ queue: the operator manually selects
+the exact CIQ vehicle in ALLDATA, then X enumerates that vehicle's ADAS Quick
+Reference procedure links sequentially, skips duplicates by canonical URL/hash
+(and conservative same-vehicle/title identity), preserves real revisions, OCRs
+and indexes new PDFs, and tells X to run the existing CIQ research_ro contract to
+link the refreshed ADAS SI evidence back to the repair order. Calibration and
+policy research deep-read later PDF pages/sidebars and bounded same-host OEM web
+pages, while chat presentation stays concise and conversation-first. Calibration
+IQ RO research remains on its existing verified operator lane and inherits the
+same exact-vehicle deep ADAS PDF search. Final policy and audit guards keep
+execution truthful and fail closed.
 """
 
 from . import adas_si as _adas_si
@@ -46,6 +53,7 @@ from . import research_alldata_navigation as _research_alldata_navigation
 from . import research_alldata_contract as _research_alldata_contract
 from . import research_alldata_terms as _research_alldata_terms
 from . import research_auto_acquire as _research_auto_acquire
+from . import research_alldata_quick_reference as _research_alldata_quick_reference
 from . import research_task_continuity as _research_task_continuity
 from . import research_policy_depth as _research_policy_depth
 from . import research_policy_compat as _research_policy_compat
@@ -70,6 +78,7 @@ _research_alldata_navigation.install()
 _research_alldata_contract.install()
 _research_alldata_terms.install()
 _research_auto_acquire.install()
+_research_alldata_quick_reference.install()
 _research_conversation.install()
 _research_task_continuity.install()
 _research_policy_depth.install()
