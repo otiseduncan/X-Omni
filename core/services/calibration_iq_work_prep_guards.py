@@ -82,11 +82,12 @@ async def _restore_browser_session_if_stale(browser: Any, session_id: str) -> No
 
 
 def install() -> None:
-    # Speech-to-text has produced "8 oz quick reference" in a real field turn.
-    # Keep this deliberately specific to Quick Reference; it must not make
-    # arbitrary "8 oz" utterances enter the licensed research lane.
+    # Speech-to-text has produced "8 oz quick reference" and "8 ass quick
+    # reference" in real field turns (both mishearings of "ADAS"). Keep this
+    # deliberately specific to Quick Reference; it must not make arbitrary
+    # "8 oz"/"8 ass" utterances enter the licensed research lane.
     prep._QUICK_REFERENCE_RE = re.compile(  # noqa: SLF001
-        r"\b(?:adas|ados|a\s*d\s*a\s*s|8\s*oz)\s+quick\s+reference\b|"
+        r"\b(?:adas|ados|a\s*d\s*a\s*s|8\s*oz|8\s*ass)\s+quick\s+reference\b|"
         r"\bquick\s+reference\b.{0,60}\b(?:adas|ados|a\s*d\s*a\s*s)\b",
         re.IGNORECASE | re.DOTALL,
     )

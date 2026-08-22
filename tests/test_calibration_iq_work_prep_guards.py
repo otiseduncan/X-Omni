@@ -9,6 +9,12 @@ def test_voice_transcribed_8_oz_quick_reference_routes_to_collector():
     ) == "quick_reference"
 
 
+def test_voice_transcribed_8_ass_quick_reference_routes_to_collector():
+    # Field trace: "collect 8 ass quick reference" -- another mishearing of
+    # "ADAS" alongside the existing "8 oz" case.
+    assert prep.classify_request("collect 8 ass quick reference") == "quick_reference"
+
+
 def test_parent_adas_map_key_does_not_promote_sibling_calibration_data():
     snapshot = {
         "adas_map": {
