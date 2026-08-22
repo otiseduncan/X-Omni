@@ -59,19 +59,18 @@ AGENT_TOOL_SCHEMA = {
                 "text": {
                     "type": "string",
                     "description": (
-                        "The ONLY field that carries a value to type or click. For fill: the "
-                        "text to type into the field named by 'selector'. For click_text: the "
-                        "visible link/button text to click. Never put this value in 'key' -- "
-                        "'key' is unrelated and only used by the press action."
+                        "The text to type (fill) or the visible link/button text to click "
+                        "(click_text). This is the field for any value you are typing or "
+                        "clicking on -- fill and click_text both use it."
                     ),
                 },
                 "selector": {"type": "string", "description": "CSS selector -- required by, and only used by, fill."},
                 "url": {"type": "string", "description": "Only used by goto; must stay on an alldata.com URL."},
-                "key": {
+                "keyboard_key": {
                     "type": "string",
                     "description": (
-                        "A keyboard key name, e.g. Enter -- ONLY used by the press action. Never "
-                        "used by fill; fill's value goes in 'text', not here."
+                        "A keyboard key name such as Enter or Tab -- ONLY used by the press "
+                        "action, to press that key. Not used by any other action."
                     ),
                 },
             },
@@ -105,16 +104,26 @@ def _system_prompt(vehicle: dict[str, Any], topic: str) -> str:
 
 def _validate_args(action: str, args: dict[str, Any]) -> Optional[str]:
     """Catch a malformed call before it even reaches the browser, with a
-    correction specific enough for the model to actually fix it -- reproduced
-    live: the model called fill with {"key": "..."} instead of {"text": "..."}
-    and repeated that exact mistake for the rest of its turn budget against a
-    generic backend ValueError that didn't spell out the fix."""
+    correction specific enough for the model to actually fix it.
+
+    Reproduced live, twice, with two different confusions: first the model
+    called fill with {"key": "..."} instead of {"text": "..."}; after that
+    field was renamed to keyboard_key to remove the naming collision, it
+    instead called fill with {"keyboard_key": "text"} -- putting the literal
+    word "text" as a value rather than switching to the text field. Both
+    are caught here defensively rather than assumed away.
+    """
     if action == "fill":
         if not str(args.get("selector") or "").strip():
             return "fill requires a non-empty 'selector' naming the field to type into."
         if not str(args.get("text") or "").strip():
-            extra = " You sent 'key' instead of 'text' -- 'key' is not read by fill." if args.get("key") else ""
-            return "fill requires a non-empty 'text' field with the value to type." + extra
+            if args.get("keyboard_key"):
+                return (
+                    "fill requires a non-empty 'text' field with the value to type. "
+                    "'keyboard_key' is not read by fill and is unrelated -- put the actual "
+                    "value (e.g. the vehicle name or search topic) in 'text'."
+                )
+            return "fill requires a non-empty 'text' field with the value to type."
     elif action == "click_text":
         if not str(args.get("text") or "").strip():
             return "click_text requires a non-empty 'text' field with the visible link/button text to click."
@@ -122,8 +131,8 @@ def _validate_args(action: str, args: dict[str, Any]) -> Optional[str]:
         if not str(args.get("url") or "").strip():
             return "goto requires a non-empty 'url'."
     elif action == "press":
-        if not str(args.get("key") or "").strip():
-            return "press requires a non-empty 'key', e.g. Enter."
+        if not str(args.get("keyboard_key") or "").strip():
+            return "press requires a non-empty 'keyboard_key', e.g. Enter."
     return None
 
 
@@ -224,8 +233,14 @@ async def run_agent_search(
                 # ever correcting the mistake.
                 result = {"error": validation_error}
             else:
+                # The underlying collision_research operator (research_operator.py)
+                # still expects "key" for press -- keyboard_key exists only in this
+                # loop's schema, to remove the naming collision with fill's "text".
+                dispatch_args = {**args, "action": action}
+                if "keyboard_key" in dispatch_args:
+                    dispatch_args["key"] = dispatch_args.pop("keyboard_key")
                 try:
-                    result = await browser.operator_action({**args, "action": action})
+                    result = await browser.operator_action(dispatch_args)
                 except Exception as exc:  # noqa: BLE001
                     result = {"error": f"{type(exc).__name__}: {exc}"}
 
