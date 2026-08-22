@@ -11,11 +11,13 @@ The post-collision research operator adds licensed ALLDATA/public-OEM research,
 mobile browser handoff, preservation into ADAS SI, and a verified composite
 workflow that records which sources were actually searched. Ordinary calibration
 questions automatically enter that deep lane unless explicitly local-only.
-Calibration and policy research deep-read later PDF pages/sidebars and bounded
-same-host OEM web pages, while chat presentation stays concise and conversation-
-first. Calibration IQ RO research remains on its existing verified operator lane
-and inherits the same deep ADAS PDF search. Final policy and audit guards keep
-execution truthful and fail closed.
+Short provider follow-ups retain the prior vehicle/system context, and ALLDATA
+research follows a vehicle-first Repair/Collision workflow before Vehicle
+Information Search. Calibration and policy research deep-read later PDF
+pages/sidebars and bounded same-host OEM web pages, while chat presentation stays
+concise and conversation-first. Calibration IQ RO research remains on its existing
+verified operator lane and inherits the same deep ADAS PDF search. Final policy
+and audit guards keep execution truthful and fail closed.
 """
 
 from . import adas_si as _adas_si
@@ -29,6 +31,8 @@ from . import research_vault as _research_vault
 from . import research_workflow as _research_workflow
 from . import research_workflow_guard as _research_workflow_guard
 from . import research_calibration_route as _research_calibration_route
+from . import research_alldata_navigation as _research_alldata_navigation
+from . import research_followup as _research_followup
 from . import research_policy_depth as _research_policy_depth
 from . import research_policy_compat as _research_policy_compat
 from . import research_conversation as _research_conversation
@@ -47,6 +51,8 @@ _research_setup.install()
 _research_workflow.install()
 _research_workflow_guard.install()
 _research_calibration_route.install()
+_research_alldata_navigation.install()
+_research_followup.install()
 _research_policy_depth.install()
 _research_policy_compat.install()
 _research_conversation.install()
