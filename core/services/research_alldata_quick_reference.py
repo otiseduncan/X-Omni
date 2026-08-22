@@ -67,6 +67,14 @@ _SELECTED_VEHICLE_SELECTORS = (
     "[id*='vehicle' i]",
     "[class*='vehicle' i]",
 )
+_PROVIDER_MAKE_ALIASES: dict[str, tuple[str, ...]] = {
+    "chevrolet": ("chevrolet", "chevy"),
+    "nissan": ("nissan", "nissan-datsun", "datsun"),
+    "dodge": ("dodge", "dodge or ram"),
+    "ram": ("ram", "dodge or ram"),
+    "mercedes-benz": ("mercedes-benz", "mercedes"),
+    "volkswagen": ("volkswagen", "vw"),
+}
 
 
 def _safe_filename(value: object, fallback: str = "ADAS procedure") -> str:
@@ -94,7 +102,12 @@ def _canonical_alldata_url(raw: object) -> str:
     if parsed.port:
         host = f"{host}:{parsed.port}"
     path = parsed.path or "/"
-    if path != "/":
+    # ALLDATA's Repair app is a hash-routed SPA and normally uses /repair/#/...
+    # Preserve that slash so a canonical URL remains safe to navigate as well
+    # as stable for dedupe.
+    if path.casefold() in {"/repair", "/repair/"}:
+        path = "/repair/"
+    elif path != "/":
         path = path.rstrip("/")
     fragment = parsed.fragment.rstrip("/")
     # Query strings are ignored for duplicate identity; the SPA hash route is
@@ -129,6 +142,40 @@ def _sha256_file(path: Path) -> str:
 
 def _plain_key(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _identity_matches_text(text: object, vehicle: dict[str, Any]) -> bool:
+    """Provider-tolerant identity check for one bounded vehicle UI string.
+
+    It deliberately normalizes punctuation so F-350/F350, CR-V/CRV, etc. match,
+    and accepts a small set of known ALLDATA make labels (Chevy,
+    Nissan-Datsun, Dodge or Ram) without weakening year/model proof.
+    """
+    raw = " ".join(str(text or "").split()).strip()
+    if not raw:
+        return False
+    folded = raw.casefold()
+    compact = _plain_key(raw)
+
+    year = str(vehicle.get("year") or "").strip()
+    if year and year not in folded:
+        return False
+
+    make = str(vehicle.get("make") or "").strip().casefold()
+    if make:
+        make_values = _PROVIDER_MAKE_ALIASES.get(make, (make,))
+        if not any(_plain_key(alias) in compact for alias in make_values):
+            return False
+
+    model_tokens = [
+        token for token in re.findall(r"[A-Za-z0-9-]+", str(vehicle.get("model_trim") or ""))
+        if len(_plain_key(token)) >= 2
+    ]
+    if model_tokens:
+        model_key = _plain_key(model_tokens[0])
+        if model_key and model_key not in compact:
+            return False
+    return bool(year or make or model_tokens)
 
 
 def _procedure_title_key(title: object, vehicle_label: object = "") -> str:
@@ -252,20 +299,8 @@ async def _selected_vehicle_signal(page: Any, vehicle: dict[str, Any]) -> dict[s
     """Return one bounded selected-vehicle proof; never scan the whole page body."""
     expected = str(vehicle.get("label") or "").strip()
     current = await nav._current_vehicle_label(page)  # noqa: SLF001
-    if await nav._confirms_identity(current, vehicle):  # noqa: SLF001
+    if await nav._confirms_identity(current, vehicle) or _identity_matches_text(current, vehicle):  # noqa: SLF001
         return {"verified": True, "label": current, "source": "navigation_vehicle_signal"}
-
-    identity_tokens = [
-        str(vehicle.get(key) or "").casefold()
-        for key in ("year", "make")
-        if vehicle.get(key)
-    ]
-    model_token = next(
-        (token.casefold() for token in str(vehicle.get("model_trim") or "").split() if len(token) >= 3),
-        "",
-    )
-    if not identity_tokens:
-        return {"verified": False, "label": current, "source": None}
 
     frames = [page, *list(getattr(page, "frames", []) or [])]
     seen_frames: set[int] = set()
@@ -292,9 +327,7 @@ async def _selected_vehicle_signal(page: Any, vehicle: dict[str, Any]) -> dict[s
                 folded = text.casefold()
                 if "select vehicle" in folded or folded.count("202") >= 4:
                     continue
-                if all(token in folded for token in identity_tokens) and (
-                    not model_token or model_token in folded
-                ):
+                if _identity_matches_text(text, vehicle):
                     return {
                         "verified": True,
                         "label": text,
@@ -462,8 +495,6 @@ async def _capture_one(
             "reason": "Quick Reference supplied an invalid or non-ALLDATA procedure URL.",
         }
 
-    # Canonical source identity is the strongest duplicate proof and avoids even
-    # re-rendering a known procedure. This is intentionally source-first.
     known_source = dedupe["urls"].get(target_url)
     if known_source is not None:
         return {
@@ -573,8 +604,6 @@ async def _capture_one(
     pdf_path = folder / f"{base}.pdf"
     sidecar_path = folder / f"{base}.source.json"
     if pdf_path.exists() or sidecar_path.exists():
-        # Never overwrite. A filename collision without a URL/hash match is a
-        # review case, not permission to create a numbered duplicate.
         return {
             "status": "possible_duplicate_skipped",
             "duplicate_reason": "destination_filename_already_exists",
