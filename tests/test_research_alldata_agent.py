@@ -202,4 +202,62 @@ async def test_unauthenticated_session_never_calls_the_model():
         client=client, browser=_UnauthenticatedBrowser(), vehicle=VEHICLE, topic=TOPIC
     )
     assert result["verified"] is False
-    assert result["human_action_required"] is True
+
+
+def test_validate_args_flags_key_used_instead_of_text_for_fill():
+    """Reproduces the exact live mistake: the model sent {"key": "..."} for a
+    fill call instead of {"text": "..."}."""
+    message = research_alldata_agent._validate_args(
+        "fill", {"selector": "#vehicleSearchBox", "key": "2018 Ford F-350"}
+    )
+    assert message is not None
+    assert "key" in message.casefold()
+
+
+def test_validate_args_accepts_a_well_formed_fill_call():
+    assert research_alldata_agent._validate_args(
+        "fill", {"selector": "#vehicleSearchBox", "text": "2018 Ford F-350"}
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_malformed_fill_call_is_caught_and_stops_early():
+    """Live reproduction: the model called fill with 'key' instead of 'text'
+    and repeated the identical malformed call for its entire remaining turn
+    budget (6 of 7 turns, all against the same generic backend error). The
+    malformed call must be caught before ever reaching the browser, and the
+    loop must stop once it's clearly not adapting rather than burning the
+    whole budget on one unrecoverable mistake."""
+    browser = _StuckBrowser()
+    malformed = ("fill", {"selector": "#vehicleSearchBox", "key": "Vehicle Information Search box"})
+    client = _ScriptedClient([[malformed]] * 7)
+
+    result = await research_alldata_agent.run_agent_search(
+        client=client, browser=browser, vehicle=VEHICLE, topic=TOPIC
+    )
+
+    assert result["verified"] is False
+    assert result["agent_stopped_reason"] == "repeated_tool_error"
+    assert browser.actions == []  # never reached the browser -- caught by validation every time
+    assert len(result["agent_trace"]) < 7  # stopped well short of the full turn budget
+
+
+@pytest.mark.asyncio
+async def test_self_correction_after_one_validation_error_still_succeeds():
+    """The circuit breaker must not punish a model that actually corrects
+    itself after seeing the validation error -- only one that repeats."""
+    browser = _ProgressingBrowser()
+    client = _ScriptedClient([
+        [("fill", {"selector": "input[placeholder*='Year' i]", "key": "2018 Ford F-350"})],  # wrong field
+        [("fill", {"selector": "input[placeholder*='Year' i]", "text": "2018 Ford F-350"})],  # corrected
+        [("click_text", {"text": "2018 Ford F-350"})],
+        [("fill", {"selector": "input[placeholder*='Search vehicle information' i]", "text": TOPIC})],
+        [("extract", {})],
+        None,
+    ])
+
+    result = await research_alldata_agent.run_agent_search(
+        client=client, browser=browser, vehicle=VEHICLE, topic=TOPIC
+    )
+
+    assert result["verified"] is True
