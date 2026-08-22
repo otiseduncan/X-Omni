@@ -25,6 +25,22 @@ def test_make_fallback_understands_compact_real_world_filenames(tmp_path: Path):
     assert adas_identity_guard.descriptor_make(lexus, adas_mod) == "Lexus"
 
 
+def test_policy_words_after_make_are_not_mistaken_for_model_name():
+    assert adas_identity_guard.explicit_model(
+        "Toyota recycled blind spot monitor module",
+        "Toyota",
+        adas_mod,
+    ) is None
+
+
+def test_adas_system_name_after_make_is_not_mistaken_for_model_name():
+    assert adas_identity_guard.explicit_model(
+        "2024 Subaru EyeSight calibration after collision",
+        "Subaru",
+        adas_mod,
+    ) is None
+
+
 def test_explicit_toyota_filter_drops_hyundai_and_lexus_even_with_compact_filename(
     tmp_path: Path,
     monkeypatch,
