@@ -3,21 +3,24 @@
 ADAS SI OCR is installed at package import so every AdasSI instance—including
 search, Calibration IQ research, and direct document opening—uses the same
 page-level OCR path without a parallel OCR-only service. Explicit manufacturer
-queries are also identity-filtered so cross-make topic matches cannot become
-repair evidence.
+queries are identity-filtered so cross-make topic matches cannot become repair
+evidence, and calibration questions deep-scan every relevant OEM PDF page for
+buried requirement/trigger language.
 
 The post-collision research operator adds licensed ALLDATA/public-OEM research,
 mobile browser handoff, preservation into ADAS SI, and a verified composite
-workflow that records which sources were actually searched. Policy research can
-deep-read later PDF pages/sidebars, while chat presentation stays concise and
-conversation-first. Calibration IQ RO research remains on its existing verified
-operator lane. Final policy and audit guards keep execution truthful and fail
-closed.
+workflow that records which sources were actually searched. Calibration and
+policy research deep-read later PDF pages/sidebars and bounded same-host OEM web
+pages, while chat presentation stays concise and conversation-first. Calibration
+IQ RO research remains on its existing verified operator lane and inherits the
+same deep ADAS PDF search. Final policy and audit guards keep execution truthful
+and fail closed.
 """
 
 from . import adas_si as _adas_si
 from . import adas_ocr as _adas_ocr
 from . import adas_identity_guard as _adas_identity_guard
+from . import adas_calibration_depth as _adas_calibration_depth
 from . import research_operator as _research_operator
 from . import research_capture as _research_capture
 from . import research_setup as _research_setup
@@ -32,6 +35,7 @@ from . import research_route_compat as _research_route_compat
 
 _adas_ocr.install_class(_adas_si.AdasSI)
 _adas_identity_guard.install(_adas_si)
+_adas_calibration_depth.install(_adas_si)
 _research_operator.install()
 _research_route_compat.install()
 _research_vault.install()
