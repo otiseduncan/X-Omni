@@ -151,6 +151,22 @@ tools:
     tier: confirm_required
     description: "Update an ADAS SI annotation record. Version-checked. Requires approval."
 
+  # ---- Post-collision research: setup is passive, operator use is authorized ----
+  research_provider_setup:
+    tier: read_only
+    description: >-
+      Open the secure ALLDATA credential and mobile authentication card in chat.
+      Credentials are sent directly to Core and Windows Credential Manager and
+      never become model arguments or conversation content.
+
+  collision_research:
+    tier: operator_authorized
+    description: >-
+      Perform targeted post-collision research using the licensed ALLDATA browser
+      and public OEM/manufacturer sources. Preserve selected ALLDATA or public OEM
+      evidence into ADAS SI with provenance. Do not bypass CAPTCHA, access controls,
+      subscription limits, or other provider boundaries.
+
   # ---- Calibration IQ: routine operator work is authorized; destructive deletes are gated ----
   calibration_iq_status:
     tier: read_only
