@@ -291,6 +291,12 @@ function AccessCard({ data }) {
   const [session, setSession] = useState(data?.browser_active && data?.session_id ? data : null);
   const [shotNonce, setShotNonce] = useState(Date.now());
   const [manualText, setManualText] = useState("");
+  // Scrolling in a real browser targets whatever is under the cursor, not
+  // the page as a whole -- a picker popup (year/make/model) often renders in
+  // a different spot than the field that opened it. Track the last tapped
+  // point so the Scroll buttons scroll that popup instead of wherever an
+  // earlier, unrelated tap happened to land.
+  const lastPoint = useRef({ x: 640, y: 450 });
 
   async function refreshStatus() {
     const response = await fetch("/api/research/providers/alldata/status", { credentials: "include", cache: "no-store" });
@@ -441,6 +447,7 @@ function AccessCard({ data }) {
               const rect = event.currentTarget.getBoundingClientRect();
               const x = ((event.clientX - rect.left) / rect.width) * 1280;
               const y = ((event.clientY - rect.top) / rect.height) * 900;
+              lastPoint.current = { x, y };
               browserAction({ action: "click", x, y }).catch((error) => setMessage(error.message));
             }}
           />
@@ -449,8 +456,8 @@ function AccessCard({ data }) {
             <button type="button" onClick={sendManualText}>Type</button>
             <button type="button" onClick={() => browserAction({ action: "press", key: "Tab" }).catch((e) => setMessage(e.message))}>Tab</button>
             <button type="button" onClick={() => browserAction({ action: "press", key: "Enter" }).catch((e) => setMessage(e.message))}>Enter</button>
-            <button type="button" onClick={() => browserAction({ action: "scroll", dy: 700 }).catch((e) => setMessage(e.message))}>Scroll ↓</button>
-            <button type="button" onClick={() => browserAction({ action: "scroll", dy: -700 }).catch((e) => setMessage(e.message))}>Scroll ↑</button>
+            <button type="button" onClick={() => browserAction({ action: "scroll", dy: 700, ...lastPoint.current }).catch((e) => setMessage(e.message))}>Scroll ↓</button>
+            <button type="button" onClick={() => browserAction({ action: "scroll", dy: -700, ...lastPoint.current }).catch((e) => setMessage(e.message))}>Scroll ↑</button>
             <button type="button" onClick={() => setShotNonce(Date.now())}><RefreshCw size={12} /> Refresh</button>
           </div>
         </div>

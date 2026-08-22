@@ -429,6 +429,16 @@ class LicensedBrowser:
                 await self._page.keyboard.press(key)
             elif action == "scroll":
                 dy = max(-1800.0, min(float(payload.get("dy") or 0), 1800.0))
+                # A real mouse wheel scrolls whatever is under the cursor, not
+                # the page as a whole. A popup (a year/make/model picker, for
+                # example) commonly renders in a different spot than the
+                # field that opened it; without moving there first, the wheel
+                # event lands wherever an earlier, unrelated click left the
+                # cursor and the popup never scrolls.
+                if "x" in payload and "y" in payload:
+                    x = max(0.0, min(float(payload.get("x") or 0), SCREENSHOT_WIDTH))
+                    y = max(0.0, min(float(payload.get("y") or 0), SCREENSHOT_HEIGHT))
+                    await self._page.mouse.move(x, y)
                 await self._page.mouse.wheel(0, dy)
             elif action == "refresh":
                 await self._page.reload(wait_until="domcontentloaded", timeout=45_000)
