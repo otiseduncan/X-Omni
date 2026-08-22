@@ -99,10 +99,13 @@ BODY_PREFIXES = {"truck", "car", "suv", "crossover", "van"}
 YEAR_RE = re.compile(r"^((?:19|20)\d{2})\s+(.+)$")
 DRIVETRAIN_RE = re.compile(r"\b(AWD|FWD|RWD|4WD|2WD|4X4)\b", re.IGNORECASE)
 PLATFORM_RE = re.compile(r"\(([^()]{1,24})\)")
+# ADAS abbreviations such as BSM/BSD/IPMA/CCM are topic markers, not part of a
+# vehicle model.  Recognizing them here keeps filenames such as
+# "2021 Jeep Cherokee BSM Calibration.pdf" indexed as model=\"Cherokee\".
 TOPIC_RE = re.compile(
-    r"\b(front camera|rear camera|surround view|blind spot|adaptive cruise|"
-    r"lane keep|lane departure|park assist|night vision|radar|lidar|"
-    r"windshield|calibration|alignment|abs|airbag)\b",
+    r"\b(front camera|forward camera|forward facing camera|rear camera|surround view|"
+    r"blind spot|bsm|bsd|eyesight|ipma|ccm|adaptive cruise|lane keep|lane departure|"
+    r"park assist|night vision|radar|lidar|windshield|calibration|alignment|abs|airbag)\b",
     re.IGNORECASE,
 )
 SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
@@ -698,174 +701,123 @@ class AdasSI:
 
     # ---------- pulling a document up in chat ----------
 
-    def relative_of(self, path: Path) -> str:
-        """POSIX-style path relative to the library root, for use in a URL."""
-        try:
-            return path.resolve().relative_to(self.source_root).as_posix()
-        except ValueError:
-            return path.name
-
     def resolve_relative(self, relative: str) -> Path:
-        """Inverse of relative_of, confined to the library. Used by the HTTP
-        route that streams a document, so a crafted path cannot escape."""
-        candidate = (self.source_root / str(relative or "").strip()).resolve()
-        if candidate != self.source_root and self.source_root not in candidate.parents:
-            raise ValueError("Path is outside the ADAS SI library.")
-        if not candidate.is_file():
-            raise ValueError("No such ADAS SI document.")
+        candidate = (self.source_root / str(relative)).resolve()
+        try:
+            candidate.relative_to(self.source_root)
+        except ValueError as exc:
+            raise ValueError("ADAS SI document path escapes the source library.") from exc
+        if not candidate.is_file() or candidate.suffix.lower() != ".pdf":
+            raise ValueError("ADAS SI document does not exist.")
         return candidate
 
-    def _document_ref(self, path: Path, descriptor: dict, page: int = 1) -> dict:
-        relative = self.relative_of(path)
-        return {
-            "title": descriptor.get("title") or path.stem,
-            "source": path.name,
-            "relative_path": relative,
-            # The UI renders this in an inline PDF frame; #page= jumps to the hit.
-            "url": f"/api/adas-si/document?path={quote(relative)}",
-            # Page images are what actually render in chat; the PDF url above
-            # stays available for print/download/copy in a real viewer.
-            "page_url": f"/api/adas-si/page?path={quote(relative)}",
-            "page": int(page or 1),
+    def relative_of(self, path: Path) -> str:
+        return str(Path(path).resolve().relative_to(self.source_root)).replace("\\", "/")
+
+    def open_document(self, args: dict) -> dict[str, Any]:
+        relative = str(args.get("relative_path") or "").strip()
+        page = max(1, int(args.get("page") or 1))
+        if not relative:
+            query = str(args.get("query") or "").strip()
+            if not query:
+                raise ValueError("relative_path or query is required")
+            matches = self.inventory.matching_documents(query, limit=4)
+            if not matches:
+                return {"status": "no_result", "document": None,
+                        "message": "No ADAS SI document matched that request."}
+            chosen = matches[0]
+            path = chosen["path"]
+            alternatives = matches[1:]
+        else:
+            path = self.resolve_relative(relative)
+            alternatives = []
+
+        total = self.page_count(path)
+        if total is not None:
+            page = min(page, max(1, total))
+        descriptor = describe_document(self.source_root, path)
+        rel = self.relative_of(path)
+        doc = {
+            "title": descriptor["title"],
+            "relative_path": rel,
+            "url": f"/api/adas-si/document?path={quote(rel)}",
+            "page_url": f"/api/adas-si/page?path={quote(rel)}",
+            "page": page,
+            "pages_total": total,
+            "renderable": pdfium is not None,
             "vehicle": {
-                k: descriptor.get(k)
+                k: descriptor[k]
                 for k in ("year", "make", "model", "drivetrain", "platform_code", "topic")
                 if descriptor.get(k) is not None
             },
+            "authoritative_path": str(path),
         }
-
-    def open_document(self, args: dict) -> dict[str, Any]:
-        """Resolve a document by name or description and return it for
-        inline display. This is what 'pull up the F-150 front camera doc'
-        should call -- it shows the real PDF rather than describing it."""
-        if not self.available():
-            return {"status": "unavailable", "document": None,
-                    "message": f"The ADAS SI library is not reachable at {self.source_root}."}
-
-        query = str(args.get("document") or args.get("query") or "").strip()
-        if not query:
-            raise ValueError("document is required")
-
-        matches = self.inventory.matching_documents(query, limit=5)
-        if not matches:
-            return {"status": "no_result", "document": None, "query": query,
-                    "message": "No ADAS SI document matched that."}
-
-        best = matches[0]
-        page = int(args.get("page") or 1)
-        ref = self._document_ref(best["path"], best["descriptor"], page)
-
-        pages_total = self.page_count(best["path"])
-        if pages_total is None:
-            try:
-                pages_total = len(self._pages(best["path"]))
-            except Exception:  # noqa: BLE001 - a scanned/broken PDF still displays
-                pages_total = None
-
         return {
-            "status": "success",
-            "query": query,
-            "document": {
-                **ref,
-                "pages_total": pages_total,
-                "renderable": pdfium is not None and best["path"].suffix.lower() == ".pdf",
-            },
+            "status": "success", "document": doc,
             "alternatives": [
-                self._document_ref(m["path"], m["descriptor"]) for m in matches[1:4]
+                {
+                    "title": a["descriptor"]["title"],
+                    "relative_path": self.relative_of(a["path"]),
+                    "url": f"/api/adas-si/document?path={quote(self.relative_of(a['path']))}",
+                }
+                for a in alternatives
             ],
+            "source": "ADAS SI",
         }
 
-    # ---------- direct writes into the library ----------
+    # ---------- direct file operations ----------
 
-    def _resolve_in_library(self, raw: str) -> Path:
-        """Resolve a path and confine it to the ADAS SI tree.
-
-        Full write access inside the library, nothing outside it -- '..'
-        cannot be used to reach the rest of the disk.
-        """
-        candidate = Path(str(raw or "").strip())
-        if not candidate.is_absolute():
-            candidate = self.source_root / candidate
-        resolved = candidate.resolve()
-        if resolved != self.source_root and self.source_root not in resolved.parents:
-            raise ValueError(
-                f"Path is outside the ADAS SI library ({self.source_root}): {resolved}"
-            )
-        return resolved
-
-    def _backup(self, path: Path) -> Optional[str]:
-        """Copy an existing file aside before it is overwritten.
-
-        This is the one rail kept on library writes. It does not block the
-        write -- it makes the write reversible, so a bad edit to an
-        authoritative document is recoverable rather than final.
-        """
-        if not path.is_file():
+    def _backup(self, path: Path) -> Optional[Path]:
+        """Back up an existing original before overwrite/delete."""
+        if not path.exists():
             return None
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        backup_dir = self.source_root / BACKUP_DIRNAME
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        target = backup_dir / f"{path.stem}.{stamp}{path.suffix}.bak"
+        rel = path.resolve().relative_to(self.source_root)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = self.source_root / BACKUP_DIRNAME / f"{stamp}-{rel.name}"
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(path.read_bytes())
-        return str(target)
+        return target
 
-    def file_write(self, args: dict, user: Optional[dict] = None) -> dict[str, Any]:
-        """Create or overwrite a file inside the ADAS SI library."""
-        if not self.available():
-            return {"status": "unavailable", "executed": False,
-                    "message": f"The ADAS SI library is not reachable at {self.source_root}."}
-
-        path = self._resolve_in_library(args.get("path"))
+    def write_file(self, args: dict, user: Optional[dict] = None) -> dict[str, Any]:
+        relative = str(args.get("relative_path") or "").strip().replace("\\", "/")
+        if not relative:
+            raise ValueError("relative_path is required")
+        target = (self.source_root / relative).resolve()
+        try:
+            target.relative_to(self.source_root)
+        except ValueError as exc:
+            raise ValueError("ADAS SI write path escapes the source library") from exc
+        if target.suffix.lower() != ".pdf":
+            raise ValueError("ADAS SI write only accepts PDF files")
         content = args.get("content")
-        if content is None:
-            raise ValueError("content is required")
-
-        existed = path.is_file()
-        backup = self._backup(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = str(content).encode("utf-8")
-        path.write_bytes(data)
-
-        # A changed file must not be served from stale extracted text.
-        if path.suffix.lower() == ".pdf":
-            try:
-                with sqlite3.connect(self.cache_path) as db:
-                    db.execute("DELETE FROM pages WHERE path=?", (str(path),))
-            except sqlite3.Error:
-                pass
-        self.inventory._cache = None  # force a re-walk on next search
-
+        if isinstance(content, str):
+            data = content.encode("utf-8")
+        elif isinstance(content, (bytes, bytearray)):
+            data = bytes(content)
+        else:
+            raise ValueError("content must be bytes or string")
+        backup = self._backup(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        self.inventory._cache = None
         return {
-            "status": "success",
-            "executed": True,
+            "status": "success", "executed": True,
             "receipt": {
-                "operation": "overwrite" if existed else "create",
-                "path": str(path),
-                "bytes": len(data),
+                "operation": "write", "relative_path": self.relative_of(target),
+                "bytes": len(data), "backup": self.relative_of(backup) if backup else None,
                 "sha256": hashlib.sha256(data).hexdigest(),
-                "backup_path": backup,
-                "overwrote_existing": existed,
             },
-            "message": (
-                f"Overwrote {path.name}. Previous version saved to {backup}."
-                if backup else f"Created {path.name}."
-            ),
         }
 
-    def record_list(self, _args: dict | None = None) -> dict[str, Any]:
-        if not self.managed_root.is_dir():
-            return {"status": "success", "records": [], "managed_path": str(self.managed_root)}
-        records = []
-        for f in sorted(self.managed_root.glob("*.json")):
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                records.append({
-                    "record_id": data.get("record_id", f.stem),
-                    "title": data.get("title"),
-                    "version": data.get("version"),
-                    "updated_at": data.get("updated_at"),
-                })
-            except (OSError, ValueError):
-                continue
-        return {"status": "success", "records": records,
-                "managed_path": str(self.managed_root)}
+    def delete_file(self, args: dict, user: Optional[dict] = None) -> dict[str, Any]:
+        path = self.resolve_relative(args.get("relative_path"))
+        backup = self._backup(path)
+        path.unlink()
+        self.inventory._cache = None
+        return {
+            "status": "success", "executed": True,
+            "receipt": {
+                "operation": "delete", "relative_path": str(args.get("relative_path")),
+                "backup": self.relative_of(backup) if backup else None,
+            },
+        }
