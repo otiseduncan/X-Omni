@@ -19,6 +19,12 @@ def test_explicit_local_only_calibration_question_stays_local():
     ) is False
 
 
+def test_what_does_adas_si_say_stays_scoped_to_adas_si():
+    assert research_workflow.full_research_request(
+        "What does ADAS SI say about calibrating EyeSight on a 2025 Subaru Outback?"
+    ) is False
+
+
 def test_calibration_iq_ro_research_still_uses_existing_operator_lane():
     assert research_workflow.full_research_request(
         "For Calibration IQ RO 2400911667, research the camera calibration and attach OEM evidence."
