@@ -18,6 +18,7 @@ import threading
 from typing import Any, Optional
 
 from . import research_operator as ro
+from . import research_verification
 from . import research_workflow
 
 _INSTALL_LOCK = threading.Lock()
@@ -291,6 +292,66 @@ async def _click_vehicle_result(page: Any, vehicle: dict[str, Any]) -> str | Non
         return None
 
 
+async def _current_vehicle_label(page: Any) -> str:
+    """Best-effort read of a *bounded* "currently selected vehicle" signal.
+
+    Deliberately narrow: this only trusts text sitting next to a vehicle
+    change/context control, never the whole page body. The vehicle picker
+    itself lists every year in its dropdown and a Recent Vehicles panel that
+    can easily contain a stray year/make combination, so a body-wide
+    substring match can be satisfied by the picker screen itself -- which is
+    exactly how a request could report "vehicle selected" while still sitting
+    on Select Vehicle. A bounded signal (or none at all) is the only thing
+    this function will vouch for; callers must fail closed otherwise.
+    """
+    for pattern in (r"Change\s+Vehicle", r"Selected\s+Vehicle", r"Current\s+Vehicle"):
+        try:
+            control = page.get_by_text(re.compile(pattern, re.IGNORECASE)).first
+            if not await _visible(control, timeout=350):
+                continue
+            text = ""
+            try:
+                container = control.locator("xpath=..")
+                text = " ".join((await container.inner_text(timeout=800)).split())
+            except Exception:
+                pass
+            if not text:
+                try:
+                    text = " ".join((await control.inner_text(timeout=800)).split())
+                except Exception:
+                    text = ""
+            if text:
+                return text
+        except Exception:
+            continue
+    # A page title is a much smaller, bounded surface than the full body --
+    # in a vehicle-scoped SPA it conventionally reflects the active context,
+    # and is very unlikely to coincidentally contain a year AND a make unless
+    # the page is actually about that vehicle.
+    try:
+        return " ".join((await page.title()).split())
+    except Exception:
+        return ""
+
+
+async def _confirms_identity(label_text: str, vehicle: dict[str, Any]) -> bool:
+    folded = label_text.casefold()
+    identity_tokens = [
+        str(vehicle.get(key) or "").casefold()
+        for key in ("year", "make")
+        if vehicle.get(key)
+    ]
+    if not identity_tokens:
+        return False
+    model_token = next(
+        (token.casefold() for token in str(vehicle.get("model_trim") or "").split() if len(token) >= 3),
+        "",
+    )
+    return all(token in folded for token in identity_tokens) and (
+        not model_token or model_token in folded
+    )
+
+
 async def _select_vehicle(page: Any, vehicle: dict[str, Any]) -> dict[str, Any]:
     label = str(vehicle.get("label") or "").strip()
     if not label:
@@ -299,23 +360,17 @@ async def _select_vehicle(page: Any, vehicle: dict[str, Any]) -> dict[str, Any]:
             "reason": "The research query did not contain enough vehicle identity for ALLDATA vehicle selection.",
         }
 
-    try:
-        body = " ".join((await page.locator("body").inner_text(timeout=5_000)).split()).casefold()
-    except Exception:
-        body = ""
-    identity_tokens = [
-        str(vehicle.get(key) or "").casefold()
-        for key in ("year", "make")
-        if vehicle.get(key)
-    ]
-    model_token = next(
-        (token.casefold() for token in str(vehicle.get("model_trim") or "").split() if len(token) >= 3),
-        "",
-    )
-    if identity_tokens and all(token in body for token in identity_tokens) and (
-        not model_token or model_token in body
-    ):
-        return {"selected": True, "vehicle_query": label, "already_selected": True}
+    # Only a bounded "current vehicle" signal is trusted for the already-
+    # selected fast path -- never the raw page body, which the Select
+    # Vehicle picker itself can satisfy by coincidence (see docstring above).
+    current_label = await _current_vehicle_label(page)
+    if await _confirms_identity(current_label, vehicle):
+        return {
+            "selected": True,
+            "vehicle_query": label,
+            "already_selected": True,
+            "confirmed_via": current_label[:200],
+        }
 
     box = await _vehicle_box(page)
     if box is None:
@@ -335,24 +390,38 @@ async def _select_vehicle(page: Any, vehicle: dict[str, Any]) -> dict[str, Any]:
         }
 
     selected_text = await _click_vehicle_result(page, vehicle)
-    if not selected_text:
-        try:
-            await box.press("Enter")
-            await asyncio.sleep(0.8)
-        except Exception:
-            pass
-        try:
-            current = " ".join((await page.locator("body").inner_text(timeout=5_000)).split()).casefold()
-        except Exception:
-            current = ""
-        if not all(token in current for token in identity_tokens):
-            return {
-                "selected": False,
-                "vehicle_query": label,
-                "reason": "ALLDATA did not expose a selectable result for the requested vehicle.",
-            }
-        selected_text = label
-    return {"selected": True, "vehicle_query": label, "selected_result": selected_text}
+    if selected_text:
+        # _click_vehicle_result only clicks a candidate whose OWN text already
+        # contained the identity tokens (see its scoring above) -- that is
+        # itself a bounded confirmation, scoped to one element rather than
+        # the whole page, so no further body-wide check is needed here.
+        return {"selected": True, "vehicle_query": label, "selected_result": selected_text}
+
+    # No candidate could be scored and clicked -- the only option left is a
+    # blind Enter keypress, which carries no bounded evidence of its own.
+    # Confirm against a bounded post-entry signal before trusting it; never
+    # fall back to a whole-body substring match, which is what let a session
+    # sitting on the raw Select Vehicle picker (whose year dropdown lists
+    # every year and whose Recent Vehicles panel can list any prior make)
+    # report a vehicle as selected when it never was.
+    try:
+        await box.press("Enter")
+        await asyncio.sleep(0.8)
+    except Exception:
+        pass
+    current_label = await _current_vehicle_label(page)
+    if await _confirms_identity(current_label, vehicle):
+        return {
+            "selected": True,
+            "vehicle_query": label,
+            "selected_result": label,
+            "confirmed_via": current_label[:200],
+        }
+    return {
+        "selected": False,
+        "vehicle_query": label,
+        "reason": "ALLDATA did not expose a selectable result for the requested vehicle, and no bounded selection signal confirmed it after entry.",
+    }
 
 
 async def _information_box(page: Any) -> Any | None:
@@ -542,10 +611,23 @@ async def search_alldata_vehicle_first(browser: Any, query: str) -> dict[str, An
             "url": str(page.url)[: ro.MAX_URL_CHARS],
         }
 
+    claim = research_verification.evaluate_alldata_claim(
+        vehicle=vehicle,
+        vehicle_state=vehicle_state,
+        query_submitted=True,
+        matched_terms=best.get("matched_terms") or [],
+        relevance_score=int(best.get("relevance_score") or 0),
+        result_page_text=best.get("page_text") or "",
+    )
     return {
         "attempted": True,
         "searched": True,
-        "verified": bool(ro._is_alldata_url(page.url)),
+        # "verified" is decided by research_verification.evaluate_alldata_claim,
+        # never by whether the browser is merely still on an alldata.com URL --
+        # domain presence proves the session is authenticated, not that the
+        # requested vehicle/topic was actually researched.
+        "verified": claim["verified"],
+        "verification_reason": claim["reason"],
         "query_submitted": True,
         "query": best.get("query"),
         "vehicle": vehicle,

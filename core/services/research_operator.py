@@ -528,6 +528,28 @@ class LicensedBrowser:
         assert self._page is not None
         if not _is_alldata_url(self._page.url):
             raise ValueError("Only an active ALLDATA page can be captured through this action.")
+
+        # Acquisition into ADAS SI is the highest-consequence step in this whole
+        # pipeline -- it becomes the answer for every future query about this
+        # vehicle. Whatever upstream navigation path produced this page
+        # (deterministic search or the model-driven agent loop), independently
+        # re-confirm the claimed vehicle here, against the live page, through the
+        # same bounded signal research_verification relies on elsewhere. Never
+        # trust the caller-supplied vehicle label on its own.
+        vehicle_label_arg = str(args.get("vehicle") or "").strip()
+        if vehicle_label_arg:
+            from . import research_alldata_navigation as nav
+
+            parsed_vehicle = nav.vehicle_from_query(vehicle_label_arg)
+            if parsed_vehicle.get("year") and parsed_vehicle.get("make"):
+                current_label = await nav._current_vehicle_label(self._page)  # noqa: SLF001
+                if not await nav._confirms_identity(current_label, parsed_vehicle):  # noqa: SLF001
+                    raise ValueError(
+                        f"Refusing to preserve this page as '{vehicle_label_arg}': the current "
+                        "ALLDATA page does not confirm that vehicle through a bounded selection "
+                        "signal. Select the exact vehicle before capturing."
+                    )
+
         vehicle = _safe_filename(args.get("vehicle") or "Vehicle")
         topic = _safe_filename(args.get("topic") or self._page.title() or "Research")
         folder = self.adas.source_root / "Acquired" / "ALLDATA"
@@ -846,7 +868,13 @@ def install() -> None:
                     "session without exposing credentials; capture_to_adas to preserve a targeted "
                     "licensed source in ADAS SI; public_search/public_read for official OEM collision "
                     "sites, position statements, technical articles, and manufacturer publications "
-                    "when local ADAS SI or ALLDATA does not answer the question. Never bypass access "
+                    "when local ADAS SI or ALLDATA does not answer the question. ALLDATA is "
+                    "vehicle-first: snapshot to see the current page, select the exact requested "
+                    "vehicle (Year/Make/Model or VIN, then click the matching result) before any "
+                    "search result can be considered relevant, then search Vehicle Information for "
+                    "the topic, open the best result, and extract. A vehicle must actually be "
+                    "selected -- confirmed by what a tool result shows, not assumed -- before "
+                    "treating any found text as belonging to that vehicle. Never bypass access "
                     "controls or CAPTCHA."
                 ),
                 "parameters": {

@@ -11,13 +11,19 @@ The post-collision research operator adds licensed ALLDATA/public-OEM research,
 mobile browser handoff, preservation into ADAS SI, and a verified composite
 workflow that records which sources were actually searched. Ordinary calibration
 questions automatically enter that deep lane unless explicitly local-only.
-Provider and procedure follow-ups retain the prior vehicle/system context.
-ALLDATA research follows the documented vehicle-first Repair/Collision workflow,
-with direct Repair entry, Change/New Vehicle handling, YYME/VIN vehicle selection,
-Vehicle Information Search, and ADAS calibration/reset terminology expansion.
+ALLDATA research follows the documented vehicle-first Repair/Collision workflow;
+when a live model client is available it drives that workflow turn-by-turn
+through the same collision_research tool actions available in ordinary chat
+(research_alldata_agent), falling back to a fixed navigation sequence otherwise.
+Either way, "verified" is decided once, centrally, by research_verification --
+never by whether the browser merely stayed on an alldata.com URL. A persistent
+ResearchTask (research_task/research_task_continuity) carries vehicle/subject
+continuity across follow-ups generically, from message shape and parsed vehicle
+identity, rather than an enumerated table of follow-up phrasings.
 When an exact calibration/reset procedure is missing locally and ALLDATA produces
 a verified exact-vehicle procedure, that source is acquired into ADAS SI with
-URL-based deduplication. Calibration and policy research deep-read later PDF
+URL-based deduplication and a second, independent vehicle-identity check at the
+moment of capture. Calibration and policy research deep-read later PDF
 pages/sidebars and bounded same-host OEM web pages, while chat presentation stays
 concise and conversation-first. Calibration IQ RO research remains on its existing
 verified operator lane and inherits the same exact-vehicle deep ADAS PDF search.
@@ -40,8 +46,7 @@ from . import research_alldata_navigation as _research_alldata_navigation
 from . import research_alldata_contract as _research_alldata_contract
 from . import research_alldata_terms as _research_alldata_terms
 from . import research_auto_acquire as _research_auto_acquire
-from . import research_followup as _research_followup
-from . import research_procedure_followup as _research_procedure_followup
+from . import research_task_continuity as _research_task_continuity
 from . import research_policy_depth as _research_policy_depth
 from . import research_policy_compat as _research_policy_compat
 from . import research_conversation as _research_conversation
@@ -65,10 +70,9 @@ _research_alldata_navigation.install()
 _research_alldata_contract.install()
 _research_alldata_terms.install()
 _research_auto_acquire.install()
-_research_followup.install()
-_research_procedure_followup.install()
+_research_conversation.install()
+_research_task_continuity.install()
 _research_policy_depth.install()
 _research_policy_compat.install()
-_research_conversation.install()
 _research_truth.install()
 _research_policy.install()
