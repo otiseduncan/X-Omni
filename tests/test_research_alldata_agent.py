@@ -204,14 +204,16 @@ async def test_unauthenticated_session_never_calls_the_model():
     assert result["verified"] is False
 
 
-def test_validate_args_flags_key_used_instead_of_text_for_fill():
-    """Reproduces the exact live mistake: the model sent {"key": "..."} for a
-    fill call instead of {"text": "..."}."""
+def test_validate_args_flags_keyboard_key_used_instead_of_text_for_fill():
+    """First live reproduction, before the field rename: the model sent
+    {"key": "..."} for a fill call instead of {"text": "..."}. After the field
+    was renamed to keyboard_key to remove the naming collision, the equivalent
+    confusion is sending the real value in keyboard_key instead of text."""
     message = research_alldata_agent._validate_args(
-        "fill", {"selector": "#vehicleSearchBox", "key": "2018 Ford F-350"}
+        "fill", {"selector": "#vehicleSearchBox", "keyboard_key": "2018 Ford F-350"}
     )
     assert message is not None
-    assert "key" in message.casefold()
+    assert "keyboard_key" in message
 
 
 def test_validate_args_accepts_a_well_formed_fill_call():
@@ -222,14 +224,14 @@ def test_validate_args_accepts_a_well_formed_fill_call():
 
 @pytest.mark.asyncio
 async def test_repeated_malformed_fill_call_is_caught_and_stops_early():
-    """Live reproduction: the model called fill with 'key' instead of 'text'
-    and repeated the identical malformed call for its entire remaining turn
-    budget (6 of 7 turns, all against the same generic backend error). The
-    malformed call must be caught before ever reaching the browser, and the
-    loop must stop once it's clearly not adapting rather than burning the
-    whole budget on one unrecoverable mistake."""
+    """Second live reproduction (after the key -> keyboard_key rename): the
+    model called fill with {"keyboard_key": "text"} -- literally putting the
+    word "text" as a value rather than switching to the text field -- and
+    repeated that exact malformed call. The malformed call must be caught
+    before ever reaching the browser, and the loop must stop once it's
+    clearly not adapting rather than burning the whole turn budget."""
     browser = _StuckBrowser()
-    malformed = ("fill", {"selector": "#vehicleSearchBox", "key": "Vehicle Information Search box"})
+    malformed = ("fill", {"selector": "#vehicle-search-input", "keyboard_key": "text"})
     client = _ScriptedClient([[malformed]] * 7)
 
     result = await research_alldata_agent.run_agent_search(
@@ -248,7 +250,7 @@ async def test_self_correction_after_one_validation_error_still_succeeds():
     itself after seeing the validation error -- only one that repeats."""
     browser = _ProgressingBrowser()
     client = _ScriptedClient([
-        [("fill", {"selector": "input[placeholder*='Year' i]", "key": "2018 Ford F-350"})],  # wrong field
+        [("fill", {"selector": "input[placeholder*='Year' i]", "keyboard_key": "2018 Ford F-350"})],  # wrong field
         [("fill", {"selector": "input[placeholder*='Year' i]", "text": "2018 Ford F-350"})],  # corrected
         [("click_text", {"text": "2018 Ford F-350"})],
         [("fill", {"selector": "input[placeholder*='Search vehicle information' i]", "text": TOPIC})],
@@ -261,3 +263,30 @@ async def test_self_correction_after_one_validation_error_still_succeeds():
     )
 
     assert result["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_press_keyboard_key_is_translated_to_key_for_the_operator():
+    """research_operator.py's operator_action still expects "key" for press --
+    keyboard_key exists only in this loop's schema. Confirm the translation
+    actually happens rather than silently dropping the value."""
+    received: list[dict] = []
+
+    class _RecordingBrowser:
+        _page = _FakePage(title="ALLDATA - Home", body="", url="https://my.alldata.com/#/home")
+
+        async def start(self, auto_login=True):  # noqa: ARG002
+            return {"authenticated": True}
+
+        async def operator_action(self, args):
+            received.append(dict(args))
+            return {"url": self._page.url, "title": self._page._title}
+
+    client = _ScriptedClient([[("press", {"keyboard_key": "Enter"})], None])
+    await research_alldata_agent.run_agent_search(
+        client=client, browser=_RecordingBrowser(), vehicle=VEHICLE, topic=TOPIC
+    )
+
+    assert received, "operator_action was never called"
+    assert received[0]["key"] == "Enter"
+    assert "keyboard_key" not in received[0]
