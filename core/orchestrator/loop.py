@@ -2053,6 +2053,12 @@ class Orchestrator:
                 yield approved_event
 
         paused = False
+        # Same-turn fingerprint cache for read_only tool calls: a model can
+        # (and, observed live, did) request the identical read-only tool with
+        # identical arguments several times in one turn. Only the first
+        # invocation touches the handler; later identical requests reuse that
+        # result instead of re-running it and re-rendering its card.
+        read_only_call_cache: dict[tuple[str, str], Any] = {}
         for round_index in range(MAX_TOOL_ROUNDS):
             tool_calls: list[dict] = []
             round_text = ""
@@ -2159,6 +2165,7 @@ class Orchestrator:
                     conversation_id=conversation_id,
                     approval_context=approval_context,
                     call_id=call_id,
+                    call_cache=read_only_call_cache,
                 ):
                     if ev["type"] == "approval":
                         paused = True
@@ -2279,6 +2286,7 @@ class Orchestrator:
         conversation_id: int,
         approval_context: Optional[dict],
         call_id: str = "call_0",
+        call_cache: Optional[dict[tuple[str, str], Any]] = None,
     ) -> AsyncIterator[dict]:
         yield {"type": "tool_start", "name": name, "args": args}
 
@@ -2292,6 +2300,28 @@ class Orchestrator:
                     "content": json.dumps(projected, default=str)[:12000],
                 }
             )
+
+        dedupe_key: Optional[tuple[str, str]] = None
+        tier_fn = getattr(self.registry, "tier", None)
+        if call_cache is not None and callable(tier_fn) and tier_fn(name) == "read_only":
+            try:
+                canonical_args = json.dumps(args, sort_keys=True, default=str)
+            except TypeError:
+                canonical_args = repr(args)
+            dedupe_key = (name, canonical_args)
+            if dedupe_key in call_cache:
+                cached_result = call_cache[dedupe_key]
+                feed(cached_result)
+                yield {
+                    "type": "tool_result",
+                    "name": name,
+                    "result": cached_result,
+                    "deduplicated": True,
+                }
+                # The first call already rendered this result's card; a
+                # verbatim repeat within the same turn must not render it
+                # again.
+                return
 
         try:
             result = await self.registry.invoke(
@@ -2414,6 +2444,8 @@ class Orchestrator:
             else result
         )
         yield {"type": "tool_result", "name": name, "result": event_result}
+        if dedupe_key is not None and call_cache is not None:
+            call_cache[dedupe_key] = result
 
         card_type = artifact_type_for_tool(name, result)
         if card_type and isinstance(result, dict):

@@ -173,6 +173,90 @@ def test_week_summary_names_each_ro_that_needs_si():
     assert "added/reactivated 1" in text
 
 
+def test_describing_the_already_open_vehicle_does_not_replay_the_login_card():
+    # Field trace: "download the adas si for the 2022 nissan altima that's
+    # open in alldata" was re-triggering the login card because "open" fell
+    # within 50 characters of "alldata" -- even though the user was
+    # describing an already-open vehicle, not asking to log in.
+    assert prep.classify_request(
+        "down load the adas si for the 2022 nissan altima thats open in alldata"
+    ) != "alldata_access"
+    # An actual login/open command must still route normally.
+    assert prep.classify_request("open alldata") == "alldata_access"
+    assert prep.classify_request("open the alldata browser") == "alldata_access"
+    assert prep.classify_request("log in to ALLDATA") == "alldata_access"
+
+
+def test_descriptive_open_state_falls_through_to_continuation_when_stage_active():
+    history = [_alldata_login_turn()]
+    assert prep.classify_request(
+        "down load the adas si for the 2022 nissan altima thats open in alldata",
+        history,
+    ) == "quick_reference"
+
+
+def _alldata_login_turn():
+    return {
+        "role": "assistant",
+        "artifacts": [{
+            "type": "work_prep_state",
+            "data": {"mode": "ciq_si_preparation", "stage": "awaiting_vehicle_selection"},
+        }],
+    }
+
+
+def test_bare_followup_without_active_stage_does_not_route_to_quick_reference():
+    # Case A precondition: with no active ALLDATA stage recorded, a message
+    # that names none of ALLDATA/quick reference/RO stays unclassified so it
+    # falls through to ordinary model tool choice, not a guessed collector.
+    assert prep.classify_request("retrieve SI information please") is None
+    assert prep.classify_request("retrieve SI information please", []) is None
+
+
+def test_low_specificity_followup_after_alldata_login_resolves_to_quick_reference():
+    # Case B: once "log in to ALLDATA" has run, a natural continuation that
+    # names no ALLDATA/quick-reference/RO wording of its own must still route
+    # to the collector so the already-selected vehicle resolves automatically.
+    history = [_alldata_login_turn()]
+    for text in (
+        "retrieve SI information please",
+        "Get the information.",
+        "Go ahead.",
+        "Pull it.",
+        "Do this one.",
+        "Okay, selected.",
+        "Ready.",
+    ):
+        assert prep.classify_request(text, history) == "quick_reference", text
+
+
+def test_unrelated_short_message_after_alldata_login_is_not_swept_in():
+    # A bare "yes"/"ok" or an unrelated short message must not be treated as
+    # an ALLDATA continuation just because a login happened recently -- it
+    # could be answering something else entirely (e.g. a calendar prompt).
+    history = [_alldata_login_turn()]
+    for text in ("yes", "ok", "what's the weather", "how many are in Macon"):
+        assert prep.classify_request(text, history) != "quick_reference", text
+
+
+def test_stage_falls_outside_lookback_window_stops_being_active():
+    history = [_alldata_login_turn()] + [
+        {"role": "assistant", "artifacts": []} for _ in range(10)
+    ]
+    assert prep.classify_request("retrieve SI information please", history) is None
+
+
+def test_completed_stage_does_not_keep_absorbing_later_short_messages():
+    history = [{
+        "role": "assistant",
+        "artifacts": [{
+            "type": "work_prep_state",
+            "data": {"mode": "ciq_si_preparation", "stage": "complete"},
+        }],
+    }]
+    assert prep.classify_request("retrieve SI information please", history) is None
+
+
 def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
     schema = registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]
     assert set(schema["parameters"]["properties"]["mode"]["enum"]) == {
