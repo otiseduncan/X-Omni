@@ -86,3 +86,55 @@ def test_a_fully_unrelated_new_request_is_not_treated_as_a_continuation():
     assert research_task_continuity.looks_like_continuation(
         "what's the weather like this weekend"
     ) is False
+
+
+def test_a_bare_adas_si_search_records_a_task(tmp_path: Path, monkeypatch):
+    """Reported bug: a question that never reaches full_research (e.g. it
+    misses the calibration-intent classifier, or is answered purely from
+    local ADAS SI) left the task store untouched, so a later "check ALLDATA
+    for it" merged against whatever task happened to already be there."""
+    store = research_task.ResearchTaskStore(tmp_path / "research_tasks.json")
+    monkeypatch.setattr(research_task, "get_store", lambda root: store)  # noqa: ARG005
+
+    research_task_continuity._record_adas_only_task(
+        "conv-1", "2019 Ford F150 360 camera calibration procedure", 0, 3
+    )
+
+    loaded = store.get("conv-1")
+    assert loaded is not None
+    assert loaded.vehicle_make == "Ford"
+    assert loaded.vehicle_year == "2019"
+    assert loaded.local_status == "missing"
+    assert loaded.alldata_status == "not_started"
+
+
+def test_a_new_vehicles_bare_search_overwrites_a_stale_different_vehicle_task(
+    tmp_path: Path, monkeypatch
+):
+    """Reproduces the exact reported mix-up: an earlier Hyundai Palisade task
+    was still active when a 2019 Ford F-150 question came in and missed
+    locally. Without recording that F-150 turn, "check ALLDATA for it" would
+    merge against the stale Hyundai task and answer about the wrong vehicle
+    entirely -- which is what was actually observed."""
+    store = research_task.ResearchTaskStore(tmp_path / "research_tasks.json")
+    monkeypatch.setattr(research_task, "get_store", lambda root: store)  # noqa: ARG005
+    store.save(research_task.ResearchTask(
+        conversation_id="conv-1",
+        vehicle_year="2024", vehicle_make="Hyundai", vehicle_label="2024 Hyundai Palisade",
+        subject="blind spot radar calibration after replacement",
+        alldata_status="searched_unverified",
+        turn_count_at_update=1,
+    ))
+
+    research_task_continuity._record_adas_only_task(
+        "conv-1", "2019 Ford F150 360 camera calibration procedure", 0, 3
+    )
+
+    task = store.get("conv-1")
+    resolved = research_task_continuity.merge_active_task("check all data", task, current_turn_count=3)
+
+    assert task.vehicle_make == "Ford"
+    assert "Ford" in resolved
+    assert "2019" in resolved
+    assert "Hyundai" not in resolved
+    assert "Palisade" not in resolved
