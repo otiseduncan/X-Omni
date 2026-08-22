@@ -19,9 +19,11 @@ from . import research_capture as _research_capture
 from . import research_setup as _research_setup
 from . import research_vault as _research_vault
 from . import research_policy as _research_policy
+from . import research_route_compat as _research_route_compat
 
 _adas_ocr.install_class(_adas_si.AdasSI)
 _research_operator.install()
+_research_route_compat.install()
 _research_vault.install()
 _research_capture.install()
 _research_setup.install()
