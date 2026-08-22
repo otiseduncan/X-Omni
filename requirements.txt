@@ -14,3 +14,7 @@ pypdfium2>=4.30
 # Text extraction for source-backed OEM page evidence. PDFium remains the
 # runtime fallback, but pypdf handles ordinary embedded text more faithfully.
 pypdf>=6,<7
+# Local OCR for scan-only/mixed OEM PDFs. RapidOCR runs through ONNX Runtime
+# on CPU so reading documents cannot evict or starve X's 30B GPU worker.
+rapidocr>=3.9,<4
+onnxruntime>=1.28,<2
