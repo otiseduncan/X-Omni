@@ -51,14 +51,23 @@ def install() -> None:
                 text = str(message or "").strip()
                 if not text:
                     return False
-                if previous(message):
-                    return True
+
+                # Explicit source boundaries outrank every broader matcher.
+                # The underlying collision-research matcher treats words such
+                # as "check" + "ADAS SI" as research intent, so calling it
+                # first would incorrectly widen "Check ADAS SI only" into an
+                # ALLDATA/public-OEM search. Honor the user's scope before
+                # delegating to any older/broader research matcher.
                 if (
                     _CIQ_RE.search(text)
                     or _LOCAL_ONLY_RE.search(text)
                     or _EXPLICIT_ADAS_SCOPE_RE.search(text)
                 ):
                     return False
+
+                if previous(message):
+                    return True
+
                 return bool(
                     adas_calibration_depth.calibration_intent(text)
                     and _QUESTION_OR_RESEARCH_RE.search(text)
