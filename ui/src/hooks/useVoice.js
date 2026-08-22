@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { toSpeechText } from "../lib/speechText.js";
+
 /**
  * Voice I/O with two selectable speech-to-text engines.
  *
@@ -287,8 +289,10 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
   const speak = useCallback(
     (text) => {
       if (!text || typeof window.speechSynthesis === "undefined") return;
+      const spoken = toSpeechText(text);
+      if (!spoken) return;
       window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text.slice(0, 4000));
+      const utter = new SpeechSynthesisUtterance(spoken.slice(0, 4000));
       const chosen = voices.find((v) => v.name === voiceName);
       if (chosen) {
         utter.voice = chosen;
