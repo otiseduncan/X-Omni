@@ -134,3 +134,41 @@ async def test_full_workflow_emits_three_lane_source_ledger(monkeypatch):
     ]
     assert all(row["verified"] is True for row in result["source_ledger"])
     assert result["adas_si"]["hits"][0]["vehicle"]["make"] == "Toyota"
+
+
+@pytest.mark.asyncio
+async def test_ledger_surfaces_verification_reason_when_a_result_was_found_but_not_trusted(monkeypatch):
+    """A run that got as far as a result (past vehicle selection, past
+    submitting a query) but failed evaluate_alldata_claim()'s checks sets
+    verification_reason, not reason -- the ledger (and therefore the chat UI)
+    must not silently drop that explanation."""
+    class FakeAdas:
+        def search(self, args):  # noqa: ARG002
+            return {"status": "no_result", "results": []}
+
+    async def fake_alldata(_browser, _query):
+        return {
+            "attempted": True,
+            "searched": True,
+            "verified": False,
+            "verification_reason": "The result page no longer carries the requested vehicle's identity.",
+            "query_submitted": True,
+            "vehicle": {"label": "2019 Ford F-150"},
+        }
+
+    async def fake_public(_query, _make):
+        return {"searched": False, "verified": False, "sources": [], "read_results": [], "result_count": 0}
+
+    monkeypatch.setattr(research_workflow, "search_alldata", fake_alldata)
+    monkeypatch.setattr(research_workflow, "search_public_oem", fake_public)
+    result = await research_workflow.full_research(
+        {"query": "2019 Ford F-150 360 camera calibration procedure", "preserve": False},
+        adas=FakeAdas(),
+        browser=SimpleNamespace(),
+    )
+
+    alldata_row = next(row for row in result["source_ledger"] if row["source"] == "ALLDATA")
+    assert alldata_row["verified"] is False
+    assert alldata_row["reason"] == "The result page no longer carries the requested vehicle's identity."
+    assert "not verified as searched" in research_workflow.fixed_summary(result)
+    assert "identity" in research_workflow.fixed_summary(result).casefold()
