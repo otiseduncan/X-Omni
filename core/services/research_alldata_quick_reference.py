@@ -698,6 +698,278 @@ async def _capture_one(
     }
 
 
+async def read_selected_alldata_vehicle(page: Any) -> dict[str, Any]:
+    """Best-effort direct read of whatever vehicle is currently selected in
+    ALLDATA -- independent of any Calibration IQ repair order. Used by the
+    general-reference collection path, where the tech has picked a vehicle
+    that may not have a repair order yet.
+    """
+    label = await nav._current_vehicle_label(page)  # noqa: SLF001
+    if not label:
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+        label = " ".join(str(title or "").split())
+    vehicle = nav.vehicle_from_query(label)
+    if not (vehicle.get("year") and vehicle.get("make") and vehicle.get("model_trim")):
+        return {}
+    return vehicle
+
+
+async def _collect_for_vehicle(
+    *,
+    adas: Any,
+    browser: Any,
+    vehicle: dict[str, Any],
+    vehicle_label: str,
+    max_documents: int,
+    delay_seconds: float,
+) -> dict[str, Any]:
+    """Shared ADAS Quick Reference capture core.
+
+    Used both by the RO-scoped collector (vehicle identity proven from a
+    Calibration IQ repair order) and the general-reference collector
+    (vehicle identity read directly from the currently selected ALLDATA
+    vehicle, with no repair order involved). Returns `links`/`results` for
+    the caller to build its own manifest from, since only the caller knows
+    whether a repair order is part of that manifest.
+    """
+    state = await browser.start(auto_login=False)
+    if not state.get("authenticated"):
+        return {
+            "status": "human_action_required",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "vehicle": vehicle_label,
+            "message": "Open the ALLDATA session and sign in, then select this vehicle.",
+            "provider_status": state,
+        }
+    page = browser._page  # noqa: SLF001
+    if page is None:
+        return {
+            "status": "browser_unavailable",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "vehicle": vehicle_label,
+            "message": "The authenticated ALLDATA browser page is not active.",
+        }
+
+    vehicle_proof = await _selected_vehicle_signal(page, vehicle)
+    if not vehicle_proof.get("verified"):
+        return {
+            "status": "vehicle_selection_required",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "vehicle": vehicle_label,
+            "message": vehicle_proof.get("reason") or f"Select {vehicle_label} in ALLDATA before collection.",
+            "vehicle_proof": vehicle_proof,
+            "provider_status": state,
+        }
+
+    quick_ref = await _open_quick_reference(page)
+    if not quick_ref.get("opened"):
+        return {
+            "status": "quick_reference_not_found",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "vehicle": vehicle_label,
+            "message": quick_ref.get("reason"),
+            "quick_reference": quick_ref,
+        }
+    quick_reference_url = str(page.url)
+
+    post_navigation_vehicle = await _selected_vehicle_signal(page, vehicle)
+    if not post_navigation_vehicle.get("verified"):
+        return {
+            "status": "vehicle_context_lost",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "vehicle": vehicle_label,
+            "message": "ALLDATA lost the selected vehicle while opening ADAS Quick Reference. Nothing was captured.",
+            "vehicle_proof": post_navigation_vehicle,
+        }
+
+    links = await _enumerate_quick_reference_links(page, max_documents)
+    if not links:
+        return {
+            "status": "no_quick_reference_links",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "vehicle": vehicle_label,
+            "quick_reference_url": _canonical_alldata_url(quick_reference_url),
+            "message": "ADAS Quick Reference opened, but no eligible ALLDATA procedure hyperlinks were found.",
+        }
+
+    dedupe = _load_dedupe_index(Path(adas.source_root), vehicle_label)
+    results: list[dict[str, Any]] = []
+    for index, link in enumerate(links):
+        if index:
+            await asyncio.sleep(delay_seconds)
+        outcome = await _capture_one(
+            page=page,
+            adas=adas,
+            vehicle=vehicle,
+            link=link,
+            quick_reference_url=quick_reference_url,
+            dedupe=dedupe,
+        )
+        results.append(outcome)
+        if outcome.get("status") == "failed" and "vehicle" in str(outcome.get("reason") or "").casefold():
+            break
+
+    try:
+        if _canonical_alldata_url(page.url) != _canonical_alldata_url(quick_reference_url):
+            await page.goto(quick_reference_url, wait_until="domcontentloaded", timeout=45_000)
+    except Exception:
+        pass
+
+    captured = [item for item in results if item.get("status") == "captured"]
+    exact_duplicates = [item for item in results if item.get("status") == "duplicate_skipped"]
+    possible_duplicates = [item for item in results if item.get("status") == "possible_duplicate_skipped"]
+    failures = [item for item in results if item.get("status") == "failed"]
+    retrieval_failures = [item for item in captured if item.get("retrieval_verified") is not True]
+    all_links_accounted_for = len(results) == len(links)
+    success = bool(links and all_links_accounted_for and not failures and not retrieval_failures)
+    status = "success" if success else ("partial_success" if results else "failed")
+
+    return {
+        "status": status,
+        "executed": True,
+        "success": success,
+        "verified": success,
+        "partial": not success and bool(results),
+        "vehicle": vehicle_label,
+        "vehicle_proof": vehicle_proof,
+        "quick_reference_url": _canonical_alldata_url(quick_reference_url),
+        "procedure_links_found": len(links),
+        "captured_count": len(captured),
+        "exact_duplicates_skipped": len(exact_duplicates),
+        "possible_duplicates_skipped": len(possible_duplicates),
+        "failure_count": len(failures),
+        "retrieval_failure_count": len(retrieval_failures),
+        "captured": captured,
+        "duplicates": [*exact_duplicates, *possible_duplicates],
+        "failures": failures,
+        "links": links,
+        "results": results,
+    }
+
+
+async def collect_general_reference(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """Collect ADAS Quick Reference for whatever vehicle is currently
+    selected in ALLDATA and store it as general ADAS SI reference material.
+
+    Unlike collect_for_calibration_iq_ro, this requires no Calibration IQ
+    repair order to exist or match -- not every vehicle pulled up in ALLDATA
+    has a repair order yet. Vehicle identity is still proven from a bounded
+    ALLDATA signal before anything is captured; this only removes the CIQ
+    match requirement, not the vehicle-selection proof requirement.
+    """
+    browser = ro.get_browser(Path(settings.root), adas=adas)
+    state = await browser.start(auto_login=False)
+    if not state.get("authenticated"):
+        return {
+            "status": "human_action_required",
+            "action": "collect_alldata_general_reference",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "repair_order_id": None,
+            "message": "Open the ALLDATA session and sign in, then select the vehicle.",
+            "provider_status": state,
+        }
+    page = browser._page  # noqa: SLF001
+    if page is None:
+        return {
+            "status": "browser_unavailable",
+            "action": "collect_alldata_general_reference",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "repair_order_id": None,
+            "message": "The authenticated ALLDATA browser page is not active.",
+        }
+
+    vehicle = await read_selected_alldata_vehicle(page)
+    if not vehicle:
+        return {
+            "status": "vehicle_selection_required",
+            "action": "collect_alldata_general_reference",
+            "executed": False,
+            "success": False,
+            "verified": False,
+            "repair_order_id": None,
+            "message": (
+                "X could not read a bounded selected-vehicle signal from ALLDATA. "
+                "Select the exact vehicle first."
+            ),
+        }
+    vehicle_label = str(vehicle.get("label") or "")
+
+    max_documents = max(1, min(int(args.get("max_documents") or MAX_QUICK_REFERENCE_LINKS), MAX_QUICK_REFERENCE_LINKS))
+    delay_seconds = float(args.get("delay_seconds") or MIN_INTER_DOCUMENT_DELAY_SECONDS)
+    delay_seconds = max(MIN_INTER_DOCUMENT_DELAY_SECONDS, min(delay_seconds, MAX_INTER_DOCUMENT_DELAY_SECONDS))
+
+    core = await _collect_for_vehicle(
+        adas=adas,
+        browser=browser,
+        vehicle=vehicle,
+        vehicle_label=vehicle_label,
+        max_documents=max_documents,
+        delay_seconds=delay_seconds,
+    )
+    core["action"] = "collect_alldata_general_reference"
+    core["repair_order_id"] = None
+    if core.get("executed") is not True:
+        return core
+
+    links = core.pop("links", [])
+    results = core.pop("results", [])
+    captured_count = int(core.get("captured_count") or 0)
+    dup_count = int(core.get("exact_duplicates_skipped") or 0) + int(core.get("possible_duplicates_skipped") or 0)
+    manifest = {
+        "schema_version": 1,
+        "vehicle": vehicle_label,
+        "quick_reference_url": core.get("quick_reference_url"),
+        "collected_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "links_found": links,
+        "results": results,
+        "summary": {
+            "procedure_links": len(links),
+            "captured": captured_count,
+            "exact_duplicates_skipped": int(core.get("exact_duplicates_skipped") or 0),
+            "possible_duplicates_skipped": int(core.get("possible_duplicates_skipped") or 0),
+            "failures": int(core.get("failure_count") or 0),
+            "retrieval_failures": int(core.get("retrieval_failure_count") or 0),
+        },
+    }
+    try:
+        _save_manifest(_capture_folder(Path(adas.source_root), vehicle), manifest)
+    except OSError:
+        pass
+
+    core["message"] = (
+        f"ALLDATA ADAS Quick Reference for {vehicle_label} accounted for all {len(links)} procedure link(s): "
+        f"{captured_count} new capture(s) and {dup_count} duplicate(s) skipped. Saved as general ADAS SI "
+        "reference material; no Calibration IQ repair order was required or created."
+        if core.get("success")
+        else (
+            f"ALLDATA ADAS Quick Reference for {vehicle_label} processed {len(results)} of {len(links)} link(s), "
+            f"captured {captured_count}, skipped {dup_count} duplicate(s), and had "
+            f"{int(core.get('failure_count') or 0)} capture failure(s) / "
+            f"{int(core.get('retrieval_failure_count') or 0)} ADAS SI retrieval verification failure(s)."
+        )
+    )
+    return core
+
+
 async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
     ro_identifier = str(args.get("repair_order_id") or "").strip()
     if not ro_identifier:
@@ -734,112 +1006,31 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
         }
 
     browser = ro.get_browser(Path(settings.root), adas=adas)
-    state = await browser.start(auto_login=False)
-    if not state.get("authenticated"):
-        return {
-            "status": "human_action_required",
-            "success": False,
-            "verified": False,
-            "repair_order_id": ro_identifier,
-            "vehicle": vehicle_label,
-            "message": "Open the ALLDATA session and sign in, then select this Calibration IQ vehicle.",
-            "provider_status": state,
-        }
-    page = browser._page  # noqa: SLF001
-    if page is None:
-        return {
-            "status": "browser_unavailable",
-            "success": False,
-            "verified": False,
-            "repair_order_id": ro_identifier,
-            "vehicle": vehicle_label,
-            "message": "The authenticated ALLDATA browser page is not active.",
-        }
-
-    vehicle_proof = await _selected_vehicle_signal(page, vehicle)
-    if not vehicle_proof.get("verified"):
-        return {
-            "status": "vehicle_selection_required",
-            "success": False,
-            "verified": False,
-            "repair_order_id": ro_identifier,
-            "vehicle": vehicle_label,
-            "message": vehicle_proof.get("reason") or f"Select {vehicle_label} in ALLDATA before collection.",
-            "vehicle_proof": vehicle_proof,
-            "provider_status": state,
-        }
-
-    quick_ref = await _open_quick_reference(page)
-    if not quick_ref.get("opened"):
-        return {
-            "status": "quick_reference_not_found",
-            "success": False,
-            "verified": False,
-            "repair_order_id": ro_identifier,
-            "vehicle": vehicle_label,
-            "message": quick_ref.get("reason"),
-            "quick_reference": quick_ref,
-        }
-    quick_reference_url = str(page.url)
-
-    post_navigation_vehicle = await _selected_vehicle_signal(page, vehicle)
-    if not post_navigation_vehicle.get("verified"):
-        return {
-            "status": "vehicle_context_lost",
-            "success": False,
-            "verified": False,
-            "repair_order_id": ro_identifier,
-            "vehicle": vehicle_label,
-            "message": "ALLDATA lost the selected CIQ vehicle while opening ADAS Quick Reference. Nothing was captured.",
-            "vehicle_proof": post_navigation_vehicle,
-        }
-
     max_documents = max(1, min(int(args.get("max_documents") or MAX_QUICK_REFERENCE_LINKS), MAX_QUICK_REFERENCE_LINKS))
-    links = await _enumerate_quick_reference_links(page, max_documents)
-    if not links:
-        return {
-            "status": "no_quick_reference_links",
-            "success": False,
-            "verified": False,
-            "repair_order_id": ro_identifier,
-            "vehicle": vehicle_label,
-            "quick_reference_url": _canonical_alldata_url(quick_reference_url),
-            "message": "ADAS Quick Reference opened, but no eligible ALLDATA procedure hyperlinks were found.",
-        }
-
     delay_seconds = float(args.get("delay_seconds") or MIN_INTER_DOCUMENT_DELAY_SECONDS)
     delay_seconds = max(MIN_INTER_DOCUMENT_DELAY_SECONDS, min(delay_seconds, MAX_INTER_DOCUMENT_DELAY_SECONDS))
-    dedupe = _load_dedupe_index(Path(adas.source_root), vehicle_label)
-    results: list[dict[str, Any]] = []
-    for index, link in enumerate(links):
-        if index:
-            await asyncio.sleep(delay_seconds)
-        outcome = await _capture_one(
-            page=page,
-            adas=adas,
-            vehicle=vehicle,
-            link=link,
-            quick_reference_url=quick_reference_url,
-            dedupe=dedupe,
-        )
-        results.append(outcome)
-        if outcome.get("status") == "failed" and "vehicle" in str(outcome.get("reason") or "").casefold():
-            break
 
-    try:
-        if _canonical_alldata_url(page.url) != _canonical_alldata_url(quick_reference_url):
-            await page.goto(quick_reference_url, wait_until="domcontentloaded", timeout=45_000)
-    except Exception:
-        pass
+    core = await _collect_for_vehicle(
+        adas=adas,
+        browser=browser,
+        vehicle=vehicle,
+        vehicle_label=vehicle_label,
+        max_documents=max_documents,
+        delay_seconds=delay_seconds,
+    )
+    core["action"] = "collect_alldata_quick_reference"
+    core["repair_order_id"] = ro_identifier
+    if core.get("executed") is not True:
+        return core
 
-    captured = [item for item in results if item.get("status") == "captured"]
+    links = core.pop("links", [])
+    results = core.pop("results", [])
+    captured = core.get("captured") or []
     exact_duplicates = [item for item in results if item.get("status") == "duplicate_skipped"]
     possible_duplicates = [item for item in results if item.get("status") == "possible_duplicate_skipped"]
-    failures = [item for item in results if item.get("status") == "failed"]
-    retrieval_failures = [item for item in captured if item.get("retrieval_verified") is not True]
-    all_links_accounted_for = len(results) == len(links)
-    success = bool(links and all_links_accounted_for and not failures and not retrieval_failures)
-    status = "success" if success else ("partial_success" if results else "failed")
+    failures = core.get("failures") or []
+    retrieval_failures = int(core.get("retrieval_failure_count") or 0)
+    success = core.get("success") is True
 
     try:
         requirements = calibration_iq._research_calibrations(snapshot, {})  # noqa: SLF001
@@ -855,7 +1046,7 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
         "schema_version": 1,
         "repair_order_id": ro_identifier,
         "vehicle": vehicle_label,
-        "quick_reference_url": _canonical_alldata_url(quick_reference_url),
+        "quick_reference_url": core.get("quick_reference_url"),
         "collected_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "links_found": links,
         "results": results,
@@ -866,7 +1057,7 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
             "exact_duplicates_skipped": len(exact_duplicates),
             "possible_duplicates_skipped": len(possible_duplicates),
             "failures": len(failures),
-            "retrieval_failures": len(retrieval_failures),
+            "retrieval_failures": retrieval_failures,
         },
     }
     try:
@@ -874,54 +1065,34 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
     except OSError:
         pass
 
-    return {
-        "status": status,
-        "action": "collect_alldata_quick_reference",
-        "executed": True,
-        "success": success,
-        "verified": success,
-        "partial": not success and bool(results),
+    core["required_calibrations"] = requirement_summary
+    core["ciq_research_ro_ready"] = bool(captured or exact_duplicates or possible_duplicates)
+    core["next_action"] = {
+        "tool": "calibration_iq_operator",
         "repair_order_id": ro_identifier,
-        "vehicle": vehicle_label,
-        "vehicle_proof": vehicle_proof,
-        "quick_reference_url": _canonical_alldata_url(quick_reference_url),
-        "procedure_links_found": len(links),
-        "captured_count": len(captured),
-        "exact_duplicates_skipped": len(exact_duplicates),
-        "possible_duplicates_skipped": len(possible_duplicates),
-        "failure_count": len(failures),
-        "retrieval_failure_count": len(retrieval_failures),
-        "captured": captured,
-        "duplicates": [*exact_duplicates, *possible_duplicates],
-        "failures": failures,
-        "required_calibrations": requirement_summary,
-        "ciq_research_ro_ready": bool(captured or exact_duplicates or possible_duplicates),
-        "next_action": {
-            "tool": "calibration_iq_operator",
-            "repair_order_id": ro_identifier,
-            "operation": "research_ro",
-            "arguments": {"complete_research": False},
-            "reason": (
-                "Re-run the existing Calibration IQ research_ro operator now so it searches the "
-                "updated ADAS SI library, imports/links matching OEM evidence into this RO workspace, "
-                "and reports any documentation still missing."
-            ),
-        },
-        "message": (
-            f"ALLDATA ADAS Quick Reference accounted for all {len(links)} procedure link(s): "
-            f"{len(captured)} new capture(s) and "
-            f"{len(exact_duplicates) + len(possible_duplicates)} duplicate(s) skipped. "
-            "Run Calibration IQ research_ro next to link the updated ADAS SI evidence to this RO."
-            if success
-            else (
-                f"ALLDATA ADAS Quick Reference processed {len(results)} of {len(links)} link(s), "
-                f"captured {len(captured)}, skipped {len(exact_duplicates) + len(possible_duplicates)} "
-                f"duplicate(s), and had {len(failures)} capture failure(s) / "
-                f"{len(retrieval_failures)} ADAS SI retrieval verification failure(s). Review before "
-                "treating this RO as SI-ready."
-            )
+        "operation": "research_ro",
+        "arguments": {"complete_research": False},
+        "reason": (
+            "Re-run the existing Calibration IQ research_ro operator now so it searches the "
+            "updated ADAS SI library, imports/links matching OEM evidence into this RO workspace, "
+            "and reports any documentation still missing."
         ),
     }
+    core["message"] = (
+        f"ALLDATA ADAS Quick Reference accounted for all {len(links)} procedure link(s): "
+        f"{len(captured)} new capture(s) and "
+        f"{len(exact_duplicates) + len(possible_duplicates)} duplicate(s) skipped. "
+        "Run Calibration IQ research_ro next to link the updated ADAS SI evidence to this RO."
+        if success
+        else (
+            f"ALLDATA ADAS Quick Reference processed {len(results)} of {len(links)} link(s), "
+            f"captured {len(captured)}, skipped {len(exact_duplicates) + len(possible_duplicates)} "
+            f"duplicate(s), and had {len(failures)} capture failure(s) / "
+            f"{retrieval_failures} ADAS SI retrieval verification failure(s). Review before "
+            "treating this RO as SI-ready."
+        )
+    )
+    return core
 
 
 def install() -> None:

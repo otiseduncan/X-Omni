@@ -981,6 +981,17 @@ def install() -> None:
                 if str(args.get("repair_order_id") or "").strip():
                     return await previous_collect(settings, adas, args)
                 resolved = await resolve_selected_alldata_to_ciq(settings, adas)
+                if resolved.get("status") == "ciq_vehicle_not_found":
+                    # The selected vehicle is real and proven -- it just has
+                    # no active Calibration IQ repair order yet. Not every
+                    # vehicle pulled up in ALLDATA has one; save it as
+                    # general ADAS SI reference material instead of failing
+                    # closed, so the tech can select any car and still have
+                    # X collect and store what they ask for.
+                    general = await quick.collect_general_reference(settings, adas, args)
+                    if isinstance(general, dict):
+                        general.setdefault("resolved_calibration_iq", resolved)
+                    return general
                 if resolved.get("verified") is not True:
                     return {
                         **resolved,
