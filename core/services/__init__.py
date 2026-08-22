@@ -29,12 +29,15 @@ the exact CIQ vehicle in ALLDATA, then X enumerates that vehicle's ADAS Quick
 Reference procedure links sequentially, skips duplicates by canonical URL/hash
 (and conservative same-vehicle/title identity), preserves real revisions, OCRs
 and indexes new PDFs, and tells X to run the existing CIQ research_ro contract to
-link the refreshed ADAS SI evidence back to the repair order. Calibration and
-policy research deep-read later PDF pages/sidebars and bounded same-host OEM web
-pages, while chat presentation stays concise and conversation-first. Calibration
-IQ RO research remains on its existing verified operator lane and inherits the
-same exact-vehicle deep ADAS PDF search. Final policy and audit guards keep
-execution truthful and fail closed.
+link the refreshed ADAS SI evidence back to the repair order. Calibration IQ work
+prep is CIQ-first: ADAS Map on each RO is treated as the governing calibration
+requirement source, missing CIQ requirements are reconciled through CIQ's own
+verified routine operator actions, and ADAS SI is checked only for the resulting
+job requirements. Calibration and policy research deep-read later PDF
+pages/sidebars and bounded same-host OEM web pages, while chat presentation stays
+concise and conversation-first. Calibration IQ RO research remains on its existing
+verified operator lane and inherits the same exact-vehicle deep ADAS PDF search.
+Final policy and audit guards keep execution truthful and fail closed.
 """
 
 from . import adas_si as _adas_si
@@ -54,6 +57,7 @@ from . import research_alldata_contract as _research_alldata_contract
 from . import research_alldata_terms as _research_alldata_terms
 from . import research_auto_acquire as _research_auto_acquire
 from . import research_alldata_quick_reference as _research_alldata_quick_reference
+from . import calibration_iq_work_prep as _calibration_iq_work_prep
 from . import research_task_continuity as _research_task_continuity
 from . import research_policy_depth as _research_policy_depth
 from . import research_policy_compat as _research_policy_compat
@@ -79,6 +83,7 @@ _research_alldata_contract.install()
 _research_alldata_terms.install()
 _research_auto_acquire.install()
 _research_alldata_quick_reference.install()
+_calibration_iq_work_prep.install()
 _research_conversation.install()
 _research_task_continuity.install()
 _research_policy_depth.install()
