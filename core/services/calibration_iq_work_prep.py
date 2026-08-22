@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 from . import calibration_iq
+from . import calibration_iq_weekly_queue as weekly_queue
 from . import research_alldata_navigation as nav
 from . import research_alldata_quick_reference as quick
 from . import research_operator
@@ -135,6 +136,17 @@ _CALIBRATION_LABEL_RE = re.compile(
 )
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
+# Walking a weekly-readiness missing-SI queue one vehicle at a time: pick a
+# vehicle in ALLDATA, say "next" instead of repeating the RO or vehicle every
+# turn. Deliberately anchored to the whole message so "next" embedded in an
+# unrelated longer sentence never matches -- this is a bare go-ahead cue, not
+# a topic word.
+_QUEUE_NEXT_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?[,.]?\s*)?(?:go\s+to\s+)?(?:the\s+)?next(?:\s+(?:one|car|vehicle|up))?\s*[.!]?\s*$|"
+    r"^\s*who'?s\s+next\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+
 # Conversational continuity for the ALLDATA acquisition flow: once "log in to
 # ALLDATA" has run, a follow-up like "retrieve SI information please" carries
 # no ALLDATA/quick-reference/RO wording of its own and would otherwise fall
@@ -207,6 +219,11 @@ def classify_request(
         return "phase_list"
     if (_RO_RE.search(value) or _THIS_RO_RE.search(value)) and _RO_REQUIREMENT_RE.search(value):
         return "ro_requirements"
+    if _QUEUE_NEXT_RE.search(value):
+        # Whether an active weekly-readiness queue actually exists is
+        # checked downstream (resolve_queue_next); a bare "next" with none
+        # active fails closed with a clear message instead of guessing.
+        return "queue_next"
     if history:
         stage = _active_work_prep_stage(history)
         if (
@@ -662,9 +679,29 @@ async def _phase_list(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
     return {"mode": "phase_list", **result}
 
 
+_WEEK_READY_DEFAULT_PHASES = frozenset({"5", "6", "7", "8"})
+
+
+def _row_phase_token(row: dict[str, Any]) -> Optional[str]:
+    phase = calibration_iq._phase_of(row)  # noqa: SLF001
+    if phase is None:
+        return None
+    token = str(phase).strip()
+    try:
+        token = str(int(float(token)))
+    except (TypeError, ValueError):
+        pass
+    return token or None
+
+
 async def _week_readiness(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
+    # "Prepared for the week" means phases 5-8: earlier phases (teardown,
+    # estimate, parts) aren't reaching calibration this week, so checking
+    # their SI coverage now would be noise. An explicit phase in the request
+    # overrides this default instead of being narrowed further by it.
+    explicit_phase = bool(args.get("phase"))
     filters: dict[str, Any] = {"include_completed": False}
-    if args.get("phase"):
+    if explicit_phase:
         filters["phase"] = str(args["phase"])
     if args.get("shop"):
         filters["shop"] = str(args["shop"])
@@ -679,6 +716,8 @@ async def _week_readiness(settings: Any, adas: Any, args: dict[str, Any]) -> dic
             "calibration_iq": queue,
         }
     rows = [item for item in (queue.get("items") or []) if isinstance(item, dict)]
+    if not explicit_phase:
+        rows = [row for row in rows if _row_phase_token(row) in _WEEK_READY_DEFAULT_PHASES]
     context = _valid_context(args.get(_CONTEXT_KEY))
 
     semaphore = asyncio.Semaphore(6)
@@ -727,6 +766,9 @@ async def _week_readiness(settings: Any, adas: Any, args: dict[str, Any]) -> dic
             "missing_si": missing_si,
         })
 
+    if context is not None:
+        _save_weekly_queue(settings, context["conversation_id"], results)
+
     return {
         "status": "success",
         "mode": "week_readiness",
@@ -739,8 +781,40 @@ async def _week_readiness(settings: Any, adas: Any, args: dict[str, Any]) -> dic
         "adas_map_unavailable_count": sum(1 for item in results if (item.get("adas_map") or {}).get("status") != "verified"),
         "ciq_requirements_added_or_reactivated": added_total,
         "filters": filters,
+        "phase_scope": [str(args["phase"])] if explicit_phase else sorted(_WEEK_READY_DEFAULT_PHASES, key=int),
         "repair_orders": results,
     }
+
+
+def _save_weekly_queue(settings: Any, conversation_id: int, results: list[dict[str, Any]]) -> None:
+    """Remember which ROs still need ADAS SI so "next" can walk the list
+    without the operator repeating the RO or vehicle every turn."""
+    items: list[weekly_queue.WeeklyQueueItem] = []
+    for row in results:
+        repair_order_id = str(row.get("repair_order_id") or "").strip()
+        missing = [
+            str(entry.get("calibration") or "").strip()
+            for entry in (row.get("missing_si") or [])
+            if isinstance(entry, dict) and entry.get("calibration")
+        ]
+        if not repair_order_id or not missing:
+            continue
+        vehicle_label = str(row.get("vehicle") or "").strip()
+        parsed_vehicle = nav.vehicle_from_query(vehicle_label)
+        items.append(weekly_queue.WeeklyQueueItem(
+            repair_order_id=repair_order_id,
+            ro_number=str(row.get("ro_number") or ""),
+            vehicle_label=vehicle_label,
+            vehicle_year=parsed_vehicle.get("year"),
+            vehicle_make=parsed_vehicle.get("make"),
+            vehicle_model_trim=parsed_vehicle.get("model_trim"),
+            missing_calibrations=missing,
+        ))
+    store = weekly_queue.get_store(Path(settings.root))
+    if not items:
+        store.clear(str(conversation_id))
+        return
+    store.save(weekly_queue.WeeklyQueue(conversation_id=str(conversation_id), items=items))
 
 
 async def handle(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -751,7 +825,23 @@ async def handle(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, An
         return await _ro_requirements(settings, adas, args)
     if mode == "week_readiness":
         return await _week_readiness(settings, adas, args)
+    if mode == "queue_next":
+        return await _queue_next_mode(settings, adas, args)
     raise ValueError("Unsupported Calibration IQ work-prep mode.")
+
+
+async def _queue_next_mode(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
+    context = _valid_context(args.get(_CONTEXT_KEY))
+    if context is None:
+        return {
+            "status": "context_missing",
+            "mode": "queue_next",
+            "success": False,
+            "verified": False,
+            "message": "X could not identify the active conversation for the weekly readiness queue.",
+        }
+    result = await resolve_queue_next(settings, adas, context["conversation_id"])
+    return {"mode": "queue_next", **result}
 
 
 async def _bounded_selected_vehicle_signals(page: Any) -> list[str]:
@@ -845,6 +935,136 @@ async def resolve_selected_alldata_to_ciq(settings: Any, adas: Any) -> dict[str,
     }
 
 
+def _queue_item_matches_signals(item: "weekly_queue.WeeklyQueueItem", signals: list[str]) -> bool:
+    vehicle = {"year": item.vehicle_year, "make": item.vehicle_make, "model_trim": item.vehicle_model_trim}
+    if not (vehicle["year"] and vehicle["make"] and vehicle["model_trim"]):
+        return False
+    return any(quick._identity_matches_text(signal, vehicle) for signal in signals)  # noqa: SLF001
+
+
+async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> dict[str, Any]:
+    """Walk the weekly-readiness missing-SI queue: resolve whatever vehicle
+    is currently selected in ALLDATA against the remaining pending items,
+    collect for it if it matches, mark it complete, and report which
+    vehicle to pull up next -- so "next" replaces repeating the RO or
+    vehicle every turn.
+    """
+    store = weekly_queue.get_store(Path(settings.root))
+    queue = store.get(str(conversation_id))
+    if queue is None or not queue.items:
+        return {
+            "status": "no_active_queue",
+            "success": False,
+            "verified": False,
+            "message": (
+                "There's no active weekly readiness queue for this conversation. "
+                "Run \"make sure we're prepared for the week\" first."
+            ),
+        }
+    if queue.is_stale():
+        return {
+            "status": "queue_stale",
+            "success": False,
+            "verified": False,
+            "message": (
+                "The weekly readiness queue from earlier is stale. "
+                "Run \"make sure we're prepared for the week\" again."
+            ),
+        }
+    pending = queue.pending()
+    if not pending:
+        return {
+            "status": "queue_complete",
+            "success": True,
+            "verified": True,
+            "message": "The weekly readiness queue is complete -- every RO that needed ADAS SI has been collected.",
+        }
+
+    browser = research_operator.get_browser(Path(settings.root), adas=adas)
+    state = await browser.start(auto_login=False)
+    if not state.get("authenticated") or browser._page is None:  # noqa: SLF001
+        return {
+            "status": "human_action_required",
+            "success": False,
+            "verified": False,
+            "message": "Open/resume the ALLDATA browser and sign in first.",
+        }
+    signals = await _bounded_selected_vehicle_signals(browser._page)  # noqa: SLF001
+    if not signals:
+        remaining = "; ".join(f"RO {item.ro_number} — {item.vehicle_label}" for item in pending[:3])
+        return {
+            "status": "vehicle_selection_required",
+            "success": False,
+            "verified": False,
+            "message": (
+                f"X could not read a bounded selected-vehicle signal from ALLDATA. "
+                f"Select the next vehicle first. Remaining: {remaining}."
+            ),
+        }
+
+    matching = [item for item in pending if _queue_item_matches_signals(item, signals)]
+    if not matching:
+        remaining = "; ".join(f"RO {item.ro_number} — {item.vehicle_label}" for item in pending[:5])
+        return {
+            "status": "not_in_queue",
+            "success": False,
+            "verified": False,
+            "signals": signals,
+            "message": (
+                "The selected ALLDATA vehicle is not in the remaining weekly readiness queue. "
+                f"Remaining: {remaining}."
+            ),
+        }
+    if len(matching) > 1:
+        # Two identical vehicle models both queued this week -- never guess
+        # which RO the collected evidence belongs to.
+        candidates = "; ".join(f"RO {item.ro_number} — {item.vehicle_label}" for item in matching[:5])
+        return {
+            "status": "ambiguous_match",
+            "success": False,
+            "verified": False,
+            "signals": signals,
+            "message": (
+                "More than one queued RO matches this vehicle; name the RO number before collecting. "
+                f"Candidates: {candidates}."
+            ),
+        }
+    matched = matching[0]
+
+    result = await quick.collect_for_calibration_iq_ro(settings, adas, {"repair_order_id": matched.repair_order_id})
+    verified = isinstance(result, dict) and result.get("verified") is True and result.get("success") is True
+    matched.status = "complete" if verified else "failed"
+    store.save(queue)
+
+    remaining_after = queue.pending()
+    done_count = sum(1 for item in queue.items if item.status == "complete")
+    total = len(queue.items)
+    if remaining_after:
+        next_item = remaining_after[0]
+        next_line = (
+            f"Next: RO {next_item.ro_number} — {next_item.vehicle_label} "
+            f"(needs {', '.join(next_item.missing_calibrations) or 'SI'})."
+        )
+    else:
+        next_line = "That was the last one -- the weekly readiness queue is complete."
+    lead = (
+        f"RO {matched.ro_number} — {matched.vehicle_label}: collected and verified."
+        if verified
+        else f"RO {matched.ro_number} — {matched.vehicle_label}: collection was not verified."
+    )
+    return {
+        "status": "success" if verified else "collection_failed",
+        "success": verified,
+        "verified": verified,
+        "repair_order_id": matched.repair_order_id,
+        "vehicle": matched.vehicle_label,
+        "done_count": done_count,
+        "total_count": total,
+        "collector_result": result,
+        "message": f"{lead} {done_count} of {total} done. {next_line}",
+    }
+
+
 def summarize(mode: str, result: Any) -> str:
     data = result if isinstance(result, dict) else {}
     message = str(data.get("message") or "").strip()
@@ -885,8 +1105,17 @@ def summarize(mode: str, result: Any) -> str:
     if mode == "week_readiness":
         if data.get("verified") is not True:
             return message or "The weekly Calibration IQ readiness audit was not verified."
+        phase_scope = [str(p) for p in (data.get("phase_scope") or []) if str(p).strip()]
+        if len(phase_scope) > 1:
+            scope_clause = (
+                f" (phase {phase_scope[0]}–{phase_scope[-1]} -- earlier phases aren't being worked this week)"
+            )
+        elif phase_scope:
+            scope_clause = f" (phase {phase_scope[0]})"
+        else:
+            scope_clause = ""
         lines = [
-            f"I checked {int(data.get('queue_count') or 0)} active Calibration IQ RO(s). "
+            f"I checked {int(data.get('queue_count') or 0)} active Calibration IQ RO(s){scope_clause}. "
             f"{int(data.get('ready_count') or 0)} are SI-ready; {int(data.get('needs_si_count') or 0)} need ADAS SI; "
             f"{int(data.get('adas_map_unavailable_count') or 0)} could not be verified against ADAS Map. "
             f"I added/reactivated {int(data.get('ciq_requirements_added_or_reactivated') or 0)} missing CIQ requirement(s) from governing ADAS Map."
@@ -935,7 +1164,7 @@ def install() -> None:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "mode": {"type": "string", "enum": ["phase_list", "ro_requirements", "week_readiness"]},
+                        "mode": {"type": "string", "enum": ["phase_list", "ro_requirements", "week_readiness", "queue_next"]},
                         "repair_order_id": {"type": "string"},
                         "phase": {"type": "string"},
                         "shop": {"type": "string"},

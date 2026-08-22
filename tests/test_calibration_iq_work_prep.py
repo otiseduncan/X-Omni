@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
+from core.services import calibration_iq_weekly_queue as weekly_queue
 from core.services import calibration_iq_work_prep as prep
 from core.tools import registry as registry_mod
 
@@ -263,4 +268,248 @@ def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
         "phase_list",
         "ro_requirements",
         "week_readiness",
+        "queue_next",
     }
+
+
+def test_bare_next_routes_to_queue_next_mode():
+    for text in ("next", "Next.", "next one", "next car", "next vehicle", "who's next?", "okay, next"):
+        assert prep.classify_request(text) == "queue_next", text
+
+
+def test_next_embedded_in_a_longer_sentence_does_not_trigger_queue_walk():
+    # _QUEUE_NEXT_RE is deliberately anchored to the whole message -- "next"
+    # as a topic word elsewhere must not hijack an unrelated turn.
+    assert prep.classify_request("what's next on my calendar today") != "queue_next"
+    assert prep.classify_request("I'll do the next RO after lunch") != "queue_next"
+
+
+def test_row_phase_token_normalizes_numeric_and_string_phases():
+    assert prep._row_phase_token({"phase": 5}) == "5"
+    assert prep._row_phase_token({"phase": "5.0"}) == "5"
+    assert prep._row_phase_token({"phase": "Reassembly"}) == "Reassembly"
+    assert prep._row_phase_token({}) is None
+
+
+@pytest.mark.asyncio
+async def test_week_readiness_defaults_to_phase_five_through_eight(monkeypatch):
+    rows = [
+        {
+            "id": f"ro-{phase}", "ro_number": f"RO{phase}", "phase": str(phase),
+            "vehicle": {"year": 2023, "make": "Ford", "model": "F-150"},
+        }
+        for phase in range(1, 9)
+    ]
+
+    async def query_repair_orders(_settings, args):
+        assert "phase" not in args
+        return {"status": "verified", "items": rows}
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+
+    async def load_snapshot(_settings, identifier):
+        return {"status": "verified", "snapshot": {"calibrations": [], "repair_order": {"id": identifier}}}
+
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+
+    async def coverage(_adas, _vehicle, _requirements):
+        return []
+
+    monkeypatch.setattr(prep, "_adas_coverage", coverage)
+
+    result = await prep._week_readiness(SimpleNamespace(), SimpleNamespace(), {})
+    assert result["queue_count"] == 4
+    assert {item["ro_number"] for item in result["repair_orders"]} == {"RO5", "RO6", "RO7", "RO8"}
+    assert result["phase_scope"] == ["5", "6", "7", "8"]
+
+
+@pytest.mark.asyncio
+async def test_week_readiness_explicit_phase_overrides_default_scope(monkeypatch):
+    row = {"id": "ro-3", "ro_number": "RO3", "phase": "3", "vehicle": {"year": 2023, "make": "Ford", "model": "F-150"}}
+
+    async def query_repair_orders(_settings, args):
+        assert args.get("phase") == "3"
+        return {"status": "verified", "items": [row]}
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+
+    async def load_snapshot(_settings, identifier):
+        return {"status": "verified", "snapshot": {"calibrations": [], "repair_order": {"id": identifier}}}
+
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+
+    async def coverage(_adas, _vehicle, _requirements):
+        return []
+
+    monkeypatch.setattr(prep, "_adas_coverage", coverage)
+
+    result = await prep._week_readiness(SimpleNamespace(), SimpleNamespace(), {"phase": "3"})
+    assert result["queue_count"] == 1
+    assert result["phase_scope"] == ["3"]
+
+
+def test_weekly_queue_round_trips_through_dict():
+    item = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Acura TLX",
+        vehicle_year="2023", vehicle_make="Acura", vehicle_model_trim="TLX",
+        missing_calibrations=["BSM calibration"],
+    )
+    original = weekly_queue.WeeklyQueue(conversation_id="42", items=[item])
+    restored = weekly_queue.WeeklyQueue.from_dict(original.to_dict())
+    assert restored.conversation_id == "42"
+    assert restored.items[0].repair_order_id == "ro-1"
+    assert restored.items[0].missing_calibrations == ["BSM calibration"]
+    assert restored.pending() == restored.items
+
+
+def test_weekly_queue_staleness_is_time_based():
+    stale = weekly_queue.WeeklyQueue(conversation_id="1", updated_at=0.0)
+    assert stale.is_stale(now=weekly_queue.STALE_AFTER_SECONDS + 1) is True
+    fresh = weekly_queue.WeeklyQueue(conversation_id="1", updated_at=1000.0)
+    assert fresh.is_stale(now=1500.0) is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_queue_next_without_an_active_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    result = await prep.resolve_queue_next(settings, SimpleNamespace(), 999)
+    assert result["status"] == "no_active_queue"
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_queue_next_reports_stale_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    item = weekly_queue.WeeklyQueueItem(repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Acura TLX")
+    old = weekly_queue.WeeklyQueue(conversation_id="7", items=[item])
+    old.updated_at = 0.0
+    # Bypass save()'s auto-touch so the persisted record is genuinely old.
+    store._write_all({"7": old.to_dict()})  # noqa: SLF001
+
+    result = await prep.resolve_queue_next(settings, SimpleNamespace(), 7)
+    assert result["status"] == "queue_stale"
+
+
+@pytest.mark.asyncio
+async def test_resolve_queue_next_selected_vehicle_not_in_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    item = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Acura TLX",
+        vehicle_year="2023", vehicle_make="Acura", vehicle_model_trim="TLX",
+    )
+    store.save(weekly_queue.WeeklyQueue(conversation_id="8", items=[item]))
+
+    class Browser:
+        _page = object()
+
+        async def start(self, auto_login=False):  # noqa: ARG002
+            return {"authenticated": True}
+
+    monkeypatch.setattr(prep.research_operator, "get_browser", lambda *_a, **_k: Browser())
+
+    async def signals(_page):
+        return ["Vehicle Information - 2019 Toyota Camry LE - ALLDATA Collision"]
+
+    monkeypatch.setattr(prep, "_bounded_selected_vehicle_signals", signals)
+
+    result = await prep.resolve_queue_next(settings, SimpleNamespace(), 8)
+    assert result["status"] == "not_in_queue"
+
+
+@pytest.mark.asyncio
+async def test_resolve_queue_next_fails_closed_on_ambiguous_match(tmp_path, monkeypatch):
+    # Two identical vehicle models both queued this week -- never guess.
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    first = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Ford F-150",
+        vehicle_year="2023", vehicle_make="Ford", vehicle_model_trim="F-150",
+    )
+    second = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-2", ro_number="RO2", vehicle_label="2023 Ford F-150",
+        vehicle_year="2023", vehicle_make="Ford", vehicle_model_trim="F-150",
+    )
+    store.save(weekly_queue.WeeklyQueue(conversation_id="10", items=[first, second]))
+
+    class Browser:
+        _page = object()
+
+        async def start(self, auto_login=False):  # noqa: ARG002
+            return {"authenticated": True}
+
+    monkeypatch.setattr(prep.research_operator, "get_browser", lambda *_a, **_k: Browser())
+
+    async def signals(_page):
+        return ["Vehicle Information - 2023 Ford F-150 4WD - ALLDATA Collision"]
+
+    monkeypatch.setattr(prep, "_bounded_selected_vehicle_signals", signals)
+
+    collected = False
+
+    async def collect(*_args, **_kwargs):
+        nonlocal collected
+        collected = True
+        return {"status": "success", "success": True, "verified": True}
+
+    monkeypatch.setattr(prep.quick, "collect_for_calibration_iq_ro", collect)
+
+    result = await prep.resolve_queue_next(settings, SimpleNamespace(), 10)
+    assert result["status"] == "ambiguous_match"
+    assert collected is False
+    reloaded = store.get("10")
+    assert all(item.status == "pending" for item in reloaded.items)
+
+
+@pytest.mark.asyncio
+async def test_resolve_queue_next_collects_marks_complete_and_names_the_next_vehicle(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    first = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Acura TLX",
+        vehicle_year="2023", vehicle_make="Acura", vehicle_model_trim="TLX",
+        missing_calibrations=["Forward camera calibration"],
+    )
+    second = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-2", ro_number="RO2", vehicle_label="2021 Jeep Cherokee",
+        vehicle_year="2021", vehicle_make="Jeep", vehicle_model_trim="Cherokee",
+        missing_calibrations=["BSM calibration"],
+    )
+    store.save(weekly_queue.WeeklyQueue(conversation_id="9", items=[first, second]))
+
+    class Browser:
+        _page = object()
+
+        async def start(self, auto_login=False):  # noqa: ARG002
+            return {"authenticated": True}
+
+    monkeypatch.setattr(prep.research_operator, "get_browser", lambda *_a, **_k: Browser())
+
+    async def signals(_page):
+        return ["Vehicle Information - 2023 Acura TLX Type S - ALLDATA Collision"]
+
+    monkeypatch.setattr(prep, "_bounded_selected_vehicle_signals", signals)
+
+    async def collect(_settings, _adas, args):
+        assert args["repair_order_id"] == "ro-1"
+        return {"status": "success", "success": True, "verified": True, "vehicle": "2023 Acura TLX"}
+
+    monkeypatch.setattr(prep.quick, "collect_for_calibration_iq_ro", collect)
+
+    result = await prep.resolve_queue_next(settings, SimpleNamespace(), 9)
+    assert result["status"] == "success"
+    assert result["repair_order_id"] == "ro-1"
+    assert result["done_count"] == 1
+    assert result["total_count"] == 2
+    assert "RO2" in result["message"]
+    assert "Jeep Cherokee" in result["message"]
+
+    reloaded = store.get("9")
+    assert reloaded.items[0].status == "complete"
+    assert reloaded.items[1].status == "pending"
