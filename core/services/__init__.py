@@ -28,6 +28,7 @@ from . import research_vault as _research_vault
 from . import research_workflow as _research_workflow
 from . import research_workflow_guard as _research_workflow_guard
 from . import research_policy_depth as _research_policy_depth
+from . import research_policy_compat as _research_policy_compat
 from . import research_conversation as _research_conversation
 from . import research_truth as _research_truth
 from . import research_policy as _research_policy
@@ -44,6 +45,7 @@ _research_setup.install()
 _research_workflow.install()
 _research_workflow_guard.install()
 _research_policy_depth.install()
+_research_policy_compat.install()
 _research_conversation.install()
 _research_truth.install()
 _research_policy.install()
