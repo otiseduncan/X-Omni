@@ -307,7 +307,14 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
         "source": "ALLDATA", "attempted": bool(alldata.get("attempted", True)),
         "searched": bool(alldata.get("searched")), "verified": bool(alldata.get("verified")),
         "query_submitted": bool(alldata.get("query_submitted")), "url": alldata.get("url"),
-        "reason": alldata.get("reason"), "human_action_required": bool(alldata.get("human_action_required")),
+        # An early-exit failure (couldn't authenticate, couldn't find the
+        # vehicle box) sets "reason"; a run that got as far as a result but
+        # failed the evaluate_alldata_claim() checks only sets
+        # "verification_reason" -- surface whichever is present so the UI
+        # never silently drops the one explanation that matters most: why a
+        # search that found *something* still wasn't trusted.
+        "reason": alldata.get("reason") or alldata.get("verification_reason"),
+        "human_action_required": bool(alldata.get("human_action_required")),
     }
 
     try:
