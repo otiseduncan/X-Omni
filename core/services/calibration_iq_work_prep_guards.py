@@ -87,9 +87,16 @@ def install() -> None:
     # deliberately specific to Quick Reference; it must not make arbitrary
     # "8 oz"/"8 ass" utterances enter the licensed research lane.
     prep._QUICK_REFERENCE_RE = re.compile(  # noqa: SLF001
-        r"\b(?:adas|ados|a\s*d\s*a\s*s|8\s*oz|8\s*ass)\s+quick\s+reference\b|"
-        r"\bquick\s+reference\b.{0,60}\b(?:adas|ados|a\s*d\s*a\s*s)\b",
+        r"\b(?:adas|ados|a\s*d\s*a\s*s|8\s*oz|8\s*ass|a\s*dash)\s+quick\s+reference\b|"
+        r"\bquick\s+reference\b.{0,60}\b(?:adas|ados|a\s*d\s*a\s*s|a\s*dash)\b",
         re.IGNORECASE | re.DOTALL,
+    )
+    # Field trace: "collect the a dash information for this car" -- the same
+    # "ADAS" mishearing outside the Quick Reference phrase. Widen the bare
+    # marker _ADAS_MARKER_RE also relies on so both patterns stay consistent.
+    prep._ADAS_MARKER_RE = re.compile(  # noqa: SLF001
+        r"\b(?:adas|ados|a\s*d\s*a\s*s|8\s*oz|8\s*ass|a\s*dash)\b",
+        re.IGNORECASE,
     )
     prep._node_has_adas_map_marker = _strict_adas_map_marker  # noqa: SLF001
     prep._phase = _safe_phase  # noqa: SLF001

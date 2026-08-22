@@ -15,6 +15,28 @@ def test_voice_transcribed_8_ass_quick_reference_routes_to_collector():
     assert prep.classify_request("collect 8 ass quick reference") == "quick_reference"
 
 
+def test_generic_adas_info_request_for_this_car_routes_to_collector():
+    # Field trace: "collect the a dash information for this car" hallucinated
+    # a fake vehicle-mismatch refusal because neither the literal "quick
+    # reference" phrase nor a recent alldata_access turn was present. An
+    # acquisition verb + an ADAS marker (including this mishearing) + an
+    # explicit reference to the vehicle in front of the tech is enough on
+    # its own.
+    assert prep.classify_request(
+        "collect the a dash information for this car"
+    ) == "quick_reference"
+    assert prep.classify_request(
+        "download the adas information for that vehicle"
+    ) == "quick_reference"
+
+
+def test_generic_adas_info_request_without_vehicle_reference_stays_unrouted():
+    # No "this car"/"that vehicle" anchor -- this reads as a knowledge
+    # question for ADAS SI, not an ALLDATA acquisition request, so it must
+    # not be swept into the licensed research lane.
+    assert prep.classify_request("get the adas calibration steps") is None
+
+
 def test_parent_adas_map_key_does_not_promote_sibling_calibration_data():
     snapshot = {
         "adas_map": {
