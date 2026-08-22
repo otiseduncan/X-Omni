@@ -1,15 +1,23 @@
 """Verified composite post-collision research for X Omni.
 
 For a post-collision technical research request, X must prove which information
-sources were actually queried. This module runs one deterministic sequence:
-ADAS SI -> authenticated ALLDATA -> public OEM/manufacturer web. It returns a
-source ledger so model prose cannot substitute for tool execution.
+sources were actually queried. This module runs one sequence: ADAS SI ->
+authenticated ALLDATA -> public OEM/manufacturer web. It returns a source
+ledger so model prose cannot substitute for tool execution.
+
+The ALLDATA step is model-driven when a live model client is available (see
+_ACTIVE_RESEARCH_CLIENT below and research_alldata_agent.run_agent_search),
+falling back to a fixed vehicle-first navigation sequence otherwise. Either
+way, "verified" is decided once, centrally, by research_verification -- never
+by which navigation path happened to run.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
+import logging
 import re
 import threading
 from typing import Any, Optional
@@ -17,9 +25,25 @@ from urllib.parse import urlparse
 
 from . import research_capture
 from . import research_operator as ro
+from . import research_verification
+
+log = logging.getLogger("xomni.research_workflow")
 
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
+
+# Carries the live model client (already attached to the app's one running
+# ModelRouter/worker) from the orchestrator turn that triggered this research
+# request down to full_research(), without ever putting a live object into a
+# tool-args dict -- those flow through Registry.invoke's audit/log_args path,
+# which is not a safe place for anything but plain, loggable data. Only the
+# Orchestrator._run wrapper installed below sets this; a model explicitly
+# invoking collision_research(action="full_research") on its own leaves it
+# unset, and full_research() falls back to the deterministic search in that
+# case rather than trying to construct a second, unmanaged ModelRouter.
+_ACTIVE_RESEARCH_CLIENT: "contextvars.ContextVar[Optional[Any]]" = contextvars.ContextVar(
+    "_xomni_active_research_client", default=None
+)
 
 _INTENT_RE = re.compile(r"\b(?:research|find|verify|check|look\s*up|investigate)\b", re.I)
 _DOMAIN_RE = re.compile(
@@ -164,8 +188,18 @@ async def search_alldata(browser: Any, query: str) -> dict[str, Any]:
             "url": str(page.url)[: ro.MAX_URL_CHARS],
         }
     matched = [token for token in _tokens(query) if token in body.casefold()]
+    # This generic keyword search never selects a vehicle -- it has no concept
+    # of vehicle-scoped results at all -- so it can never truthfully claim
+    # "verified" regardless of what the URL says. research_alldata_navigation's
+    # vehicle-first search is what supplies real vehicle-selection evidence;
+    # this path only exists as a last-resort fallback when that flow can't
+    # even find a search field to try.
+    claim = research_verification.unselected_source_claim(
+        "This search never confirmed a vehicle selection; it only reached a generic keyword search field."
+    )
     return {
-        "attempted": True, "searched": True, "verified": ro._is_alldata_url(page.url),
+        "attempted": True, "searched": True, "verified": claim["verified"],
+        "verification_reason": claim["reason"],
         "query_submitted": True, "query": query, "url": str(page.url)[: ro.MAX_URL_CHARS],
         "title": (await page.title())[:300], "matched_terms": matched[:12],
         "relevance_score": len(matched), "page_text": body[:12_000],
@@ -219,6 +253,34 @@ async def search_public_oem(query: str, make: Optional[str]) -> dict[str, Any]:
     }
 
 
+async def _search_alldata_best_available(browser: Any, query: str) -> dict[str, Any]:
+    """Prefer model-driven ALLDATA navigation; fall back to the fixed sequence.
+
+    A live client is only present when this research request was triggered
+    from an active conversation turn (see the Orchestrator._run wrapper
+    installed below) -- that's the only context where reusing the app's one
+    running model worker is safe. Anything else (a model calling
+    collision_research(action="full_research") on its own, or the agent
+    failing before it can even authenticate) uses the deterministic
+    vehicle-first search, unchanged.
+    """
+    client = _ACTIVE_RESEARCH_CLIENT.get()
+    if client is not None:
+        try:
+            from . import research_alldata_agent
+            from . import research_alldata_navigation as nav
+
+            vehicle = nav.vehicle_from_query(query)
+            if vehicle.get("label"):
+                topic = nav.topic_from_query(query, vehicle)
+                return await research_alldata_agent.run_agent_search(
+                    client=client, browser=browser, vehicle=vehicle, topic=topic,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ALLDATA agent navigation failed; falling back to deterministic search: %s", exc)
+    return await search_alldata(browser, query)
+
+
 async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dict[str, Any]:
     from . import adas_si as adas_mod
 
@@ -238,7 +300,7 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
     }
 
     try:
-        alldata = await search_alldata(browser, query)
+        alldata = await _search_alldata_best_available(browser, query)
     except Exception as exc:  # noqa: BLE001
         alldata = {"attempted": True, "searched": False, "verified": False, "reason": f"ALLDATA provider error: {type(exc).__name__}: {exc}"}
     alldata_ledger = {
@@ -331,6 +393,62 @@ async def synthesize(orchestrator: Any, question: str, result: dict[str, Any]) -
     return f"{answer}\n\n{proof}".strip() if answer else proof
 
 
+def _persist_research_task(conversation_id: Any, result: dict[str, Any], history_len: int) -> None:
+    """Best-effort: record this research turn as the conversation's active task.
+
+    This is what lets a later, short follow-up ("show me the exact procedure")
+    be resolved generically by research_task_continuity instead of needing its
+    own enumerated regex -- the vehicle/subject/status it needs is already
+    sitting here from the request that just ran.
+    """
+    try:
+        from . import research_task
+        from . import research_alldata_navigation as nav
+        from ..config import Settings
+
+        alldata = result.get("alldata") if isinstance(result.get("alldata"), dict) else {}
+        vehicle = alldata.get("vehicle") if isinstance(alldata.get("vehicle"), dict) else {}
+        query = str(result.get("query") or "")
+        if not vehicle.get("label") and query:
+            vehicle = nav.vehicle_from_query(query)
+        topic = str(alldata.get("topic") or query)[:200]
+
+        ledger = {
+            str(item.get("source")): item
+            for item in (result.get("source_ledger") or [])
+            if isinstance(item, dict)
+        }
+        local_row = ledger.get("ADAS SI", {})
+        alldata_row = ledger.get("ALLDATA", {})
+        public_row = ledger.get("Public OEM web", {})
+
+        def status_of(row: dict[str, Any]) -> str:
+            if row.get("verified"):
+                return "verified"
+            if row.get("searched"):
+                return "searched_unverified"
+            return "not_started"
+
+        task = research_task.ResearchTask(
+            conversation_id=str(conversation_id),
+            vehicle_year=vehicle.get("year"),
+            vehicle_make=vehicle.get("make"),
+            vehicle_model_trim=vehicle.get("model_trim"),
+            vehicle_label=vehicle.get("label"),
+            subject=topic,
+            local_status="found" if int(local_row.get("result_count") or 0) > 0 else "missing",
+            alldata_status=status_of(alldata_row),
+            alldata_evidence_url=alldata_row.get("url"),
+            oem_web_status=status_of(public_row),
+            oem_web_evidence_url=(public_row.get("url") if isinstance(public_row.get("url"), str) else None),
+            acquisition_status="captured" if result.get("captures") else "pending",
+            turn_count_at_update=history_len + 1,
+        )
+        research_task.get_store(Settings.load().root).save(task)
+    except Exception:  # noqa: BLE001 - continuity is best-effort, never blocks the answer
+        pass
+
+
 def install() -> None:
     global _INSTALLED
     with _INSTALL_LOCK:
@@ -384,6 +502,13 @@ def install() -> None:
                     context = approval_context if isinstance(approval_context, dict) else {}
                     args = {"action": "full_research", "query": str(user_message or "")[:2000], "preserve": preserve_requested(user_message)}
                     yield {"type": "tool_start", "name": "collision_research", "args": args}
+                    # Hand the live model client to full_research() for the duration of
+                    # this one invocation only, via the contextvar -- never through
+                    # `args`, which Registry.invoke logs/audits as plain data. This is
+                    # the only call site where reusing self.client is safe: it's the
+                    # app's one already-running ModelRouter/worker, owned by this
+                    # orchestrator instance, not a second one constructed on the side.
+                    client_token = _ACTIVE_RESEARCH_CLIENT.set(self.client)
                     try:
                         result = await self.registry.invoke(
                             "collision_research", args, message_id=user_message_id,
@@ -396,6 +521,9 @@ def install() -> None:
                             "workflow_complete": False, "external_search_verified": False,
                             "source_ledger": [], "error": f"{type(exc).__name__}: {exc}",
                         }
+                    finally:
+                        _ACTIVE_RESEARCH_CLIENT.reset(client_token)
+                    _persist_research_task(conversation_id, result, len(history))
                     artifact = {"type": "research_provider", "data": result}
                     yield {"type": "tool_result", "name": "collision_research", "result": result}
                     yield {"type": "artifact", "artifact": artifact}
