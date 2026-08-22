@@ -39,26 +39,41 @@ AGENT_TOOL_SCHEMA = {
     "function": {
         "name": "collision_research",
         "description": (
-            "Operate the already-authenticated ALLDATA Repair/Collision browser session. "
-            "ALLDATA's workflow is vehicle-first: (1) snapshot to see what's currently on "
+            "Operate the ALLDATA Repair/Collision browser session, which is ALREADY "
+            "authenticated and already sitting inside my.alldata.com -- never goto a fresh "
+            "URL as your first move; call snapshot first to see the real page you're already "
+            "on. ALLDATA's workflow is vehicle-first: (1) snapshot to see what's currently on "
             "screen, (2) fill the Year/Make/Model or VIN box with the requested vehicle and "
             "click_text the matching result to select that exact vehicle -- this is mandatory "
             "before any search result can count as relevant to it, (3) once selected, fill the "
             "Vehicle Information Search box with the calibration/reset topic and press Enter, "
             "(4) click_text the most relevant result, (5) extract to read the procedure text. "
-            "Call snapshot first if you are unsure what is currently on screen. Stop calling "
-            "tools and answer in plain text once you have extracted the relevant procedure, or "
-            "once you are confident ALLDATA does not have it for this exact vehicle -- do not "
-            "keep calling tools once you have enough information to answer."
+            "Stop calling tools and answer in plain text once you have extracted the relevant "
+            "procedure, or once you are confident ALLDATA does not have it for this exact "
+            "vehicle -- do not keep calling tools once you have enough information to answer."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": list(_NAV_ACTIONS)},
-                "text": {"type": "string", "description": "Text to fill, or link/button text to click_text."},
-                "selector": {"type": "string", "description": "CSS selector -- only used by fill."},
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "The ONLY field that carries a value to type or click. For fill: the "
+                        "text to type into the field named by 'selector'. For click_text: the "
+                        "visible link/button text to click. Never put this value in 'key' -- "
+                        "'key' is unrelated and only used by the press action."
+                    ),
+                },
+                "selector": {"type": "string", "description": "CSS selector -- required by, and only used by, fill."},
                 "url": {"type": "string", "description": "Only used by goto; must stay on an alldata.com URL."},
-                "key": {"type": "string", "description": "Only used by press, e.g. Enter."},
+                "key": {
+                    "type": "string",
+                    "description": (
+                        "A keyboard key name, e.g. Enter -- ONLY used by the press action. Never "
+                        "used by fill; fill's value goes in 'text', not here."
+                    ),
+                },
             },
             "required": ["action"],
             "additionalProperties": False,
@@ -71,16 +86,45 @@ def _system_prompt(vehicle: dict[str, Any], topic: str) -> str:
     label = str(vehicle.get("label") or "").strip() or "the requested vehicle"
     return (
         "You are operating a licensed ALLDATA Repair/Collision browser session for a "
-        "collision repair technician. Find the exact OEM procedure for:\n"
+        "collision repair technician. The browser session is ALREADY authenticated and "
+        "already positioned inside my.alldata.com -- call snapshot as your very first action "
+        "to see the real page you're on. Do not call goto to a fresh URL (e.g. alldata.com or "
+        "www.alldata.com) as your first move; that leaves the authenticated portal and lands "
+        "on the public marketing site instead. Find the exact OEM procedure for:\n"
         f"Vehicle: {label}\n"
         f"Topic: {topic}\n\n"
         "Do not substitute a different model, trim, or year, and do not answer from general "
         "knowledge -- only from what you actually observe in a tool result. Your final answer "
         "is independently checked against the real page state afterward, so a claim that isn't "
         "backed by what the tools actually showed you will be discarded rather than trusted. "
-        "If you cannot find this exact vehicle/topic after a reasonable number of steps, say so "
-        "plainly instead of guessing."
+        "If a tool call returns an error, read it and change what you send -- do not repeat the "
+        "exact same call. If you cannot find this exact vehicle/topic after a reasonable number "
+        "of steps, say so plainly instead of guessing."
     )
+
+
+def _validate_args(action: str, args: dict[str, Any]) -> Optional[str]:
+    """Catch a malformed call before it even reaches the browser, with a
+    correction specific enough for the model to actually fix it -- reproduced
+    live: the model called fill with {"key": "..."} instead of {"text": "..."}
+    and repeated that exact mistake for the rest of its turn budget against a
+    generic backend ValueError that didn't spell out the fix."""
+    if action == "fill":
+        if not str(args.get("selector") or "").strip():
+            return "fill requires a non-empty 'selector' naming the field to type into."
+        if not str(args.get("text") or "").strip():
+            extra = " You sent 'key' instead of 'text' -- 'key' is not read by fill." if args.get("key") else ""
+            return "fill requires a non-empty 'text' field with the value to type." + extra
+    elif action == "click_text":
+        if not str(args.get("text") or "").strip():
+            return "click_text requires a non-empty 'text' field with the visible link/button text to click."
+    elif action == "goto":
+        if not str(args.get("url") or "").strip():
+            return "goto requires a non-empty 'url'."
+    elif action == "press":
+        if not str(args.get("key") or "").strip():
+            return "press requires a non-empty 'key', e.g. Enter."
+    return None
 
 
 def _extract_content(events: list[dict[str, Any]]) -> str:
@@ -129,6 +173,8 @@ async def run_agent_search(
     query_submitted = False
     last_extract_text = ""
     stopped_reason = "model_finished"
+    last_failed_call: Optional[tuple[str, tuple[tuple[str, Any], ...]]] = None
+    repeated_failure_count = 0
 
     for turn in range(max_turns):
         try:
@@ -156,6 +202,7 @@ async def run_agent_search(
         ]
         messages.append({"role": "assistant", "content": content or None, "tool_calls": wire_calls})
 
+        turn_hit_repeat_limit = False
         for call, wire_call in zip(calls, wire_calls):
             try:
                 args = json.loads(call.get("arguments") or "{}")
@@ -164,15 +211,42 @@ async def run_agent_search(
             except Exception:
                 args = {}
             action = str(args.get("action") or "").casefold()
+            validation_error = _validate_args(action, args) if action in _NAV_ACTIONS else None
             if action not in _NAV_ACTIONS:
                 result: dict[str, Any] = {
                     "error": f"'{action or '(missing)'}' is not a navigation action available to this loop."
                 }
+            elif validation_error:
+                # Caught before ever reaching the browser: a specific, fixable
+                # correction beats the backend's generic "selector and text are
+                # required" -- reproduced live, the model repeated that exact
+                # malformed call for its entire remaining turn budget without
+                # ever correcting the mistake.
+                result = {"error": validation_error}
             else:
                 try:
                     result = await browser.operator_action({**args, "action": action})
                 except Exception as exc:  # noqa: BLE001
                     result = {"error": f"{type(exc).__name__}: {exc}"}
+
+            call_error = (result or {}).get("error") if isinstance(result, dict) else None
+            call_signature = (action, tuple(sorted((k, v) for k, v in args.items() if k != "action")))
+            if call_error and call_signature == last_failed_call:
+                repeated_failure_count += 1
+            else:
+                repeated_failure_count = 1 if call_error else 0
+            last_failed_call = call_signature if call_error else None
+            if call_error and repeated_failure_count >= 2:
+                result = {
+                    **result,
+                    "error": (
+                        f"REPEATED MISTAKE ({repeated_failure_count}x): you sent the exact same "
+                        f"call and got the exact same error again. Re-read the error and change "
+                        f"the arguments -- do not resend this call unchanged. {call_error}"
+                    ),
+                }
+            if call_error and repeated_failure_count >= 3:
+                turn_hit_repeat_limit = True
 
             if action == "fill" and "search" in str(args.get("selector") or "").casefold():
                 query_submitted = True
@@ -192,6 +266,15 @@ async def run_agent_search(
                 "tool_call_id": wire_call["id"],
                 "content": json.dumps(result, default=str)[:6_000],
             })
+
+        if turn_hit_repeat_limit:
+            # The model sent the identical failing call three times in a row
+            # even after a corrective hint -- reproduced live, it burned an
+            # entire 7-turn budget on one malformed fill call. No point
+            # spending the rest of the budget on a mistake it isn't
+            # correcting; stop and let the epilogue report honestly.
+            stopped_reason = "repeated_tool_error"
+            break
     else:
         stopped_reason = "turn_budget_exhausted"
 
