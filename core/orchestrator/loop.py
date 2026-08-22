@@ -120,6 +120,48 @@ _CIQ_PHASE_WORDS = {
     "ten": "10",
 }
 _CIQ_CONTEXT_STRING_FILTERS = ("shop", "phase", "status", "insurance", "q")
+_CIQ_EXPLICIT_SUBJECT_RE = re.compile(
+    r"\b(?:calibration\s+iq|ciq)\b",
+    re.IGNORECASE,
+)
+_CIQ_RO_IDENTIFIER_RE = re.compile(
+    r"\b(?:repair\s+order|ro)\s*(?:number|no\.?|#|id)?\s*[:#]?\s*[`\"']?"
+    r"(?P<identifier>"
+    r"XOP-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*|"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|"
+    r"(?=[A-Za-z0-9-]{5,64}\b)(?=[A-Za-z0-9-]*\d)"
+    r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
+    r")\b",
+    re.IGNORECASE,
+)
+_CIQ_RESEARCH_INTENT_RE = re.compile(
+    r"\b(?:research|oem\s+evidence|adas\s+si)\b",
+    re.IGNORECASE,
+)
+_CIQ_RESEARCH_PERSIST_RE = re.compile(
+    r"\b(?:complete|finish(?:ed)?|re[-\s]?run|rerun|redo|repeat|persist|"
+    r"attach|import|link|save|record|update)\b"
+    r"|\b(?:verify|validate|confirm)\b[^.!?\n]{0,100}"
+    r"\b(?:persisted|evidence|documents?|citations?|pages?|research)\b"
+    r"|\bresearch\s+(?:this|that|the)\s+(?:calibration\s+iq\s+)?"
+    r"(?:repair\s+order|ro)\b",
+    re.IGNORECASE,
+)
+_CIQ_RESEARCH_COMPLETE_RE = re.compile(
+    r"\b(?:complete|completed|finish|finished)\b",
+    re.IGNORECASE,
+)
+_CIQ_RESEARCH_NO_COMPLETE_RE = re.compile(
+    r"\b(?:do\s+not|don't|without)\b[^.!?\n]{0,40}"
+    r"\b(?:complete|finish|mark(?:ing)?\s+(?:the\s+)?research\s+complete)\b",
+    re.IGNORECASE,
+)
+_CIQ_RESEARCH_READ_ONLY_RE = re.compile(
+    r"\bread[-\s]?only\b"
+    r"|\b(?:do\s+not|don't|without)\b[^.!?\n]{0,80}"
+    r"\b(?:change|persist|save|attach|import|link|update|write|record)\b",
+    re.IGNORECASE,
+)
 _EXPLICIT_WEB_RESEARCH_RE = re.compile(
     r"\b(?:search|browse)\s+(?:the\s+)?(?:web|internet)\b"
     r"|\b(?:search|look\s+up|find)\b.{0,120}\b(?:online|on\s+the\s+(?:web|internet))\b"
@@ -270,6 +312,43 @@ def calibration_iq_read_request(
     return tool, args
 
 
+def calibration_iq_research_request(
+    user_message: object,
+) -> Optional[dict[str, Any]]:
+    """Build one composite operator action for explicit persisted RO research.
+
+    Ordinary ADAS SI questions remain model-selected read-only work. This lane
+    requires Calibration IQ, an exact RO identifier, research language, and a
+    persistence/completion instruction so a procedure lookup cannot mutate a
+    repair order accidentally.
+    """
+    text = str(user_message or "").strip()
+    if (
+        not text
+        or not _CIQ_EXPLICIT_SUBJECT_RE.search(text)
+        or not _CIQ_RESEARCH_INTENT_RE.search(text)
+        or not _CIQ_RESEARCH_PERSIST_RE.search(text)
+        or _CIQ_RESEARCH_READ_ONLY_RE.search(text)
+    ):
+        return None
+    match = _CIQ_RO_IDENTIFIER_RE.search(text)
+    if match is None:
+        return None
+    complete_research = bool(
+        _CIQ_RESEARCH_COMPLETE_RE.search(text)
+        and not _CIQ_RESEARCH_NO_COMPLETE_RE.search(text)
+    )
+    return {
+        "actions": [
+            {
+                "operation": "research_ro",
+                "repair_order_id": match.group("identifier"),
+                "arguments": {"complete_research": complete_research},
+            }
+        ]
+    }
+
+
 def _joined_breakdown(entries: list[tuple[str, Any]]) -> str:
     parts = [f"{count} {label}" for label, count in entries[:3]]
     if len(entries) > 3:
@@ -284,8 +363,7 @@ def calibration_iq_result_summary(result: Any, *, listing: bool) -> str:
     payload = result if isinstance(result, dict) else {}
     if payload.get("status") != "verified":
         return str(
-            payload.get("message")
-            or "Calibration IQ did not return a verified result."
+            payload.get("message") or "Calibration IQ did not return a verified result."
         ).strip()[:600]
 
     count = int(payload.get("count") or 0)
@@ -323,8 +401,7 @@ def website_update_intent(user_message: object) -> bool:
     if _WEBSITE_EDIT_ACTION_RE.search(text):
         return True
     return bool(
-        _WEBSITE_MAKE_EDIT_RE.search(text)
-        and _WEBSITE_DESIGN_TARGET_RE.search(text)
+        _WEBSITE_MAKE_EDIT_RE.search(text) and _WEBSITE_DESIGN_TARGET_RE.search(text)
     )
 
 
@@ -363,9 +440,7 @@ def website_result_summary(result: Any, *, update: bool) -> str:
                 f"Updated {title} in the existing chat preview. All cards now use a "
                 "translucent glass effect. No files were written or deployed."
             )
-        return (
-            f"Updated {title} in the existing chat preview. No files were written or deployed."
-        )
+        return f"Updated {title} in the existing chat preview. No files were written or deployed."
     return (
         f"Generated {title} as a buffered website preview in chat. No files were written "
         "or deployed."
@@ -406,8 +481,7 @@ def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
     if not text:
         return None
     explicit = bool(
-        _EXPLICIT_WEB_RESEARCH_RE.search(text)
-        or _WEB_SOURCE_REQUEST_RE.search(text)
+        _EXPLICIT_WEB_RESEARCH_RE.search(text) or _WEB_SOURCE_REQUEST_RE.search(text)
     )
     temporal = bool(
         _CURRENT_INFORMATION_RE.search(text)
@@ -449,6 +523,7 @@ def web_research_fallback_summary(result: Any) -> str:
         "results for that query. That is a search-result limitation, not a lack of web access."
     )
 
+
 # Tool name -> card type the UI knows how to render.
 ARTIFACT_FOR_TOOL = {
     "get_weather": "weather",
@@ -485,7 +560,611 @@ ARTIFACT_FOR_TOOL = {
     "calibration_iq_ro": "calibration_iq_ro",
     "calibration_iq_status": "calibration_iq_status",
     "calibration_iq_update": "calibration_iq_receipt",
+    "calibration_iq_operator": "calibration_iq_receipt",
+    "calibration_iq_destructive": "calibration_iq_receipt",
 }
+
+_CALIBRATION_IQ_OPERATOR_TOOLS = frozenset(
+    {
+        "calibration_iq_operator",
+        "calibration_iq_destructive",
+    }
+)
+
+
+def _calibration_iq_operator_payload(result: Any) -> dict[str, Any]:
+    """Return the authoritative operator payload, including approval replays."""
+    if not isinstance(result, dict):
+        return {}
+    nested = result.get("result")
+    if (
+        isinstance(nested, dict)
+        and result.get("verified") is not True
+        and result.get("success") is not True
+        and (
+            result.get("replayed") is True
+            or isinstance(result.get("execution_receipt"), dict)
+        )
+    ):
+        return nested
+    return result
+
+
+def calibration_iq_operator_result_is_verified(result: Any) -> bool:
+    """Require the operator's complete, positive receipt-level success contract."""
+    payload = _calibration_iq_operator_payload(result)
+    receipts = [
+        receipt
+        for receipt in (payload.get("receipts") or [])
+        if isinstance(receipt, dict)
+    ]
+    requested_count = _bounded_nonnegative_int(
+        payload.get("requested_count"), len(receipts)
+    )
+    processed_count = _bounded_nonnegative_int(
+        payload.get("processed_count"), len(receipts)
+    )
+    return bool(
+        payload.get("status") == "success"
+        and payload.get("success") is True
+        and payload.get("verified") is True
+        and payload.get("partial") is not True
+        and receipts
+        and requested_count == processed_count == len(receipts)
+        and all(
+            receipt.get("status") == "completed"
+            and receipt.get("success") is True
+            and isinstance(receipt.get("verification"), dict)
+            and receipt["verification"].get("verified") is True
+            for receipt in receipts
+        )
+    )
+
+
+def _bounded_nonnegative_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def calibration_iq_operator_failure_summary(result: Any) -> str:
+    """Return concise prose containing only structured Calibration IQ truth."""
+    payload = _calibration_iq_operator_payload(result)
+    raw_receipts = payload.get("receipts")
+    receipts = (
+        [receipt for receipt in raw_receipts if isinstance(receipt, dict)]
+        if isinstance(raw_receipts, list)
+        else []
+    )
+    requested_count = _bounded_nonnegative_int(
+        payload.get("requested_count"), len(receipts)
+    )
+    processed_count = _bounded_nonnegative_int(
+        payload.get("processed_count"), len(receipts)
+    )
+    verified_count = sum(
+        1
+        for receipt in receipts
+        if (
+            receipt.get("status") == "completed"
+            and receipt.get("success") is True
+            and isinstance(receipt.get("verification"), dict)
+            and receipt["verification"].get("verified") is True
+        )
+    )
+
+    error = payload.get("error")
+    error = (
+        error
+        if isinstance(error, dict)
+        else next(
+            (
+                receipt.get("error")
+                for receipt in receipts
+                if isinstance(receipt.get("error"), dict)
+            ),
+            {},
+        )
+    )
+    error_code = str(error.get("code") or error.get("category") or "").strip()
+    status = str(payload.get("status") or "unverified_result").strip()
+    structured_name = error_code or status or "unverified_result"
+    structured_name = re.sub(r"\s+", " ", structured_name)[:120]
+    detail = str(error.get("message") or payload.get("message") or "").strip()
+    detail = re.sub(r"\s+", " ", detail)[:400]
+
+    partial = bool(payload.get("partial") is True or verified_count > 0)
+    lead = (
+        "Calibration IQ only partially verified the requested operation."
+        if partial
+        else "Calibration IQ did not verify the requested operation."
+    )
+    exact = f" Structured error: {structured_name}"
+    if detail:
+        exact += f" — {detail}"
+    if not exact.endswith((".", "!", "?")):
+        exact += "."
+    total = max(requested_count, processed_count, len(receipts), verified_count)
+    counts = (
+        f"Verified actions: {verified_count} of {total}; "
+        f"processed actions: {processed_count} of {total}."
+        if total
+        else "Verified actions: 0; processed actions: 0."
+    )
+    return f"{lead}{exact} {counts}"
+
+
+def _calibration_iq_receipt_is_verified(receipt: Any) -> bool:
+    return bool(
+        isinstance(receipt, dict)
+        and receipt.get("status") == "completed"
+        and receipt.get("success") is True
+        and isinstance(receipt.get("verification"), dict)
+        and receipt["verification"].get("verified") is True
+    )
+
+
+def _calibration_iq_summary_value(value: Any, *, limit: int = 240) -> str:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return ""
+    cleaned = re.sub(r"\s+", " ", str(value)).strip()
+    return cleaned[:limit]
+
+
+def _calibration_iq_receipt_correction_key(receipt: dict[str, Any]) -> tuple[str, str]:
+    return (
+        _calibration_iq_summary_value(receipt.get("operation"), limit=120),
+        _calibration_iq_summary_value(receipt.get("repair_order_id"), limit=160),
+    )
+
+
+def _calibration_iq_receipts_are_same_action(
+    failed: dict[str, Any], verified: dict[str, Any]
+) -> bool:
+    failed_operation, failed_ro = _calibration_iq_receipt_correction_key(failed)
+    verified_operation, verified_ro = _calibration_iq_receipt_correction_key(verified)
+    if not failed_operation or failed_operation != verified_operation:
+        return False
+    strong_fields = ("mutation_id", "idempotency_key", "correlation_id")
+    failed_identities = {
+        (field, value)
+        for field in strong_fields
+        if (value := _calibration_iq_summary_value(failed.get(field), limit=200))
+    }
+    verified_identities = {
+        (field, value)
+        for field in strong_fields
+        if (value := _calibration_iq_summary_value(verified.get(field), limit=200))
+    }
+    if failed_identities or verified_identities:
+        return bool(failed_identities & verified_identities)
+    # Never hide a failure based on the operation name alone: one turn may
+    # apply the same operation to multiple ROs or resources.
+    if failed_ro or verified_ro:
+        return bool(failed_ro and verified_ro and failed_ro == verified_ro)
+    for field in ("target_id", "resource_id"):
+        failed_resource = _calibration_iq_summary_value(failed.get(field), limit=200)
+        verified_resource = _calibration_iq_summary_value(
+            verified.get(field), limit=200
+        )
+        if (
+            failed_resource
+            and verified_resource
+            and failed_resource == verified_resource
+        ):
+            return True
+    return False
+
+
+def _calibration_iq_receipt_identity(receipt: dict[str, Any]) -> tuple[str, str] | None:
+    for field in ("mutation_id", "idempotency_key"):
+        value = _calibration_iq_summary_value(receipt.get(field), limit=200)
+        if value:
+            return field, value
+    return None
+
+
+def _calibration_iq_receipt_resource(receipt: dict[str, Any]) -> str:
+    operation = _calibration_iq_summary_value(receipt.get("operation"), limit=120)
+    operation = operation or "operation"
+    resource_type = _calibration_iq_summary_value(
+        receipt.get("resource_type"), limit=120
+    )
+    resource_id = _calibration_iq_summary_value(receipt.get("resource_id"), limit=200)
+    path = ""
+    for state_name in ("after", "before"):
+        state = receipt.get(state_name)
+        if not isinstance(state, dict):
+            continue
+        for field in ("path", "storage_relative_path", "case_folder_relative_path"):
+            path = _calibration_iq_summary_value(state.get(field), limit=300)
+            if path:
+                break
+        if path:
+            break
+
+    facts: list[str] = []
+    if resource_type:
+        facts.append(f"type={resource_type}")
+    if resource_id:
+        facts.append(f"id={resource_id}")
+    if path:
+        facts.append(f"path={path}")
+    if not facts:
+        facts.append("receipt verified; resource type/id/path not returned")
+    return f"{operation} -> {', '.join(facts)}"
+
+
+def _calibration_iq_snapshot_state(
+    result_payloads: list[dict[str, Any]],
+) -> str:
+    latest: dict[str, dict[str, Any]] = {}
+    for payload in result_payloads:
+        snapshots = payload.get("final_snapshots")
+        snapshots = snapshots if isinstance(snapshots, dict) else {}
+        if not snapshots:
+            # Without a fresh authoritative reread, a later transport,
+            # indeterminate, or invalid-response result cannot inherit an
+            # older snapshot and label it as the current post-call state.
+            latest.clear()
+        affected_ro_ids = {
+            _calibration_iq_summary_value(receipt.get("repair_order_id"), limit=160)
+            for receipt in (payload.get("receipts") or [])
+            if isinstance(receipt, dict) and receipt.get("repair_order_id")
+        }
+        # A later operator call without a verified reread must not inherit an
+        # older snapshot and present it as the current post-call state.
+        for ro_id in affected_ro_ids:
+            if ro_id and ro_id not in snapshots:
+                latest.pop(ro_id, None)
+        for raw_ro_id, envelope in snapshots.items():
+            ro_id = _calibration_iq_summary_value(raw_ro_id, limit=160)
+            if not ro_id:
+                continue
+            if not (
+                isinstance(envelope, dict)
+                and envelope.get("status") == "verified"
+                and isinstance(envelope.get("snapshot"), dict)
+            ):
+                latest.pop(ro_id, None)
+                continue
+            latest[ro_id] = envelope["snapshot"]
+
+    if not latest:
+        return (
+            "Current repair-order state: unavailable because no verified final "
+            "snapshot was returned."
+        )
+
+    rendered: list[str] = []
+    for ro_id, snapshot in latest.items():
+        repair_order = snapshot.get("repair_order")
+        repair_order = repair_order if isinstance(repair_order, dict) else snapshot
+        workflow = snapshot.get("workflow")
+        workflow = workflow if isinstance(workflow, dict) else {}
+
+        number = ""
+        for field in ("ro_number", "roNumber", "number", "ro", "RO"):
+            number = _calibration_iq_summary_value(repair_order.get(field), limit=160)
+            if number:
+                break
+        status = _calibration_iq_summary_value(
+            workflow.get("status")
+            or repair_order.get("status")
+            or snapshot.get("workflow_status"),
+            limit=120,
+        )
+        version_value = repair_order.get("version")
+        if version_value is None:
+            version_value = workflow.get("version")
+        if version_value is None:
+            version_value = snapshot.get("version")
+        version = _calibration_iq_summary_value(version_value, limit=80)
+
+        identifier = f"number={number}" if number else f"id={ro_id}; number unavailable"
+        rendered.append(
+            f"Current repair order: {identifier}; status={status or 'unavailable'}; "
+            f"version={version or 'unavailable'}."
+        )
+    return " ".join(rendered)
+
+
+def calibration_iq_operator_terminal_summary(results: Any) -> str:
+    """Seal operator turns with only receipt and final-snapshot truth.
+
+    Multiple tool calls can be required when a later action consumes an id from
+    an earlier receipt. Verified receipts are accumulated. A failed receipt is
+    treated as a stale retry only when a later verified receipt identifies the
+    same operation and the same RO or target resource.
+    """
+    raw_results = results if isinstance(results, list) else [results]
+    payloads = [
+        _calibration_iq_operator_payload(result)
+        for result in raw_results
+        if isinstance(result, dict)
+    ]
+    payloads = [payload for payload in payloads if payload]
+    if not payloads:
+        return calibration_iq_operator_failure_summary({"status": "unverified_result"})
+
+    attempts: list[dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
+    requested_total = 0
+    processed_total = 0
+    for result_index, payload in enumerate(payloads):
+        receipts = [
+            receipt
+            for receipt in (payload.get("receipts") or [])
+            if isinstance(receipt, dict)
+        ]
+        requested_count = _bounded_nonnegative_int(
+            payload.get("requested_count"), len(receipts)
+        )
+        processed_count = _bounded_nonnegative_int(
+            payload.get("processed_count"), len(receipts)
+        )
+        requested_total += requested_count
+        processed_total += processed_count
+        attempt = {
+            "requested_count": requested_count,
+            "processed_count": processed_count,
+            "complete": calibration_iq_operator_result_is_verified(payload),
+            "entries": [],
+        }
+        attempts.append(attempt)
+        for receipt in receipts:
+            entry = {
+                "result_index": result_index,
+                "receipt": receipt,
+                "verified": _calibration_iq_receipt_is_verified(receipt),
+                "payload_complete": attempt["complete"],
+                "suppressed": False,
+                "suppression_reason": None,
+            }
+            entries.append(entry)
+            attempt["entries"].append(entry)
+
+    # Do not double-count an idempotent replay that returns the same mutation.
+    seen_verified: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not entry["verified"]:
+            continue
+        identity = _calibration_iq_receipt_identity(entry["receipt"])
+        if identity is not None and identity in seen_verified:
+            entry["suppressed"] = True
+            entry["suppression_reason"] = "duplicate"
+            requested_total = max(0, requested_total - 1)
+            processed_total = max(0, processed_total - 1)
+        elif identity is not None:
+            seen_verified.add(identity)
+
+    # A completely verified retry can replace at most one earlier failed
+    # attempt. Prefer the closest matching failure so one success never hides
+    # several same-operation errors.
+    for candidate in entries:
+        if (
+            not candidate["verified"]
+            or not candidate["payload_complete"]
+            or candidate["suppressed"]
+        ):
+            continue
+        matching_failures = [
+            entry
+            for entry in entries
+            if entry["result_index"] < candidate["result_index"]
+            and not entry["verified"]
+            and not entry["suppressed"]
+            and _calibration_iq_receipts_are_same_action(
+                entry["receipt"], candidate["receipt"]
+            )
+        ]
+        if matching_failures:
+            corrected = matching_failures[-1]
+            corrected["suppressed"] = True
+            corrected["suppression_reason"] = "corrected_retry"
+            requested_total = max(0, requested_total - 1)
+            processed_total = max(0, processed_total - 1)
+
+    verified_receipts = [
+        entry["receipt"]
+        for entry in entries
+        if entry["verified"] and not entry["suppressed"]
+    ]
+    verified_count = len(verified_receipts)
+    requested_total = max(requested_total, verified_count)
+    processed_total = max(min(processed_total, requested_total), verified_count)
+    outstanding = max(0, requested_total - verified_count)
+    active_attempt_indexes = {
+        index
+        for index, attempt in enumerate(attempts)
+        if (
+            max(
+                0,
+                int(attempt["requested_count"])
+                - sum(
+                    1
+                    for entry in attempt["entries"]
+                    if entry["suppression_reason"] == "corrected_retry"
+                ),
+            )
+            > 0
+            or (not attempt["complete"] and int(attempt["requested_count"]) == 0)
+        )
+    }
+    incomplete_outcome = any(
+        not attempts[index]["complete"] for index in active_attempt_indexes
+    )
+
+    if verified_count and not outstanding and not incomplete_outcome:
+        lead = (
+            f"Calibration IQ verified {verified_count} of {requested_total} "
+            "requested actions."
+        )
+    elif verified_count:
+        lead = (
+            "Calibration IQ only partially verified this operator turn. "
+            f"Verified actions: {verified_count} of {requested_total}; processed "
+            f"actions: {processed_total} of {requested_total}."
+        )
+    elif len(active_attempt_indexes) <= 1:
+        latest_index = max(active_attempt_indexes) if active_attempt_indexes else -1
+        latest = payloads[latest_index]
+        # Preserve the established structured failure wording for a completely
+        # unverified turn while still preventing any model-authored diagnosis.
+        return calibration_iq_operator_failure_summary(latest)
+    else:
+        lead = (
+            "Calibration IQ did not verify this operator turn. "
+            f"Verified actions: 0 of {requested_total}; processed actions: "
+            f"{processed_total} of {requested_total}."
+        )
+
+    operations = " ".join(
+        f"{index}) {_calibration_iq_receipt_resource(receipt)};"
+        for index, receipt in enumerate(verified_receipts, start=1)
+    ).rstrip(";")
+    operation_summary = f" Verified operations: {operations}." if operations else ""
+
+    error_summary = ""
+    if outstanding or incomplete_outcome:
+        active_failures = [
+            entry["receipt"]
+            for entry in entries
+            if not entry["verified"] and not entry["suppressed"]
+        ]
+        error = next(
+            (
+                receipt.get("error")
+                for receipt in reversed(active_failures)
+                if isinstance(receipt.get("error"), dict)
+            ),
+            None,
+        )
+        if not isinstance(error, dict):
+            error = next(
+                (
+                    payload.get("error")
+                    for index, payload in reversed(list(enumerate(payloads)))
+                    if index in active_attempt_indexes
+                    and not attempts[index]["complete"]
+                    and isinstance(payload.get("error"), dict)
+                ),
+                None,
+            )
+        if isinstance(error, dict):
+            code = _calibration_iq_summary_value(
+                error.get("code") or error.get("category"), limit=120
+            )
+            detail = _calibration_iq_summary_value(error.get("message"), limit=400)
+            if code or detail:
+                error_summary = (
+                    f" Latest structured error: {code or 'operation_failed'}"
+                )
+                if detail:
+                    error_summary += f" — {detail}"
+                error_summary += "."
+
+    return (
+        f"{lead}{operation_summary}{error_summary} "
+        f"{_calibration_iq_snapshot_state(payloads)}"
+    )
+
+
+def calibration_iq_research_result_summary(result: Any) -> str:
+    """Summarize only receipt-backed facts from a routed research operation."""
+    payload = _calibration_iq_operator_payload(result)
+    if not calibration_iq_operator_result_is_verified(payload):
+        return calibration_iq_operator_failure_summary(payload)
+
+    receipts = [
+        receipt
+        for receipt in (payload.get("receipts") or [])
+        if isinstance(receipt, dict)
+    ]
+    verified_receipts = sum(
+        1
+        for receipt in receipts
+        if (
+            receipt.get("status") == "completed"
+            and receipt.get("success") is True
+            and isinstance(receipt.get("verification"), dict)
+            and receipt["verification"].get("verified") is True
+        )
+    )
+    reports = [
+        report for report in (payload.get("research") or []) if isinstance(report, dict)
+    ]
+    requested_complete = bool(
+        reports
+        and all(report.get("research_complete_requested") is True for report in reports)
+    )
+    completion_verified = bool(
+        requested_complete
+        and all(report.get("research_complete_verified") is True for report in reports)
+    )
+
+    required: set[str] = set()
+    evidence: set[str] = set()
+    existing: set[str] = set()
+    prepared: set[str] = set()
+    for report in reports:
+        requirements = report.get("final_required_calibrations") or report.get(
+            "required_calibrations"
+        )
+        for item in requirements or []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("id") or item.get("label") or "").strip()
+            if key:
+                required.add(key)
+        for field, destination in (
+            ("already_present", existing),
+            ("documents_prepared", prepared),
+        ):
+            for item in report.get(field) or []:
+                if not isinstance(item, dict):
+                    continue
+                key = str(
+                    item.get("document_id")
+                    or item.get("source_uri")
+                    or item.get("relative_path")
+                    or item.get("source")
+                    or item.get("title")
+                    or ""
+                ).strip()
+                if key:
+                    destination.add(key)
+                    evidence.add(key)
+
+    if completion_verified:
+        parts = ["Calibration IQ verified the RO's OEM research as complete."]
+    else:
+        parts = ["Calibration IQ verified the RO-scoped OEM research operation."]
+    if evidence and required:
+        parts.append(
+            f"{len(evidence)} managed OEM document(s) cover "
+            f"{len(required)} required calibration(s)."
+        )
+    elif evidence:
+        parts.append(f"{len(evidence)} managed OEM document(s) were verified.")
+    if existing and not prepared:
+        parts.append(
+            f"It reused {len(existing)} existing managed document(s) instead of "
+            "importing duplicate copies."
+        )
+    receipt_detail = (
+        "the receipt card contains the persisted source and page-citation details."
+        if evidence
+        else "the receipt card contains the exact findings and missing-documentation details."
+    )
+    parts.append(
+        f"Verified receipts: {verified_receipts} of {len(receipts)}; {receipt_detail}"
+    )
+    return " ".join(parts)
 
 
 def tool_result_for_model(name: str, result: Any) -> Any:
@@ -731,8 +1410,10 @@ class Orchestrator:
         final_summary = summary
         final_artifacts = artifacts
         try:
-            if update and result.get("ok") is True and hasattr(
-                self.store, "add_website_revision_message"
+            if (
+                update
+                and result.get("ok") is True
+                and hasattr(self.store, "add_website_revision_message")
             ):
                 message_id = self.store.add_website_revision_message(
                     conversation_id,
@@ -841,7 +1522,8 @@ class Orchestrator:
     ) -> AsyncIterator[dict]:
         history = self.store.get_messages(conversation_id)
         messages = prompt_mod.build_messages(
-            self.router, history,
+            self.router,
+            history,
             self.settings.context_tokens,
             self.settings.max_response_tokens,
         )
@@ -854,18 +1536,26 @@ class Orchestrator:
             tools = self.registry.model_tools()
         artifacts: list[dict] = []
         full_text = ""
+        last_calibration_iq_operator_result: Optional[dict[str, Any]] = None
+        calibration_iq_operator_results: list[dict[str, Any]] = []
+        calibration_iq_truth_emitted = False
 
-        # Qwen's tool choice can occasionally answer an explicit camera request
-        # from stale conversational context. Pre-route only this high-confidence
-        # read-only intent through the same Registry/_execute boundary used by
-        # model-selected calls, so policy, audit, artifact, and chat rendering
-        # semantics stay identical.
+        # Qwen's tool choice can occasionally spend every tool round on source
+        # reads before a requested persisted RO-research action. Pre-route only
+        # high-confidence intents through the same Registry/_execute boundary
+        # used by model-selected calls, so policy, audit, artifact, and chat
+        # rendering semantics stay identical.
         base_routed_tool = (
             None if approved_tool else deterministic_read_tool(user_message)
         )
+        ciq_research = (
+            calibration_iq_research_request(user_message)
+            if not approved_tool and base_routed_tool is None
+            else None
+        )
         ciq_request = (
             calibration_iq_read_request(user_message, history)
-            if not approved_tool and base_routed_tool is None
+            if (not approved_tool and base_routed_tool is None and ciq_research is None)
             else None
         )
         image_request = (
@@ -885,6 +1575,7 @@ class Orchestrator:
         )
         routed_tool = (
             base_routed_tool
+            or ("calibration_iq_operator" if ciq_research else None)
             or (ciq_request[0] if ciq_request else None)
             or ("image_generate" if image_request else None)
             or ("web_research_current" if web_request else None)
@@ -900,6 +1591,9 @@ class Orchestrator:
             "calibration_iq_summary",
             "calibration_iq_read",
         }
+        routed_is_ciq_research = routed_tool == "calibration_iq_operator" and bool(
+            ciq_research
+        )
         routed_is_image = routed_tool == "image_generate"
         routed_is_web = routed_tool == "web_research_current"
         routed_result = None
@@ -910,9 +1604,12 @@ class Orchestrator:
             and (
                 routed_tier == "read_only"
                 or (routed_is_image and routed_tier == "confirm_required")
+                or (routed_is_ciq_research and routed_tier == "operator_authorized")
             )
         ):
-            if routed_is_ciq and ciq_request:
+            if routed_is_ciq_research and ciq_research:
+                routed_args = dict(ciq_research)
+            elif routed_is_ciq and ciq_request:
                 routed_args = dict(ciq_request[1])
             elif routed_is_image and image_request:
                 routed_args = dict(image_request)
@@ -925,18 +1622,22 @@ class Orchestrator:
             routed_call_id = (
                 f"routed_{routed_tool}_{int(conversation_id)}_{len(history)}"
             )
-            messages.append({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": routed_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": routed_tool,
-                        "arguments": json.dumps(routed_args),
-                    },
-                }],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": routed_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": routed_tool,
+                                "arguments": json.dumps(routed_args),
+                            },
+                        }
+                    ],
+                }
+            )
             routed_events: list[dict] = []
             routed_paused = False
             async for event in self._execute(
@@ -958,9 +1659,10 @@ class Orchestrator:
                         "website_preview",
                         "calibration_iq_summary",
                         "calibration_iq_ros",
+                        "calibration_iq_receipt",
                     }:
                         routed_result = artifact.get("data")
-                if routed_is_website or routed_is_ciq:
+                if routed_is_website or routed_is_ciq or routed_is_ciq_research:
                     routed_events.append(event)
                 else:
                     yield event
@@ -978,6 +1680,53 @@ class Orchestrator:
                     worker_used=self.router.active_name,
                     artifacts=artifacts,
                 )
+                yield {
+                    "type": "done",
+                    "message_id": message_id,
+                    "worker": self.router.active_name,
+                    "artifacts": artifacts,
+                }
+                return
+
+            # The composite research operator already performed its own ADAS
+            # searches, imports/links, final snapshot reread, and evidence
+            # verification. Seal this turn with receipt-derived prose instead
+            # of returning to the model for another sequence of read calls.
+            if routed_is_ciq_research:
+                result = (
+                    routed_result
+                    if isinstance(routed_result, dict)
+                    else {
+                        "status": "failed",
+                        "success": False,
+                        "verified": False,
+                        "partial": False,
+                        "error": {
+                            "code": "invalid_response",
+                            "message": (
+                                "Calibration IQ returned no usable operator result."
+                            ),
+                        },
+                    }
+                )
+                summary = calibration_iq_research_result_summary(result)
+                message_id = self.store.add_message(
+                    conversation_id,
+                    "assistant",
+                    summary,
+                    worker_used=self.router.active_name,
+                    artifacts=artifacts,
+                )
+                if len(history) <= 1 and summary:
+                    self.store.touch_conversation(
+                        conversation_id, title=user_message[:60]
+                    )
+                # Persist the result card and nonempty receipt-grounded prose
+                # before either is emitted. A disconnect or model round cap
+                # therefore cannot recreate the observed blank assistant turn.
+                for routed_event in routed_events:
+                    yield routed_event
+                yield {"type": "token", "text": summary}
                 yield {
                     "type": "done",
                     "message_id": message_id,
@@ -1024,10 +1773,14 @@ class Orchestrator:
                 return
 
             if routed_is_ciq:
-                result = routed_result if isinstance(routed_result, dict) else {
-                    "status": "error",
-                    "message": "Calibration IQ returned no usable result.",
-                }
+                result = (
+                    routed_result
+                    if isinstance(routed_result, dict)
+                    else {
+                        "status": "error",
+                        "message": "Calibration IQ returned no usable result.",
+                    }
+                )
                 card_type = ARTIFACT_FOR_TOOL[routed_tool]
                 matching_artifacts = [
                     artifact
@@ -1089,30 +1842,78 @@ class Orchestrator:
             args = approved_tool.get("args") or {}
             result = approved_tool.get("result")
             receipt = approved_tool.get("receipt") or {}
+            if name in _CALIBRATION_IQ_OPERATOR_TOOLS:
+                operator_payload = (
+                    result
+                    if isinstance(result, dict)
+                    else {"status": "unverified_result"}
+                )
+                if calibration_iq_operator_result_is_verified(
+                    operator_payload
+                ) and not (
+                    receipt.get("tool_name") == name
+                    and receipt.get("status") == "succeeded"
+                    and receipt.get("executed") is True
+                    and receipt.get("success") is True
+                    and receipt.get("result") == result
+                ):
+                    operator_payload = {
+                        "status": "failed",
+                        "executed": False,
+                        "success": False,
+                        "verified": False,
+                        "partial": False,
+                        "requested_count": _bounded_nonnegative_int(
+                            result.get("requested_count"), 1
+                        ),
+                        "processed_count": 0,
+                        "receipts": [],
+                        "final_snapshots": {},
+                        "error": {
+                            "code": "approval_receipt_mismatch",
+                            "message": (
+                                "The approved result did not match a successful "
+                                "terminal execution receipt."
+                            ),
+                        },
+                    }
+                    result = operator_payload
+                last_calibration_iq_operator_result = operator_payload
+                calibration_iq_operator_results.append(
+                    last_calibration_iq_operator_result
+                )
             call_id = approved_tool.get("call_id") or "approved_call"
-            messages.append({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(args)},
-                }],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": name,
-                "content": json.dumps(
-                    {"result": result, "execution_receipt": receipt}, default=str
-                )[:12000],
-            })
-            approved_events = [{
-                "type": "tool_result",
-                "name": name,
-                "result": result,
-                "receipt": receipt,
-            }]
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(args)},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": json.dumps(
+                        {"result": result, "execution_receipt": receipt}, default=str
+                    )[:12000],
+                }
+            )
+            approved_events = [
+                {
+                    "type": "tool_result",
+                    "name": name,
+                    "result": result,
+                    "receipt": receipt,
+                }
+            ]
             receipt_artifact = {"type": "execution_receipt", "data": receipt}
             artifacts.append(receipt_artifact)
             approved_events.append({"type": "artifact", "artifact": receipt_artifact})
@@ -1251,6 +2052,7 @@ class Orchestrator:
             for approved_event in approved_events:
                 yield approved_event
 
+        paused = False
         for round_index in range(MAX_TOOL_ROUNDS):
             tool_calls: list[dict] = []
             round_text = ""
@@ -1263,16 +2065,19 @@ class Orchestrator:
                     # the same streamed round. Hold round text until the tool
                     # choice is known so a late website call cannot expose a
                     # success claim before its artifact is durably committed.
-                    sealed_round_tokens.append(
-                        {"type": "token", "text": event["text"]}
-                    )
+                    sealed_round_tokens.append({"type": "token", "text": event["text"]})
                 elif event["type"] == "tool_call":
                     tool_calls.append(event)
 
             website_call_in_round = any(
-                call.get("name") == "website_preview_generate"
+                call.get("name") == "website_preview_generate" for call in tool_calls
+            )
+            operator_call_in_round = any(
+                call.get("name") in _CALIBRATION_IQ_OPERATOR_TOOLS
                 for call in tool_calls
             )
+            operator_turn_active = bool(calibration_iq_operator_results)
+            guarded_operator_response = bool(operator_turn_active and not tool_calls)
             guarded_web_response = bool(
                 routed_is_web
                 and not tool_calls
@@ -1287,15 +2092,27 @@ class Orchestrator:
                     )
                 )
             )
-            if not website_call_in_round and not guarded_web_response:
+            if (
+                not website_call_in_round
+                and not operator_call_in_round
+                and not operator_turn_active
+                and not guarded_web_response
+            ):
                 for token_event in sealed_round_tokens:
                     yield token_event
 
-            if guarded_web_response:
+            if guarded_operator_response:
+                guarded_text = calibration_iq_operator_terminal_summary(
+                    calibration_iq_operator_results
+                )
+                yield {"type": "token", "text": guarded_text}
+                full_text = guarded_text
+                calibration_iq_truth_emitted = True
+            elif guarded_web_response:
                 guarded_text = web_research_fallback_summary(routed_result)
                 yield {"type": "token", "text": guarded_text}
                 full_text += guarded_text
-            else:
+            elif not operator_call_in_round and not operator_turn_active:
                 full_text += round_text
 
             if not tool_calls:
@@ -1303,18 +2120,23 @@ class Orchestrator:
 
             # Record the assistant's tool-call turn so the model sees its own
             # request alongside the result on the next pass.
-            messages.append({
-                "role": "assistant",
-                "content": round_text or "",
-                "tool_calls": [
-                    {
-                        "id": c.get("id") or f"call_{round_index}_{i}",
-                        "type": "function",
-                        "function": {"name": c["name"], "arguments": c["arguments"]},
-                    }
-                    for i, c in enumerate(tool_calls)
-                ],
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": round_text or "",
+                    "tool_calls": [
+                        {
+                            "id": c.get("id") or f"call_{round_index}_{i}",
+                            "type": "function",
+                            "function": {
+                                "name": c["name"],
+                                "arguments": c["arguments"],
+                            },
+                        }
+                        for i, c in enumerate(tool_calls)
+                    ],
+                }
+            )
 
             paused = False
             for i, call in enumerate(tool_calls):
@@ -1329,12 +2151,30 @@ class Orchestrator:
                 is_website_call = call.get("name") == "website_preview_generate"
                 sealed_events: list[dict] = []
                 website_result = None
-                async for ev in self._execute(call["name"], args, messages,
-                                              artifacts, conversation_id=conversation_id,
-                                              approval_context=approval_context,
-                                              call_id=call_id):
+                async for ev in self._execute(
+                    call["name"],
+                    args,
+                    messages,
+                    artifacts,
+                    conversation_id=conversation_id,
+                    approval_context=approval_context,
+                    call_id=call_id,
+                ):
                     if ev["type"] == "approval":
                         paused = True
+                    if (
+                        call.get("name") in _CALIBRATION_IQ_OPERATOR_TOOLS
+                        and ev.get("type") == "tool_result"
+                    ):
+                        operator_result = ev.get("result")
+                        last_calibration_iq_operator_result = (
+                            operator_result
+                            if isinstance(operator_result, dict)
+                            else {"status": "unverified_result"}
+                        )
+                        calibration_iq_operator_results.append(
+                            last_calibration_iq_operator_result
+                        )
                     if is_website_call:
                         sealed_events.append(ev)
                         if ev.get("type") == "tool_result":
@@ -1350,12 +2190,9 @@ class Orchestrator:
 
                 if is_website_call:
                     result = website_result if isinstance(website_result, dict) else {}
-                    is_update = (
-                        args.get("operation") == "update_latest"
-                        or result.get("status") in {
-                            "updated_preview", "unchanged_preview", "update_failed"
-                        }
-                    )
+                    is_update = args.get("operation") == "update_latest" or result.get(
+                        "status"
+                    ) in {"updated_preview", "unchanged_preview", "update_failed"}
                     summary = website_result_summary(result, update=is_update)
                     message_id, summary, artifacts, result = self._persist_website_turn(
                         conversation_id,
@@ -1388,9 +2225,39 @@ class Orchestrator:
         else:
             log.warning("Tool loop hit the %d-round cap", MAX_TOOL_ROUNDS)
 
+        if (
+            paused
+            and not calibration_iq_truth_emitted
+            and calibration_iq_operator_results
+        ):
+            # A routine operator action may complete before a later destructive
+            # action pauses the turn for approval. Preserve the completed
+            # receipt truth in this turn instead of saving a blank assistant
+            # message; the approval continuation owns only the protected call.
+            guarded_text = calibration_iq_operator_terminal_summary(
+                calibration_iq_operator_results
+            )
+            yield {"type": "token", "text": guarded_text}
+            full_text = guarded_text
+            calibration_iq_truth_emitted = True
+
+        if (
+            not paused
+            and not calibration_iq_truth_emitted
+            and calibration_iq_operator_results
+        ):
+            guarded_text = calibration_iq_operator_terminal_summary(
+                calibration_iq_operator_results
+            )
+            yield {"type": "token", "text": guarded_text}
+            full_text = guarded_text
+
         message_id = self.store.add_message(
-            conversation_id, "assistant", full_text,
-            worker_used=self.router.active_name, artifacts=artifacts,
+            conversation_id,
+            "assistant",
+            full_text,
+            worker_used=self.router.active_name,
+            artifacts=artifacts,
         )
         if len(history) <= 1 and full_text:
             self.store.touch_conversation(conversation_id, title=user_message[:60])
@@ -1417,16 +2284,19 @@ class Orchestrator:
 
         def feed(payload: Any) -> None:
             projected = tool_result_for_model(name, payload)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "name": name,
-                "content": json.dumps(projected, default=str)[:12000],
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": json.dumps(projected, default=str)[:12000],
+                }
+            )
 
         try:
             result = await self.registry.invoke(
-                name, args,
+                name,
+                args,
                 message_id=(approval_context or {}).get("message_id"),
                 conversation_id=conversation_id,
                 tool_call_id=call_id,
@@ -1435,7 +2305,9 @@ class Orchestrator:
             )
         except NeedsApproval as pending:
             context = approval_context or {}
-            if not all(context.get(key) for key in ("session_id", "user_id", "message_id")):
+            if not all(
+                context.get(key) for key in ("session_id", "user_id", "message_id")
+            ):
                 payload = {
                     "status": "blocked",
                     "message": "Protected action identity is incomplete; nothing was run.",
@@ -1444,7 +2316,9 @@ class Orchestrator:
                 yield {"type": "tool_result", "name": name, "result": payload}
                 return
             approval_id = self.store.create_approval(
-                name, pending.summary, {"name": name, "args": args},
+                name,
+                pending.summary,
+                {"name": name, "args": args},
                 conversation_id=conversation_id,
                 session_id=str(context["session_id"]),
                 user_id=str(context["user_id"]),
@@ -1465,8 +2339,12 @@ class Orchestrator:
                     "replayed": True,
                 }
                 feed(replay)
-                yield {"type": "tool_result", "name": name, "result": replay,
-                       "receipt": receipt}
+                yield {
+                    "type": "tool_result",
+                    "name": name,
+                    "result": replay,
+                    "receipt": receipt,
+                }
                 if receipt:
                     artifact = {"type": "execution_receipt", "data": receipt}
                     artifacts.append(artifact)
@@ -1474,19 +2352,22 @@ class Orchestrator:
                 return
             if record.get("status") == "executing":
                 payload = {
-                    "status": "executing", "executed": False,
+                    "status": "executing",
+                    "executed": False,
                     "message": "This exact protected action is already executing.",
                 }
                 feed(payload)
                 yield {"type": "tool_result", "name": name, "result": payload}
                 return
-            feed({
-                "status": "awaiting_approval",
-                "message": (
-                    "This action needs Otis's approval before it can run: "
-                    f"{public_record.get('summary', 'Protected action')}"
-                ),
-            })
+            feed(
+                {
+                    "status": "awaiting_approval",
+                    "message": (
+                        "This action needs Otis's approval before it can run: "
+                        f"{public_record.get('summary', 'Protected action')}"
+                    ),
+                }
+            )
             approval = {
                 "id": approval_id,
                 "tool": public_record.get("tool", name),
@@ -1505,13 +2386,19 @@ class Orchestrator:
             return
         except ToolBlocked as exc:
             feed({"status": "blocked", "message": str(exc)})
-            yield {"type": "tool_result", "name": name,
-                   "result": {"status": "blocked", "message": str(exc)}}
+            yield {
+                "type": "tool_result",
+                "name": name,
+                "result": {"status": "blocked", "message": str(exc)},
+            }
             return
         except (ToolError, ValueError) as exc:
             feed({"status": "error", "message": str(exc)})
-            yield {"type": "tool_result", "name": name,
-                   "result": {"status": "error", "message": str(exc)}}
+            yield {
+                "type": "tool_result",
+                "name": name,
+                "result": {"status": "error", "message": str(exc)},
+            }
             return
         except Exception as exc:  # noqa: BLE001
             log.exception("tool %s failed", name)

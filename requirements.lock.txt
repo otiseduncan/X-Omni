@@ -24,6 +24,8 @@ pydantic==2.13.4
 pydantic_core==2.46.4
 Pygments==2.20.0
 PyJWT==2.13.0
+pypdf==6.16.1
+pypdfium2==5.13.0
 pytest==8.4.2
 pytest-asyncio==1.4.0
 python-dotenv==1.2.2

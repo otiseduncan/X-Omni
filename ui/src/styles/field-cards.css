@@ -394,6 +394,21 @@
   font-weight: 600;
 }
 
+.ciq-operation-list .ro-item {
+  min-width: 0;
+}
+
+.ciq-operation-list .ro-line {
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ciq-operation-error {
+  color: var(--warning);
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 430px) {
   .field-meta {
     max-width: 100%;

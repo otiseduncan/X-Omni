@@ -23,12 +23,12 @@ text is then scored with procedure-specific term weighting.
 Extracted page text is cached in SQLite keyed on the file's mtime, so a
 re-search is fast and an edited source re-extracts automatically.
 
-Known limitation kept from XV12: text extraction is pypdf only, no OCR.
-A scanned image-only PDF yields no text. That case is reported honestly
-as `partial_success` -- "the document exists and matched, but no text
-could be extracted" -- rather than as "no result", because telling a
-technician a procedure doesn't exist when it does is the worst possible
-failure here.
+Known limitation kept from XV12: pypdf is preferred for embedded text and
+PDFium is the runtime fallback, but neither performs OCR. A scanned image-only
+PDF therefore yields no text. That case is reported honestly as
+`partial_success` -- "the document exists and matched, but no text could be
+extracted" -- rather than as "no result", because telling a technician a
+procedure doesn't exist when it does is the worst possible failure here.
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ MAX_RESULTS = 8
 MAX_MATCHED_DOCS = 5
 EXCERPT_LEAD = 350
 EXCERPT_LEN = 1800
+CACHE_SCHEMA_VERSION = "2"
 
 IGNORE_TOKENS = {
     "the", "for", "show", "find", "display", "procedure", "calibration",
@@ -329,7 +330,15 @@ class AdasSI:
                 "  path TEXT, page INTEGER, text TEXT, source_mtime_ns INTEGER,"
                 "  PRIMARY KEY(path, page));"
                 "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
-                "INSERT OR REPLACE INTO meta VALUES('schema_version','1');"
+            )
+            current = db.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            if current is None or str(current[0]) != CACHE_SCHEMA_VERSION:
+                db.execute("DELETE FROM pages")
+            db.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                (CACHE_SCHEMA_VERSION,),
             )
 
     def available(self) -> bool:
@@ -348,13 +357,63 @@ class AdasSI:
         if cached:
             return [(int(p), str(t)) for p, t in cached]
 
-        if PdfReader is None:
-            raise RuntimeError("pypdf is not installed; cannot read ADAS SI PDFs.")
-        reader = PdfReader(str(path), strict=False)
-        pages = [
-            (n, (page.extract_text() or "")[:MAX_PAGE_CHARS])
-            for n, page in enumerate(reader.pages, 1)
-        ]
+        pages: Optional[list[tuple[int, str]]] = None
+        if PdfReader is not None:
+            try:
+                reader = PdfReader(str(path), strict=False)
+                pages = [
+                    (n, (page.extract_text() or "")[:MAX_PAGE_CHARS])
+                    for n, page in enumerate(reader.pages, 1)
+                ]
+            except Exception as exc:  # noqa: BLE001 - PDFium is the supported fallback
+                if pdfium is None:
+                    raise
+                log.warning(
+                    "ADAS SI: pypdf extraction failed for %s; trying PDFium: %s",
+                    path.name,
+                    type(exc).__name__,
+                )
+
+        # PDFium is already the supported Windows runtime used for inline page
+        # rendering. Use it when pypdf is unavailable, raises, or yields no
+        # embedded text. If pypdf successfully identified a scan and PDFium
+        # itself fails, retain the honest empty-page result instead of turning
+        # a displayable matched document into an unreadable error.
+        needs_pdfium = pages is None or not any(text.strip() for _, text in pages)
+        if needs_pdfium and pdfium is not None:
+            pypdf_pages = pages
+            document = None
+            try:
+                document = pdfium.PdfDocument(str(path))
+                pdfium_pages: list[tuple[int, str]] = []
+                for index in range(len(document)):
+                    page = document[index]
+                    try:
+                        text_page = page.get_textpage()
+                        try:
+                            text = text_page.get_text_range() or ""
+                        finally:
+                            text_page.close()
+                    finally:
+                        page.close()
+                    pdfium_pages.append((index + 1, text[:MAX_PAGE_CHARS]))
+                pages = pdfium_pages
+            except Exception as exc:  # noqa: BLE001 - preserve a valid pypdf scan result
+                if pypdf_pages is None:
+                    raise
+                pages = pypdf_pages
+                log.warning(
+                    "ADAS SI: PDFium fallback failed for %s: %s",
+                    path.name,
+                    type(exc).__name__,
+                )
+            finally:
+                if document is not None:
+                    document.close()
+        if pages is None:
+            raise RuntimeError(
+                "Neither pypdf nor pypdfium2 is installed; cannot read ADAS SI PDFs."
+            )
         with sqlite3.connect(self.cache_path) as db:
             db.execute("DELETE FROM pages WHERE path=?", (str(path),))
             db.executemany(

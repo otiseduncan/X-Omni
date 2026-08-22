@@ -35,6 +35,7 @@ test("Calibration IQ cards expose summary, list, empty, error, and incomplete st
 
   assert.match(cards, /calibration_iq_ros:\s*CalibrationRosCard/);
   assert.match(cards, /calibration_iq_summary:\s*CalibrationSummaryCard/);
+  assert.match(cards, /calibration_iq_receipt:\s*CalibrationReceiptCard/);
   assert.equal((cards.match(/calibration_iq_summary:\s*CalibrationSummaryCard/g) || []).length, 1);
   assert.match(cards, /<div className="ciq-count">[\s\S]*?<strong>/);
   assert.match(cards, /calibrationPhaseBreakdown\(label, n\)/);
@@ -43,6 +44,12 @@ test("Calibration IQ cards expose summary, list, empty, error, and incomplete st
   assert.match(cards, /Calibration IQ is unavailable/);
   assert.match(cards, /data\.collection_capped[\s\S]*?CALIBRATION_COLLECTION_WARNING/);
   assert.match(cards, /finished \{data\.completed_count === 1 \? "order" : "orders"\} excluded/);
+  assert.match(cards, /Calibration IQ — partially completed/);
+  assert.match(cards, /data\?\.receipts/);
+  assert.match(cards, /verification\?\.verified/);
+  assert.match(cards, /duplicate absorbed/);
+  assert.match(cards, /not executed/);
+  assert.match(cards, /Missing documentation:/);
 
   assert.equal(calibrationCountLabel(59, false), "59");
   assert.equal(calibrationCountLabel(400, true), "at least 400");

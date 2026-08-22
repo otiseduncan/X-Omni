@@ -19,6 +19,7 @@ from pydantic import BaseModel, SecretStr, ValidationError
 from ..models.router import WorkerSwapError
 from ..services import camera as camera_svc
 from ..services import calendar as calendar_svc
+from ..services import calibration_iq as calibration_iq_svc
 from ..services import exterior_camera as exterior_camera_svc
 from ..services.image_generation import ImageGenerationError, generated_image_path
 from ..services.video_generation import (
@@ -31,6 +32,73 @@ from ..services import weather as weather_svc
 log = logging.getLogger("xomni.routes")
 
 MAX_EXTERIOR_CAMERA_CONFIG_BYTES = 16 * 1024
+
+_CALIBRATION_IQ_PROXY_STATUS = {
+    "invalid_input": 400,
+    "unauthorized": 401,
+    "permission_denied": 403,
+    "not_found": 404,
+    "document_too_large": 413,
+    "workspace_file_too_large": 413,
+    "photo_too_large": 413,
+    "invalid_response": 502,
+    "temporary_service_failure": 503,
+    "not_configured": 503,
+}
+
+
+def _calibration_iq_proxy_response(
+    result: dict, *, resource_kind: str
+) -> StreamingResponse:
+    if (
+        result.get("status") != "verified"
+        or result.get("success") is not True
+        or result.get("verified") is not True
+    ):
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        code = str(error.get("code") or result.get("status") or "operation_failed")
+        raise HTTPException(
+            _CALIBRATION_IQ_PROXY_STATUS.get(code, 502),
+            {"code": code, "message": str(error.get("message") or result.get("message"))},
+        )
+    data = result.get("content")
+    expected_length = result.get("content_length")
+    expected_sha256 = str(result.get("sha256") or "").strip().casefold()
+    content_type = calibration_iq_svc._validated_operator_content_type(
+        result.get("content_type"), resource_kind=resource_kind
+    )
+    if (
+        not isinstance(data, bytes)
+        or isinstance(expected_length, bool)
+        or not isinstance(expected_length, int)
+        or expected_length < 0
+        or len(data) != expected_length
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or hashlib.sha256(data).hexdigest() != expected_sha256
+        or content_type is None
+    ):
+        raise HTTPException(
+            502,
+            {
+                "code": "invalid_response",
+                "message": "Calibration IQ proxy data failed local integrity validation.",
+            },
+        )
+    disposition = str(result.get("content_disposition") or "attachment")
+    if "\r" in disposition or "\n" in disposition or len(disposition) > 1000:
+        disposition = "attachment"
+    return StreamingResponse(
+        iter([data]),
+        media_type=content_type,
+        headers={
+            "Content-Disposition": disposition,
+            "Content-Length": str(expected_length),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Content-SHA256": expected_sha256,
+            "X-Content-Length-Verified": str(expected_length),
+        },
+    )
 
 
 class SwapRequest(BaseModel):
@@ -460,6 +528,43 @@ def create_router(
             media_type=media,
             headers={"Content-Disposition": f'{disposition}; filename="{safe_name}"'},
         )
+
+    @api.get("/calibration-iq/documents/{document_id}/download")
+    async def calibration_iq_document_download(
+        document_id: str,
+        _session: dict = Depends(require_owner),
+    ):
+        """Authenticated same-origin proxy for Calibration IQ managed files.
+
+        The browser never receives the internal service URL or bearer token,
+        and Core buffers no more than the service adapter's fixed size limit.
+        """
+        result = await calibration_iq_svc.fetch_operator_document(settings, document_id)
+        return _calibration_iq_proxy_response(result, resource_kind="document")
+
+    @api.get("/calibration-iq/workspace-file")
+    async def calibration_iq_workspace_file(
+        repair_order_id: str,
+        path: str,
+        _session: dict = Depends(require_owner),
+    ):
+        """Authenticated proxy for one path-confined managed RO workspace file."""
+        result = await calibration_iq_svc.fetch_operator_workspace_file(
+            settings, repair_order_id, path
+        )
+        return _calibration_iq_proxy_response(result, resource_kind="workspace")
+
+    @api.get("/calibration-iq/photos/{photo_id}/{variant}")
+    async def calibration_iq_photo(
+        photo_id: str,
+        variant: str,
+        _session: dict = Depends(require_owner),
+    ):
+        """Authenticated proxy for a verified Calibration IQ photo or thumbnail."""
+        result = await calibration_iq_svc.fetch_operator_photo(
+            settings, photo_id, variant
+        )
+        return _calibration_iq_proxy_response(result, resource_kind="photo")
 
     @api.get("/adas-si/page")
     async def adas_si_page(

@@ -6,6 +6,7 @@
 #
 # tiers:
 #   read_only        runs immediately, logged
+#   operator_authorized runs routine domain actions immediately, logged and verified
 #   confirm_required surfaces an approval card in chat, waits for you
 #   blocked          never runs, regardless of what asks
 #
@@ -150,7 +151,7 @@ tools:
     tier: confirm_required
     description: "Update an ADAS SI annotation record. Version-checked. Requires approval."
 
-  # ---- Calibration IQ: live field data, so writes are always gated ----
+  # ---- Calibration IQ: routine operator work is authorized; destructive deletes are gated ----
   calibration_iq_status:
     tier: read_only
     description: "Is Calibration IQ reachable and is the service token accepted."
@@ -173,6 +174,20 @@ tools:
       Change a repair order in Calibration IQ (status, fields, blockers,
       requirements). Idempotency-keyed and version-checked upstream.
       Requires approval.
+
+  calibration_iq_operator:
+    tier: operator_authorized
+    description: >-
+      Perform verified, idempotent Calibration IQ operator batches, including
+      research, photos, managed case-file/document work, status undo,
+      no-calibration decisions, and location administration. Routine authorized
+      operations run immediately and are audited upstream and in X.
+
+  calibration_iq_destructive:
+    tier: confirm_required
+    description: >-
+      Remove a calibration requirement, blocker, photo, or general prerequisite
+      through explicit backend destructive operations. Requires Owner approval.
 
   delete_file:
     tier: blocked

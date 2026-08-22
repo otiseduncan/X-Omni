@@ -10,6 +10,7 @@ never leaks into a result that reaches model context or the audit log.
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -567,6 +568,109 @@ def test_unreadable_pdf_is_not_reported_as_no_result(adas: adas_mod.AdasSI):
     assert result["status"] == "partial_success"
     assert "do not treat this as the procedure being absent" in result["message"]
     assert result["matched_documents"][0]["make"] == "Ford"
+
+
+def test_page_text_extraction_falls_back_to_pdfium_and_caches_result(
+    tmp_path: Path, monkeypatch,
+):
+    source_root = tmp_path / "ADAS SI"
+    source_root.mkdir()
+    source = source_root / "2024 Toyota Camry Front Camera Calibration.pdf"
+    source.write_bytes(b"%PDF fixture")
+    lifecycle: list[str] = []
+
+    class BrokenPdfReader:
+        def __init__(self, *_args, **_kwargs):
+            raise ValueError("pypdf could not parse this valid PDFium document")
+
+    class FakeTextPage:
+        def __init__(self, text: str):
+            self.text = text
+
+        def get_text_range(self):
+            return self.text
+
+        def close(self):
+            lifecycle.append("text_closed")
+
+    class FakePage:
+        def __init__(self, text: str):
+            self.text = text
+
+        def get_textpage(self):
+            return FakeTextPage(self.text)
+
+        def close(self):
+            lifecycle.append("page_closed")
+
+    class FakeDocument:
+        texts = [
+            "Forward recognition camera overview",
+            "Perform the front camera calibration with the OEM target.",
+        ]
+
+        def __init__(self, path: str):
+            assert path == str(source)
+            lifecycle.append("document_opened")
+
+        def __len__(self):
+            return len(self.texts)
+
+        def __getitem__(self, index: int):
+            return FakePage(self.texts[index])
+
+        def close(self):
+            lifecycle.append("document_closed")
+
+    class FakePdfium:
+        PdfDocument = FakeDocument
+
+    monkeypatch.setattr(adas_mod, "PdfReader", BrokenPdfReader)
+    monkeypatch.setattr(adas_mod, "pdfium", FakePdfium)
+    adas = adas_mod.AdasSI(source_root, tmp_path / "cache" / "index.sqlite")
+
+    expected = [(1, FakeDocument.texts[0]), (2, FakeDocument.texts[1])]
+    assert adas._pages(source) == expected
+    assert lifecycle == [
+        "document_opened",
+        "text_closed", "page_closed",
+        "text_closed", "page_closed",
+        "document_closed",
+    ]
+    assert adas._pages(source) == expected
+    assert lifecycle.count("document_opened") == 1
+
+
+def test_page_cache_schema_version_change_invalidates_old_extracted_text(tmp_path: Path):
+    source_root = tmp_path / "ADAS SI"
+    source_root.mkdir()
+    source = source_root / "2024 Toyota Camry Front Camera Calibration.pdf"
+    source.write_bytes(b"%PDF fixture")
+    cache_path = tmp_path / "cache" / "index.sqlite"
+    cache_path.parent.mkdir(parents=True)
+    with sqlite3.connect(cache_path) as db:
+        db.executescript(
+            "CREATE TABLE pages("
+            "path TEXT, page INTEGER, text TEXT, source_mtime_ns INTEGER,"
+            "PRIMARY KEY(path, page));"
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);"
+        )
+        db.execute(
+            "INSERT INTO pages(path, page, text, source_mtime_ns) VALUES(?,?,?,?)",
+            (str(source), 1, "stale extractor output", source.stat().st_mtime_ns),
+        )
+        db.execute(
+            "INSERT INTO meta(key, value) VALUES('schema_version', '1')"
+        )
+
+    adas_mod.AdasSI(source_root, cache_path)
+
+    with sqlite3.connect(cache_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 0
+        version = db.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert version == adas_mod.CACHE_SCHEMA_VERSION
 
 
 def test_search_requires_a_query(adas: adas_mod.AdasSI):

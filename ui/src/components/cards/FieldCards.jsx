@@ -478,20 +478,87 @@ export function CalibrationRoCard({ data }) {
 /* ---------------- Calibration IQ: write receipt ---------------- */
 
 export function CalibrationReceiptCard({ data }) {
-  const verified = data?.receipt?.verified;
-  const tone = verified ? undefined : "warn";
+  const actions = Array.isArray(data?.receipts)
+    ? data.receipts
+    : Array.isArray(data?.actions)
+      ? data.actions
+      : Array.isArray(data?.results)
+        ? data.results
+        : [];
+  const legacyVerified = data?.receipt?.verified === true;
+  const actionVerified = actions.length > 0
+    && actions.every((item) => (
+      item?.success === true
+      && item?.status === "completed"
+      && (item?.verification?.verified === true || item?.verified === true || item?.receipt?.verified === true)
+    ));
+  const verified = data?.verified === true || actionVerified || legacyVerified;
+  const partial = data?.partial === true || data?.status === "partial_success" || data?.status === "partial";
+  const failed = data?.success === false || data?.status === "failed" || data?.status === "error";
+  const tone = verified && !partial && !failed ? undefined : "warn";
+  const title = verified && !partial && !failed
+    ? "Calibration IQ — changes verified"
+    : partial
+      ? "Calibration IQ — partially completed"
+      : "Calibration IQ — not confirmed";
+  const actionLabel = (item) => item?.operation || item?.receipt?.operation || "operation";
+  const targetLabel = (item) => (
+    item?.resource_id
+    || item?.resource?.id
+    || item?.repair_order_id
+    || item?.target_id
+    || item?.receipt?.resource?.id
+    || "—"
+  );
+  const isVerified = (item) => (
+    item?.success === true
+    && item?.status === "completed"
+    && (item?.verification?.verified === true || item?.verified === true || item?.receipt?.verified === true)
+  );
+  const errorMessage = (item) => item?.error?.message || item?.message;
   return (
     <Card
       icon={Wrench}
-      title={verified ? "Calibration IQ — change confirmed" : "Calibration IQ — not confirmed"}
+      title={title}
       tone={tone}
     >
-      <div className="kv">
-        <div><span>Operation</span><strong>{data?.operation}</strong></div>
-        <div><span>Repair order</span><strong>{data?.repair_order_id}</strong></div>
-        <div><span>Verified</span><strong>{verified ? "yes" : "no"}</strong></div>
-        {data?.duplicate && <div><span>Duplicate</span><strong>absorbed</strong></div>}
-      </div>
+      {actions.length > 0 ? (
+        <div className="ro-list ciq-operation-list">
+          {actions.map((item, index) => (
+            <div className="ro-item" key={item?.mutation_id || item?.receipt_id || item?.idempotency_key || index}>
+              <div className="ro-line">
+                <strong>{actionLabel(item)}</strong>
+                <span className={`ro-pill ${isVerified(item) ? "done" : "warn"}`}>
+                  {isVerified(item)
+                    ? "verified"
+                    : item?.status === "completed" || item?.executed
+                      ? "not verified"
+                      : "not executed"}
+                </span>
+              </div>
+              <div className="ro-line ro-sub">
+                <span>{targetLabel(item)}</span>
+                {(item?.replayed || item?.duplicate) && <span>duplicate absorbed</span>}
+              </div>
+              {errorMessage(item) && (
+                <p className="card-note ciq-operation-error">{errorMessage(item)}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="kv">
+          <div><span>Operation</span><strong>{data?.operation}</strong></div>
+          <div><span>Repair order</span><strong>{data?.repair_order_id}</strong></div>
+          <div><span>Verified</span><strong>{verified ? "yes" : "no"}</strong></div>
+          {data?.duplicate && <div><span>Duplicate</span><strong>absorbed</strong></div>}
+        </div>
+      )}
+      {data?.missing_documentation?.length > 0 && (
+        <p className="card-note ciq-incomplete" style={{ marginTop: 8 }}>
+          Missing documentation: {data.missing_documentation.join(", ")}
+        </p>
+      )}
       {data?.message && <p className="card-note" style={{ marginTop: 8 }}>{data.message}</p>}
     </Card>
   );

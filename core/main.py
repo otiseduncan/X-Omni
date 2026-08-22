@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
@@ -176,11 +175,19 @@ def build_app(settings: Settings) -> FastAPI:
     async def calibration_iq_update(args: dict) -> dict:
         return await ciq_svc.mutate(settings, args)
 
+    async def calibration_iq_operator(args: dict) -> dict:
+        return await ciq_svc.operator_execute(settings, adas, args)
+
+    async def calibration_iq_destructive(args: dict) -> dict:
+        return await ciq_svc.operator_execute(settings, adas, args, destructive=True)
+
     registry.register("calibration_iq_status", calibration_iq_status)
     registry.register("calibration_iq_summary", calibration_iq_summary)
     registry.register("calibration_iq_read", calibration_iq_read)
     registry.register("calibration_iq_ro", calibration_iq_ro)
     registry.register("calibration_iq_update", calibration_iq_update)
+    registry.register("calibration_iq_operator", calibration_iq_operator)
+    registry.register("calibration_iq_destructive", calibration_iq_destructive)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

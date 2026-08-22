@@ -45,6 +45,78 @@ MAX_RESULT_STRING = 200_000
 MAX_RESULT_ITEMS = 500
 MAX_RESULT_BYTES = 256_000
 
+# Policy configuration is executable security state. A misspelled or newly
+# invented tier must never silently become an immediately executable tool.
+VALID_POLICY_TIERS = frozenset({
+    "read_only",
+    "operator_authorized",
+    "confirm_required",
+    "blocked",
+})
+
+_CALIBRATION_IQ_CONTEXT_KEY = "__xomni_invocation"
+
+CALIBRATION_IQ_ROUTINE_OPERATIONS = (
+    "create_ro",
+    "update_ro",
+    "change_status",
+    "hold_ro",
+    "resume_ro",
+    "close_ro",
+    "reopen_ro",
+    "undo_status",
+    "add_note",
+    "update_note",
+    "add_calibration",
+    "update_calibration",
+    "complete_calibration",
+    "reopen_calibration",
+    "mark_no_calibration_required",
+    "reopen_calibration_review",
+    "add_blocker",
+    "update_blocker",
+    "resolve_blocker",
+    "reopen_blocker",
+    "add_prerequisite",
+    "update_prerequisite",
+    "complete_prerequisite",
+    "verify_prerequisite",
+    "reject_prerequisite",
+    "reopen_prerequisite",
+    "update_research",
+    "research_ro",
+    "ensure_case_workspace",
+    "create_folder",
+    "rename_entry",
+    "move_entry",
+    "copy_entry",
+    "create_file",
+    "archive_entry",
+    "restore_entry",
+    "import_document",
+    "update_document",
+    "link_document",
+    "unlink_document",
+    "replace_document",
+    "archive_document",
+    "restore_document",
+    "import_photo",
+    "update_photo",
+    "update_location",
+    "create_location",
+    "annotate_domo",
+    "create_assessment",
+    "update_assessment",
+    "publish_assessment",
+)
+
+CALIBRATION_IQ_DESTRUCTIVE_OPERATIONS = (
+    "delete_calibration",
+    "delete_blocker",
+    "delete_photo",
+    "delete_prerequisite",
+)
+
 _SENSITIVE_PATH_EXACT = {
     ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".git", ".hg", ".svn",
     "credentials", "credential",
@@ -575,6 +647,118 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["repair_order_id", "operation", "arguments"],
         },
     },
+    "calibration_iq_operator": {
+        "description": (
+            "Perform one or more routine, authorized Calibration IQ business actions in a "
+            "single verified batch. Existing query tools remain preferable for ordinary reads. "
+            "Use operation research_ro to search ADAS SI, import matched OEM PDFs with page/source "
+            "provenance, link evidence to supplied or discovered calibration ids, and report missing "
+            "documentation. Set arguments.complete_research=true only when the user explicitly asks "
+            "to finish research; completion is withheld unless every required calibration has "
+            "source-backed persisted evidence. If research depends on a calibration mutation, call "
+            "this tool sequentially in the same user turn: verify the mutation receipt, then call "
+            "research_ro with the generated calibration id. Do not combine them in one actions array. "
+            "It also manages photos, general workspace entries, status undo, no-calibration decisions, "
+            "locations, document links/replacement/archive/restore, and verified download URLs. "
+            "delete_calibration, delete_blocker, delete_photo, and delete_prerequisite are not accepted "
+            "here; they use the confirmation-gated destructive tool."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "operation": {
+                                "type": "string",
+                                "enum": list(CALIBRATION_IQ_ROUTINE_OPERATIONS),
+                                "description": (
+                                    "Exact routine Calibration IQ operator operation. Photo and workspace "
+                                    "actions manage product-owned files; document actions support metadata, "
+                                    "link/unlink, replacement, archive, and restore. undo_status uses the "
+                                    "product's history-aware correction, while no-calibration decisions use "
+                                    "their dedicated business actions. Verified file URLs are returned "
+                                    "through authenticated X proxies."
+                                ),
+                            },
+                            "repair_order_id": {
+                                "type": "string",
+                                "description": (
+                                    "Authoritative repair-order UUID from a prior snapshot, or the "
+                                    "exact displayed RO number. X resolves a number to one UUID and "
+                                    "fails closed when it is missing or ambiguous."
+                                ),
+                            },
+                            "target_id": {"type": "string"},
+                            "expected_version": {"type": "integer", "minimum": 1},
+                            "arguments": {
+                                "type": "object",
+                                "description": (
+                                    "Operation-specific business fields. For add_note use body; for "
+                                    "create_folder use path. Do not send alternate names for the "
+                                    "same field or conflicting duplicate values."
+                                ),
+                            },
+                        },
+                        "required": ["operation"],
+                    },
+                },
+                "continue_on_error": {
+                    "type": "boolean",
+                    "description": "Continue later actions after a failed action. Default false.",
+                },
+            },
+            "required": ["actions"],
+            "additionalProperties": False,
+        },
+    },
+    "calibration_iq_destructive": {
+        "description": (
+            "Remove a calibration requirement, blocker, photo, or general prerequisite through "
+            "Calibration IQ's explicit destructive operations. These actions require owner "
+            "confirmation. Archive and reversible restore operations remain routine operator work."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "operation": {
+                                "type": "string",
+                                "enum": list(CALIBRATION_IQ_DESTRUCTIVE_OPERATIONS),
+                                "description": "Exact backend-declared destructive operation.",
+                            },
+                            "repair_order_id": {
+                                "type": "string",
+                                "description": (
+                                    "Authoritative repair-order UUID from a prior snapshot, or the "
+                                    "exact displayed RO number for unique fail-closed resolution."
+                                ),
+                            },
+                            "target_id": {"type": "string"},
+                            "expected_version": {"type": "integer", "minimum": 1},
+                            "arguments": {"type": "object"},
+                        },
+                        "required": ["operation"],
+                    },
+                },
+                "continue_on_error": {"type": "boolean"},
+            },
+            "required": ["actions"],
+            "additionalProperties": False,
+        },
+    },
 }
 
 
@@ -605,7 +789,8 @@ class Registry:
 
     def tier(self, name: str) -> str:
         entry = self.policy.get(name)
-        return (entry or {}).get("tier", "blocked")
+        tier = str((entry or {}).get("tier", "blocked"))
+        return tier if tier in VALID_POLICY_TIERS else "blocked"
 
     @staticmethod
     def role_allows_tool(role: str, name: str) -> bool:
@@ -783,6 +968,19 @@ class Registry:
                 f"{args.get('repair_order_id')}"
                 f"{f' ({detail})' if detail else ''}"
             )
+        if name == "calibration_iq_destructive":
+            actions = args.get("actions") if isinstance(args.get("actions"), list) else []
+            summaries = []
+            for action in actions[:5]:
+                if not isinstance(action, dict):
+                    continue
+                target = action.get("target_id") or action.get("repair_order_id") or "?"
+                summaries.append(f"{action.get('operation') or '?'} {target}")
+            suffix = f" (+{len(actions) - 5} more)" if len(actions) > 5 else ""
+            return (
+                "Calibration IQ destructive correction — "
+                f"{'; '.join(summaries) or 'invalid empty request'}{suffix}"
+            )
         if name == "adas_si_file_write":
             return f"Write into the ADAS SI library: {args.get('path')} (previous version backed up)"
         if name == "adas_si_record_write":
@@ -883,6 +1081,38 @@ class Registry:
         reports process failure in its result rather than raising, so classify
         that result before the approval is finalized.
         """
+        if name in {
+            "calibration_iq_update",
+            "calibration_iq_operator",
+            "calibration_iq_destructive",
+        }:
+            if not isinstance(result, dict):
+                return "Calibration IQ returned an invalid execution result."
+            status = str(result.get("status") or "").casefold()
+            error = result.get("error") if isinstance(result.get("error"), dict) else {}
+            message = str(
+                result.get("message")
+                or error.get("message")
+                or "Calibration IQ did not provide verified completion proof."
+            )
+            if name == "calibration_iq_update":
+                receipt = result.get("receipt") if isinstance(result.get("receipt"), dict) else {}
+                if not (
+                    status == "success"
+                    and result.get("executed") is True
+                    and receipt.get("verified") is True
+                ):
+                    return message
+                return None
+            if not (
+                status in {"success", "completed", "verified"}
+                and result.get("executed") is True
+                and result.get("success") is True
+                and result.get("verified") is True
+                and result.get("partial") is not True
+            ):
+                return message
+            return None
         if name == "image_generate":
             if not isinstance(result, dict):
                 return "Image generation returned an invalid execution result."
@@ -1086,6 +1316,37 @@ class Registry:
             return f"PowerShell exited with code {exit_code}."
         return None
 
+    @staticmethod
+    def _calibration_iq_invocation_context(
+        *,
+        conversation_id: Optional[int],
+        tool_call_id: Optional[str],
+        message_id: Optional[int],
+        user_id: Optional[str],
+        role: str,
+    ) -> dict[str, Any]:
+        """Return identity X owns; model-produced arguments never choose it."""
+        if (
+            isinstance(conversation_id, bool)
+            or not isinstance(conversation_id, int)
+            or conversation_id <= 0
+            or isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or message_id <= 0
+            or not str(tool_call_id or "").strip()
+        ):
+            raise ToolBlocked(
+                "Calibration IQ operator actions must be bound to an active conversation, "
+                "persisted user turn, and tool call. Nothing was run."
+            )
+        return {
+            "conversation_id": conversation_id,
+            "tool_call_id": str(tool_call_id).strip(),
+            "message_id": message_id,
+            "user_id": str(user_id or "local-dev"),
+            "role": str(role or "owner"),
+        }
+
     async def invoke(
         self,
         name: str,
@@ -1098,6 +1359,12 @@ class Registry:
         user_id: Optional[str] = None,
         role: Optional[str] = None,
     ) -> Any:
+        if name in {"calibration_iq_operator", "calibration_iq_destructive"}:
+            # This namespace is Registry-owned. Drop a model-provided value
+            # before approval persistence, summaries, audit logging, or handler
+            # execution; an authoritative value is injected later.
+            args = dict(args)
+            args.pop(_CALIBRATION_IQ_CONTEXT_KEY, None)
         tier = self.tier(name)
 
         if self.store and conversation_id is not None:
@@ -1143,6 +1410,17 @@ class Registry:
         if name in {"get_weather", "list_tasks", "add_task", "update_task_status"}:
             handler_args = dict(args)
             handler_args["__xomni_user_id"] = user_id or "local-dev"
+        if name in {"calibration_iq_operator", "calibration_iq_destructive"}:
+            handler_args = dict(args)
+            # Overwrite (never merge) the reserved field. The model cannot
+            # choose delegation identity or the seed used for exact-once IDs.
+            handler_args[_CALIBRATION_IQ_CONTEXT_KEY] = self._calibration_iq_invocation_context(
+                conversation_id=conversation_id,
+                tool_call_id=tool_call_id,
+                message_id=message_id,
+                user_id=user_id,
+                role=role,
+            )
         if name == "website_preview_generate" and args.get("operation") == "update_latest":
             if isinstance(conversation_id, bool) or not isinstance(conversation_id, int):
                 raise ToolBlocked(
@@ -1160,12 +1438,23 @@ class Registry:
 
         result = await self._invoke_handler(name, handler_args)
         if self.store:
+            execution_error = self._approved_result_error(name, result)
+            call_status = "failed" if execution_error else "succeeded"
             self.store.log_tool_call(
                 message_id, name, self.log_args(name, args), self.log_result(name, result),
-                approved_by="auto", conversation_id=conversation_id,
-                tool_call_id=tool_call_id, status="succeeded",
+                approved_by=("operator_authorized" if tier == "operator_authorized" else "auto"),
+                conversation_id=conversation_id, tool_call_id=tool_call_id,
+                status=call_status,
             )
-            self.store.audit("tool_invoked", {"tool": name, "tier": tier})
+            self.store.audit(
+                "tool_invoked",
+                {
+                    "tool": name,
+                    "tier": tier,
+                    "status": call_status,
+                    "error": execution_error,
+                },
+            )
         return result
 
     async def resolve_approval(
@@ -1258,6 +1547,17 @@ class Registry:
             if name in {"add_task", "update_task_status"}:
                 handler_args = dict(args)
                 handler_args["__xomni_user_id"] = user_id
+            if name == "calibration_iq_destructive":
+                handler_args = dict(args)
+                handler_args[_CALIBRATION_IQ_CONTEXT_KEY] = (
+                    self._calibration_iq_invocation_context(
+                        conversation_id=conversation_id,
+                        tool_call_id=approval.get("tool_call_id"),
+                        message_id=approval.get("message_id"),
+                        user_id=user_id,
+                        role=role,
+                    )
+                )
             result = await self._invoke_handler(name, handler_args)
         except asyncio.CancelledError as exc:
             # The handler owns cancellation cleanup (including model restore)
@@ -1301,9 +1601,16 @@ class Registry:
             )
         else:
             execution_error = self._approved_result_error(name, result)
+            executed = True
+            if name in {
+                "calibration_iq_update",
+                "calibration_iq_operator",
+                "calibration_iq_destructive",
+            } and isinstance(result, dict):
+                executed = result.get("executed") is True
             completed = self.store.complete_approval(
                 approval_id, success=execution_error is None, result=result,
-                error=execution_error,
+                error=execution_error, executed=executed,
             )
         self.store.audit(
             "approval_executed",

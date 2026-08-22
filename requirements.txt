@@ -11,3 +11,6 @@ qrcode[pil]>=8,<9
 # ADAS SI page rendering -- inline document display in chat.
 # Apache-2.0/BSD, prebuilt Windows wheels, no external binaries.
 pypdfium2>=4.30
+# Text extraction for source-backed OEM page evidence. PDFium remains the
+# runtime fallback, but pypdf handles ordinary embedded text more faithfully.
+pypdf>=6,<7
