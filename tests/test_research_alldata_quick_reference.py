@@ -326,6 +326,71 @@ async def test_read_selected_alldata_vehicle_returns_empty_without_bounded_signa
     assert await quick.read_selected_alldata_vehicle(_VehiclePage()) == {}
 
 
+class _HeadingItem:
+    def __init__(self, text: str):
+        self._text = text
+
+    async def is_visible(self, timeout=None):  # noqa: ARG002
+        return True
+
+    async def inner_text(self, timeout=None):  # noqa: ARG002
+        return self._text
+
+
+class _HeadingLocator:
+    def __init__(self, texts: list[str]):
+        self._texts = texts
+
+    async def count(self):
+        return len(self._texts)
+
+    def nth(self, index: int):
+        return _HeadingItem(self._texts[index])
+
+
+class _HeadingPage:
+    """A page with no "Change Vehicle" control and a title that doesn't
+    contain the vehicle -- only an h1 heading does. Models the ADAS Systems,
+    Locations, and Calibrations page from the field report."""
+
+    def __init__(self, heading_texts: list[str]):
+        self._heading_texts = heading_texts
+
+    async def title(self):
+        return "ADAS Systems, Locations, and Calibrations - ALLDATA Collision"
+
+    def locator(self, selector):
+        if selector == "h1":
+            return _HeadingLocator(self._heading_texts)
+        return _HeadingLocator([])
+
+
+@pytest.mark.asyncio
+async def test_read_selected_alldata_vehicle_falls_back_to_page_heading(monkeypatch):
+    # Field report: the ADAS Systems, Locations, and Calibrations page shows
+    # the vehicle as a plain heading, with no "Change Vehicle" control nearby
+    # and no vehicle identity in the page title -- X reported no bounded
+    # signal at all despite the vehicle clearly being selected on screen.
+    async def current_label(_page):
+        return ""
+
+    monkeypatch.setattr(quick.nav, "_current_vehicle_label", current_label)
+    page = _HeadingPage(["2026 Ford Mustang GT V8-5.0L"])
+    vehicle = await quick.read_selected_alldata_vehicle(page)
+    assert vehicle.get("year") == "2026"
+    assert vehicle.get("make") == "Ford"
+
+
+@pytest.mark.asyncio
+async def test_read_selected_alldata_vehicle_ignores_non_vehicle_heading(monkeypatch):
+    async def current_label(_page):
+        return ""
+
+    monkeypatch.setattr(quick.nav, "_current_vehicle_label", current_label)
+    page = _HeadingPage(["ADAS Systems, Locations, and Calibrations"])
+    assert await quick.read_selected_alldata_vehicle(page) == {}
+
+
 @pytest.mark.asyncio
 async def test_collect_general_reference_requires_a_proven_vehicle(monkeypatch, tmp_path: Path):
     async def empty_vehicle(_page):
