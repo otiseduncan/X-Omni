@@ -298,6 +298,152 @@ async def test_collector_stops_before_quick_reference_when_selected_vehicle_mism
     assert opened is False
 
 
+@pytest.mark.asyncio
+async def test_read_selected_alldata_vehicle_parses_bounded_signal(monkeypatch):
+    class _VehiclePage:
+        async def title(self):
+            return "ALLDATA Collision - Home"
+
+    async def current_label(_page):
+        return "Vehicle Information - 2022 Nissan-Datsun Altima AWD L4-2.5L (PR25DD) - ALLDATA Collision"
+
+    monkeypatch.setattr(quick.nav, "_current_vehicle_label", current_label)
+    vehicle = await quick.read_selected_alldata_vehicle(_VehiclePage())
+    assert vehicle.get("year") == "2022"
+    assert vehicle.get("make") == "Nissan"
+
+
+@pytest.mark.asyncio
+async def test_read_selected_alldata_vehicle_returns_empty_without_bounded_signal(monkeypatch):
+    class _VehiclePage:
+        async def title(self):
+            return "ALLDATA Collision - Home"
+
+    async def current_label(_page):
+        return ""
+
+    monkeypatch.setattr(quick.nav, "_current_vehicle_label", current_label)
+    assert await quick.read_selected_alldata_vehicle(_VehiclePage()) == {}
+
+
+@pytest.mark.asyncio
+async def test_collect_general_reference_requires_a_proven_vehicle(monkeypatch, tmp_path: Path):
+    async def empty_vehicle(_page):
+        return {}
+
+    monkeypatch.setattr(quick, "read_selected_alldata_vehicle", empty_vehicle)
+
+    class Browser:
+        def __init__(self):
+            self._page = object()
+
+        async def start(self, auto_login=False):  # noqa: ARG002
+            return {"authenticated": True}
+
+    monkeypatch.setattr(quick.ro, "get_browser", lambda *_a, **_k: Browser())
+    settings = SimpleNamespace(root=tmp_path)
+    adas = SimpleNamespace(source_root=tmp_path / "ADAS SI")
+
+    result = await quick.collect_general_reference(settings, adas, {})
+    assert result["status"] == "vehicle_selection_required"
+    assert result["repair_order_id"] is None
+    assert result["action"] == "collect_alldata_general_reference"
+
+
+@pytest.mark.asyncio
+async def test_collect_general_reference_captures_and_stores_with_no_repair_order(
+    tmp_path: Path, monkeypatch
+):
+    # Field request: "select any car, download the info I'm telling her to,
+    # and store it" -- no active Calibration IQ RO required or created.
+    root = tmp_path / "ADAS SI"
+    root.mkdir()
+    page = _Page("https://my.alldata.com/repair/#/quick-reference", _pdf_bytes(b"G"))
+    adas = _Adas(root)
+
+    async def vehicle_reader(_page):
+        return {"year": "2022", "make": "Nissan", "model_trim": "Altima", "label": "2022 Nissan Altima"}
+
+    monkeypatch.setattr(quick, "read_selected_alldata_vehicle", vehicle_reader)
+
+    async def selected(*_args, **_kwargs):
+        return {"verified": True, "label": "2022 Nissan Altima", "source": "test"}
+
+    monkeypatch.setattr(quick, "_selected_vehicle_signal", selected)
+
+    async def opened(_page):
+        return {"opened": True, "already_open": True, "label": "ADAS Quick Reference", "url": page.url}
+
+    monkeypatch.setattr(quick, "_open_quick_reference", opened)
+
+    async def links(_page, _limit):
+        return [{
+            "title": "Forward Facing Camera Calibration",
+            "url": "https://my.alldata.com/repair/#/article/999",
+            "score": 6,
+            "article_id": "999",
+        }]
+
+    monkeypatch.setattr(quick, "_enumerate_quick_reference_links", links)
+
+    class Browser:
+        def __init__(self):
+            self._page = page
+
+        async def start(self, auto_login=False):  # noqa: ARG002
+            return {"authenticated": True}
+
+    monkeypatch.setattr(quick.ro, "get_browser", lambda *_a, **_k: Browser())
+    settings = SimpleNamespace(root=tmp_path)
+
+    result = await quick.collect_general_reference(settings, adas, {})
+
+    assert result["status"] == "success"
+    assert result["repair_order_id"] is None
+    assert result["action"] == "collect_alldata_general_reference"
+    assert result["captured_count"] == 1
+    assert "required_calibrations" not in result
+    assert "next_action" not in result
+    manifest = (
+        root / "Acquired" / "ALLDATA" / "Nissan" / "2022 Nissan Altima"
+        / "ADAS Quick Reference" / "quick-reference-manifest.json"
+    )
+    assert manifest.is_file()
+
+
+@pytest.mark.asyncio
+async def test_collector_falls_back_to_general_reference_when_no_ciq_ro_matches(monkeypatch):
+    from core.services import calibration_iq_work_prep as prep_mod
+
+    async def not_found(_settings, _adas):
+        return {
+            "status": "ciq_vehicle_not_found",
+            "verified": False,
+            "message": "The selected ALLDATA vehicle did not match an active Calibration IQ RO.",
+        }
+
+    monkeypatch.setattr(prep_mod, "resolve_selected_alldata_to_ciq", not_found)
+
+    async def general(_settings, _adas, _args):
+        return {
+            "status": "success",
+            "action": "collect_alldata_general_reference",
+            "executed": True,
+            "success": True,
+            "verified": True,
+            "repair_order_id": None,
+            "vehicle": "2022 Nissan Altima",
+            "captured_count": 1,
+        }
+
+    monkeypatch.setattr(quick, "collect_general_reference", general)
+
+    result = await quick.collect_for_calibration_iq_ro(SimpleNamespace(root=None), SimpleNamespace(), {})
+    assert result["action"] == "collect_alldata_general_reference"
+    assert result["repair_order_id"] is None
+    assert result["resolved_calibration_iq"]["status"] == "ciq_vehicle_not_found"
+
+
 def test_collision_research_schema_advertises_ciq_quick_reference_collector():
     schema = registry_mod.TOOL_SCHEMAS["collision_research"]
     props = schema["parameters"]["properties"]
