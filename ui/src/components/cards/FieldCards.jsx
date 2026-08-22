@@ -15,6 +15,7 @@ import {
   calibrationSummaryScopeLabel,
   calibrationStatusTone as statusTone,
 } from "../../lib/calibrationIqPresentation.js";
+import { ResearchProviderCard } from "./ResearchCards.jsx";
 
 /*
  * Inline cards for Otis's two field systems.
@@ -327,7 +328,6 @@ export function CalibrationRosCard({ data }) {
   );
 }
 
-
 /** Human label for the filters that produced a result. */
 function filterLabel(filters) {
   const parts = Object.entries(filters || {})
@@ -637,4 +637,5 @@ export const FIELD_CARDS = {
   calibration_iq_ro: CalibrationRoCard,
   calibration_iq_receipt: CalibrationReceiptCard,
   calibration_iq_status: CalibrationStatusCard,
+  research_provider: ResearchProviderCard,
 };
