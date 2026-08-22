@@ -102,6 +102,15 @@ _ALLDATA_ACCESS_RE = re.compile(
     r"\ball\s*data\b.{0,50}\b(?:log\s*in|login|open|resume|start|setup)\b",
     re.IGNORECASE | re.DOTALL,
 )
+# "download the SI for the [vehicle] that's open in ALLDATA" describes the
+# already-open browser state; it is not a request to open/log in to it. Only
+# the login-card verbs immediately followed by "in" + ALLDATA are excluded --
+# "open ALLDATA", "open the ALLDATA browser", and "log in to ALLDATA" all
+# still match the access request above.
+_ALLDATA_DESCRIPTIVE_STATE_RE = re.compile(
+    r"\b(?:open|resumed|started|running|loaded|showing|pulled\s+up)\s+(?:up\s+)?in\s+all\s*data\b",
+    re.IGNORECASE,
+)
 _ADAS_MAP_MARKER_RE = re.compile(r"\badas\s*[-_ ]?map\b|\badasmap\b", re.IGNORECASE)
 _REQUIREMENT_KEY_RE = re.compile(
     r"calibrat|requirement|required|system|service|operation|procedure|aim|align|reset|relearn|initial",
@@ -115,12 +124,63 @@ _CALIBRATION_LABEL_RE = re.compile(
 )
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
+# Conversational continuity for the ALLDATA acquisition flow: once "log in to
+# ALLDATA" has run, a follow-up like "retrieve SI information please" carries
+# no ALLDATA/quick-reference/RO wording of its own and would otherwise fall
+# through to the model's own (unrouted) tool choice -- which is exactly what
+# produced repeated adas_si_inventory calls in the field. The active stage is
+# recorded as an invisible artifact (no UI card is registered for its type) on
+# the assistant turn that ran alldata_access/quick_reference, then read back
+# here so a short, low-content follow-up resolves against it instead of
+# needing its own exact phrasing.
+_WORK_PREP_STATE_ARTIFACT = "work_prep_state"
+_WORK_PREP_MODE = "ciq_si_preparation"
+_CONTINUATION_LOOKBACK_MESSAGES = 8
+_CONTINUATION_PHRASE_RE = re.compile(
+    r"\b(?:go\s+ahead|do\s+it|do\s+this\s+one|pull\s+it|ready|proceed|okay|"
+    r"go\s+for\s+it|sounds\s+good)\b",
+    re.IGNORECASE,
+)
 
-def classify_request(text: object) -> Optional[str]:
+
+def _looks_like_work_prep_continuation(text: str) -> bool:
+    # Deliberately narrow: only an explicit acquisition verb (collect, pull,
+    # retrieve, ...) or one of a short list of unmistakable go-ahead phrases
+    # counts. A bare "yes"/"ok" is excluded -- it is too generic and could be
+    # answering something unrelated (a calendar prompt, an approval card)
+    # that happens to fall within the same lookback window.
+    value = " ".join(str(text or "").split()).strip()
+    if not value or len(value) > 160:
+        return False
+    return bool(_QUICK_ACTION_RE.search(value) or _CONTINUATION_PHRASE_RE.search(value))
+
+
+def _active_work_prep_stage(history: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    for index, message in enumerate(reversed(history or [])):
+        if index >= _CONTINUATION_LOOKBACK_MESSAGES:
+            break
+        artifacts = message.get("artifacts") or []
+        if not isinstance(artifacts, list):
+            continue
+        for artifact in reversed(artifacts):
+            if isinstance(artifact, dict) and artifact.get("type") == _WORK_PREP_STATE_ARTIFACT:
+                data = artifact.get("data")
+                if isinstance(data, dict):
+                    return data
+    return None
+
+
+def classify_request(
+    text: object, history: Optional[list[dict[str, Any]]] = None
+) -> Optional[str]:
     value = str(text or "").strip()
     if not value:
         return None
-    if _ALLDATA_ACCESS_RE.search(value) and not _QUICK_REFERENCE_RE.search(value):
+    if (
+        _ALLDATA_ACCESS_RE.search(value)
+        and not _QUICK_REFERENCE_RE.search(value)
+        and not _ALLDATA_DESCRIPTIVE_STATE_RE.search(value)
+    ):
         return "alldata_access"
     if _QUICK_REFERENCE_RE.search(value) and _QUICK_ACTION_RE.search(value):
         return "quick_reference"
@@ -130,6 +190,15 @@ def classify_request(text: object) -> Optional[str]:
         return "phase_list"
     if (_RO_RE.search(value) or _THIS_RO_RE.search(value)) and _RO_REQUIREMENT_RE.search(value):
         return "ro_requirements"
+    if history:
+        stage = _active_work_prep_stage(history)
+        if (
+            stage
+            and stage.get("mode") == _WORK_PREP_MODE
+            and stage.get("stage") in {"awaiting_vehicle_selection", "awaiting_ro_disambiguation"}
+            and _looks_like_work_prep_continuation(value)
+        ):
+            return "quick_reference"
     return None
 
 
@@ -926,7 +995,8 @@ def install() -> None:
                     approved_tool: Optional[dict],
                     approval_context: Optional[dict],
                 ) -> AsyncIterator[dict]:
-                    mode = None if approved_tool else classify_request(user_message)
+                    history = self.store.get_messages(conversation_id)
+                    mode = None if approved_tool else classify_request(user_message, history)
                     if mode is None:
                         async for event in previous_run(
                             self, conversation_id, user_message, approved_tool, approval_context
@@ -934,7 +1004,6 @@ def install() -> None:
                             yield event
                         return
 
-                    history = self.store.get_messages(conversation_id)
                     effective_context = dict(approval_context or {})
                     message_id = _message_id(history, approval_context)
                     if message_id is not None:
@@ -1025,6 +1094,29 @@ def install() -> None:
                             artifact for artifact in artifacts
                             if artifact.get("type") != "research_provider"
                         ]
+
+                    # Tag the turn with the active ALLDATA acquisition stage so
+                    # a later low-content follow-up ("retrieve SI information
+                    # please", "go ahead") can resolve against it without
+                    # needing its own exact wording. The artifact type has no
+                    # registered UI card, so this is invisible in chat.
+                    if mode == "alldata_access":
+                        artifacts.append({
+                            "type": _WORK_PREP_STATE_ARTIFACT,
+                            "data": {"mode": _WORK_PREP_MODE, "stage": "awaiting_vehicle_selection"},
+                        })
+                    elif mode == "quick_reference":
+                        payload = result if isinstance(result, dict) else {}
+                        if payload.get("verified") is True and payload.get("success") is True:
+                            stage = "complete"
+                        elif payload.get("status") == "ciq_vehicle_ambiguous":
+                            stage = "awaiting_ro_disambiguation"
+                        else:
+                            stage = "awaiting_vehicle_selection"
+                        artifacts.append({
+                            "type": _WORK_PREP_STATE_ARTIFACT,
+                            "data": {"mode": _WORK_PREP_MODE, "stage": stage},
+                        })
 
                     summary = summarize(mode, result)
                     saved_id = self.store.add_message(
