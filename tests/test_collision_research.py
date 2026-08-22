@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from core.orchestrator import loop as loop_mod
-from core.services import research_operator, research_setup
+from core.services import research_capture, research_operator, research_setup
 from core.tools.registry import Registry, TOOL_SCHEMAS
 
 
@@ -62,6 +62,10 @@ def test_research_capture_filename_is_bounded_and_sanitized():
     assert ":" not in result
     assert "<" not in result
     assert len(result) <= 150
+    public_result = research_capture._safe_filename("Toyota / Collision: Position <statement>")
+    assert "/" not in public_result
+    assert ":" not in public_result
+    assert "<" not in public_result
 
 
 def test_mobile_setup_page_never_uses_browser_secret_storage():
@@ -74,20 +78,36 @@ def test_mobile_setup_page_never_uses_browser_secret_storage():
     assert "one-time-code" in lowered
 
 
-def test_collision_tool_schema_has_no_password_argument():
+def test_collision_tool_schema_has_no_password_argument_and_can_capture_public_oem():
     properties = TOOL_SCHEMAS["collision_research"]["parameters"]["properties"]
     assert "password" not in properties
     assert "credential" not in properties
     assert "action" in properties
+    assert "public_capture" in properties["action"]["enum"]
 
 
 def test_setup_regex_does_not_capture_generic_web_login():
     assert research_setup._SETUP_RE.search("log in to my bank") is None
 
 
-def test_windows_vault_validates_before_platform_write(monkeypatch):
-    vault = research_operator.WindowsCredentialVault()
+def test_windows_vault_validation_does_not_require_windows_api():
     with pytest.raises(ValueError, match="username"):
-        vault.write("", "password")
+        research_operator.WindowsCredentialVault._validate("", "password")
     with pytest.raises(ValueError, match="password"):
-        vault.write("otis", "")
+        research_operator.WindowsCredentialVault._validate("otis", "")
+    username, password = research_operator.WindowsCredentialVault._validate(" otis@example.com ", "secret")
+    assert username == "otis@example.com"
+    assert password == "secret"
+
+
+def test_public_html_snapshot_strips_scripts_and_keeps_readable_text():
+    document = """
+    <html><head><title>Toyota Collision Position Statement</title></head>
+    <body><script>steal()</script><h1>Blind Spot Monitor</h1>
+    <p>Do not install a recycled sensor when the OEM procedure prohibits it.</p></body></html>
+    """
+    assert research_capture._html_title(document) == "Toyota Collision Position Statement"
+    text = research_capture._visible_text(document)
+    assert "steal" not in text
+    assert "Blind Spot Monitor" in text
+    assert "recycled sensor" in text
