@@ -10,9 +10,10 @@ Acquisition is conservative:
 * one browser/page, one procedure at a time; no parallel requests
 * exact CIQ vehicle must be proved from a bounded ALLDATA vehicle UI signal
 * only ALLDATA Repair/Collision links from ADAS Quick Reference are eligible
-* duplicate prevention uses canonical source URL, whole-library PDF SHA-256,
-  and a conservative same-vehicle/title fallback
-* same URL + changed content is preserved as a revision, never overwritten
+* duplicate prevention is source-first: a known canonical ALLDATA procedure URL
+  is skipped without another capture; new URLs are then checked against the
+  whole ADAS SI PDF SHA-256 index and a conservative same-vehicle/title fallback
+* existing evidence is never overwritten
 * every saved PDF is passed through the existing ADAS SI native/OCR page path
   and then searched back out of ADAS SI before it is reported retrievable
 
@@ -69,12 +70,9 @@ _SELECTED_VEHICLE_SELECTORS = (
 
 
 def _safe_filename(value: object, fallback: str = "ADAS procedure") -> str:
-    # Use the research operator's existing filename policy so ALLDATA captures
-    # stay consistent with prior acquisitions.
     try:
         return ro._safe_filename(str(value or ""), fallback)  # noqa: SLF001
     except TypeError:
-        # Older helper revisions accepted only one positional argument.
         cleaned = re.sub(r"[^A-Za-z0-9._()\- ]+", " ", str(value or ""))
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
         return cleaned[:150] or fallback
@@ -90,7 +88,7 @@ def _canonical_alldata_url(raw: object) -> str:
         return ""
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return ""
-    if not ro._is_alldata_url(value):  # noqa: SLF001 - same provider boundary
+    if not ro._is_alldata_url(value):  # noqa: SLF001
         return ""
     host = parsed.hostname.casefold()
     if parsed.port:
@@ -99,8 +97,8 @@ def _canonical_alldata_url(raw: object) -> str:
     if path != "/":
         path = path.rstrip("/")
     fragment = parsed.fragment.rstrip("/")
-    # Query strings on this SPA are not part of the article identity. The hash
-    # route is; keep it exactly so two different article/guid routes stay apart.
+    # Query strings are ignored for duplicate identity; the SPA hash route is
+    # retained because article/guid identity lives there.
     return urlunsplit((parsed.scheme.casefold(), host, path, "", fragment))
 
 
@@ -196,8 +194,7 @@ def _load_dedupe_index(source_root: Path, vehicle_label: str) -> dict[str, Any]:
             title_keys[title_key] = record
 
     # Older ADAS SI PDFs may predate provenance sidecars/hashes. Hash the whole
-    # library once per collection run so byte-identical content cannot be added
-    # again merely because it originated before this collector existed.
+    # library once per run so byte-identical content cannot be added again.
     for pdf_path in source_root.rglob("*.pdf"):
         try:
             digest = _sha256_file(pdf_path)
@@ -205,9 +202,9 @@ def _load_dedupe_index(source_root: Path, vehicle_label: str) -> dict[str, Any]:
             continue
         hashes.setdefault(digest, {"sidecar": None, "pdf": pdf_path, "data": {}})
 
-    # Conservative same-vehicle/title fallback for manually seeded ALLDATA PDFs
-    # that have no source sidecar. This prevents obvious duplicate filenames
-    # while treating a different hash at the same canonical URL as a revision.
+    # Conservative same-vehicle/title fallback for manually seeded PDFs that
+    # have no provenance sidecar. Ambiguous same-title content is skipped for
+    # review instead of automatically creating another file.
     vehicle = nav.vehicle_from_query(vehicle_label)
     requested_year = str(vehicle.get("year") or "")
     requested_make = str(vehicle.get("make") or "").casefold()
@@ -290,9 +287,6 @@ async def _selected_vehicle_signal(page: Any, vehicle: dict[str, Any]) -> dict[s
                     text = " ".join((await item.inner_text(timeout=500)).split()).strip()
                 except Exception:
                     continue
-                # A vehicle picker/list is not proof of selection. Keep the
-                # candidate tightly bounded and reject controls that contain a
-                # large year/menu inventory.
                 if not 4 <= len(text) <= 420:
                     continue
                 folded = text.casefold()
@@ -326,9 +320,6 @@ async def _open_quick_reference(page: Any) -> dict[str, Any]:
             if not await marker.is_visible(timeout=250):
                 continue
             label = " ".join((await marker.inner_text(timeout=600)).split()).strip()
-            # If the marker is already part of the current quick-reference page,
-            # clicking it again is harmless in the normal SPA. Prefer a link or
-            # button ancestor where possible.
             try:
                 clickable = marker.locator("xpath=ancestor-or-self::a[1] | ancestor-or-self::button[1]")
                 if await clickable.count():
@@ -339,8 +330,6 @@ async def _open_quick_reference(page: Any) -> dict[str, Any]:
                 try:
                     await marker.click(timeout=5_000)
                 except Exception:
-                    # Marker exists but is not clickable: treat the page as the
-                    # already-open quick-reference surface.
                     return {
                         "opened": True,
                         "already_open": True,
@@ -392,8 +381,6 @@ async def _enumerate_quick_reference_links(page: Any, limit: int) -> list[dict[s
         if id(frame) in seen_frames:
             continue
         seen_frames.add(id(frame))
-        # Prefer semantic content containers to avoid global navigation links;
-        # fall back to all anchors because some ALLDATA SPA views omit <main>.
         for selector in ("main a[href], [role='main'] a[href], article a[href]", "a[href]"):
             try:
                 links = frame.locator(selector)
@@ -466,7 +453,27 @@ async def _capture_one(
     quick_reference_url: str,
     dedupe: dict[str, Any],
 ) -> dict[str, Any]:
-    target_url = str(link.get("url") or "")
+    target_url = _canonical_alldata_url(link.get("url"))
+    if not target_url:
+        return {
+            "status": "failed",
+            "title": link.get("title"),
+            "url": str(link.get("url") or ""),
+            "reason": "Quick Reference supplied an invalid or non-ALLDATA procedure URL.",
+        }
+
+    # Canonical source identity is the strongest duplicate proof and avoids even
+    # re-rendering a known procedure. This is intentionally source-first.
+    known_source = dedupe["urls"].get(target_url)
+    if known_source is not None:
+        return {
+            "status": "duplicate_skipped",
+            "duplicate_reason": "canonical_source_url_already_present",
+            "title": link.get("title"),
+            "url": target_url,
+            "existing_relative_path": _record_path(known_source, Path(adas.source_root)),
+        }
+
     try:
         await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
         await asyncio.sleep(0.65)
@@ -488,6 +495,17 @@ async def _capture_one(
             "vehicle_proof": vehicle_proof,
         }
 
+    canonical_url = _canonical_alldata_url(page.url) or target_url
+    known_source = dedupe["urls"].get(canonical_url)
+    if known_source is not None:
+        return {
+            "status": "duplicate_skipped",
+            "duplicate_reason": "canonical_source_url_already_present",
+            "title": link.get("title"),
+            "url": canonical_url,
+            "existing_relative_path": _record_path(known_source, Path(adas.source_root)),
+        }
+
     try:
         body_text = str(await page.locator("body").inner_text(timeout=8_000) or "")
     except Exception:
@@ -496,7 +514,7 @@ async def _capture_one(
         return {
             "status": "failed",
             "title": link.get("title"),
-            "url": str(page.url),
+            "url": canonical_url,
             "reason": "The ALLDATA procedure page did not contain enough readable content to preserve.",
         }
 
@@ -504,13 +522,16 @@ async def _capture_one(
         title = " ".join((await page.title()).split()).strip() or str(link.get("title") or "ADAS procedure")
     except Exception:
         title = str(link.get("title") or "ADAS procedure")
-    canonical_url = _canonical_alldata_url(page.url) or _canonical_alldata_url(target_url)
-    if not canonical_url:
+    source_title = str(link.get("title") or title).strip() or title
+    title_key = _procedure_title_key(source_title, vehicle.get("label") or "")
+    same_title = dedupe["title_keys"].get(title_key) if title_key else None
+    if same_title is not None:
         return {
-            "status": "failed",
-            "title": title,
-            "url": str(page.url),
-            "reason": "The procedure did not resolve to a valid ALLDATA URL.",
+            "status": "possible_duplicate_skipped",
+            "duplicate_reason": "same_vehicle_procedure_title_already_present",
+            "title": source_title,
+            "url": canonical_url,
+            "existing_relative_path": _record_path(same_title, Path(adas.source_root)),
         }
 
     try:
@@ -518,73 +539,49 @@ async def _capture_one(
     except Exception as exc:
         return {
             "status": "failed",
-            "title": title,
+            "title": source_title,
             "url": canonical_url,
             "reason": f"ALLDATA print capture failed: {type(exc).__name__}.",
         }
     if not pdf_bytes.startswith(b"%PDF") or len(pdf_bytes) < 1000:
         return {
             "status": "failed",
-            "title": title,
+            "title": source_title,
             "url": canonical_url,
             "reason": "ALLDATA did not produce a valid non-empty PDF snapshot.",
         }
 
     digest = _sha256_bytes(pdf_bytes)
-    same_url = dedupe["urls"].get(canonical_url)
     same_hash = dedupe["hashes"].get(digest)
-    title_key = _procedure_title_key(link.get("title") or title, vehicle.get("label") or "")
-    same_title = dedupe["title_keys"].get(title_key) if title_key else None
-
     if same_hash is not None:
         return {
             "status": "duplicate_skipped",
             "duplicate_reason": "identical_pdf_sha256",
-            "title": title,
+            "title": source_title,
             "url": canonical_url,
             "sha256": digest,
             "existing_relative_path": _record_path(same_hash, Path(adas.source_root)),
         }
 
-    if same_url is not None:
-        # We rendered the current article before deciding. A different hash on
-        # the same canonical article URL is positive evidence of a revision,
-        # so preserve it and retain the previous file path in provenance.
-        revision_of = _record_path(same_url, Path(adas.source_root))
-        revision = True
-    else:
-        revision_of = None
-        revision = False
-        if same_title is not None:
-            # No canonical URL proves equivalence and the bytes differ. Do not
-            # silently create a second same-vehicle/same-procedure file; surface
-            # it for review instead. This is intentionally conservative.
-            return {
-                "status": "possible_duplicate_skipped",
-                "duplicate_reason": "same_vehicle_procedure_title_different_content_or_unknown_source",
-                "title": title,
-                "url": canonical_url,
-                "sha256": digest,
-                "existing_relative_path": _record_path(same_title, Path(adas.source_root)),
-            }
-
     folder = _capture_folder(Path(adas.source_root), vehicle)
     folder.mkdir(parents=True, exist_ok=True)
     article = _article_id(canonical_url)
-    source_title = str(link.get("title") or title).strip() or title
     base = _safe_filename(
         f"{vehicle.get('label') or 'Vehicle'} {source_title}"
         + (f" article-{article}" if article else f" {digest[:10]}")
     )
-    if revision:
-        base = _safe_filename(f"{base} rev-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}")
     pdf_path = folder / f"{base}.pdf"
     sidecar_path = folder / f"{base}.source.json"
     if pdf_path.exists() or sidecar_path.exists():
-        # A same-second collision is not permission to overwrite evidence.
-        base = _safe_filename(f"{base} {digest[:10]}")
-        pdf_path = folder / f"{base}.pdf"
-        sidecar_path = folder / f"{base}.source.json"
+        # Never overwrite. A filename collision without a URL/hash match is a
+        # review case, not permission to create a numbered duplicate.
+        return {
+            "status": "possible_duplicate_skipped",
+            "duplicate_reason": "destination_filename_already_exists",
+            "title": source_title,
+            "url": canonical_url,
+            "existing_relative_path": str(pdf_path.relative_to(adas.source_root)).replace("\\", "/") if pdf_path.exists() else None,
+        }
 
     pdf_path.write_bytes(pdf_bytes)
     provenance = {
@@ -606,17 +603,13 @@ async def _capture_one(
         "targeted_research": True,
         "selected_vehicle_verified": True,
         "vehicle_proof": vehicle_proof,
-        "revision": revision,
-        "supersedes_relative_path": revision_of,
         "credential_secret_stored_in_document": False,
     }
     sidecar_path.write_text(json.dumps(provenance, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Existing OCR wrapper is installed on AdasSI._pages; this validates that
-    # the saved print snapshot is readable before it is admitted as acquired SI.
     try:
-        adas.inventory._cache = None  # noqa: SLF001 - intentional ingestion invalidation
-        pages = adas._pages(pdf_path)  # noqa: SLF001 - shared authoritative extraction path
+        adas.inventory._cache = None  # noqa: SLF001
+        pages = adas._pages(pdf_path)  # noqa: SLF001
         readable_pages = sum(1 for _number, text in pages if str(text or "").strip())
     except Exception as exc:
         pdf_path.unlink(missing_ok=True)
@@ -640,8 +633,6 @@ async def _capture_one(
         }
 
     relative = adas.relative_of(pdf_path)
-    # Prove that ordinary ADAS SI search can find this newly acquired file, not
-    # merely that bytes were written to disk.
     retrieval_query = f"{vehicle.get('label') or ''} {source_title}".strip()
     try:
         retrieval = adas.search({"query": retrieval_query})
@@ -673,8 +664,6 @@ async def _capture_one(
         "sha256": digest,
         "pages": len(pages),
         "readable_pages": readable_pages,
-        "revision": revision,
-        "supersedes_relative_path": revision_of,
         "retrieval_verified": retrieval_verified,
         "retrieval_query": retrieval_query,
     }
@@ -690,9 +679,7 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
             "message": "repair_order_id is required. Use the Calibration IQ RO id or exact displayed RO number.",
         }
 
-    ro_result = await calibration_iq.get_repair_order(
-        settings, {"repair_order_id": ro_identifier}
-    )
+    ro_result = await calibration_iq.get_repair_order(settings, {"repair_order_id": ro_identifier})
     if ro_result.get("status") != "verified":
         return {
             "status": "ciq_unavailable",
@@ -729,7 +716,7 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
             "message": "Open the ALLDATA session and sign in, then select this Calibration IQ vehicle.",
             "provider_status": state,
         }
-    page = browser._page  # noqa: SLF001 - provider automation owned by this service
+    page = browser._page  # noqa: SLF001
     if page is None:
         return {
             "status": "browser_unavailable",
@@ -766,8 +753,6 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
         }
     quick_reference_url = str(page.url)
 
-    # Re-confirm after navigation. A stale or reset session must not collect
-    # procedures under the CIQ vehicle simply because the first page matched.
     post_navigation_vehicle = await _selected_vehicle_signal(page, vehicle)
     if not post_navigation_vehicle.get("verified"):
         return {
@@ -780,10 +765,7 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
             "vehicle_proof": post_navigation_vehicle,
         }
 
-    max_documents = max(
-        1,
-        min(int(args.get("max_documents") or MAX_QUICK_REFERENCE_LINKS), MAX_QUICK_REFERENCE_LINKS),
-    )
+    max_documents = max(1, min(int(args.get("max_documents") or MAX_QUICK_REFERENCE_LINKS), MAX_QUICK_REFERENCE_LINKS))
     links = await _enumerate_quick_reference_links(page, max_documents)
     if not links:
         return {
@@ -797,10 +779,7 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
         }
 
     delay_seconds = float(args.get("delay_seconds") or MIN_INTER_DOCUMENT_DELAY_SECONDS)
-    delay_seconds = max(
-        MIN_INTER_DOCUMENT_DELAY_SECONDS,
-        min(delay_seconds, MAX_INTER_DOCUMENT_DELAY_SECONDS),
-    )
+    delay_seconds = max(MIN_INTER_DOCUMENT_DELAY_SECONDS, min(delay_seconds, MAX_INTER_DOCUMENT_DELAY_SECONDS))
     dedupe = _load_dedupe_index(Path(adas.source_root), vehicle_label)
     results: list[dict[str, Any]] = []
     for index, link in enumerate(links):
@@ -815,12 +794,9 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
             dedupe=dedupe,
         )
         results.append(outcome)
-        # If vehicle context is lost, continuing would risk cross-vehicle data.
         if outcome.get("status") == "failed" and "vehicle" in str(outcome.get("reason") or "").casefold():
             break
 
-    # Return the operator to the quick-reference surface when possible. Failure
-    # here does not change captured evidence truth.
     try:
         if _canonical_alldata_url(page.url) != _canonical_alldata_url(quick_reference_url):
             await page.goto(quick_reference_url, wait_until="domcontentloaded", timeout=45_000)
@@ -829,20 +805,11 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
 
     captured = [item for item in results if item.get("status") == "captured"]
     exact_duplicates = [item for item in results if item.get("status") == "duplicate_skipped"]
-    possible_duplicates = [
-        item for item in results if item.get("status") == "possible_duplicate_skipped"
-    ]
+    possible_duplicates = [item for item in results if item.get("status") == "possible_duplicate_skipped"]
     failures = [item for item in results if item.get("status") == "failed"]
-    retrieval_failures = [
-        item for item in captured if item.get("retrieval_verified") is not True
-    ]
+    retrieval_failures = [item for item in captured if item.get("retrieval_verified") is not True]
     all_links_accounted_for = len(results) == len(links)
-    success = bool(
-        links
-        and all_links_accounted_for
-        and not failures
-        and not retrieval_failures
-    )
+    success = bool(links and all_links_accounted_for and not failures and not retrieval_failures)
     status = "success" if success else ("partial_success" if results else "failed")
 
     try:
@@ -913,8 +880,8 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
         },
         "message": (
             f"ALLDATA ADAS Quick Reference accounted for all {len(links)} procedure link(s): "
-            f"{len(captured)} new/revised capture(s), {len(exact_duplicates)} exact duplicate(s) "
-            f"skipped, and {len(possible_duplicates)} conservative duplicate candidate(s) skipped. "
+            f"{len(captured)} new capture(s) and "
+            f"{len(exact_duplicates) + len(possible_duplicates)} duplicate(s) skipped. "
             "Run Calibration IQ research_ro next to link the updated ADAS SI evidence to this RO."
             if success
             else (
@@ -969,16 +936,16 @@ def install() -> None:
                     "type": "number",
                     "minimum": MIN_INTER_DOCUMENT_DELAY_SECONDS,
                     "maximum": MAX_INTER_DOCUMENT_DELAY_SECONDS,
-                    "description": "Optional delay between procedure pages. Values below 1.25 seconds are not accepted by the collector.",
+                    "description": "Optional delay between procedure pages. Values below 1.25 seconds are clamped upward.",
                 },
             )
             description = str(schema.get("description") or "")
             addition = (
                 " Use collect_alldata_quick_reference only when the operator has manually selected "
                 "the Calibration IQ vehicle in ALLDATA. It opens that vehicle's ADAS Quick Reference, "
-                "captures its procedure links one at a time into ADAS SI with URL/hash/title dedupe, "
-                "and proves the new PDFs are searchable. After it returns, call calibration_iq_operator "
-                "research_ro for the same RO to import/link the updated evidence."
+                "captures its procedure links one at a time into ADAS SI with source URL/hash/title "
+                "dedupe, and proves new PDFs are searchable. After it returns, call "
+                "calibration_iq_operator research_ro for the same RO to import/link the updated evidence."
             )
             if "collect_alldata_quick_reference" not in description:
                 schema["description"] = description + addition
