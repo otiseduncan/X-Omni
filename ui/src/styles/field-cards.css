@@ -113,6 +113,8 @@
 
 /* search hits */
 .field-hit {
+  min-width: 0;
+  overflow: hidden;
   border-top: 1px solid rgba(42, 60, 85, 0.42);
   padding: 7px 0;
 }
@@ -123,21 +125,43 @@
 
 .field-hit summary {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
+  flex-wrap: wrap;
   gap: 8px;
   cursor: pointer;
   font-size: 0.82rem;
+  line-height: 1.35;
 }
 
 .field-hit summary strong {
+  flex: 1 1 220px;
+  min-width: 0;
   font-weight: 600;
   overflow-wrap: anywhere;
 }
 
-.field-excerpt {
-  max-height: 220px;
-  margin-top: 7px;
+.field-hit summary .field-page {
+  flex: 0 0 auto;
+}
+
+.field-excerpt,
+.research-readable-text {
+  position: relative;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  max-height: 300px;
+  box-sizing: border-box;
+  margin: 8px 0 0;
+  padding: 10px 11px;
+  overflow: auto;
   font-size: 0.73rem;
+  line-height: 1.5 !important;
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-variant-ligatures: none;
+  isolation: isolate;
 }
 
 .field-alts {
@@ -184,9 +208,7 @@
   margin-top: 6px;
 }
 
-/* repair-order board
-   Two lines per RO instead of a four-column grid: a 10-digit RO number was
-   wrapping mid-number in a 78px column, which is unreadable on a phone. */
+/* repair-order board */
 .ro-list {
   display: grid;
   gap: 5px;
@@ -217,7 +239,7 @@
   font-size: 0.78rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;      /* never break an RO number */
+  white-space: nowrap;
 }
 
 .ro-vehicle {
@@ -275,19 +297,12 @@
 }
 
 @media (max-width: 640px) {
-  .ro-vehicle {
-    white-space: normal;
-  }
-  .pdf-frame {
-    height: 260px;
-  }
-  .pdf-frame.is-expanded {
-    height: 70vh;
-  }
+  .ro-vehicle { white-space: normal; }
+  .pdf-frame { height: 260px; }
+  .pdf-frame.is-expanded { height: 70vh; }
 }
 
 /* ---------- inline page viewer ---------- */
-
 .page-view {
   position: relative;
   width: 100%;
@@ -300,127 +315,82 @@
   -webkit-overflow-scrolling: touch;
 }
 
-.page-view.is-zoomed {
-  max-height: 84vh;
-  cursor: zoom-out;
-}
-
-.page-view img {
-  display: block;
-  width: 100%;
-  height: auto;
-}
-
-/* Zoomed: render wider than the container and let it pan, which is how you
-   actually read a spec sheet on a phone. */
-.page-view.is-zoomed img {
-  width: 190%;
-  max-width: none;
-}
-
-.page-nav {
-  gap: 8px;
-}
-
-.page-nav button {
-  min-width: 34px;
-  font-size: 0.95rem;
-  line-height: 1;
-}
-
-.page-scrub {
-  flex: 1;
-  min-width: 90px;
-  accent-color: var(--blue-bright);
-}
+.page-view.is-zoomed { max-height: 84vh; cursor: zoom-out; }
+.page-view img { display: block; width: 100%; height: auto; }
+.page-view.is-zoomed img { width: 190%; max-width: none; }
+.page-nav { gap: 8px; }
+.page-nav button { min-width: 34px; font-size: 0.95rem; line-height: 1; }
+.page-scrub { flex: 1; min-width: 90px; accent-color: var(--blue-bright); }
 
 @media (max-width: 640px) {
-  .page-view {
-    max-height: 54vh;
-  }
-  .page-view.is-zoomed {
-    max-height: 76vh;
-  }
-  /* keep the pager thumb-reachable */
-  .page-nav button {
-    min-height: 34px;
-    min-width: 42px;
-  }
-  .page-scrub {
-    order: 10;
-    flex-basis: 100%;
-  }
+  .page-view { max-height: 54vh; }
+  .page-view.is-zoomed { max-height: 76vh; }
+  .page-nav button { min-height: 34px; min-width: 42px; }
+  .page-scrub { order: 10; flex-basis: 100%; }
 }
 
-/* ---------- Calibration IQ summary: a number you can glance at ---------- */
+/* ---------- Calibration IQ summary ---------- */
+.ciq-count { display: flex; align-items: baseline; gap: 9px; margin-bottom: 9px; }
+.ciq-count strong { font-size: 2rem; line-height: 1; color: #f4f8ff; font-variant-numeric: tabular-nums; }
+.ciq-count span { color: var(--text-soft); font-size: 0.8rem; }
+.ciq-chips { display: flex; flex-wrap: wrap; min-width: 0; gap: 5px; margin-bottom: 4px; }
+.ciq-chips .ro-pill { max-width: 100%; white-space: normal; overflow-wrap: anywhere; line-height: 1.3; }
+.ciq-incomplete { margin: 0 0 9px; color: var(--warning); font-weight: 600; }
+.ciq-operation-list .ro-item { min-width: 0; }
+.ciq-operation-list .ro-line { align-items: center; gap: 8px; flex-wrap: wrap; }
+.ciq-operation-error { color: var(--warning); overflow-wrap: anywhere; }
 
-.ciq-count {
-  display: flex;
-  align-items: baseline;
-  gap: 9px;
-  margin-bottom: 9px;
-}
-
-.ciq-count strong {
-  font-size: 2rem;
-  line-height: 1;
-  color: #f4f8ff;
-  font-variant-numeric: tabular-nums;
-}
-
-.ciq-count span {
-  color: var(--text-soft);
-  font-size: 0.8rem;
-}
-
-.ciq-chips {
-  display: flex;
-  flex-wrap: wrap;
+/* ---------- verified post-collision research ---------- */
+.research-query { margin: 0 0 10px; line-height: 1.45; }
+.research-section-title { margin-top: 10px; }
+.research-source-ledger { display: grid; gap: 7px; min-width: 0; }
+.research-source-row {
   min-width: 0;
-  gap: 5px;
-  margin-bottom: 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: rgba(5, 15, 31, 0.5);
 }
-
-.ciq-chips .ro-pill {
-  max-width: 100%;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  line-height: 1.3;
-}
-
-.ciq-incomplete {
-  margin: 0 0 9px;
-  color: var(--warning);
-  font-weight: 600;
-}
-
-.ciq-operation-list .ro-item {
-  min-width: 0;
-}
-
-.ciq-operation-list .ro-line {
-  align-items: center;
+.research-source-row.is-verified { border-color: rgba(53, 232, 138, 0.34); }
+.research-source-row.is-warning { border-color: rgba(255, 184, 77, 0.38); }
+.research-source-line,
+.research-evidence-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
   gap: 8px;
-  flex-wrap: wrap;
+  min-width: 0;
+  line-height: 1.35;
 }
+.research-source-line strong,
+.research-evidence-title strong { min-width: 0; overflow-wrap: anywhere; }
+.research-source-detail { display: flex; flex-wrap: wrap; gap: 5px 10px; margin-top: 5px; color: var(--text-muted); font-size: 0.7rem; }
+.research-source-reason { margin: 6px 0 0; color: var(--warning); line-height: 1.4; }
+.research-evidence-group { min-width: 0; margin-top: 11px; padding-top: 8px; border-top: 1px solid rgba(42, 60, 85, 0.42); }
+.research-evidence-group > summary,
+.research-read-result > summary { color: var(--blue-bright); cursor: pointer; font-size: 0.78rem; font-weight: 700; line-height: 1.4; overflow-wrap: anywhere; }
+.research-evidence-item { min-width: 0; padding: 8px 0; border-bottom: 1px solid rgba(42, 60, 85, 0.28); }
+.research-evidence-item:last-child { border-bottom: 0; }
+.research-evidence-kv { margin-top: 8px; }
+.research-public-list { margin-top: 8px; }
+.research-public-list .ro-item { min-width: 0; }
+.research-public-snippet { margin: 6px 0; line-height: 1.45; overflow-wrap: anywhere; }
+.research-source-link { margin-left: 0; margin-top: 6px; }
+.research-read-result { margin-top: 8px; }
+.research-capture-row { display: flex; align-items: flex-start; gap: 8px; min-width: 0; padding: 6px 0; font-size: 0.75rem; }
+.research-capture-row > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.research-authority-note { margin: 11px 0 0; padding-top: 8px; border-top: 1px solid rgba(42, 60, 85, 0.34); line-height: 1.45; }
 
-.ciq-operation-error {
-  color: var(--warning);
-  overflow-wrap: anywhere;
+@media (max-width: 480px) {
+  .field-excerpt,
+  .research-readable-text { max-height: 260px; padding: 9px; font-size: 0.72rem; line-height: 1.55 !important; }
+  .research-source-line,
+  .research-evidence-title { flex-wrap: wrap; }
+  .research-source-line .ro-pill { white-space: normal; }
 }
 
 @media (max-width: 430px) {
-  .field-meta {
-    max-width: 100%;
-  }
-
-  .ciq-count {
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .ciq-count span {
-    min-width: 0;
-    overflow-wrap: anywhere;
-  }
+  .field-meta { max-width: 100%; }
+  .ciq-count { align-items: flex-start; flex-wrap: wrap; }
+  .ciq-count span { min-width: 0; overflow-wrap: anywhere; }
 }
