@@ -9,6 +9,18 @@ from core.services import research_capture, research_operator, research_setup
 from core.tools.registry import Registry, TOOL_SCHEMAS
 
 
+def _policy_text(*, include_research: bool = True) -> str:
+    tools = ""
+    if include_research:
+        tools = (
+            "  research_provider_setup:\n"
+            "    tier: read_only\n"
+            "  collision_research:\n"
+            "    tier: operator_authorized\n"
+        )
+    return f"roots: []\nwrite_roots: []\ntools:\n{tools or '  {}\n'}"
+
+
 def test_alldata_setup_language_routes_directly_to_secure_card():
     phrases = [
         "Set up AllData for me",
@@ -26,7 +38,7 @@ def test_unrelated_requests_keep_existing_deterministic_router_behavior():
 
 def test_research_tools_are_registered_with_separate_policy_tiers(tmp_path: Path):
     policy = tmp_path / "tools.yaml"
-    policy.write_text("roots: []\nwrite_roots: []\ntools: {}\n", encoding="utf-8")
+    policy.write_text(_policy_text(), encoding="utf-8")
     registry = Registry(policy)
     assert registry.tier("research_provider_setup") == "read_only"
     assert registry.tier("collision_research") == "operator_authorized"
@@ -36,9 +48,22 @@ def test_research_tools_are_registered_with_separate_policy_tiers(tmp_path: Path
     assert "collision_research" in TOOL_SCHEMAS
 
 
+def test_research_handlers_cannot_self_authorize_when_policy_entries_are_removed(tmp_path: Path):
+    policy = tmp_path / "tools.yaml"
+    policy.write_text(_policy_text(include_research=False), encoding="utf-8")
+    registry = Registry(policy)
+    assert "research_provider_setup" in registry._handlers  # noqa: SLF001
+    assert "collision_research" in registry._handlers  # noqa: SLF001
+    assert registry.tier("research_provider_setup") == "blocked"
+    assert registry.tier("collision_research") == "blocked"
+    names = {item["function"]["name"] for item in registry.model_tools("owner")}
+    assert "research_provider_setup" not in names
+    assert "collision_research" not in names
+
+
 def test_test_users_do_not_receive_owner_research_provider_tools(tmp_path: Path):
     policy = tmp_path / "tools.yaml"
-    policy.write_text("roots: []\nwrite_roots: []\ntools: {}\n", encoding="utf-8")
+    policy.write_text(_policy_text(), encoding="utf-8")
     registry = Registry(policy)
     names = {
         item["function"]["name"]
