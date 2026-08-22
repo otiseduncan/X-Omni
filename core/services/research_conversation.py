@@ -1,6 +1,6 @@
 """Conversation-first presentation for verified collision research.
 
-The research engine can be exhaustive; the chat answer should not be.  This
+The research engine can be exhaustive; the chat answer should not be. This
 layer distills verified evidence into a short coworker-style answer and leaves
 the full source trail in the research artifact for optional inspection.
 """
@@ -35,9 +35,6 @@ def _compact_finding(finding: dict[str, Any]) -> dict[str, Any]:
 def _distill(result: dict[str, Any]) -> dict[str, Any]:
     public = result.get("public_oem") if isinstance(result.get("public_oem"), dict) else {}
 
-    # Manufacturer findings are the highest-value evidence for these questions.
-    # Preserve policy and calibration-trigger findings separately so the model
-    # does not confuse a service procedure with an OEM collision requirement.
     policy_findings = [
         _compact_finding(item)
         for item in (public.get("policy_findings") or [])[:4]
@@ -73,6 +70,9 @@ def _distill(result: dict[str, Any]) -> dict[str, Any]:
         "url": alldata.get("url"),
         "title": alldata.get("title"),
         "page_text": str(alldata.get("page_text") or "")[:1600],
+        "vehicle": alldata.get("vehicle"),
+        "topic": alldata.get("topic"),
+        "result_title": alldata.get("result_title"),
     }
 
     public_sources = []
@@ -114,12 +114,41 @@ def _distill(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _plain_chat(text: str) -> str:
+    """Remove Markdown control syntax from conversational research prose.
+
+    X's chat stream is intentionally plain conversational text. Models may
+    still emit Markdown emphasis even when asked not to; normalize it before
+    persistence so users neither see nor hear literal asterisks/backticks.
+    Source URLs remain visible after Markdown link labels are flattened.
+    """
+    value = str(text or "")
+    value = re.sub(r"!\[([^\]]*)\]\(([^)]*)\)", r"\1", value)
+    value = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 — \2", value)
+    value = re.sub(r"```[^\n]*\n?", "", value)
+    value = value.replace("```", "")
+    value = re.sub(r"`([^`]*)`", r"\1", value)
+    value = re.sub(r"^\s{0,3}#{1,6}\s+", "", value, flags=re.MULTILINE)
+    value = re.sub(r"^\s*>+\s?", "", value, flags=re.MULTILINE)
+    value = re.sub(r"^\s*[-+*]\s+", "", value, flags=re.MULTILINE)
+    value = value.replace("***", "").replace("___", "")
+    value = value.replace("**", "").replace("__", "").replace("~~", "")
+    value = value.replace("*", "")
+    return value.strip()
+
+
 def _trim(text: str) -> str:
-    text = re.sub(r"\n{3,}", "\n\n", str(text or "").strip())
+    text = _plain_chat(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     if len(text) <= MAX_CHAT_CHARS:
         return text
     clipped = text[:MAX_CHAT_CHARS]
-    boundary = max(clipped.rfind(". "), clipped.rfind(".\n"), clipped.rfind("? "), clipped.rfind("! "))
+    boundary = max(
+        clipped.rfind(". "),
+        clipped.rfind(".\n"),
+        clipped.rfind("? "),
+        clipped.rfind("! "),
+    )
     if boundary >= 700:
         clipped = clipped[: boundary + 1]
     return clipped.rstrip() + "…"
@@ -135,11 +164,11 @@ async def conversational_synthesize(orchestrator: Any, question: str, result: di
                 "You are Xoduz speaking to an experienced post-collision repair professional. "
                 "Answer like a competent coworker, not a report generator. Give the conclusion first, then the key reason. "
                 "Use one or two short paragraphs, normally 80-170 words total. Do not list the research process, source ledger, "
-                "raw excerpts, tool output, result counts, or capture details. Do not use section headings or bullet lists unless absolutely necessary. "
-                "Manufacturer collision policy and explicit manufacturer calibration-trigger language outrank inference from a service procedure. "
-                "A calibration requirement may be buried in a sidebar, warning, applicability note, or late PDF page; use deep calibration findings when present. "
-                "Never infer that transferring data from an old module means a recycled module is approved. "
-                "State uncertainty plainly when needed. You may include at most two useful source URLs inline. "
+                "raw excerpts, tool output, result counts, or capture details. Do not use Markdown, section headings, bullets, bold markers, "
+                "asterisks, or code formatting. Manufacturer collision policy and explicit manufacturer calibration-trigger language outrank "
+                "inference from a service procedure. A calibration requirement may be buried in a sidebar, warning, applicability note, or late "
+                "PDF page; use deep calibration findings when present. Never infer that transferring data from an old module means a recycled "
+                "module is approved. State uncertainty plainly when needed. You may include at most two useful source URLs inline. "
                 "Use ONLY the distilled verified evidence supplied."
             ),
         },
@@ -167,7 +196,10 @@ async def conversational_synthesize(orchestrator: Any, question: str, result: di
                 f"It directly addresses the repair/calibration requirement, so I would rely on that manufacturer statement rather than infer the answer from a generic procedure.{url}"
             )
         else:
-            answer = "I completed the research, but the verified evidence does not support a confident manufacturer conclusion yet. The source details are available below if you want to inspect them."
+            answer = (
+                "I completed the research, but the verified evidence does not support a confident manufacturer conclusion yet. "
+                "The source details are available below if you want to inspect them."
+            )
     return _trim(answer)
 
 
