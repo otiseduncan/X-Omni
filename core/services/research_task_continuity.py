@@ -57,6 +57,54 @@ def looks_like_continuation(message: object) -> bool:
     return _content_token_count(text) <= 2
 
 
+def _record_adas_only_task(conversation_id: object, query: str, result_count: Optional[int], turn_count: int) -> None:
+    """Best-effort: a plain ADAS SI search (the model's own tool choice, not
+    routed through full_research) still names a vehicle/topic worth
+    remembering. Without this, a turn that misses locally and never reaches
+    ALLDATA leaves the task store untouched -- so a later "check ALLDATA for
+    it" would merge against whatever older task happened to still be there
+    (reported: a Ford F-150 question picked up a stale Hyundai Palisade task
+    from earlier in the conversation, because the F-150 turn never updated
+    anything).
+    """
+    try:
+        from . import research_alldata_navigation as nav
+        from ..config import Settings
+
+        vehicle = nav.vehicle_from_query(query)
+        if not vehicle.get("label"):
+            return  # not enough identity in this query to be worth recording
+        topic = nav.topic_from_query(query, vehicle)
+        store = research_task.get_store(Settings.load().root)
+        existing = store.get(str(conversation_id))
+        same_vehicle = bool(
+            existing
+            and existing.vehicle_year == vehicle.get("year")
+            and existing.vehicle_make == vehicle.get("make")
+        )
+        store.save(research_task.ResearchTask(
+            conversation_id=str(conversation_id),
+            vehicle_year=vehicle.get("year"),
+            vehicle_make=vehicle.get("make"),
+            vehicle_model_trim=vehicle.get("model_trim"),
+            vehicle_label=vehicle.get("label"),
+            subject=topic[:200],
+            local_status="found" if (result_count or 0) > 0 else "missing",
+            # Only carry forward ALLDATA/OEM/acquisition status when this is
+            # still the same vehicle -- a different vehicle is a fresh task,
+            # not a continuation, and should not inherit an unrelated
+            # vehicle's "verified" evidence.
+            alldata_status=existing.alldata_status if same_vehicle and existing else "not_started",
+            alldata_evidence_url=(existing.alldata_evidence_url if same_vehicle and existing else None),
+            oem_web_status=existing.oem_web_status if same_vehicle and existing else "not_started",
+            oem_web_evidence_url=(existing.oem_web_evidence_url if same_vehicle and existing else None),
+            acquisition_status=existing.acquisition_status if same_vehicle and existing else "pending",
+            turn_count_at_update=turn_count,
+        ))
+    except Exception:  # noqa: BLE001 - continuity is best-effort, never blocks the turn
+        pass
+
+
 def merge_active_task(
     message: object, task: Optional["research_task.ResearchTask"], current_turn_count: int
 ) -> str:
@@ -101,18 +149,36 @@ def install() -> None:
                         return
 
                     merged = user_message
+                    history_len = 0
                     try:
                         from ..config import Settings
 
                         store = research_task.get_store(Settings.load().root)
                         task = store.get(str(conversation_id))
                         history = self.store.get_messages(conversation_id)
-                        merged = merge_active_task(user_message, task, len(history))
+                        history_len = len(history)
+                        merged = merge_active_task(user_message, task, history_len)
                     except Exception:  # noqa: BLE001 - continuity is best-effort, never blocks the turn
                         pass
 
+                    # Watch (without altering) this turn's tool events for a plain
+                    # ADAS SI search the model chose on its own -- the only path
+                    # research_workflow._persist_research_task doesn't cover, since
+                    # it only fires when full_research actually runs.
+                    adas_query: Optional[str] = None
+                    adas_result_count: Optional[int] = None
                     async for event in previous(self, conversation_id, merged, approved_tool, approval_context):
+                        if event.get("name") == "adas_si_search":
+                            if event.get("type") == "tool_start":
+                                adas_query = str((event.get("args") or {}).get("query") or "") or adas_query
+                            elif event.get("type") == "tool_result":
+                                result = event.get("result")
+                                if isinstance(result, dict):
+                                    adas_result_count = len(result.get("results") or [])
                         yield event
+
+                    if adas_query:
+                        _record_adas_only_task(conversation_id, adas_query, adas_result_count, history_len + 1)
 
                 run._xomni_task_continuity = True  # type: ignore[attr-defined]
                 loop_mod.Orchestrator._run = run

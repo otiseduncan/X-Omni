@@ -29,7 +29,15 @@ _CALIBRATION_INTENT_RE = re.compile(
     r"aim(?:ing|ment)?|beam\s+axis|target\s+(?:placement|setting)|"
     r"camera\s+(?:aim|alignment)|radar\s+(?:aim|alignment|adjustment)|"
     r"adas\s+(?:calibration|aiming)|eyesight|blind\s+spot\s+(?:monitor|radar)|"
-    r"forward\s+recognition\s+camera|millimeter\s+wave\s+radar)\b",
+    r"forward\s+recognition\s+camera|millimeter\s+wave\s+radar|"
+    # These are standalone ADAS system names (same tier as eyesight / blind
+    # spot monitor above) so a plain "I need the 360 camera procedure for X"
+    # routes into research without also requiring collision-context language
+    # -- a real reported gap: that exact phrasing matched neither this regex
+    # nor the collision-context fallback below, so ALLDATA was never even
+    # attempted and the turn silently dead-ended at a local ADAS SI miss.
+    r"360[\s-]?(?:degree\s+)?(?:view\s+)?camera|surround\s+(?:view|vision)\s+camera|"
+    r"parking\s+aid\s+camera)\b",
     re.IGNORECASE,
 )
 _COLLISION_CONTEXT_RE = re.compile(
