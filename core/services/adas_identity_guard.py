@@ -15,20 +15,29 @@ from typing import Any, Optional
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
 
+# Words that mark the end of a vehicle model/trim and the beginning of the
+# research topic.  These include ADAS system names as well as policy vocabulary;
+# e.g. "Toyota recycled blind spot..." is a Toyota policy query, not a model
+# named "Recycled", and "Subaru EyeSight calibration" is not a model named
+# "EyeSight".
 _TOPIC_BOUNDARY_RE = re.compile(
-    r"\b(?:front|forward|rear|blind|bsm|bsd|adas|camera|radar|sensor|module|"
-    r"calibrat\w*|recalibrat\w*|aim\w*|align\w*|adjust\w*|initializ\w*|"
+    r"\b(?:front|forward|rear|blind|bsm|bsd|adas|eyesight|camera|radar|sensor|module|"
+    r"ccm|ipma|calibrat\w*|recalibrat\w*|aim\w*|align\w*|adjust\w*|initializ\w*|"
     r"relearn\w*|reset\w*|procedure|repair|collision|position\s+statement|"
-    r"windshield|steering|occupant|parking|park\s+assist)\b",
+    r"windshield|steering|occupant|parking|park\s+assist|recycled|salvaged?|"
+    r"aftermarket|remanufactured|reconditioned|used|genuine|oem|approved|"
+    r"prohibited|permitted|allowed|require(?:d|ment)?|replace(?:d|ment)?)\b",
     re.IGNORECASE,
 )
 _YEAR_ANY_RE = re.compile(r"(?<!\d)(?P<year>20\d{2}|\d{2})(?!\d)")
 _RANGE_RE = re.compile(r"(?<!\d)(?P<start>20\d{2}|\d{2})\s*[-–]\s*(?P<end>20\d{2}|\d{2})(?!\d)")
 _MODEL_SYSTEM_TOKENS = {
-    "adas", "bsm", "bsd", "ccm", "ipma", "camera", "radar", "sensor",
+    "adas", "bsm", "bsd", "ccm", "ipma", "eyesight", "camera", "radar", "sensor",
     "module", "calibration", "alignment", "adjustment", "aiming", "aim",
     "initialization", "initialize", "relearn", "reset", "monitor", "parking",
-    "surround", "forward", "front", "rear", "blind", "lane",
+    "surround", "forward", "front", "rear", "blind", "lane", "recycled",
+    "salvage", "salvaged", "aftermarket", "remanufactured", "reconditioned",
+    "used", "genuine", "oem", "approved", "prohibited", "permitted", "allowed",
 }
 
 
@@ -98,6 +107,7 @@ def explicit_model(query: object, requested_make: Optional[str], adas_mod: Any) 
 
     The comparison is prefix-compatible so ``Cherokee Latitude Luxe`` matches a
     document indexed simply as ``Cherokee`` while still excluding Grand Cherokee.
+    Topic/policy words terminate model extraction immediately.
     """
     if not requested_make:
         return None
