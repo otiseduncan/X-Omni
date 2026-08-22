@@ -199,6 +199,13 @@ tools:
       no-calibration decisions, and location administration. Routine authorized
       operations run immediately and are audited upstream and in X.
 
+  calibration_iq_work_prep:
+    tier: operator_authorized
+    description: >-
+      Prepare Calibration IQ work from the authoritative RO queue: read phase and
+      RO requirements, reconcile ADAS Map requirements into Calibration IQ through
+      verified routine operator actions, and check exact ADAS SI procedure coverage.
+
   calibration_iq_destructive:
     tier: confirm_required
     description: >-
