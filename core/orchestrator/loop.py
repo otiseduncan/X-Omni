@@ -252,18 +252,40 @@ def latest_calibration_iq_filters(history: list[dict]) -> dict[str, Any]:
     return {}
 
 
+def _mentioned_shops(text: str) -> list[str]:
+    return [label for pattern, label in _CIQ_SHOPS if pattern.search(text)]
+
+
+def _mentioned_phases(text: str) -> list[str]:
+    tokens = {m.group("phase").casefold() for m in _CIQ_PHASE_RE.finditer(text)}
+    return sorted(
+        _CIQ_PHASE_WORDS[t] if t in _CIQ_PHASE_WORDS else str(int(t)) for t in tokens
+    )
+
+
+def calibration_iq_filter_is_ambiguous(text: str) -> bool:
+    """True when a message names more than one shop or phase.
+
+    Live field trace: "you're only showing Warner Robins, what about Macon
+    and Perry" mentions Warner Robins (referencing what was just shown)
+    alongside the actually-requested Macon and Perry. A fixed-priority
+    first-match scan grabbed "Warner Robins" -- the wrong one -- and
+    answered deterministically before the model ever saw the message. A
+    message with an unambiguous single shop/phase mention still routes
+    deterministically; only a genuinely ambiguous one defers to the model,
+    which already handles a multi-shop ask correctly as separate calls.
+    """
+    return len(_mentioned_shops(text)) > 1 or len(_mentioned_phases(text)) > 1
+
+
 def _explicit_calibration_filters(text: str) -> dict[str, Any]:
     filters: dict[str, Any] = {}
-    for pattern, label in _CIQ_SHOPS:
-        if pattern.search(text):
-            filters["shop"] = label
-            break
-    phase_match = _CIQ_PHASE_RE.search(text)
-    if phase_match:
-        token = phase_match.group("phase").casefold()
-        filters["phase"] = (
-            _CIQ_PHASE_WORDS[token] if token in _CIQ_PHASE_WORDS else str(int(token))
-        )
+    shops = _mentioned_shops(text)
+    if len(shops) == 1:
+        filters["shop"] = shops[0]
+    phases = _mentioned_phases(text)
+    if len(phases) == 1:
+        filters["phase"] = phases[0]
     if _CIQ_ALL_WORK_RE.search(text):
         filters["include_completed"] = True
         filters["terminal_only"] = False
@@ -295,6 +317,8 @@ def calibration_iq_read_request(
     count_intent = bool(_CIQ_COUNT_RE.search(text))
     list_intent = bool(_CIQ_LIST_RE.search(text))
     if not count_intent and not list_intent:
+        return None
+    if calibration_iq_filter_is_ambiguous(text):
         return None
 
     explicit = _explicit_calibration_filters(text)

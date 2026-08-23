@@ -6,6 +6,7 @@ import pytest
 
 from core.orchestrator.loop import (
     Orchestrator,
+    calibration_iq_filter_is_ambiguous,
     calibration_iq_read_request,
     calibration_iq_result_summary,
     latest_calibration_iq_filters,
@@ -350,3 +351,90 @@ def test_context_is_never_inherited_across_conversations(tmp_path):
     )
     other_history = store.get_messages(other_conversation)
     assert calibration_iq_read_request("Show me those.", other_history) is None
+
+
+# --------------------------------------------------------------------------
+# Live field trace: "you're only showing Warner Robins, what about Macon and
+# Perry" mentioned Warner Robins (referencing what was already shown)
+# alongside the actually-requested Macon and Perry. The fixed-priority
+# first-match shop scan grabbed "Warner Robins" -- the wrong one -- and
+# answered deterministically, before the model ever read the message.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "you're only showing Warner Robins, what about Macon and Perry",
+        "what about Perry and Macon",
+        "compare Macon to Warner Robins",
+    ],
+)
+def test_multi_shop_mention_is_ambiguous(text):
+    assert calibration_iq_filter_is_ambiguous(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "how many are active in Macon",
+        "show me those",
+        "how many are in phase 5",
+    ],
+)
+def test_single_or_no_shop_mention_is_not_ambiguous(text):
+    assert calibration_iq_filter_is_ambiguous(text) is False
+
+
+def test_multi_shop_message_declines_the_deterministic_route_entirely():
+    text = "you're only showing Warner Robins, what about Macon and Perry"
+    assert calibration_iq_read_request(text, []) is None
+
+
+def test_multi_phase_message_declines_the_deterministic_route_entirely():
+    text = "what about phase 6 instead of phase 5"
+    assert calibration_iq_read_request(text, []) is None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_shop_message_falls_through_to_correct_model_tool_choice(
+    tmp_path,
+):
+    """The model already handles this correctly as two separate calls once
+    the router gets out of the way -- reproduced live once this fix landed."""
+    store = Store(tmp_path / "ciq-ambiguous.sqlite")
+    conversation_id = store.create_conversation("Calibration IQ")
+    handlers = _CalibrationHandlers()
+    registry = Registry("config/tools.yaml", store=store)
+    registry.register("calibration_iq_summary", handlers.summary)
+
+    class ModelClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def stream(self, _messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "type": "tool_call", "id": "call-perry",
+                    "name": "calibration_iq_summary", "arguments": '{"shop": "Perry"}',
+                }
+                yield {
+                    "type": "tool_call", "id": "call-macon",
+                    "name": "calibration_iq_summary", "arguments": '{"shop": "Macon"}',
+                }
+                return
+            yield {"type": "content", "text": "Perry and Macon breakdown above."}
+
+    client = ModelClient()
+    orchestrator = Orchestrator(
+        _Router(), client, registry, store,
+        SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
+    )
+    events = await _run_user_turn(
+        store, conversation_id, orchestrator,
+        "you're only showing Warner Robins, what about Macon and Perry",
+    )
+
+    tool_calls = [e for e in events if e["type"] == "tool_start"]
+    assert [c["args"] for c in tool_calls] == [{"shop": "Perry"}, {"shop": "Macon"}]
+    assert client.calls == 2
