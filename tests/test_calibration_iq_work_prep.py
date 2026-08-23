@@ -480,6 +480,7 @@ def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
         "phase_coverage",
         "ro_requirements",
         "week_readiness",
+        "queue_list",
         "queue_next",
     }
 
@@ -493,6 +494,128 @@ def test_next_embedded_in_a_longer_sentence_does_not_trigger_queue_walk():
     # _QUEUE_NEXT_RE is deliberately anchored to the whole message -- "next"
     # as a topic word elsewhere must not hijack an unrelated turn.
     assert prep.classify_request("what's next on my calendar today") != "queue_next"
+
+
+def test_show_me_the_ones_needing_si_routes_to_queue_list():
+    """Live field trace: a plain follow-up to "prepare for the week" matched
+    no existing branch, fell through to ordinary model tool choice, and the
+    model answered from stored artifact context in unbounded prose with no
+    card -- instead of this cheap, always-instant disk read."""
+    for text in (
+        "show me a list of the ones needing SI",
+        "give me the list of the ones that need SI",
+        "list the ROs missing SI",
+        "which vehicles need SI",
+        "show me those cars requiring SI",
+        "can you pull up the ones needing SI",
+    ):
+        assert prep.classify_request(text) == "queue_list", text
+
+
+def test_queue_list_does_not_capture_the_week_command_or_bare_next():
+    assert prep.classify_request("let's prepare for the week") == "week_readiness"
+    assert prep.classify_request("next") == "queue_next"
+    assert prep.classify_request("how many cars need calibration today") != "queue_list"
+
+
+@pytest.mark.asyncio
+async def test_queue_list_mode_reports_no_active_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    result = await prep._queue_list_mode(  # noqa: SLF001
+        settings,
+        {prep._CONTEXT_KEY: {"conversation_id": 999, "message_id": 1, "tool_call_id": "call-1"}},  # noqa: SLF001
+    )
+    assert result["status"] == "no_active_queue"
+    assert result["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_queue_list_mode_reports_stale_queue(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    item = weekly_queue.WeeklyQueueItem(repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Acura TLX")
+    old = weekly_queue.WeeklyQueue(conversation_id="7", items=[item])
+    old.updated_at = 0.0
+    store._write_all({"7": old.to_dict()})  # noqa: SLF001
+
+    result = await prep._queue_list_mode(  # noqa: SLF001
+        settings,
+        {prep._CONTEXT_KEY: {"conversation_id": 7, "message_id": 1, "tool_call_id": "call-1"}},  # noqa: SLF001
+    )
+    assert result["status"] == "queue_stale"
+
+
+@pytest.mark.asyncio
+async def test_queue_list_mode_returns_missing_and_unverified_items(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    missing_item = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-1", ro_number="2400612490", vehicle_label="2023 Ford Maverick",
+        missing_calibrations=["Passenger Seat Weight Sensor"], category="missing",
+    )
+    unverified_item = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-2", ro_number="2400612471", vehicle_label="2026 Chevrolet Equinox",
+        unverified_calibrations=["Windshield mono-camera calibration"], category="unverified",
+    )
+    done_item = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-3", ro_number="2400612455", vehicle_label="2022 Honda CR-V",
+        missing_calibrations=["Seat Belt"], category="missing", status="complete",
+    )
+    store.save(weekly_queue.WeeklyQueue(
+        conversation_id="11", items=[missing_item, unverified_item, done_item],
+    ))
+
+    result = await prep._queue_list_mode(  # noqa: SLF001
+        settings,
+        {prep._CONTEXT_KEY: {"conversation_id": 11, "message_id": 1, "tool_call_id": "call-1"}},  # noqa: SLF001
+    )
+    assert result["status"] == "success"
+    assert result["pending_count"] == 2
+    assert result["missing_count"] == 1
+    assert result["unverified_count"] == 1
+    assert result["done_count"] == 1
+    ro_numbers = {item["ro_number"] for item in result["items"]}
+    assert ro_numbers == {"2400612490", "2400612471"}
+    assert "2400612455" not in ro_numbers  # already complete -- not "pending"
+
+    summary = prep.summarize("queue_list", result)
+    assert "2 RO(s) still need SI" in summary
+    assert "1 confirmed missing" in summary
+    assert "1 unverified" in summary
+
+
+def test_save_weekly_queue_persists_missing_and_unverified_rows_with_category(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    results = [
+        {
+            "repair_order_id": "ro-1", "ro_number": "2400612490", "vehicle": "2023 Ford Maverick",
+            "missing_si": [{"calibration": "Passenger Seat Weight Sensor", "state": "MISSING"}],
+            "unverified_si": [],
+        },
+        {
+            "repair_order_id": "ro-2", "ro_number": "2400612471", "vehicle": "2026 Chevrolet Equinox",
+            "missing_si": [],
+            "unverified_si": [{"calibration": "Windshield mono-camera calibration", "state": "UNVERIFIED"}],
+        },
+        {
+            "repair_order_id": "ro-3", "ro_number": "2400612455", "vehicle": "2022 Honda CR-V",
+            "missing_si": [], "unverified_si": [],
+        },
+    ]
+    prep._save_weekly_queue(settings, 12, results)  # noqa: SLF001
+
+    store = weekly_queue.get_store(tmp_path)
+    queue = store.get("12")
+    by_ro = {item.ro_number: item for item in queue.items}
+    assert set(by_ro) == {"2400612490", "2400612471"}  # the fully-covered RO is not queued
+    assert by_ro["2400612490"].category == "missing"
+    assert by_ro["2400612490"].missing_calibrations == ["Passenger Seat Weight Sensor"]
+    assert by_ro["2400612471"].category == "unverified"
+    assert by_ro["2400612471"].unverified_calibrations == ["Windshield mono-camera calibration"]
     assert prep.classify_request("I'll do the next RO after lunch") != "queue_next"
 
 

@@ -81,8 +81,18 @@ test("calibration_iq_work_prep is wired to a dedicated card, not silently droppe
   // route somewhere -- a missing case would fall through to whatever the
   // default renders, silently showing the wrong shape.
   assert.match(cards, /case "phase_list":/);
+  assert.match(cards, /case "queue_list":/);
   assert.match(cards, /case "queue_next":/);
   assert.match(cards, /case "ro_requirements":/);
+
+  // queue_list is the read-only replay of the persisted weekly-readiness SI
+  // queue -- it must distinguish missing (confirmed gap) from unverified
+  // (couldn't be proven either way), not conflate the two.
+  assert.match(cards, /function WorkPrepQueueListCard/);
+  assert.match(cards, /item\.category === "missing"/);
+  assert.match(cards, /missing_count/);
+  assert.match(cards, /unverified_count/);
+  assert.match(cards, /\["no_active_queue",\s*"queue_stale",\s*"context_missing"\]/);
 
   // phase_list shares calibration_iq_read's exact result shape (see
   // calibration_iq_work_prep.py's _phase_list: `{"mode": "phase_list",

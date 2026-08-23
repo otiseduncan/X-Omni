@@ -184,6 +184,22 @@ _QUEUE_NEXT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Reading the persisted weekly-readiness SI queue instantly, without
+# re-running the live (write-capable) audit just to redisplay it. Live field
+# trace: "show me a list of the ones needing SI" -- a plain follow-up to
+# "prepare for the week" -- matched no existing branch here, fell through to
+# ordinary model tool choice, and the model answered from stored artifact
+# context in unbounded prose with no card, instead of this cheap disk read.
+_QUEUE_LIST_RE = re.compile(
+    r"\b(?:show|list|give|pull\s+up|see)\b.{0,60}"
+    r"\b(?:ones?|ros?|repair\s+orders?|vehicles?|cars?)\b.{0,40}"
+    r"\b(?:need(?:ing|s)?|missing|requir(?:e|ing|ed))\b.{0,20}\b(?:adas\s+si|si)\b|"
+    r"\b(?:what|which)\b.{0,60}"
+    r"\b(?:ones?|ros?|repair\s+orders?|vehicles?|cars?)\b.{0,40}"
+    r"\b(?:need(?:ing|s)?|missing|requir(?:e|ing|ed))\b.{0,20}\b(?:adas\s+si|si)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # Conversational continuity for the ALLDATA acquisition flow: once "log in to
 # ALLDATA" has run, a follow-up like "retrieve SI information please" carries
 # no ALLDATA/quick-reference/RO wording of its own and would otherwise fall
@@ -268,6 +284,11 @@ def classify_request(
         _RO_RE.search(value) or _THIS_RO_RE.search(value)
     ) and _RO_REQUIREMENT_RE.search(value):
         return "ro_requirements"
+    if _QUEUE_LIST_RE.search(value):
+        # Whether a queue was actually saved is checked downstream
+        # (_queue_list_mode); no active queue fails closed with a clear
+        # message instead of guessing at board-wide filters.
+        return "queue_list"
     if _QUEUE_NEXT_RE.search(value):
         # Whether an active weekly-readiness queue actually exists is
         # checked downstream (resolve_queue_next); a bare "next" with none
@@ -2370,8 +2391,17 @@ async def _phase_coverage(
 
 
 def _save_weekly_queue(settings: Any, conversation_id: int, results: list[dict[str, Any]]) -> None:
-    """Remember which ROs still need ADAS SI so "next" can walk the list
-    without the operator repeating the RO or vehicle every turn."""
+    """Remember which ROs still need ADAS SI so "next" can walk the list,
+    and a cheap read-only "which ones need SI" question can be answered
+    instantly, without the operator repeating the RO or vehicle every turn
+    or X re-running the full live audit just to redisplay it.
+
+    A row can land here for two distinct reasons: missing_si is a confirmed
+    coverage gap, unverified_si is "could not be proven either way." Both
+    are things Otis wants walked and listed together (a genuine field
+    decision, not a default) -- category records which one it actually was,
+    since the two are not the same claim.
+    """
     items: list[weekly_queue.WeeklyQueueItem] = []
     for row in results:
         repair_order_id = str(row.get("repair_order_id") or "").strip()
@@ -2380,7 +2410,12 @@ def _save_weekly_queue(settings: Any, conversation_id: int, results: list[dict[s
             for entry in (row.get("missing_si") or [])
             if isinstance(entry, dict) and entry.get("calibration")
         ]
-        if not repair_order_id or not missing:
+        unverified = [
+            str(entry.get("calibration") or "").strip()
+            for entry in (row.get("unverified_si") or [])
+            if isinstance(entry, dict) and entry.get("calibration")
+        ]
+        if not repair_order_id or not (missing or unverified):
             continue
         vehicle_label = str(row.get("vehicle") or "").strip()
         parsed_vehicle = nav.vehicle_from_query(vehicle_label)
@@ -2392,6 +2427,8 @@ def _save_weekly_queue(settings: Any, conversation_id: int, results: list[dict[s
             vehicle_make=parsed_vehicle.get("make"),
             vehicle_model_trim=parsed_vehicle.get("model_trim"),
             missing_calibrations=missing,
+            unverified_calibrations=unverified,
+            category="missing" if missing else "unverified",
         ))
     store = weekly_queue.get_store(Path(settings.root))
     if not items:
@@ -2412,7 +2449,71 @@ async def handle(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, An
         return await _phase_coverage(settings, adas, args)
     if mode == "queue_next":
         return await _queue_next_mode(settings, adas, args)
+    if mode == "queue_list":
+        return await _queue_list_mode(settings, args)
     raise ValueError("Unsupported Calibration IQ work-prep mode.")
+
+
+async def _queue_list_mode(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only: report the persisted weekly-readiness SI queue instantly.
+
+    No live Calibration IQ/ADAS Map/ADAS SI audit runs here -- the data was
+    already computed and saved by the most recent week_readiness/
+    phase_coverage call in this conversation. This exists specifically so
+    "show me the list of the ones needing SI" doesn't have to choose between
+    re-running a slow, write-capable audit just to redisplay it, or
+    answering in prose from context with no card at all.
+    """
+    context = _valid_context(args.get(_CONTEXT_KEY))
+    if context is None:
+        return {
+            "status": "context_missing",
+            "mode": "queue_list",
+            "success": False,
+            "verified": False,
+            "message": "X could not identify the active conversation for the weekly readiness queue.",
+            "items": [],
+        }
+    store = weekly_queue.get_store(Path(settings.root))
+    queue = store.get(str(context["conversation_id"]))
+    if queue is None or not queue.items:
+        return {
+            "status": "no_active_queue",
+            "mode": "queue_list",
+            "success": True,
+            "verified": True,
+            "message": (
+                "There's no active weekly readiness queue for this conversation. "
+                "Run \"make sure we're prepared for the week\" first."
+            ),
+            "items": [],
+        }
+    if queue.is_stale():
+        return {
+            "status": "queue_stale",
+            "mode": "queue_list",
+            "success": True,
+            "verified": True,
+            "message": (
+                "The weekly readiness queue from earlier is stale. "
+                "Run \"make sure we're prepared for the week\" again."
+            ),
+            "items": [],
+        }
+    pending = queue.pending()
+    done = [item for item in queue.items if item.status != "pending"]
+    return {
+        "status": "success",
+        "mode": "queue_list",
+        "success": True,
+        "verified": True,
+        "queue_count": len(queue.items),
+        "pending_count": len(pending),
+        "missing_count": sum(1 for item in pending if item.category == "missing"),
+        "unverified_count": sum(1 for item in pending if item.category == "unverified"),
+        "done_count": len(done),
+        "items": [item.to_dict() for item in pending],
+    }
 
 
 async def _queue_next_mode(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -2882,6 +2983,27 @@ def summarize(mode: str, result: Any) -> str:
         if map_status != "verified":
             suffix += " ADAS Map requirements were not machine-readable on this RO, so I did not invent any missing requirements."
         return f"{base}: {requirements}.{suffix}"
+    if mode == "queue_list":
+        if data.get("status") in {"no_active_queue", "queue_stale", "context_missing"}:
+            return message or "The weekly readiness queue is unavailable."
+        items = [item for item in (data.get("items") or []) if isinstance(item, dict)]
+        pending_count = int(data.get("pending_count") or len(items))
+        missing_count = int(data.get("missing_count") or 0)
+        unverified_count = int(data.get("unverified_count") or 0)
+        if not items:
+            return "The weekly readiness queue is complete -- every RO that needed SI has been collected."
+        lead = (
+            f"{pending_count} RO(s) still need SI: {missing_count} confirmed missing, "
+            f"{unverified_count} unverified."
+        )
+        detail = "; ".join(
+            f"RO {item.get('ro_number') or item.get('repair_order_id')} — "
+            f"{item.get('vehicle_label') or 'vehicle'}"
+            for item in items[:_SUMMARY_EXCEPTION_LIMIT]
+        )
+        omitted = max(0, len(items) - _SUMMARY_EXCEPTION_LIMIT)
+        tail = f" {omitted} more in the card above." if omitted else ""
+        return f"{lead} {detail}.{tail}" if detail else lead
     if mode in {"week_readiness", "phase_coverage"}:
         if data.get("verified") is not True:
             fallback = (
@@ -2918,13 +3040,13 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Calibration IQ work-prep bridge. Use CIQ as the work queue, ADAS Map on each RO as the governing calibration-requirement source, and ADAS SI as procedure coverage. It can list a phase, run a full ADAS Map/SI coverage audit for one phase, report one RO's saved requirements, or audit/reconcile the active queue for weekly SI readiness. Missing CIQ calibrations proved by ADAS Map are added/reactivated through CIQ's verified routine operator contract."
+                    "Calibration IQ work-prep bridge. Use CIQ as the work queue, ADAS Map on each RO as the governing calibration-requirement source, and ADAS SI as procedure coverage. It can list a phase, run a full ADAS Map/SI coverage audit for one phase, report one RO's saved requirements, or audit/reconcile the active queue for weekly SI readiness. Missing CIQ calibrations proved by ADAS Map are added/reactivated through CIQ's verified routine operator contract. mode: queue_list re-displays the persisted missing/unverified-SI queue from the most recent week_readiness/phase_coverage call in this conversation instantly, with no live re-audit -- use it for a same-conversation 'show me the list' follow-up instead of re-running week_readiness."
                 ),
                 "parameters": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "mode": {"type": "string", "enum": ["phase_list", "phase_coverage", "ro_requirements", "week_readiness", "queue_next"]},
+                        "mode": {"type": "string", "enum": ["phase_list", "phase_coverage", "ro_requirements", "week_readiness", "queue_list", "queue_next"]},
                         "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
                         "repair_order_id": {"type": "string"},
                         "phase": {"type": "string"},

@@ -38,6 +38,13 @@ class WeeklyQueueItem:
     vehicle_make: Optional[str] = None
     vehicle_model_trim: Optional[str] = None
     missing_calibrations: list[str] = field(default_factory=list)
+    # Calibrations whose SI coverage could not be proven either way -- not
+    # the same claim as missing_calibrations (a confirmed gap). Otis chose to
+    # have both categories walked and listed together: an unverified result
+    # is still something to go check in the field, even though it isn't yet
+    # a proven miss.
+    unverified_calibrations: list[str] = field(default_factory=list)
+    category: str = "missing"  # "missing" | "unverified"
     status: str = "pending"  # pending | complete | failed
 
     def to_dict(self) -> dict[str, Any]:

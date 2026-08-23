@@ -661,6 +661,76 @@ function WorkPrepQueueNextCard({ data }) {
   );
 }
 
+function WorkPrepQueueItemRow({ item }) {
+  const calibrations = item.category === "unverified"
+    ? item.unverified_calibrations || []
+    : item.missing_calibrations || [];
+  return (
+    <div className="ro-item" key={item.repair_order_id}>
+      <div className="ro-line">
+        <span className="ro-num">{item.ro_number || "—"}</span>
+        <span className="ro-vehicle">{item.vehicle_label || "—"}</span>
+      </div>
+      <div className="ro-line ro-sub">
+        <span className={`ro-pill ${item.category === "missing" ? "warn" : ""}`}>
+          {item.category === "missing" ? "SI missing" : "SI unverified"}
+        </span>
+      </div>
+      {calibrations.length > 0 && (
+        <p className="card-note" style={{ marginTop: 4 }}>
+          {item.category === "missing" ? "Needs" : "Unverified"}: {calibrations.join(", ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Read-only replay of the persisted weekly-readiness SI queue -- no live
+ * re-audit, so it always returns instantly with a real card. */
+function WorkPrepQueueListCard({ data }) {
+  if (["no_active_queue", "queue_stale", "context_missing"].includes(data?.status)) {
+    return (
+      <Card icon={ClipboardList} title="Weekly readiness queue" tone="warn">
+        <p className="card-note">{data?.message || "No active weekly readiness queue."}</p>
+      </Card>
+    );
+  }
+
+  const items = data?.items || [];
+  const missingCount = data?.missing_count ?? 0;
+  const unverifiedCount = data?.unverified_count ?? 0;
+
+  return (
+    <Card
+      icon={items.length === 0 ? ClipboardList : AlertTriangle}
+      title="Weekly readiness queue"
+      meta={`${items.length} pending`}
+      tone={items.length === 0 ? undefined : "warn"}
+    >
+      {items.length === 0 ? (
+        <p className="card-note">Every RO that needed SI has been collected.</p>
+      ) : (
+        <>
+          <div className="ciq-chips" style={{ marginBottom: 9 }}>
+            {missingCount > 0 && <span className="ro-pill warn">{missingCount} missing</span>}
+            {unverifiedCount > 0 && <span className="ro-pill">{unverifiedCount} unverified</span>}
+          </div>
+          <div className="ro-list">
+            {items.map((item, i) => (
+              <WorkPrepQueueItemRow item={item} key={item.repair_order_id || i} />
+            ))}
+          </div>
+        </>
+      )}
+      {typeof data?.done_count === "number" && data.done_count > 0 && (
+        <p className="card-note" style={{ marginTop: 9 }}>
+          {data.done_count} already collected this week.
+        </p>
+      )}
+    </Card>
+  );
+}
+
 function WorkPrepRoRequirementsCard({ data }) {
   const reqs = data?.calibration_requirements || [];
   const mapStatus = data?.adas_map?.status;
@@ -767,6 +837,8 @@ export function CalibrationWorkPrepCard({ data }) {
   switch (data?.mode) {
     case "phase_list":
       return <WorkPrepPhaseListCard data={data} />;
+    case "queue_list":
+      return <WorkPrepQueueListCard data={data} />;
     case "queue_next":
       return <WorkPrepQueueNextCard data={data} />;
     case "ro_requirements":
