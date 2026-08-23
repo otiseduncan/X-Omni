@@ -24,6 +24,14 @@ import { toSpeechText } from "../lib/speechText.js";
 
 const STT_KEY = "xomni.sttMode";
 const VOICE_KEY = "xomni.voiceName";
+const BROWSER_END_SILENCE_MS = 1800;
+const BROWSER_RESTART_DELAY_MS = 120;
+const LOCAL_AUDIO_CONSTRAINTS = {
+  channelCount: 1,
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
 
 function readPref(key, fallback) {
   try {
@@ -65,6 +73,7 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
   const [voiceName, setVoiceNameState] = useState(() => readPref(VOICE_KEY, ""));
 
   const recognitionRef = useRef(null);
+  const browserSessionRef = useRef(null);
   const recorderRef = useRef(null);
   const chunksRef = useRef([]);
   const streamRef = useRef(null);
@@ -129,56 +138,128 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
 
   // ---------- STT: browser (Chrome / Google) ----------
   const startBrowserStt = useCallback(() => {
-    const recognition = new SpeechRecognitionImpl();
-    recognitionRef.current = recognition;
+    if (!SpeechRecognitionImpl) return;
+
     finalRef.current = "";
+    const session = {
+      active: true,
+      finishing: false,
+      idleTimer: null,
+      restartTimer: null,
+      finalize: null,
+    };
+    browserSessionRef.current = session;
 
-    recognition.lang = "en-US";
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-
-    recognition.onresult = (event) => {
-      let interim = "";
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        const chunk = event.results[i][0].transcript;
-        if (event.results[i].isFinal) finalRef.current += chunk;
-        else interim += chunk;
-      }
-      cb.current.onInterim?.((finalRef.current + interim).trim());
+    const clearTimers = () => {
+      if (session.idleTimer != null) window.clearTimeout(session.idleTimer);
+      if (session.restartTimer != null) window.clearTimeout(session.restartTimer);
+      session.idleTimer = null;
+      session.restartTimer = null;
     };
 
-    recognition.onerror = (event) => {
-      setRecording(false);
-      const map = {
-        "not-allowed": "Microphone permission was denied.",
-        "service-not-allowed": "Speech recognition was blocked by the browser.",
-        network:
-          "Chrome's speech recognition needs internet access. Switch STT to Local (Omni) to run offline.",
-        "no-speech": "Didn't catch anything — try again.",
-        aborted: null, // user-initiated stop; not an error worth surfacing
-      };
-      const message = map[event.error];
-      if (message) cb.current.onError?.(message);
-      else if (message !== null) cb.current.onError?.(`Speech error: ${event.error}`);
-    };
-
-    recognition.onend = () => {
-      setRecording(false);
+    const finalize = () => {
+      if (browserSessionRef.current !== session) return;
+      session.active = false;
+      session.finishing = true;
+      clearTimers();
+      browserSessionRef.current = null;
       recognitionRef.current = null;
+      setRecording(false);
       const text = finalRef.current.trim();
       finalRef.current = "";
       cb.current.onInterim?.("");
       if (text) cb.current.onTranscript?.(text);
     };
+    session.finalize = finalize;
 
-    try {
-      recognition.start();
-      setRecording(true);
-    } catch (err) {
-      setRecording(false);
-      cb.current.onError?.(`Could not start recognition: ${err.message || err}`);
-    }
+    const requestFinishAfterSilence = () => {
+      if (!session.active || session.finishing) return;
+      if (session.idleTimer != null) window.clearTimeout(session.idleTimer);
+      session.idleTimer = window.setTimeout(() => {
+        if (!session.active || session.finishing) return;
+        session.finishing = true;
+        const recognition = recognitionRef.current;
+        if (recognition) {
+          try {
+            recognition.stop();
+          } catch {
+            finalize();
+          }
+        } else {
+          finalize();
+        }
+      }, BROWSER_END_SILENCE_MS);
+    };
+
+    const launch = () => {
+      if (!session.active || session.finishing || browserSessionRef.current !== session) return;
+
+      const recognition = new SpeechRecognitionImpl();
+      recognitionRef.current = recognition;
+      recognition.lang = "en-US";
+      // Chrome can end an individual recognition stream after a short pause.
+      // Continuous mode plus a guarded restart keeps the user's dictation
+      // session alive until X's own silence grace period decides they are done.
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 3;
+
+      recognition.onresult = (event) => {
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const chunk = event.results[i][0]?.transcript || "";
+          if (event.results[i].isFinal) {
+            finalRef.current += `${chunk} `;
+          } else {
+            interim += chunk;
+          }
+        }
+        cb.current.onInterim?.(`${finalRef.current}${interim}`.trim());
+        requestFinishAfterSilence();
+      };
+
+      recognition.onerror = (event) => {
+        const map = {
+          "not-allowed": "Microphone permission was denied.",
+          "service-not-allowed": "Speech recognition was blocked by the browser.",
+          network:
+            "Chrome's speech recognition needs internet access. Switch STT to Local (Omni) to run offline.",
+        };
+
+        // Chrome routinely emits no-speech when it rotates a continuous
+        // recognizer. That is not a reason to throw away the current session.
+        if (event.error === "no-speech") return;
+        if (event.error === "aborted" && (session.finishing || !session.active)) return;
+
+        const message = map[event.error] || `Speech error: ${event.error}`;
+        session.finishing = true;
+        cb.current.onError?.(message);
+      };
+
+      recognition.onend = () => {
+        if (recognitionRef.current === recognition) recognitionRef.current = null;
+        if (session.finishing || !session.active) {
+          finalize();
+          return;
+        }
+        // Chrome may still rotate/end the recognizer itself. Restart quickly
+        // while preserving accumulated final text and the silence timer.
+        session.restartTimer = window.setTimeout(launch, BROWSER_RESTART_DELAY_MS);
+      };
+
+      try {
+        recognition.start();
+      } catch (err) {
+        session.finishing = true;
+        setRecording(false);
+        browserSessionRef.current = null;
+        recognitionRef.current = null;
+        cb.current.onError?.(`Could not start recognition: ${err.message || err}`);
+      }
+    };
+
+    setRecording(true);
+    launch();
   }, [SpeechRecognitionImpl]);
 
   // ---------- STT: local (Omni) ----------
@@ -192,7 +273,9 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: LOCAL_AUDIO_CONSTRAINTS,
+      });
       streamRef.current = stream;
       chunksRef.current = [];
 
@@ -208,10 +291,12 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       };
 
       rec.onstop = async () => {
+        recorderRef.current = null;
         const blob = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
         chunksRef.current = [];
         streamRef.current?.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
+        setRecording(false);
         if (blob.size < 1200) {
           cb.current.onError?.("That recording was too short.");
           return;
@@ -241,7 +326,9 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
         }
       };
 
-      rec.start();
+      // Timesliced chunks are more resilient on mobile browsers and avoid
+      // losing the entire utterance if MediaRecorder stalls during stop().
+      rec.start(250);
       setRecording(true);
     } catch (err) {
       cb.current.onError?.(
@@ -253,16 +340,30 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
   }, [recorderAvailable, secureContext]);
 
   const stop = useCallback(() => {
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        /* already stopping */
+    const browserSession = browserSessionRef.current;
+    if (browserSession) {
+      browserSession.active = false;
+      browserSession.finishing = true;
+      if (browserSession.idleTimer != null) window.clearTimeout(browserSession.idleTimer);
+      if (browserSession.restartTimer != null) window.clearTimeout(browserSession.restartTimer);
+      const recognition = recognitionRef.current;
+      if (recognition) {
+        try {
+          recognition.stop();
+        } catch {
+          browserSession.finalize?.();
+        }
+      } else {
+        browserSession.finalize?.();
       }
       return;
     }
+
     const rec = recorderRef.current;
-    if (rec && rec.state !== "inactive") rec.stop();
+    if (rec && rec.state !== "inactive") {
+      rec.stop();
+      return;
+    }
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     setRecording(false);
@@ -284,6 +385,30 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
     if (effectiveMode === "browser") startBrowserStt();
     else startLocalStt();
   }, [recording, stop, supported, secureContext, effectiveMode, startBrowserStt, startLocalStt]);
+
+  useEffect(() => () => {
+    const browserSession = browserSessionRef.current;
+    if (browserSession) {
+      browserSession.active = false;
+      browserSession.finishing = true;
+      if (browserSession.idleTimer != null) window.clearTimeout(browserSession.idleTimer);
+      if (browserSession.restartTimer != null) window.clearTimeout(browserSession.restartTimer);
+    }
+    try {
+      recognitionRef.current?.abort();
+    } catch {
+      /* already closed */
+    }
+    const rec = recorderRef.current;
+    if (rec && rec.state !== "inactive") {
+      try {
+        rec.stop();
+      } catch {
+        /* already closed */
+      }
+    }
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+  }, []);
 
   // ---------- TTS ----------
   const speak = useCallback(
