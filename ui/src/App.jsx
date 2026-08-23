@@ -8,6 +8,7 @@ import {
   Plus,
   Send,
   Settings2,
+  Square,
   Volume2,
   VolumeX,
   Wrench,
@@ -80,9 +81,6 @@ export function isNearChatBottom(element, threshold = 72) {
 }
 
 function SignIn({ error, auth, onOpenSetup }) {
-  // Offering a sign-in button that can only 503 is worse than saying
-  // plainly that Google was never configured. Tell the truth and give
-  // the two ways out.
   const notConfigured = auth && auth.auth_enabled && !auth.google_configured;
 
   if (notConfigured) {
@@ -199,7 +197,6 @@ export default function App() {
 
   const authError = new URLSearchParams(window.location.search).get("auth_error");
 
-  // ---------- auth ----------
   const refreshAuth = useCallback(async () => {
     const response = await fetch("/api/auth/status", {
       credentials: "include",
@@ -215,19 +212,14 @@ export default function App() {
     try {
       await refreshAuth();
     } catch {
-      // The logout POST already removed the session. Fail closed in the UI
-      // even if the follow-up status request is temporarily unavailable.
       setAuth((current) => ({ ...(current || {}), signed_in: false }));
     }
   }, [refreshAuth]);
 
   useEffect(() => {
-    refreshAuth()
-      // Core unreachable is NOT the same as "please sign in" — surfacing
-      // a login screen here would hide the real problem.
-      .catch(() =>
-        setAuth({ signed_in: false, auth_enabled: true, core_unreachable: true })
-      );
+    refreshAuth().catch(() =>
+      setAuth({ signed_in: false, auth_enabled: true, core_unreachable: true })
+    );
   }, [refreshAuth]);
 
   const refreshSettledWorkerState = useCallback(async () => {
@@ -244,19 +236,15 @@ export default function App() {
       setExternalWorkload(null);
       return true;
     } catch {
-      // A failed health read cannot prove a workload settled. Preserve the
-      // socket state until Core supplies authoritative evidence.
       return false;
     }
   }, []);
 
-  // ---------- voice ----------
   const voice = useVoice({
     onTranscript: (text) => {
       setInterim("");
       sendMessage(text);
     },
-    // live partial text while you're still talking
     onInterim: setInterim,
     onSpeakingChange: setSpeaking,
     onError: (message) => {
@@ -265,7 +253,6 @@ export default function App() {
     },
   });
 
-  // ---------- socket ----------
   const handleEvent = useCallback(
     (event) => {
       switch (event.type) {
@@ -446,6 +433,25 @@ export default function App() {
           break;
         }
 
+        case "cancelled": {
+          setThinking(false);
+          setActiveTool(null);
+          const text = streamingRef.current;
+          streamingRef.current = "";
+          lastExecutionReceiptRef.current = null;
+          setStreaming("");
+          if (text.trim()) {
+            push({
+              kind: "assistant",
+              key: event.message_id ? `message:${event.message_id}` : undefined,
+              text,
+              worker: event.worker || worker,
+            });
+          }
+          window.setTimeout(() => reconcile(), 0);
+          break;
+        }
+
         case "error":
           setThinking(false);
           setActiveTool(null);
@@ -470,9 +476,6 @@ export default function App() {
     enabled: socketEnabled,
   });
 
-  // Every successful socket connection re-reads the durable conversation.
-  // That covers reload, phone background/resume, and a dropped connection
-  // after a write without trusting a partial client-only stream.
   useEffect(() => {
     if (!connected || connectionEpoch < 1) return;
     let active = true;
@@ -493,7 +496,6 @@ export default function App() {
     setStreaming("");
   }, [connected, connectionEpoch]);
 
-  // "reconnecting…" forever is a lie once it's clearly not coming back.
   const linkLabel = connected
     ? "connected"
     : restoring
@@ -504,13 +506,11 @@ export default function App() {
         ? "core offline"
         : "reconnecting…";
 
-  // ---------- autoscroll ----------
   useEffect(() => {
     const el = streamRef.current;
     if (el && followStreamRef.current) el.scrollTop = el.scrollHeight;
   }, [items, streaming, thinking, activeTool]);
 
-  // ---------- actions ----------
   function sendMessage(text) {
     const body = String(text ?? draft).trim();
     if (!body || thinking || swapping) return;
@@ -523,12 +523,21 @@ export default function App() {
       push({ kind: "error", text: "Not connected to X Omni Core." });
       return;
     }
-    // Sending is an explicit return to the live edge. Otherwise, streaming
-    // and reconciliation respect a reader who has scrolled up.
     followStreamRef.current = true;
     push({ kind: "user", text: body });
     setDraft("");
+    setThinking(true);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
+  }
+
+  function stopResponse() {
+    const sent = send({
+      type: "stop",
+      conversation_id: conversationIdRef.current,
+    });
+    if (!sent) {
+      push({ kind: "error", text: "Stop was not sent because Core is disconnected." });
+    }
   }
 
   function requestSwap(target) {
@@ -556,12 +565,8 @@ export default function App() {
     setItems((previous) => updateApproval(previous, id, { status: "deciding" }));
   }
 
-  /** Run a read-only tool straight from the rail and drop its card into
-   *  the stream. No model turn, no tokens -- just the data. */
   async function runToolDirect(name) {
     try {
-      // A first-time install can legitimately have no conversation yet. The
-      // direct-tool endpoint requires one so its artifact has durable history.
       let conversationId = conversationIdRef.current;
       if (conversationId == null) conversationId = await createConversation();
 
@@ -702,8 +707,6 @@ export default function App() {
       }
 
       const artifact = safeCameraObservationArtifact(payload.artifact);
-      // Use the exact durable key returned by Core. Reconciliation then
-      // replaces this immediate server response instead of duplicating it.
       if (conversationIdRef.current === conversationId) {
         push({
           kind: "artifact",
@@ -739,7 +742,6 @@ export default function App() {
     }
   }
 
-  // ---------- render ----------
   if (!auth) return <div className="signin" />;
   if (auth.core_unreachable) {
     return (
@@ -752,7 +754,7 @@ export default function App() {
             reload.
           </p>
           <div className="signin-error">
-            Start it with <code>.\scripts\start.ps1</code>
+            Start it with <code>.\\scripts\\start.ps1</code>
           </div>
         </div>
       </div>
@@ -791,6 +793,7 @@ export default function App() {
   const videoWorkload = externalWorkload === "video_generation";
   const mediaWorkload = imageWorkload || videoWorkload;
   const workloadLabel = videoWorkload ? "rendering video" : "generating image";
+  const responseActive = thinking || Boolean(streaming) || Boolean(activeTool);
 
   return (
     <div className="shell">
@@ -883,9 +886,6 @@ export default function App() {
           externalWorkload={externalWorkload}
           swapSeconds={lastSwapSeconds}
         />
-        {/* Calendar, weather and the tool rail live here permanently --
-            visible without having to ask. They read their own REST
-            endpoints, so they still render with no model worker up. */}
         <DashboardRail>
           <ToolRail
             onRun={runToolDirect}
@@ -1040,18 +1040,23 @@ export default function App() {
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
-                sendMessage();
+                if (!responseActive) sendMessage();
               }
             }}
           />
 
           <button
-            className="send-btn"
-            onClick={() => sendMessage()}
-            disabled={!draft.trim() || thinking || swapping || !connected || restoring}
-            aria-label="Send message"
+            className={`send-btn${responseActive ? " is-stop" : ""}`}
+            onClick={responseActive ? stopResponse : () => sendMessage()}
+            disabled={responseActive
+              ? !connected
+              : !draft.trim() || swapping || !connected || restoring}
+            aria-label={responseActive ? "Stop response" : "Send message"}
+            title={responseActive ? "Stop response" : "Send message"}
           >
-            <Send size={18} />
+            {responseActive
+              ? <Square size={16} fill="currentColor" />
+              : <Send size={18} />}
           </button>
         </div>
       </div>
