@@ -586,6 +586,13 @@ ARTIFACT_FOR_TOOL = {
     "calibration_iq_update": "calibration_iq_receipt",
     "calibration_iq_operator": "calibration_iq_receipt",
     "calibration_iq_destructive": "calibration_iq_receipt",
+    # Persist the work-prep audit result so a later-turn follow-up ("which
+    # ones need SI") can be answered from the stored artifact instead of the
+    # model falling back to a generic board query with guessed filters --
+    # the tool's own result already has nothing else to lose it to (no UI
+    # card renders this type yet; storage and later-turn context still work,
+    # per conversationTimeline.js: "Unknown types safely render null.").
+    "calibration_iq_work_prep": "calibration_iq_work_prep",
 }
 
 _CALIBRATION_IQ_OPERATOR_TOOLS = frozenset(
