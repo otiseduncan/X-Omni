@@ -135,6 +135,59 @@ def test_artifact_context_is_globally_bounded_and_keeps_newest_first():
     assert "item-1" not in encoded
 
 
+def test_calibration_iq_work_prep_gets_a_larger_list_and_size_budget():
+    """calibration_iq_work_prep already does its own careful byte-budgeted
+    compaction server-side (see calibration_iq_work_prep.py's
+    _bounded_readiness_rows); the generic 12-item/2.4K-char caps sized for
+    ordinary cards would re-truncate that result down to a handful of rows,
+    which is exactly what left a same-conversation "which ones need SI"
+    follow-up with nothing to work from."""
+    rows = [
+        {
+            "ro_number": f"24006{index:05d}",
+            "vehicle": f"202{index % 5} Make{index} Model{index}",
+            "ready": index % 4 != 0,
+            "coverage_status": "MISSING" if index % 4 == 0 else "COVERED",
+        }
+        for index in range(49)
+    ]
+    message = {
+        "id": 1,
+        "worker_used": "omni",
+        "artifacts": [{
+            "type": "calibration_iq_work_prep",
+            "data": {
+                "status": "partial_success",
+                "mode": "week_readiness",
+                "exception_count": sum(1 for r in rows if not r["ready"]),
+                "queue_count": len(rows),
+                "repair_orders": rows,
+            },
+        }],
+    }
+    summary = prompt._artifact_summary(message, message["artifacts"][0])
+
+    kept = len(summary["data"]["repair_orders"])
+    assert kept > prompt.ARTIFACT_MAX_LIST_ITEMS
+    assert kept < len(rows)  # still bounded, just with more room than the generic cap
+    encoded = prompt._encode_artifact_json(summary)
+    assert len(encoded) > prompt.ARTIFACT_ITEM_MAX_CHARS
+
+    context = prompt._stored_artifact_context([message], 8_000)
+    assert "calibration_iq_work_prep" in context
+
+
+def test_ordinary_artifact_types_keep_the_generic_smaller_budget():
+    rows = [{"marker": index} for index in range(30)]
+    message = {
+        "id": 1,
+        "worker_used": "omni",
+        "artifacts": [{"type": "calibration_iq_ros", "data": {"rows": rows}}],
+    }
+    summary = prompt._artifact_summary(message, message["artifacts"][0])
+    assert len(summary["data"]["rows"]) == prompt.ARTIFACT_MAX_LIST_ITEMS + 1  # + omission marker
+
+
 def test_artifact_context_respects_total_prompt_budget():
     history = [{
         "id": 1,

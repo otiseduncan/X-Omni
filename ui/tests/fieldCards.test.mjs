@@ -63,6 +63,43 @@ test("Calibration IQ cards expose summary, list, empty, error, and incomplete st
   assert.match(CALIBRATION_COLLECTION_WARNING, /may be incomplete/i);
 });
 
+test("calibration_iq_work_prep is wired to a dedicated card, not silently dropped", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/FieldCards.jsx", import.meta.url),
+    "utf8",
+  );
+
+  // Registered in FIELD_CARDS -- otherwise a work-prep result would render
+  // as nothing (conversationTimeline.js: "Unknown types safely render null").
+  assert.match(cards, /calibration_iq_work_prep:\s*CalibrationWorkPrepCard/);
+  assert.equal(
+    (cards.match(/calibration_iq_work_prep:\s*CalibrationWorkPrepCard/g) || []).length,
+    1,
+  );
+
+  // Every mode from calibration_iq_work_prep.py's TOOL_SCHEMAS enum must
+  // route somewhere -- a missing case would fall through to whatever the
+  // default renders, silently showing the wrong shape.
+  assert.match(cards, /case "phase_list":/);
+  assert.match(cards, /case "queue_next":/);
+  assert.match(cards, /case "ro_requirements":/);
+
+  // phase_list shares calibration_iq_read's exact result shape (see
+  // calibration_iq_work_prep.py's _phase_list: `{"mode": "phase_list",
+  // **result}` where result comes straight from read_repair_orders) --
+  // it must reuse CalibrationRosCard rather than reinterpreting that shape.
+  assert.match(cards, /function WorkPrepPhaseListCard[\s\S]*?<CalibrationRosCard/);
+
+  // The default (week_readiness / phase_coverage) branch surfaces the
+  // fields calibration_iq_work_prep.py's _week_readiness actually returns.
+  assert.match(cards, /data\?\.exception_count/);
+  assert.match(cards, /data\?\.queue_count/);
+  assert.match(cards, /adas_map_verified_count/);
+  assert.match(cards, /si_covered_count/);
+  assert.match(cards, /repair_orders_truncated/);
+  assert.match(cards, /r\.ready !== true/);
+});
+
 test("Calibration IQ card CSS protects 360, 390, and 430 pixel layouts", async () => {
   const styles = await readFile(
     new URL("../src/styles/field-cards.css", import.meta.url),

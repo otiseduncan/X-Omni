@@ -146,6 +146,22 @@ ARTIFACT_MAX_LIST_ITEMS = 12
 ARTIFACT_MAX_DICT_ITEMS = 32
 ARTIFACT_MAX_DEPTH = 6
 
+# calibration_iq_work_prep already does its own careful byte-budgeted
+# compaction server-side (progressively degrading detail, then a
+# priority-ordered byte-budget selection, always with a declared truncation
+# count -- see _bounded_readiness_rows in calibration_iq_work_prep.py). The
+# generic 12-item/2.4K-char caps below were sized for ordinary cards and
+# would re-truncate that already-careful result down to a handful of rows,
+# which is what left a same-conversation "which ones need SI" follow-up with
+# nothing to work from. Give this one type more room instead of quietly
+# discarding work the backend already did.
+_ARTIFACT_TYPE_LIST_ITEM_LIMITS = {
+    "calibration_iq_work_prep": 40,
+}
+_ARTIFACT_TYPE_ITEM_CHAR_LIMITS = {
+    "calibration_iq_work_prep": 6_000,
+}
+
 _EXCLUDED_ARTIFACT_TYPES = {
     "approval",
     "approval_request",
@@ -209,16 +225,19 @@ def _compact_artifact_value(
 
     if isinstance(value, (list, tuple, set)):
         items = list(value)
+        list_limit = _ARTIFACT_TYPE_LIST_ITEM_LIMITS.get(
+            artifact_type, ARTIFACT_MAX_LIST_ITEMS
+        )
         compact_items = [
             _compact_artifact_value(
                 item,
                 artifact_type=artifact_type,
                 depth=depth + 1,
             )
-            for item in items[:ARTIFACT_MAX_LIST_ITEMS]
+            for item in items[:list_limit]
         ]
-        if len(items) > ARTIFACT_MAX_LIST_ITEMS:
-            compact_items.append({"_omitted_items": len(items) - ARTIFACT_MAX_LIST_ITEMS})
+        if len(items) > list_limit:
+            compact_items.append({"_omitted_items": len(items) - list_limit})
         return compact_items
 
     if isinstance(value, bytes):
@@ -274,8 +293,11 @@ def _artifact_summary(message: dict, artifact: Any) -> Optional[dict[str, Any]]:
         ]
     summary["data"] = compact
 
+    item_char_limit = _ARTIFACT_TYPE_ITEM_CHAR_LIMITS.get(
+        artifact_type, ARTIFACT_ITEM_MAX_CHARS
+    )
     encoded = _encode_artifact_json(summary)
-    if len(encoded) <= ARTIFACT_ITEM_MAX_CHARS:
+    if len(encoded) <= item_char_limit:
         return summary
 
     # A valid JSON string preview is preferable to slicing the outer JSON and
@@ -283,7 +305,7 @@ def _artifact_summary(message: dict, artifact: Any) -> Optional[dict[str, Any]]:
     compact_json = _encode_artifact_json(compact)
     metadata = {key: value for key, value in summary.items() if key != "data"}
     metadata.update({
-        "data_preview": compact_json[: ARTIFACT_ITEM_MAX_CHARS // 2],
+        "data_preview": compact_json[: item_char_limit // 2],
         "data_characters": len(compact_json),
         "truncated": True,
     })

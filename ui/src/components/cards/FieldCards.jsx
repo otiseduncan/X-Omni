@@ -588,6 +588,194 @@ export function CalibrationStatusCard({ data }) {
   );
 }
 
+/* ---------------- Calibration IQ: weekly readiness / work-prep audit ---------------- */
+
+function coverageTone(status) {
+  const normalized = String(status || "").toUpperCase();
+  if (normalized === "COVERED") return "done";
+  if (normalized === "MISSING") return "warn";
+  return "";
+}
+
+function coverageLabel(status) {
+  const normalized = String(status || "").toUpperCase();
+  if (normalized === "COVERED") return "SI covered";
+  if (normalized === "MISSING") return "SI missing";
+  return "SI unverified";
+}
+
+function WorkPrepExceptionRow({ item }) {
+  const missing = (item.missing_si || [])
+    .map((m) => m?.calibration || m?.label)
+    .filter(Boolean);
+  return (
+    <div className="ro-item" key={item.ro_number}>
+      <div className="ro-line">
+        <span className="ro-num">{item.ro_number || "—"}</span>
+        <span className="ro-vehicle">{item.vehicle || "—"}</span>
+      </div>
+      <div className="ro-line ro-sub">
+        <span className={`ro-pill ${coverageTone(item.coverage_status)}`}>
+          {coverageLabel(item.coverage_status)}
+        </span>
+        {item.status === "adas_map_unverified" && (
+          <span className="ro-shop">ADAS Map unverified</span>
+        )}
+        {item.status === "reconciliation_failed" && (
+          <span className="ro-shop">reconciliation failed</span>
+        )}
+        {item.status === "ro_unavailable" && (
+          <span className="ro-shop">RO detail unavailable</span>
+        )}
+      </div>
+      {missing.length > 0 && (
+        <p className="card-note" style={{ marginTop: 4 }}>
+          Needs: {missing.join(", ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** phase_list shares calibration_iq_read's exact result shape. */
+function WorkPrepPhaseListCard({ data }) {
+  return <CalibrationRosCard data={data} />;
+}
+
+function WorkPrepQueueNextCard({ data }) {
+  const ok = data?.success !== false;
+  return (
+    <Card icon={ClipboardList} title="Weekly readiness queue" tone={ok ? undefined : "warn"}>
+      {typeof data?.done_count === "number" && (
+        <div className="kv">
+          <div>
+            <span>Collected</span>
+            <strong>{data.done_count} of {data.total_count}</strong>
+          </div>
+        </div>
+      )}
+      <p className="card-note" style={{ marginTop: 8 }}>
+        {data?.message || "No update."}
+      </p>
+    </Card>
+  );
+}
+
+function WorkPrepRoRequirementsCard({ data }) {
+  const reqs = data?.calibration_requirements || [];
+  const mapStatus = data?.adas_map?.status;
+  return (
+    <Card icon={ClipboardList} title={`RO ${data?.ro_number || "—"}`} meta={data?.vehicle}>
+      <div className="kv">
+        <div><span>ADAS Map</span><strong>{mapStatus || "unknown"}</strong></div>
+      </div>
+      {reqs.length > 0 ? (
+        <>
+          <p className="rail-sub" style={{ marginTop: 10 }}>Calibration requirements</p>
+          {reqs.map((r, i) => (
+            <div className="field-row" key={r.id || i}>
+              <Wrench size={13} />
+              <span>{r.label}{r.determination ? ` — ${r.determination}` : ""}</span>
+            </div>
+          ))}
+        </>
+      ) : (
+        <p className="card-note">No saved calibration requirements.</p>
+      )}
+      {data?.message && <p className="card-note" style={{ marginTop: 8 }}>{data.message}</p>}
+    </Card>
+  );
+}
+
+/** week_readiness and phase_coverage share the same result shape. */
+function WorkPrepReadinessCard({ data }) {
+  if (data?.success === false || data?.status === "invalid_request" || data?.status === "context_missing") {
+    return (
+      <Card icon={AlertTriangle} title="Weekly readiness" tone="warn">
+        <p className="card-note">{data?.message || "Calibration IQ work-prep is unavailable."}</p>
+      </Card>
+    );
+  }
+
+  const exceptionCount = data?.exception_count ?? 0;
+  const queueCount = data?.queue_count ?? 0;
+  const rows = data?.repair_orders || [];
+  const exceptions = rows.filter((r) => r.ready !== true);
+  const phaseScope = (data?.phase_scope || []).join("–");
+  const title = data?.mode === "phase_coverage"
+    ? `Phase ${data?.filters?.phase || ""} coverage`
+    : "Weekly readiness";
+
+  return (
+    <Card
+      icon={exceptionCount === 0 ? ClipboardList : AlertTriangle}
+      title={title}
+      meta={phaseScope ? `phase ${phaseScope}` : undefined}
+      tone={exceptionCount === 0 ? undefined : "warn"}
+    >
+      <div className="ciq-count">
+        <strong>{exceptionCount}</strong>
+        <span>of {queueCount} not yet SI-ready</span>
+      </div>
+
+      <div className="kv" style={{ marginTop: 10 }}>
+        <div>
+          <span>ADAS Map</span>
+          <strong>
+            {data?.adas_map_verified_count ?? 0} verified · {data?.adas_map_missing_count ?? 0} missing · {data?.adas_map_unverified_count ?? 0} unverified
+          </strong>
+        </div>
+        <div>
+          <span>ADAS SI</span>
+          <strong>
+            {data?.si_covered_count ?? 0} covered · {data?.si_missing_count ?? 0} missing · {data?.si_unverified_count ?? 0} unverified
+          </strong>
+        </div>
+        {data?.ciq_requirements_added_or_reactivated != null && (
+          <div>
+            <span>CIQ reconciliation</span>
+            <strong>{data.ciq_requirements_added_or_reactivated} added/reactivated</strong>
+          </div>
+        )}
+        {data?.alldata_queued_count > 0 && (
+          <div><span>ALLDATA</span><strong>{data.alldata_queued_count} vehicle(s) queued</strong></div>
+        )}
+      </div>
+
+      {exceptions.length > 0 && (
+        <details className="field-alts" style={{ marginTop: 9 }} open>
+          <summary>{exceptions.length} needing attention</summary>
+          <div className="ro-list">
+            {exceptions.map((item, i) => (
+              <WorkPrepExceptionRow item={item} key={item.ro_number || i} />
+            ))}
+          </div>
+        </details>
+      )}
+
+      {data?.repair_orders_truncated && (
+        <p className="card-note" style={{ marginTop: 9 }}>
+          Showing {data.repair_orders_shown} of {data.repair_orders_total}. Ask for a
+          specific RO or phase to narrow it.
+        </p>
+      )}
+    </Card>
+  );
+}
+
+export function CalibrationWorkPrepCard({ data }) {
+  switch (data?.mode) {
+    case "phase_list":
+      return <WorkPrepPhaseListCard data={data} />;
+    case "queue_next":
+      return <WorkPrepQueueNextCard data={data} />;
+    case "ro_requirements":
+      return <WorkPrepRoRequirementsCard data={data} />;
+    default:
+      return <WorkPrepReadinessCard data={data} />;
+  }
+}
+
 /* ---------------- ADAS SI: annotation records ---------------- */
 
 export function AdasRecordsCard({ data }) {
@@ -637,5 +825,6 @@ export const FIELD_CARDS = {
   calibration_iq_ro: CalibrationRoCard,
   calibration_iq_receipt: CalibrationReceiptCard,
   calibration_iq_status: CalibrationStatusCard,
+  calibration_iq_work_prep: CalibrationWorkPrepCard,
   research_provider: ResearchProviderCard,
 };
