@@ -199,6 +199,13 @@ def test_explicit_terminal_and_all_work_scopes(utterance, expected):
     )
 
 
+def test_phase_count_with_vehicle_noun_still_uses_count_summary():
+    assert calibration_iq_read_request("How many vehicles are in phase 5?", []) == (
+        "calibration_iq_summary",
+        {"phase": "5"},
+    )
+
+
 def test_terminal_scope_is_inherited_and_explicit_active_clears_category():
     history = [{
         "artifacts": [{

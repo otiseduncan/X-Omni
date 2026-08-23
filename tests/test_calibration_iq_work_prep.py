@@ -18,6 +18,57 @@ def test_request_classifier_routes_field_workflows_without_generic_adas_search()
     assert prep.classify_request("what is the weather") is None
 
 
+def test_week_typo_alias_is_narrow_and_does_not_capture_ordinary_weak_language():
+    for text in (
+        "prepare week",
+        "prepare the week",
+        "let's prepare for the week",
+        "get us ready for the week",
+        "prepare everything for this week",
+        "prepare weak",
+        "prepare the weak",
+        "please prep us for the weak",
+        "let's prepare for the weak",
+    ):
+        assert prep.classify_request(text) == "week_readiness", text
+
+    for text in (
+        "prepare a weak argument",
+        "prepare weak evidence",
+        "prepare a weak argument for work",
+        "prepare weak evidence for next week",
+        "prepare a presentation for work",
+        "help me get ready for a week-long trip",
+        "I'm ready for work",
+        "the signal is weak",
+    ):
+        assert prep.classify_request(text) is None, text
+
+
+def test_explicit_phase_coverage_uses_coverage_mode_and_counts_stay_on_count_lane():
+    for text in (
+        "what Phase 5 cars need ADAS SI?",
+        "which phase 5 vehicles are missing ADAS SI coverage?",
+        "what ADAS SI is missing for phase 5 vehicles?",
+        "check phase 5 coverage",
+        "is phase 5 covered?",
+    ):
+        assert prep.classify_request(text) == "phase_coverage", text
+
+    assert prep.classify_request("how many vehicles are in phase 5?") is None
+    assert (
+        prep._phase_coverage_focus(
+            "do all cars in phase 5 have an ADAS Map report in ADAS SI?"
+        )
+        == "adas_map"
+    )
+    assert (
+        prep._phase_coverage_focus("which phase 5 cars need ADAS SI coverage?")
+        == "si_readiness"
+    )
+    assert prep.classify_request("show vehicles in phase 5") == "phase_list"
+
+
 def test_phase_parser_accepts_spoken_number():
     assert prep._phase("check phase five") == "5"
     assert prep._phase("show phase 6") == "6"
@@ -111,7 +162,7 @@ def test_reconciliation_adds_only_missing_and_reactivates_historical_item():
     assert all("Blind Spot Monitor" not in str(item) for item in actions)
 
 
-def test_existing_required_requirement_is_not_duplicated():
+def test_likely_requirement_is_promoted_without_creating_a_duplicate():
     snapshot = {
         "calibrations": [
             {
@@ -127,7 +178,18 @@ def test_existing_required_requirement_is_not_duplicated():
         "status": "verified",
         "requirements": [{"label": "BSM calibration", "method": "STATIC"}],
     }
-    assert prep.build_reconciliation_actions(snapshot, map_info, "ro") == []
+    assert prep.build_reconciliation_actions(snapshot, map_info, "ro") == [
+        {
+            "operation": "update_calibration",
+            "target_id": "1",
+            "expected_version": 1,
+            "arguments": {
+                "determination": "REQUIRED",
+                "research_status": "ADAS Map governing source",
+                "method": "STATIC",
+            },
+        }
+    ]
 
 
 def test_selected_alldata_signal_matches_same_vehicle_not_same_make_only():
@@ -171,11 +233,160 @@ def test_week_summary_names_each_ro_that_needs_si():
             ],
         },
     )
+    assert text.startswith("No —")
     assert "RO 101" in text
     assert "BSM calibration" in text
     assert "RO 102" in text
     assert "ADAS Map" in text
-    assert "added/reactivated 1" in text
+    assert "1 requirement(s) added/reactivated" in text
+
+
+def test_week_summary_bounds_ro_exceptions_and_calibration_labels():
+    repair_orders = [
+        {
+            "ro_number": str(index),
+            "vehicle": f"Vehicle {index}",
+            "ready": False,
+            "adas_map": {"status": "verified"},
+            "missing_si": [
+                {"calibration": f"Calibration {index}-{calibration}"}
+                for calibration in range(1, 6)
+            ],
+        }
+        for index in range(1, 6)
+    ]
+    text = prep.summarize(
+        "week_readiness",
+        {
+            "verified": True,
+            "readiness_complete": False,
+            "exception_count": 5,
+            "queue_count": 5,
+            "ready_count": 0,
+            "needs_si_count": 5,
+            "adas_map_unavailable_count": 0,
+            "reconciliation_failed_count": 0,
+            "phase_scope": ["5", "6", "7", "8"],
+            "repair_orders": repair_orders,
+        },
+    )
+
+    assert text.startswith("No — 5 of 5")
+    assert "RO 1" in text and "RO 2" in text and "RO 3" in text
+    assert "RO 4" not in text and "RO 5" not in text
+    assert "Calibration 1-3 (+2 more)" in text
+    assert "2 additional RO exception(s)" in text
+
+
+def test_phase_coverage_summary_answers_yes_directly():
+    text = prep.summarize(
+        "phase_coverage",
+        {
+            "verified": True,
+            "readiness_complete": True,
+            "exception_count": 0,
+            "queue_count": 2,
+            "ready_count": 2,
+            "needs_si_count": 0,
+            "adas_map_unavailable_count": 0,
+            "reconciliation_failed_count": 0,
+            "phase_scope": ["5"],
+            "repair_orders": [
+                {"ro_number": "100", "vehicle": "Vehicle 1", "ready": True},
+                {"ro_number": "101", "vehicle": "Vehicle 2", "ready": True},
+            ],
+        },
+    )
+    assert text.startswith(
+        "Yes — all 2 active Calibration IQ ROs in Phase 5 are SI-ready."
+    )
+
+
+def test_phase_map_report_question_answers_map_coverage_not_si_readiness():
+    text = prep.summarize(
+        "phase_coverage",
+        {
+            "verified": True,
+            "coverage_focus": "adas_map",
+            "readiness_complete": False,
+            "exception_count": 1,
+            "queue_count": 2,
+            "ready_count": 1,
+            "adas_map_verified_count": 2,
+            "adas_map_unavailable_count": 0,
+            "si_covered_count": 1,
+            "si_missing_count": 1,
+            "si_unverified_count": 0,
+            "phase_scope": ["5"],
+            "repair_orders": [
+                {
+                    "ro_number": "100",
+                    "vehicle": "Vehicle 1",
+                    "ready": True,
+                    "adas_map": {"status": "verified"},
+                },
+                {
+                    "ro_number": "101",
+                    "vehicle": "Vehicle 2",
+                    "ready": False,
+                    "status": "si_missing",
+                    "adas_map": {"status": "verified"},
+                    "missing_si": [{"calibration": "Front Camera"}],
+                },
+            ],
+        },
+    )
+
+    assert text.startswith(
+        "Yes — all 2 active Calibration IQ ROs in Phase 5 have verified ADAS Map reports."
+    )
+    assert "ADAS SI: 1 fully covered; 1 genuinely missing; 0 unverified." in text
+    assert "RO 101" not in text
+
+
+def test_phase_map_report_summary_separates_missing_from_unverified_ros():
+    text = prep.summarize(
+        "phase_coverage",
+        {
+            "verified": True,
+            "coverage_focus": "adas_map",
+            "queue_count": 3,
+            "ready_count": 1,
+            "adas_map_verified_count": 1,
+            "adas_map_missing_count": 1,
+            "adas_map_unverified_count": 1,
+            "adas_map_unavailable_count": 2,
+            "phase_scope": ["5"],
+            "repair_orders": [
+                {
+                    "ro_number": "100",
+                    "vehicle": "Vehicle 1",
+                    "ready": True,
+                    "adas_map": {"status": "verified"},
+                },
+                {
+                    "ro_number": "101",
+                    "vehicle": "Vehicle 2",
+                    "ready": False,
+                    "adas_map": {"status": "not_found"},
+                },
+                {
+                    "ro_number": "102",
+                    "vehicle": "Vehicle 3",
+                    "ready": False,
+                    "adas_map": {"status": "ambiguous"},
+                },
+            ],
+        },
+    )
+
+    assert text.startswith(
+        "No — 2 of 3 active Calibration IQ ROs in Phase 5 do not have verified ADAS Map reports."
+    )
+    assert "ADAS Map: 1 verified; 1 genuinely missing; 1 unverified." in text
+    assert "RO 101" in text and "genuinely missing" in text
+    assert "RO 102" in text and "ambiguous" in text
+    assert "RO 100" not in text
 
 
 def test_describing_the_already_open_vehicle_does_not_replay_the_login_card():
@@ -266,6 +477,7 @@ def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
     schema = registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]
     assert set(schema["parameters"]["properties"]["mode"]["enum"]) == {
         "phase_list",
+        "phase_coverage",
         "ro_requirements",
         "week_readiness",
         "queue_next",
@@ -292,10 +504,52 @@ def test_row_phase_token_normalizes_numeric_and_string_phases():
 
 
 @pytest.mark.asyncio
+async def test_phase_coverage_mode_runs_the_full_readiness_audit(monkeypatch):
+    observed = {}
+
+    async def week_readiness(_settings, _adas, args):
+        observed.update(args)
+        return {
+            "status": "success",
+            "mode": "week_readiness",
+            "success": True,
+            "verified": True,
+            "readiness_complete": True,
+            "queue_count": 1,
+        }
+
+    monkeypatch.setattr(prep, "_week_readiness", week_readiness)
+    result = await prep.handle(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {"mode": "phase_coverage", "phase": "5", "shop": "Macon"},
+    )
+
+    assert observed == {"mode": "phase_coverage", "phase": "5", "shop": "Macon"}
+    assert result["mode"] == "phase_coverage"
+    assert result["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_phase_coverage_mode_requires_an_explicit_phase():
+    result = await prep.handle(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {"mode": "phase_coverage"},
+    )
+
+    assert result["status"] == "invalid_request"
+    assert result["success"] is False
+    assert result["verified"] is False
+
+
+@pytest.mark.asyncio
 async def test_week_readiness_defaults_to_phase_five_through_eight(monkeypatch):
     rows = [
         {
-            "id": f"ro-{phase}", "ro_number": f"RO{phase}", "phase": str(phase),
+            "id": f"ro-{phase}",
+            "ro_number": f"RO{phase}",
+            "phase": str(phase),
             "vehicle": {"year": 2023, "make": "Ford", "model": "F-150"},
         }
         for phase in range(1, 9)
@@ -303,12 +557,16 @@ async def test_week_readiness_defaults_to_phase_five_through_eight(monkeypatch):
 
     async def query_repair_orders(_settings, args):
         assert "phase" not in args
+        assert args.get("include_completed") is True
         return {"status": "verified", "items": rows}
 
     monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
 
     async def load_snapshot(_settings, identifier):
-        return {"status": "verified", "snapshot": {"calibrations": [], "repair_order": {"id": identifier}}}
+        return {
+            "status": "verified",
+            "snapshot": {"calibrations": [], "repair_order": {"id": identifier}},
+        }
 
     monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
 
@@ -319,8 +577,60 @@ async def test_week_readiness_defaults_to_phase_five_through_eight(monkeypatch):
 
     result = await prep._week_readiness(SimpleNamespace(), SimpleNamespace(), {})
     assert result["queue_count"] == 4
-    assert {item["ro_number"] for item in result["repair_orders"]} == {"RO5", "RO6", "RO7", "RO8"}
+    assert {item["ro_number"] for item in result["repair_orders"]} == {
+        "RO5",
+        "RO6",
+        "RO7",
+        "RO8",
+    }
     assert result["phase_scope"] == ["5", "6", "7", "8"]
+
+
+@pytest.mark.asyncio
+async def test_week_readiness_keeps_completed_rows_still_in_ciq_active_work(
+    monkeypatch,
+):
+    rows = [
+        {
+            "id": "ro-source-active",
+            "ro_number": "RO5",
+            "phase": "5",
+            "status": "Calibration Complete",
+            "source_presence": {"active_on_source": True},
+        },
+        {
+            "id": "ro-source-removed",
+            "ro_number": "REMOVED5",
+            "phase": "5",
+            "status": "Calibration Complete",
+            "source_presence": {"active_on_source": False},
+        },
+    ]
+
+    async def query_repair_orders(_settings, args):
+        # Calibration IQ's active collection already applies active_on_source;
+        # include_completed prevents X from undoing that authority decision.
+        assert args == {"include_completed": True, "phase": "5"}
+        return {"status": "verified", "items": rows}
+
+    async def load_snapshot(_settings, identifier):
+        return {
+            "status": "verified",
+            "snapshot": {
+                "calibrations": [],
+                "repair_order": {"id": identifier, "ro_number": "RO5"},
+            },
+        }
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+
+    result = await prep._week_readiness(
+        SimpleNamespace(), SimpleNamespace(), {"phase": "5"}
+    )
+
+    assert result["queue_count"] == 1
+    assert result["repair_orders"][0]["ro_number"] == "RO5"
 
 
 @pytest.mark.asyncio

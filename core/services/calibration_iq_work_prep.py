@@ -7,6 +7,7 @@ second queue or teaching the model to guess at job scope.
 
 High-confidence conversational workflows are handled directly:
 * "check what cars are in phase five" -> Calibration IQ phase list
+* "which phase five cars need ADAS SI" -> full phase-scoped readiness audit
 * "what does RO ... need/have" -> the RO's saved CIQ calibration requirements
 * "make sure we're prepared for the week" -> active CIQ queue + ADAS Map
   reconciliation + exact ADAS SI coverage report
@@ -25,11 +26,13 @@ checking ADAS SI. No calibration is invented from ADAS SI or ALLDATA.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import threading
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
+from . import adas_artifact_catalog
 from . import calibration_iq
 from . import calibration_iq_weekly_queue as weekly_queue
 from . import research_alldata_navigation as nav
@@ -41,7 +44,7 @@ _CONTEXT_KEY = "__xomni_work_prep_context"
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
 
-_ACTIVE_DETERMINATIONS = {"REQUIRED", "LIKELY_REQUIRED"}
+_ACTIVE_DETERMINATIONS = {"REQUIRED", "LIKELY_REQUIRED", "NEEDS_RESEARCH"}
 _METHODS = {"STATIC", "DYNAMIC", "BOTH", "INSPECTION_ONLY", "UNKNOWN"}
 
 _RO_RE = re.compile(
@@ -90,11 +93,45 @@ _ADAS_MARKER_RE = re.compile(r"\b(?:adas|ados|a\s*d\s*a\s*s)\b", re.IGNORECASE)
 _VEHICLE_REFERENCE_RE = re.compile(r"\b(?:this|that)\s+(?:car|vehicle|one)\b", re.IGNORECASE)
 _WEEK_READY_RE = re.compile(
     r"\b(?:prepared|prepare|prep|ready|readiness)\b.{0,90}"
-    r"\b(?:week|queue|work|cars?|vehicles?|repair\s+orders?|si|adas)\b|"
-    r"\b(?:what|which)\b.{0,60}\b(?:adas\s+si|si)\b.{0,60}\b(?:missing|need|needed)\b|"
-    r"\bmake\s+sure\b.{0,80}\bprepared\b",
+    r"\b(?:weekly\s+queue|queue|repair\s+orders?|ros?|si|adas|calibration\s+iq|ciq)\b|"
+    r"\b(?:what|which)\b.{0,60}\b(?:adas\s+si|si)\b.{0,60}\b(?:missing|need|needed)\b",
     re.IGNORECASE | re.DOTALL,
 )
+# Whole-utterance aliases for the ordinary weekly command.  Week/work alone is
+# not sufficient because this is an operator-authorized lane: phrases such as
+# "prepare a presentation for work" and "ready for a week-long trip" must stay
+# in normal conversation.
+_WEEK_COMMAND_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:let(?:'s|\s+us)\s+)?(?:"
+    r"(?:prepare|prep)(?:\s+(?:me|us|everything|all\s+cars|the\s+cars))?"
+    r"(?:\s+for)?\s+(?:(?:this|the)\s+)?week|"
+    r"get(?:\s+(?:me|us|all\s+cars|the\s+cars))?\s+ready\s+for\s+"
+    r"(?:(?:this|the)\s+)?week|"
+    r"make\s+sure\s+(?:we(?:'re|\s+are)|(?:all|the)\s+(?:cars|vehicles)\s+are)"
+    r"\s+(?:prepared|ready)\s+for\s+(?:(?:this|the)\s+)?week"
+    r")\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+# Speech-to-text can turn the final word in the terse field command
+# "prepare week" into "weak".  Keep this alias anchored to the complete
+# utterance so ordinary phrases such as "prepare a weak argument" never enter
+# the Calibration IQ workflow.
+_WEEK_WEAK_ALIAS_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:let(?:'s|\s+us)\s+)?(?:prepare|prep)(?:\s+(?:me|us))?"
+    r"(?:\s+for)?\s+(?:the\s+)?weak\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_PHASE_COVERAGE_RE = re.compile(
+    r"\b(?:coverage|covered|si[-\s]?ready)\b|"
+    r"\badas\s+map\s+(?:reports?|evidence|results?)\b.{0,60}\badas\s+si\b|"
+    r"\badas\s+si\b.{0,60}\badas\s+map\s+(?:reports?|evidence|results?)\b|"
+    r"\b(?:missing|need|needs|needed|requiring)\b.{0,50}"
+    r"\b(?:adas\s+si|si|coverage)\b|"
+    r"\b(?:adas\s+si|si|coverage)\b.{0,50}"
+    r"\b(?:missing|needed|required|available|ready|covered)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_COUNT_INTENT_RE = re.compile(r"\b(?:how\s+many|count)\b", re.IGNORECASE)
 _PHASE_LIST_RE = re.compile(
     r"\b(?:check|what|which|show|list|display|see|pull\s+up)\b.{0,100}"
     r"\b(?:cars?|vehicles?|repair\s+orders?|ros?)\b|"
@@ -213,11 +250,23 @@ def classify_request(
         and _VEHICLE_REFERENCE_RE.search(value)
     ):
         return "quick_reference"
-    if _WEEK_READY_RE.search(value):
+    if _PHASE_RE.search(value) and _PHASE_COVERAGE_RE.search(value):
+        return "phase_coverage"
+    if (
+        _WEEK_READY_RE.search(value)
+        or _WEEK_COMMAND_RE.fullmatch(value)
+        or _WEEK_WEAK_ALIAS_RE.fullmatch(value)
+    ):
         return "week_readiness"
-    if _PHASE_RE.search(value) and _PHASE_LIST_RE.search(value):
+    if (
+        _PHASE_RE.search(value)
+        and _PHASE_LIST_RE.search(value)
+        and not _COUNT_INTENT_RE.search(value)
+    ):
         return "phase_list"
-    if (_RO_RE.search(value) or _THIS_RO_RE.search(value)) and _RO_REQUIREMENT_RE.search(value):
+    if (
+        _RO_RE.search(value) or _THIS_RO_RE.search(value)
+    ) and _RO_REQUIREMENT_RE.search(value):
         return "ro_requirements"
     if _QUEUE_NEXT_RE.search(value):
         # Whether an active weekly-readiness queue actually exists is
@@ -229,7 +278,8 @@ def classify_request(
         if (
             stage
             and stage.get("mode") == _WORK_PREP_MODE
-            and stage.get("stage") in {"awaiting_vehicle_selection", "awaiting_ro_disambiguation"}
+            and stage.get("stage")
+            in {"awaiting_vehicle_selection", "awaiting_ro_disambiguation"}
             and _looks_like_work_prep_continuation(value)
         ):
             return "quick_reference"
@@ -242,6 +292,15 @@ def _phase(text: object) -> Optional[str]:
         return None
     token = match.group("phase").casefold()
     return _PHASE_WORDS.get(token, str(int(token)))
+
+
+def _phase_coverage_focus(text: object) -> str:
+    value = str(text or "")
+    if _ADAS_MAP_MARKER_RE.search(value) and re.search(
+        r"\b(?:reports?|evidence|results?)\b", value, re.IGNORECASE
+    ):
+        return "adas_map"
+    return "si_readiness"
 
 
 def _shop(text: object) -> Optional[str]:
@@ -292,11 +351,46 @@ def _plain(value: object) -> str:
 
 def _calibration_key(value: object) -> str:
     text = str(value or "").casefold()
+    # These are deliberately bounded domain aliases, not fuzzy semantics.  They
+    # let ADAS Map and CIQ name the same physical operation differently without
+    # promoting a merely-related component to an authoritative requirement.
+    families = (
+        (
+            r"\b(?:occupant\s+(?:classification|detection)|ocs|passenger\s+seat\s+weight|"
+            r"seat[-\s]*weight(?:\s+sensor)?(?:\s+zero\s+point)?)\b",
+            "occupantclassification",
+        ),
+        (r"\bseat\s*belt(?:\s+inspection)?\b", "seatbelt"),
+        (
+            r"\b(?:ipma|forward\s+recognition|mono(?:cular)?\s+camera|"
+            r"windshield\s+(?:mono[-\s]*)?camera|front\s+camera|"
+            r"forward(?:[-\s]+facing)?\s+camera|lane\s+camera)\b",
+            "frontcamera",
+        ),
+        (
+            r"\b(?:millimeter[-\s]*wave|front|forward|adaptive\s+cruise)\s+radar\b|\bccm\b",
+            "frontradar",
+        ),
+        (r"\b(?:blind\s*spot(?:\s+monitor(?:ing)?)?|bsm|bsd|sodcm)\b", "blindspot"),
+        (r"\bsteering\s*angle(?:\s+sensor)?\b|\bsas\b", "steeringangle"),
+        (r"\b(?:rear(?:\s+view)?|reverse)\s+camera\b", "rearcamera"),
+        (r"\b(?:surround|around)\s+view\b|\b360(?:\s+camera)?\b", "surroundcamera"),
+        (r"\b(?:parking|park)\s+assist\b|\bultrasonic\b|\bsonar\b", "parkingassist"),
+    )
+    for pattern, key in families:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return key
     replacements = (
         (r"\bblind\s*spot(?:\s+monitor(?:ing)?)?\b|\bbsm\b|\bbsd\b", " bsm "),
         (r"\bsteering\s*angle(?:\s+sensor)?\b", " steeringangle "),
-        (r"\b(?:forward(?:\s*facing)?|front|windshield|lane)\s+camera\b", " frontcamera "),
-        (r"\b(?:millimeter[-\s]*wave|forward|front|adaptive\s+cruise)\s+radar\b", " frontradar "),
+        (
+            r"\b(?:forward(?:\s*facing)?|front|windshield|lane)\s+camera\b",
+            " frontcamera ",
+        ),
+        (
+            r"\b(?:millimeter[-\s]*wave|forward|front|adaptive\s+cruise)\s+radar\b",
+            " frontradar ",
+        ),
         (r"\b(?:rear\s*view|rear)\s+camera\b", " rearcamera "),
         (r"\b(?:surround|around)\s+view\b|\b360\s+camera\b", " surroundcamera "),
         (r"\boccupant\s+classification(?:\s+system)?\b|\bocs\b", " ocs "),
@@ -463,13 +557,15 @@ def _active_ciq_requirements(snapshot: Any) -> list[dict[str, Any]]:
     ]
 
 
-def build_reconciliation_actions(snapshot: dict[str, Any], map_info: dict[str, Any], ro_id: str) -> list[dict[str, Any]]:
+def build_reconciliation_actions(
+    snapshot: dict[str, Any], map_info: dict[str, Any], ro_id: str
+) -> list[dict[str, Any]]:
     existing = _ciq_calibrations(snapshot)
-    by_key: dict[str, dict[str, Any]] = {}
+    by_key: dict[str, list[dict[str, Any]]] = {}
     for item in existing:
         key = _calibration_key(item.get("calibration_type"))
         if key:
-            by_key.setdefault(key, item)
+            by_key.setdefault(key, []).append(item)
 
     actions: list[dict[str, Any]] = []
     for required in map_info.get("requirements") or []:
@@ -479,40 +575,136 @@ def build_reconciliation_actions(snapshot: dict[str, Any], map_info: dict[str, A
         key = _calibration_key(label)
         if not key:
             continue
-        found = by_key.get(key)
-        if found is None:
-            actions.append({
-                "operation": "add_calibration",
-                "repair_order_id": ro_id,
-                "arguments": {
-                    "calibration_type": label,
-                    "determination": "REQUIRED",
-                    "method": _method(required.get("method")),
-                    "notes": "Added by X from governing ADAS Map during SI readiness reconciliation.",
-                    "research_status": "ADAS Map governing source",
-                },
-            })
+        matches = by_key.get(key) or []
+        map_method = _method(required.get("method"))
+        active_required = [
+            item
+            for item in matches
+            if str(item.get("determination") or "").upper() == "REQUIRED"
+        ]
+        if any(
+            map_method == "UNKNOWN" or _method(item.get("method")) == map_method
+            for item in active_required
+        ):
             continue
-        if str(found.get("determination") or "").upper() in _ACTIVE_DETERMINATIONS:
+        if not matches:
+            actions.append(
+                {
+                    "operation": "add_calibration",
+                    "repair_order_id": ro_id,
+                    "arguments": {
+                        "calibration_type": label,
+                        "determination": "REQUIRED",
+                        "method": _method(required.get("method")),
+                        "notes": "Added by X from governing ADAS Map during SI readiness reconciliation.",
+                        "research_status": "ADAS Map governing source",
+                    },
+                }
+            )
             continue
+        # Prefer correcting an already-active record, then the newest
+        # versioned inactive record.  Never add a second record merely because
+        # an existing alias lacks the optimistic-lock fields needed for a safe
+        # update; the post-read parity check will expose that as an exception.
+        candidates = sorted(
+            matches,
+            key=lambda item: (
+                str(item.get("determination") or "").upper() in _ACTIVE_DETERMINATIONS,
+                int(item.get("version") or 0)
+                if isinstance(item.get("version"), int)
+                and not isinstance(item.get("version"), bool)
+                else 0,
+            ),
+            reverse=True,
+        )
+        found = candidates[0]
         item_id = str(found.get("id") or "").strip()
         version = found.get("version")
-        if not item_id or isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        if (
+            not item_id
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or version < 1
+        ):
             continue
         changes: dict[str, Any] = {
             "determination": "REQUIRED",
             "research_status": "ADAS Map governing source",
         }
-        map_method = _method(required.get("method"))
         if map_method != "UNKNOWN":
             changes["method"] = map_method
-        actions.append({
-            "operation": "update_calibration",
-            "target_id": item_id,
-            "expected_version": version,
-            "arguments": changes,
-        })
+        actions.append(
+            {
+                "operation": "update_calibration",
+                "target_id": item_id,
+                "expected_version": version,
+                "arguments": changes,
+            }
+        )
     return actions
+
+
+def _reconciliation_issues(
+    snapshot: dict[str, Any], map_info: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Prove that the authoritative ADAS Map set exists exactly in CIQ."""
+    existing = _ciq_calibrations(snapshot)
+    issues: list[dict[str, Any]] = []
+    if map_info.get("explicit_no_calibration") is True:
+        active = [
+            item
+            for item in existing
+            if str(item.get("determination") or "").upper() in _ACTIVE_DETERMINATIONS
+        ]
+        if active:
+            issues.append({"code": "explicit_none_conflicts_with_active_ciq"})
+        return issues
+
+    governing_keys: dict[str, str] = {}
+    for required in map_info.get("requirements") or []:
+        if not isinstance(required, dict):
+            continue
+        label = str(required.get("label") or "").strip()
+        key = _calibration_key(label)
+        if not key:
+            issues.append({"code": "requirement_unparsed", "calibration": label})
+            continue
+        governing_keys.setdefault(key, label)
+        matches = [
+            item
+            for item in existing
+            if _calibration_key(item.get("calibration_type")) == key
+            and str(item.get("determination") or "").upper() in _ACTIVE_DETERMINATIONS
+        ]
+        if not matches:
+            issues.append({"code": "required_item_missing", "calibration": label})
+            continue
+        if len(matches) > 1:
+            issues.append({"code": "duplicate_active_items", "calibration": label})
+            continue
+        if str(matches[0].get("determination") or "").upper() != "REQUIRED":
+            issues.append({"code": "required_item_not_final", "calibration": label})
+            continue
+        map_method = _method(required.get("method"))
+        if map_method != "UNKNOWN" and _method(matches[0].get("method")) != map_method:
+            issues.append({"code": "method_mismatch", "calibration": label})
+
+    for item in existing:
+        if str(item.get("determination") or "").upper() not in _ACTIVE_DETERMINATIONS:
+            continue
+        label = _requirement_label(item)
+        key = _calibration_key(label)
+        if not key:
+            issues.append(
+                {
+                    "code": "extra_active_item",
+                    "calibration": label,
+                    "reason": "active CIQ label could not be normalized",
+                }
+            )
+        elif key not in governing_keys:
+            issues.append({"code": "extra_active_item", "calibration": label})
+    return issues
 
 
 def _vehicle_label(snapshot: dict[str, Any], fallback: str = "") -> str:
@@ -533,6 +725,278 @@ def _ro_number(snapshot: dict[str, Any], fallback: str = "") -> str:
 
 def _requirement_label(item: dict[str, Any]) -> str:
     return str(item.get("calibration_type") or item.get("label") or "").strip()
+
+
+def _catalog_for(adas: Any) -> Optional[adas_artifact_catalog.AdasArtifactCatalog]:
+    source_root = getattr(adas, "source_root", None)
+    cache_path = getattr(adas, "cache_path", None)
+    if source_root is None or cache_path is None:
+        return None
+    return adas_artifact_catalog.AdasArtifactCatalog(
+        Path(source_root), Path(cache_path)
+    )
+
+
+def _artifact_identity(
+    snapshot: dict[str, Any], *, include_vehicle: bool = False
+) -> dict[str, Any]:
+    ro = snapshot.get("repair_order")
+    ro = ro if isinstance(ro, dict) else {}
+    vehicle = snapshot.get("vehicle")
+    vehicle = vehicle if isinstance(vehicle, dict) else {}
+    ro_number = str(ro.get("ro_number") or "").strip()
+    vin = str(vehicle.get("vin") or ro.get("vin") or "").strip().upper()
+    query: dict[str, Any] = {
+        "ro_number": ro_number or None,
+        "vin": vin or None,
+    }
+    if not ro_number and not vin:
+        query["ciq_ro_id"] = str(ro.get("id") or "").strip() or None
+    if include_vehicle or not any(query.values()):
+        year = vehicle.get("year")
+        make = vehicle.get("make")
+        model = vehicle.get("model")
+        if (
+            year not in (None, "")
+            and make not in (None, "")
+            and model
+            not in (
+                None,
+                "",
+            )
+        ):
+            query.update(
+                {
+                    "year": year,
+                    "make": make,
+                    "model": model,
+                    "trim": vehicle.get("trim"),
+                    "configuration": _identity_text(
+                        vehicle.get("configuration") or ro.get("vehicle_configuration")
+                    )
+                    or None,
+                }
+            )
+    if not any(query.values()):
+        query.update(
+            {
+                "year": vehicle.get("year"),
+                "make": vehicle.get("make"),
+                "model": vehicle.get("model"),
+            }
+        )
+    return query
+
+
+def _identity_text(value: object) -> str:
+    if isinstance(value, dict):
+        for key in (
+            "adas_map_model_configuration",
+            "model_configuration",
+            "configuration",
+            "label",
+            "name",
+        ):
+            candidate = " ".join(str(value.get(key) or "").split()).casefold()
+            if candidate:
+                return candidate
+        return ""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _artifact_identity_conflicts(
+    snapshot: dict[str, Any], record: dict[str, Any]
+) -> list[str]:
+    ro = snapshot.get("repair_order")
+    ro = ro if isinstance(ro, dict) else {}
+    expected_vehicle = snapshot.get("vehicle")
+    expected_vehicle = expected_vehicle if isinstance(expected_vehicle, dict) else {}
+    observed_vehicle = record.get("vehicle")
+    observed_vehicle = observed_vehicle if isinstance(observed_vehicle, dict) else {}
+    conflicts: list[str] = []
+
+    pairs = {
+        "repair_order_id": (
+            calibration_iq._authoritative_repair_order_id(snapshot),  # noqa: SLF001
+            record.get("ciq_ro_id"),
+        ),
+        "ro_number": (_ro_number(snapshot), record.get("ro_number")),
+        "vin": (
+            expected_vehicle.get("vin") or ro.get("vin"),
+            record.get("vin"),
+        ),
+        "year": (expected_vehicle.get("year"), observed_vehicle.get("year")),
+        "make": (expected_vehicle.get("make"), observed_vehicle.get("make")),
+        "model": (expected_vehicle.get("model"), observed_vehicle.get("model")),
+        "trim": (expected_vehicle.get("trim"), observed_vehicle.get("trim")),
+        "configuration": (
+            expected_vehicle.get("configuration") or ro.get("vehicle_configuration"),
+            observed_vehicle.get("configuration"),
+        ),
+    }
+    for field, (expected, observed) in pairs.items():
+        if expected in (None, "") or observed in (None, ""):
+            continue
+        if field == "year":
+            try:
+                matches = int(expected) == int(observed)
+            except (TypeError, ValueError):
+                matches = False
+        elif field == "vin":
+            matches = str(expected).strip().upper() == str(observed).strip().upper()
+        else:
+            matches = _identity_text(expected) == _identity_text(observed)
+        if not matches:
+            conflicts.append(field)
+    return conflicts
+
+
+async def _discover_adas_map(
+    catalog: Optional[adas_artifact_catalog.AdasArtifactCatalog],
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    if catalog is None:
+        return {
+            "status": "unverified",
+            "governing_source": "ADAS Map",
+            "requirements": [],
+            "sources": [],
+            "requirement_count": 0,
+            "reason": "The ADAS artifact catalog is unavailable.",
+        }
+    try:
+        discovery = await asyncio.to_thread(
+            catalog.discover, **_artifact_identity(snapshot)
+        )
+    except Exception as exc:  # noqa: BLE001 - one artifact must not abort the queue
+        return {
+            "status": "unverified",
+            "governing_source": "ADAS Map",
+            "requirements": [],
+            "sources": [],
+            "requirement_count": 0,
+            "reason": f"Artifact discovery failed ({type(exc).__name__}).",
+        }
+
+    record = (
+        discovery.get("record") if isinstance(discovery.get("record"), dict) else {}
+    )
+    requirements = [
+        dict(item)
+        for item in (record.get("requirements") or [])
+        if isinstance(item, dict) and str(item.get("label") or "").strip()
+    ]
+    explicit_none = record.get("explicit_no_calibration") is True
+    discovery_status = str(discovery.get("status") or "unverified")
+    status = discovery_status
+    if discovery_status == adas_artifact_catalog.DISCOVERY_VERIFIED:
+        status = "verified" if requirements or explicit_none else "present_unparsed"
+
+    identity_conflicts = _artifact_identity_conflicts(snapshot, record)
+    if identity_conflicts:
+        status = "ambiguous"
+        discovery_status = "ambiguous"
+
+    return {
+        "status": status,
+        "discovery_status": discovery_status,
+        "governing_source": "ADAS Map",
+        "requirements": requirements,
+        "sources": list(record.get("sources") or []),
+        "requirement_count": len(requirements),
+        "explicit_no_calibration": explicit_none,
+        "inspection_id": record.get("inspection_id"),
+        "vin": record.get("vin"),
+        "vehicle": record.get("vehicle"),
+        "artifact_index": discovery.get("index"),
+        "reason": (
+            "ADAS Map provenance contradicts the authoritative CIQ identity: "
+            + ", ".join(identity_conflicts)
+            if identity_conflicts
+            else discovery.get("reason")
+        ),
+        "identity_conflicts": identity_conflicts,
+    }
+
+
+async def _catalog_coverage(
+    catalog: Optional[adas_artifact_catalog.AdasArtifactCatalog],
+    snapshot: dict[str, Any],
+    map_info: dict[str, Any],
+) -> list[dict[str, Any]]:
+    labels = [
+        str(item.get("label") or "").strip()
+        for item in (map_info.get("requirements") or [])
+        if isinstance(item, dict) and str(item.get("label") or "").strip()
+    ]
+    if not labels or map_info.get("status") != "verified":
+        return []
+    if catalog is None:
+        return [
+            {
+                "calibration": label,
+                "state": adas_artifact_catalog.UNVERIFIED,
+                "available": False,
+                "documents": [],
+                "reason": "The ADAS artifact catalog is unavailable.",
+            }
+            for label in labels
+        ]
+    try:
+        payload = await asyncio.to_thread(
+            catalog.requirement_coverage,
+            labels,
+            **_artifact_identity(snapshot, include_vehicle=True),
+        )
+    except Exception as exc:  # noqa: BLE001 - classify uncertainty; keep processing ROs
+        return [
+            {
+                "calibration": label,
+                "state": adas_artifact_catalog.UNVERIFIED,
+                "available": False,
+                "documents": [],
+                "reason": f"Artifact coverage failed ({type(exc).__name__}).",
+            }
+            for label in labels
+        ]
+
+    outcomes = {
+        _calibration_key(item.get("requirement")): item
+        for item in (payload.get("requirements") or [])
+        if isinstance(item, dict)
+    }
+    coverage: list[dict[str, Any]] = []
+    for label in labels:
+        outcome = outcomes.get(_calibration_key(label)) or {}
+        state = str(outcome.get("state") or adas_artifact_catalog.UNVERIFIED).upper()
+        if state not in {
+            adas_artifact_catalog.COVERED,
+            adas_artifact_catalog.MISSING,
+            adas_artifact_catalog.UNVERIFIED,
+        }:
+            state = adas_artifact_catalog.UNVERIFIED
+        sources = [
+            item for item in (outcome.get("sources") or []) if isinstance(item, dict)
+        ]
+        coverage.append(
+            {
+                "calibration": label,
+                "state": state,
+                # Compatibility only; decision code below keys on the explicit
+                # three-state value and never maps False directly to MISSING.
+                "available": state == adas_artifact_catalog.COVERED,
+                "documents": sorted(
+                    {
+                        str(item.get("relative_path") or "")
+                        for item in sources
+                        if str(item.get("relative_path") or "").strip()
+                    }
+                ),
+                "sources": sources,
+                "reason": outcome.get("reason") or payload.get("reason"),
+            }
+        )
+    return coverage
 
 
 async def _adas_coverage(adas: Any, vehicle: str, requirements: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -622,38 +1086,83 @@ async def _reconcile_one(
     if reread.get("status") == "verified" and isinstance(reread.get("snapshot"), dict):
         return dict(reread["snapshot"]), actions, result
     return snapshot, actions, {
+        **result,
         "status": "verification_failed",
+        "executed": result.get("executed") is True,
         "success": False,
         "verified": False,
         "message": "Calibration IQ accepted the ADAS Map reconciliation but the authoritative reread failed.",
+        "authoritative_reread": reread,
     }
 
 
 async def _load_ro_snapshot(settings: Any, identifier: str) -> dict[str, Any]:
-    result = await calibration_iq.get_repair_order(settings, {"repair_order_id": identifier})
+    result = await calibration_iq.operator_resolve_snapshot(settings, identifier)
     if result.get("status") != "verified":
-        return {"status": "error", "message": result.get("message") or "Calibration IQ did not return a verified RO.", "raw": result}
-    snapshot = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+        return {
+            "status": "error",
+            "message": result.get("message")
+            or "Calibration IQ did not return a verified operator snapshot.",
+            "raw": result,
+        }
+    snapshot = (
+        result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
+    )
     return {"status": "verified", "snapshot": snapshot, "result": result}
 
 
-async def _ro_requirements(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
+async def _ro_requirements(
+    settings: Any, adas: Any, args: dict[str, Any]
+) -> dict[str, Any]:
     identifier = str(args.get("repair_order_id") or "").strip()
     loaded = await _load_ro_snapshot(settings, identifier)
     if loaded.get("status") != "verified":
-        return {"mode": "ro_requirements", "success": False, "verified": False, **loaded}
+        return {
+            "mode": "ro_requirements",
+            "success": False,
+            "verified": False,
+            **loaded,
+        }
     snapshot = dict(loaded["snapshot"])
-    map_info = extract_adas_map(snapshot)
+    map_info = await _discover_adas_map(_catalog_for(adas), snapshot)
     context = _valid_context(args.get(_CONTEXT_KEY))
-    snapshot, planned, reconciliation = await _reconcile_one(settings, adas, snapshot, map_info, context)
+    snapshot, planned, reconciliation = await _reconcile_one(
+        settings, adas, snapshot, map_info, context
+    )
     requirements = _active_ciq_requirements(snapshot)
+    reconciliation_issues = (
+        _reconciliation_issues(snapshot, map_info)
+        if map_info.get("status") == "verified"
+        else []
+    )
+    reconcile_ok = bool(
+        map_info.get("status") != "verified"
+        or (
+            not reconciliation_issues
+            and (
+                not planned
+                or (
+                    reconciliation is not None
+                    and reconciliation.get("verified") is True
+                )
+            )
+        )
+    )
+    reconciliation_executed = bool(
+        planned
+        and reconciliation is not None
+        and reconciliation.get("executed") is True
+    )
     return {
-        "status": "success" if reconciliation is None or reconciliation.get("verified") is True else "partial_success",
+        "status": "success" if reconcile_ok else "partial_success",
         "mode": "ro_requirements",
-        "executed": bool(planned),
-        "success": reconciliation is None or reconciliation.get("verified") is True,
-        "verified": True,
-        "repair_order_id": str(calibration_iq._authoritative_repair_order_id(snapshot) or identifier),  # noqa: SLF001
+        "executed": reconciliation_executed,
+        "success": reconcile_ok,
+        "verified": reconcile_ok,
+        "snapshot_verified": True,
+        "repair_order_id": str(
+            calibration_iq._authoritative_repair_order_id(snapshot) or identifier
+        ),  # noqa: SLF001
         "ro_number": _ro_number(snapshot, identifier),
         "vehicle": _vehicle_label(snapshot),
         "calibration_requirements": [
@@ -668,6 +1177,7 @@ async def _ro_requirements(settings: Any, adas: Any, args: dict[str, Any]) -> di
         "adas_map": map_info,
         "reconciliation_actions": planned,
         "reconciliation": reconciliation,
+        "reconciliation_issues": reconciliation_issues,
     }
 
 
@@ -694,13 +1204,558 @@ def _row_phase_token(row: dict[str, Any]) -> Optional[str]:
     return token or None
 
 
-async def _week_readiness(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
+def _row_is_source_active(row: dict[str, Any]) -> bool:
+    """Honor an explicit CIQ source-presence tombstone, if one is present."""
+    active = calibration_iq._dig(  # noqa: SLF001
+        row,
+        "source_presence.active_on_source",
+        "active_on_source",
+        default=None,
+    )
+    return active is not False
+
+
+_COMPACT_TEXT_LIMIT = 320
+_COMPACT_LIST_LIMIT = 12
+_COMPACT_RECEIPT_LIMIT = 12
+_READINESS_ROWS_BYTE_BUDGET = 180_000
+
+
+def _compact_text(value: Any, *, limit: int = _COMPACT_TEXT_LIMIT) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _compact_error(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return _compact_text(value)
+    compact = {
+        key: value[key]
+        for key in ("code", "category", "retryable", "status_code")
+        if key in value
+    }
+    if value.get("message") is not None:
+        compact["message"] = _compact_text(value.get("message"))
+    details = value.get("details")
+    if isinstance(details, dict) and "status_code" in details:
+        compact["status_code"] = details["status_code"]
+    return compact
+
+
+def _compact_verification(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    compact = {
+        key: value[key]
+        for key in (
+            "verified",
+            "source",
+            "resource_type",
+            "resource_id",
+            "observed_version",
+            "reason",
+        )
+        if key in value
+    }
+    if value.get("message") is not None:
+        compact["message"] = _compact_text(value.get("message"))
+    if value.get("error") is not None:
+        compact["error"] = _compact_error(value.get("error"))
+    for key, item in list(compact.items()):
+        if isinstance(item, str):
+            compact[key] = _compact_text(item)
+    return compact
+
+
+def _compact_receipt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = {
+        key: value[key]
+        for key in (
+            "mutation_id",
+            "idempotency_key",
+            "correlation_id",
+            "operation",
+            "risk",
+            "status",
+            "success",
+            "verified",
+            "replayed",
+            "may_have_executed",
+            "indeterminate",
+            "repair_order_id",
+            "target_id",
+            "resource_type",
+            "resource_id",
+        )
+        if key in value
+    }
+    for key, item in list(compact.items()):
+        if isinstance(item, str):
+            compact[key] = _compact_text(item)
+    if value.get("verification") is not None:
+        compact["verification"] = _compact_verification(value.get("verification"))
+    if value.get("error") is not None:
+        compact["error"] = _compact_error(value.get("error"))
+    return compact
+
+
+def _receipt_is_critical(value: dict[str, Any]) -> bool:
+    verification = value.get("verification")
+    return bool(
+        value.get("indeterminate") is True
+        or value.get("may_have_executed") is True
+        or value.get("success") is not True
+        or value.get("status") not in {"completed", "succeeded"}
+        or not isinstance(verification, dict)
+        or verification.get("verified") is not True
+    )
+
+
+def _compact_reconciliation_result(
+    value: Any, *, receipt_limit: int = _COMPACT_RECEIPT_LIMIT
+) -> Optional[dict[str, Any]]:
+    """Keep receipt truth without repeating authoritative snapshots per RO.
+
+    Operator results can contain a full Calibration IQ snapshot for every
+    reconciled repair order.  A weekly audit already rereads and evaluates
+    those snapshots before reaching this boundary, so returning all of them
+    again can exceed the tool gateway's result limit and turn a verified audit
+    into a synthetic ``truncated`` result.  Receipts and outcome fields remain
+    intact; only the duplicated reread payload is omitted.
+    """
+    if not isinstance(value, dict):
+        return None
+    compact: dict[str, Any] = {
+        key: value[key]
+        for key in (
+            "status",
+            "executed",
+            "success",
+            "verified",
+            "partial",
+            "requested_count",
+            "processed_count",
+            "verified_count",
+            "stopped_on_error",
+        )
+        if key in value
+    }
+    raw_receipts = [
+        item for item in (value.get("receipts") or []) if isinstance(item, dict)
+    ]
+    raw_receipts = [
+        item
+        for _index, item in sorted(
+            enumerate(raw_receipts),
+            key=lambda pair: (
+                not _receipt_is_critical(pair[1]),
+                pair[0],
+            ),
+        )
+    ]
+    receipts = [_compact_receipt(item) for item in raw_receipts]
+    compact["receipt_count"] = len(receipts)
+    compact["critical_receipt_count"] = sum(
+        1
+        for item in raw_receipts
+        if _receipt_is_critical(item)
+    )
+    compact["receipts"] = receipts[:receipt_limit]
+    compact["receipts_shown"] = len(compact["receipts"])
+    compact["receipts_truncated"] = len(receipts) > receipt_limit
+    compact["receipt_sample_order"] = "critical_first"
+    if value.get("message") is not None:
+        compact["message"] = _compact_text(value.get("message"))
+    if value.get("error") is not None:
+        compact["error"] = _compact_error(value.get("error"))
+    reread = value.get("authoritative_reread")
+    if isinstance(reread, dict):
+        compact["authoritative_reread"] = {
+            key: reread[key]
+            for key in ("status", "success", "verified")
+            if key in reread
+        }
+        if reread.get("message") is not None:
+            compact["authoritative_reread"]["message"] = _compact_text(
+                reread.get("message")
+            )
+        if reread.get("error") is not None:
+            compact["authoritative_reread"]["error"] = _compact_error(
+                reread.get("error")
+            )
+    return compact
+
+
+def _compact_evidence_item(
+    value: Any, *, include_documents: bool = True
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = {
+        key: value[key] for key in ("state", "available") if key in value
+    }
+    if value.get("calibration") is not None:
+        compact["calibration"] = _compact_text(value.get("calibration"))
+    documents = [
+        _compact_text(item, limit=240)
+        for item in (value.get("documents") or [])
+        if _compact_text(item, limit=240)
+    ]
+    compact["document_count"] = len(documents)
+    if include_documents:
+        compact["documents"] = documents[:3]
+        compact["documents_truncated"] = len(documents) > 3
+    if value.get("reason") is not None:
+        compact["reason"] = _compact_text(value.get("reason"))
+    return compact
+
+
+def _compact_map_result(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"status": "unverified"}
+    sources: list[dict[str, Any]] = []
+    for source in value.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        compact_source = {
+            key: source[key]
+            for key in (
+                    "kind",
+                    "item_id",
+                    "inspection_id",
+                    "source_url",
+                    "artifact_kind",
+                    "relative_path",
+                    "sha256",
+                    "readable",
+                    "identity_verified",
+            )
+            if key in source
+        }
+        for key, item in list(compact_source.items()):
+            if isinstance(item, str):
+                compact_source[key] = _compact_text(item, limit=320)
+        sources.append(compact_source)
+    artifact_index = value.get("artifact_index")
+    compact_index = None
+    if isinstance(artifact_index, dict):
+        errors = [
+            _compact_error(item)
+            for item in (artifact_index.get("errors") or [])
+        ]
+        compact_index = {
+            key: artifact_index[key]
+            for key in (
+                "status",
+                "scan_complete",
+                "physical_pdf_count",
+                "unreadable",
+            )
+            if key in artifact_index
+        }
+        compact_index["error_count"] = len(errors)
+        compact_index["errors"] = errors[:3]
+        compact_index["errors_truncated"] = len(errors) > 3
+    compact = {
+        key: value[key]
+        for key in (
+            "status",
+            "discovery_status",
+            "governing_source",
+            "requirement_count",
+            "explicit_no_calibration",
+            "inspection_id",
+            "vin",
+            "vehicle",
+            "reason",
+            "identity_conflicts",
+        )
+        if key in value
+    }
+    if compact.get("reason") is not None:
+        compact["reason"] = _compact_text(compact["reason"])
+    if isinstance(compact.get("vehicle"), dict):
+        compact["vehicle"] = {
+            key: _compact_text(item) if isinstance(item, str) else item
+            for key, item in compact["vehicle"].items()
+            if key in {"year", "make", "model", "trim", "configuration"}
+        }
+    conflicts = [
+        _compact_error(item) for item in (value.get("identity_conflicts") or [])
+    ]
+    compact["identity_conflict_count"] = len(conflicts)
+    compact["identity_conflicts"] = conflicts[:3]
+    compact["identity_conflicts_truncated"] = len(conflicts) > 3
+    compact["source_count"] = len(sources)
+    compact["sources"] = sources[:4]
+    compact["sources_truncated"] = len(sources) > 4
+    if compact_index is not None:
+        compact["artifact_index"] = compact_index
+    return compact
+
+
+def _compact_action(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = {
+        key: value[key]
+        for key in (
+            "operation",
+            "target_id",
+            "repair_order_id",
+            "expected_version",
+            "idempotency_key",
+        )
+        if key in value
+    }
+    arguments = value.get("arguments")
+    if isinstance(arguments, dict):
+        compact["arguments"] = {
+            key: _compact_text(item) if isinstance(item, str) else item
+            for key, item in arguments.items()
+            if key
+            in {
+                "calibration_type",
+                "determination",
+                "method",
+                "research_status",
+            }
+        }
+    return compact
+
+
+def _compact_issue(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"message": _compact_text(value)}
+    return {
+        key: _compact_text(item) if isinstance(item, str) else item
+        for key, item in value.items()
+        if key in {"code", "calibration", "message"}
+    }
+
+
+def _compact_label_list(value: Any) -> tuple[list[str], int]:
+    labels = [
+        _compact_text(item, limit=200)
+        for item in (value or [])
+        if _compact_text(item, limit=200)
+    ]
+    return labels[:_COMPACT_LIST_LIMIT], len(labels)
+
+
+def _compact_readiness_row(
+    row: dict[str, Any], *, minimal: bool = False
+) -> dict[str, Any]:
+    """Return the bounded, inspectable form persisted by the tool gateway."""
+    compact = {
+        key: row[key]
+        for key in (
+            "repair_order_id",
+            "ro_number",
+            "vehicle",
+            "status",
+            "ready",
+            "coverage_status",
+        )
+        if key in row
+    }
+    for key in ("repair_order_id", "ro_number", "vehicle", "status"):
+        if isinstance(compact.get(key), str):
+            compact[key] = _compact_text(compact[key])
+    if row.get("message") is not None:
+        compact["message"] = _compact_text(row.get("message"))
+    requirements, requirement_count = _compact_label_list(
+        row.get("calibration_requirements")
+    )
+    ciq_requirements, ciq_requirement_count = _compact_label_list(
+        row.get("ciq_calibration_requirements")
+    )
+    compact["calibration_requirement_count"] = requirement_count
+    compact["calibration_requirements"] = requirements
+    compact["ciq_calibration_requirement_count"] = ciq_requirement_count
+    compact["ciq_calibration_requirements"] = ciq_requirements
+    actions = [
+        _compact_action(item)
+        for item in (row.get("reconciliation_actions") or [])
+        if isinstance(item, dict)
+    ]
+    action_limit = 3 if minimal else _COMPACT_LIST_LIMIT
+    compact["reconciliation_action_count"] = len(actions)
+    compact["reconciliation_actions"] = actions[:action_limit]
+    compact["reconciliation_actions_truncated"] = len(actions) > action_limit
+    issues = [
+        _compact_issue(item)
+        for item in (row.get("reconciliation_issues") or [])
+    ]
+    issue_limit = 4 if minimal else _COMPACT_LIST_LIMIT
+    compact["reconciliation_issue_count"] = len(issues)
+    compact["reconciliation_issues"] = issues[:issue_limit]
+    compact["reconciliation_issues_truncated"] = len(issues) > issue_limit
+    compact["adas_map"] = _compact_map_result(row.get("adas_map"))
+    if minimal:
+        compact["adas_map"] = {
+            key: compact["adas_map"][key]
+            for key in ("status", "inspection_id", "reason")
+            if key in compact["adas_map"]
+        }
+    compact["reconciliation"] = _compact_reconciliation_result(
+        row.get("reconciliation"), receipt_limit=3 if minimal else _COMPACT_RECEIPT_LIMIT
+    )
+    coverage = [
+        _compact_evidence_item(item, include_documents=not minimal)
+        for item in (row.get("coverage") or [])
+    ]
+    coverage_limit = 4 if minimal else _COMPACT_LIST_LIMIT
+    compact["coverage_count"] = len(coverage)
+    compact["coverage"] = coverage[:coverage_limit]
+    compact["coverage_truncated"] = len(coverage) > coverage_limit
+    missing_si = [
+        _compact_evidence_item(item, include_documents=False)
+        for item in (row.get("missing_si") or [])
+    ]
+    compact["missing_si_count"] = len(missing_si)
+    compact["missing_si"] = missing_si[:_COMPACT_LIST_LIMIT]
+    compact["missing_si_truncated"] = len(missing_si) > _COMPACT_LIST_LIMIT
+    unverified_si = [
+        _compact_evidence_item(item, include_documents=False)
+        for item in (row.get("unverified_si") or [])
+    ]
+    compact["unverified_si_count"] = len(unverified_si)
+    compact["unverified_si"] = unverified_si[:_COMPACT_LIST_LIMIT]
+    compact["unverified_si_truncated"] = len(unverified_si) > _COMPACT_LIST_LIMIT
+    return compact
+
+
+def _readiness_row_skeleton(row: dict[str, Any]) -> dict[str, Any]:
+    compact = _compact_readiness_row(row, minimal=True)
+    reconciliation = compact.get("reconciliation")
+    if isinstance(reconciliation, dict):
+        reconciliation = _compact_reconciliation_result(
+            row.get("reconciliation"), receipt_limit=1
+        )
+    skeleton = {
+        key: compact[key]
+        for key in (
+            "repair_order_id",
+            "ro_number",
+            "vehicle",
+            "status",
+            "ready",
+            "coverage_status",
+            "adas_map",
+            "missing_si_count",
+            "missing_si",
+            "missing_si_truncated",
+            "unverified_si_count",
+            "unverified_si",
+            "unverified_si_truncated",
+            "reconciliation_issue_count",
+        )
+        if key in compact
+    } | {"reconciliation": reconciliation}
+    for key in ("missing_si", "unverified_si"):
+        values = list(skeleton.get(key) or [])
+        skeleton[key] = values[:3]
+        skeleton[f"{key}_truncated"] = int(skeleton.get(f"{key}_count") or 0) > 3
+    return skeleton
+
+
+def _bounded_readiness_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    compact = [_compact_readiness_row(row) for row in rows]
+    if len(json.dumps(compact, ensure_ascii=False, default=str).encode("utf-8")) <= _READINESS_ROWS_BYTE_BUDGET:
+        return compact, {
+            "repair_orders_total": len(rows),
+            "repair_orders_shown": len(compact),
+            "repair_orders_truncated": False,
+        }
+
+    minimal = [_compact_readiness_row(row, minimal=True) for row in rows]
+    if len(json.dumps(minimal, ensure_ascii=False, default=str).encode("utf-8")) <= _READINESS_ROWS_BYTE_BUDGET:
+        return minimal, {
+            "repair_orders_total": len(rows),
+            "repair_orders_shown": len(minimal),
+            "repair_orders_truncated": False,
+            "repair_order_detail_compacted": True,
+        }
+
+    skeletons = [_readiness_row_skeleton(row) for row in rows]
+    if len(json.dumps(skeletons, ensure_ascii=False, default=str).encode("utf-8")) <= _READINESS_ROWS_BYTE_BUDGET:
+        return skeletons, {
+            "repair_orders_total": len(rows),
+            "repair_orders_shown": len(skeletons),
+            "repair_orders_truncated": False,
+            "repair_order_detail_compacted": True,
+            "repair_order_skeletons": True,
+        }
+
+    # Preserve executed/exception rows first, then include as many remaining
+    # rows as the explicit result budget permits. Counts above remain complete,
+    # and omission is always declared rather than gateway-truncated silently.
+    prioritized = sorted(
+        enumerate(skeletons),
+        key=lambda pair: (
+            (pair[1].get("reconciliation") or {}).get("executed") is not True,
+            pair[1].get("ready") is True,
+            pair[0],
+        ),
+    )
+    selected: list[dict[str, Any]] = []
+    used = 2
+    for _index, row in prioritized:
+        encoded = len(json.dumps(row, ensure_ascii=False, default=str).encode("utf-8"))
+        if selected and used + encoded + 1 > _READINESS_ROWS_BYTE_BUDGET:
+            continue
+        if not selected and encoded + 2 > _READINESS_ROWS_BYTE_BUDGET:
+            continue
+        selected.append(row)
+        used += encoded + (1 if len(selected) > 1 else 0)
+    selected_identities = {
+        (str(row.get("repair_order_id") or ""), str(row.get("ro_number") or ""))
+        for row in selected
+    }
+    omitted_rows = [
+        row
+        for row in skeletons
+        if (str(row.get("repair_order_id") or ""), str(row.get("ro_number") or ""))
+        not in selected_identities
+    ]
+    omitted_executed = [
+        row
+        for row in omitted_rows
+        if (row.get("reconciliation") or {}).get("executed") is True
+    ]
+    omitted_executed_ids = [
+        str(row.get("ro_number") or row.get("repair_order_id") or "")
+        for row in omitted_executed
+    ]
+    return selected, {
+        "repair_orders_total": len(rows),
+        "repair_orders_shown": len(selected),
+        "repair_orders_truncated": len(selected) < len(rows),
+        "repair_order_detail_compacted": True,
+        "repair_orders_omitted": len(rows) - len(selected),
+        "executed_repair_orders_omitted": len(omitted_executed),
+        "executed_repair_order_identities": omitted_executed_ids[:50],
+        "executed_repair_order_identities_truncated": len(omitted_executed_ids) > 50,
+    }
+
+
+async def _week_readiness(
+    settings: Any, adas: Any, args: dict[str, Any]
+) -> dict[str, Any]:
     # "Prepared for the week" means phases 5-8: earlier phases (teardown,
     # estimate, parts) aren't reaching calibration this week, so checking
     # their SI coverage now would be noise. An explicit phase in the request
     # overrides this default instead of being narrowed further by it.
     explicit_phase = bool(args.get("phase"))
-    filters: dict[str, Any] = {"include_completed": False}
+    # The upstream collection's default scope is Calibration IQ Active Work,
+    # which deliberately includes terminal-status ROs still marked
+    # active_on_source.  Keep those rows instead of locally dropping them by
+    # status after Calibration IQ has already declared them active.
+    filters: dict[str, Any] = {"include_completed": True}
     if explicit_phase:
         filters["phase"] = str(args["phase"])
     if args.get("shop"):
@@ -712,77 +1767,299 @@ async def _week_readiness(settings: Any, adas: Any, args: dict[str, Any]) -> dic
             "mode": "week_readiness",
             "success": False,
             "verified": False,
-            "message": queue.get("message") or "Calibration IQ did not return a complete active queue.",
+            "message": queue.get("message")
+            or "Calibration IQ did not return a complete active queue.",
             "calibration_iq": queue,
         }
-    rows = [item for item in (queue.get("items") or []) if isinstance(item, dict)]
+    rows = [
+        item
+        for item in (queue.get("items") or [])
+        if isinstance(item, dict) and _row_is_source_active(item)
+    ]
     if not explicit_phase:
-        rows = [row for row in rows if _row_phase_token(row) in _WEEK_READY_DEFAULT_PHASES]
+        rows = [
+            row for row in rows if _row_phase_token(row) in _WEEK_READY_DEFAULT_PHASES
+        ]
     context = _valid_context(args.get(_CONTEXT_KEY))
+    catalog = _catalog_for(adas)
 
     semaphore = asyncio.Semaphore(6)
+
     async def load(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        ident = str(calibration_iq._dig(item, "id", "repair_order_id", "uuid", "ro_number", "roNumber", "number", "ro") or "").strip()  # noqa: SLF001
+        ident = str(
+            calibration_iq._dig(
+                item,
+                "id",
+                "repair_order_id",
+                "uuid",
+                "ro_number",
+                "roNumber",
+                "number",
+                "ro",
+            )
+            or ""
+        ).strip()  # noqa: SLF001
         async with semaphore:
             return item, await _load_ro_snapshot(settings, ident)
 
     loaded = await asyncio.gather(*(load(item) for item in rows))
     results: list[dict[str, Any]] = []
     added_total = 0
+    executed_any = False
+    processed_total = 0
+    receipt_total = 0
+    verified_receipt_total = 0
     for row, envelope in loaded:
         if envelope.get("status") != "verified":
-            results.append({
-                "ro_number": str(calibration_iq._dig(row, "ro_number", "roNumber", "number", "ro") or ""),  # noqa: SLF001
-                "vehicle": calibration_iq._vehicle_label(row),  # noqa: SLF001
-                "ready": False,
-                "status": "ro_unavailable",
-                "missing_si": [],
-                "message": envelope.get("message"),
-            })
+            results.append(
+                {
+                    "ro_number": str(
+                        calibration_iq._dig(
+                            row, "ro_number", "roNumber", "number", "ro"
+                        )
+                        or ""
+                    ),  # noqa: SLF001
+                    "vehicle": calibration_iq._vehicle_label(row),  # noqa: SLF001
+                    "ready": False,
+                    "status": "ro_unavailable",
+                    "adas_map": {"status": "unverified"},
+                    "coverage_status": adas_artifact_catalog.UNVERIFIED,
+                    "missing_si": [],
+                    "unverified_si": [],
+                    "message": envelope.get("message"),
+                }
+            )
             continue
         snapshot = dict(envelope["snapshot"])
-        map_info = extract_adas_map(snapshot)
-        snapshot, planned, reconciliation = await _reconcile_one(settings, adas, snapshot, map_info, context)
-        if reconciliation is not None and reconciliation.get("verified") is True:
-            added_total += len(planned)
-        requirements = _active_ciq_requirements(snapshot)
+        map_info = await _discover_adas_map(catalog, snapshot)
+        snapshot, planned, reconciliation = await _reconcile_one(
+            settings, adas, snapshot, map_info, context
+        )
+        if reconciliation is not None:
+            receipts = [
+                item
+                for item in (reconciliation.get("receipts") or [])
+                if isinstance(item, dict)
+            ]
+            receipt_total += len(receipts)
+            verified_receipt_total += sum(
+                1
+                for item in receipts
+                if item.get("status") == "completed"
+                and item.get("success") is True
+                and isinstance(item.get("verification"), dict)
+                and item["verification"].get("verified") is True
+            )
+            processed = reconciliation.get("processed_count")
+            if (
+                not isinstance(processed, int)
+                or isinstance(processed, bool)
+                or processed < 0
+            ):
+                processed = len(receipts)
+            processed_total += processed
+            if reconciliation.get("executed") is True:
+                executed_any = True
+            if reconciliation.get("verified") is True:
+                added_total += len(planned)
+        requirements = [
+            dict(item)
+            for item in (map_info.get("requirements") or [])
+            if isinstance(item, dict)
+        ]
         vehicle = _vehicle_label(snapshot, calibration_iq._vehicle_label(row))  # noqa: SLF001
-        coverage = await _adas_coverage(adas, vehicle, requirements)
-        missing_si = [item for item in coverage if item.get("available") is not True]
+        coverage = await _catalog_coverage(catalog, snapshot, map_info)
+        missing_si = [
+            item
+            for item in coverage
+            if item.get("state") == adas_artifact_catalog.MISSING
+        ]
+        unverified_si = [
+            item
+            for item in coverage
+            if item.get("state") == adas_artifact_catalog.UNVERIFIED
+        ]
         map_ok = map_info.get("status") == "verified"
-        reconcile_ok = not planned or (reconciliation is not None and reconciliation.get("verified") is True)
-        ready = bool(map_ok and reconcile_ok and requirements and not missing_si)
-        results.append({
-            "repair_order_id": str(calibration_iq._authoritative_repair_order_id(snapshot) or ""),  # noqa: SLF001
-            "ro_number": _ro_number(snapshot, str(calibration_iq._dig(row, "ro_number", "roNumber", "number", "ro") or "")),  # noqa: SLF001
-            "vehicle": vehicle,
-            "status": "ready" if ready else ("adas_map_unavailable" if not map_ok else "si_missing" if missing_si else "reconciliation_failed"),
-            "ready": ready,
-            "adas_map": map_info,
-            "calibration_requirements": [_requirement_label(item) for item in requirements],
-            "reconciliation_actions": planned,
-            "reconciliation": reconciliation,
-            "coverage": coverage,
-            "missing_si": missing_si,
-        })
+        reconciliation_issues = (
+            _reconciliation_issues(snapshot, map_info) if map_ok else []
+        )
+        reconcile_ok = bool(
+            map_ok
+            and not reconciliation_issues
+            and (
+                not planned
+                or (
+                    reconciliation is not None
+                    and reconciliation.get("verified") is True
+                )
+            )
+        )
+        if not map_ok:
+            coverage_status = adas_artifact_catalog.UNVERIFIED
+        elif map_info.get("explicit_no_calibration") is True:
+            coverage_status = adas_artifact_catalog.COVERED
+        elif missing_si:
+            coverage_status = adas_artifact_catalog.MISSING
+        elif unverified_si or not requirements:
+            coverage_status = adas_artifact_catalog.UNVERIFIED
+        else:
+            coverage_status = adas_artifact_catalog.COVERED
+        ready = bool(
+            map_ok and reconcile_ok and coverage_status == adas_artifact_catalog.COVERED
+        )
+        if ready:
+            status = "ready"
+        elif not map_ok:
+            status = "adas_map_unverified"
+        elif not reconcile_ok:
+            status = "reconciliation_failed"
+        elif coverage_status == adas_artifact_catalog.MISSING:
+            status = "si_missing"
+        else:
+            status = "si_unverified"
+        results.append(
+            {
+                "repair_order_id": str(
+                    calibration_iq._authoritative_repair_order_id(snapshot) or ""
+                ),  # noqa: SLF001
+                "ro_number": _ro_number(
+                    snapshot,
+                    str(
+                        calibration_iq._dig(
+                            row, "ro_number", "roNumber", "number", "ro"
+                        )
+                        or ""
+                    ),
+                ),  # noqa: SLF001
+                "vehicle": vehicle,
+                "status": status,
+                "ready": ready,
+                "adas_map": map_info,
+                "calibration_requirements": [
+                    _requirement_label(item) for item in requirements
+                ],
+                "ciq_calibration_requirements": [
+                    _requirement_label(item)
+                    for item in _active_ciq_requirements(snapshot)
+                ],
+                "reconciliation_actions": planned,
+                "reconciliation": reconciliation,
+                "reconciliation_issues": reconciliation_issues,
+                "coverage": coverage,
+                "coverage_status": coverage_status,
+                "missing_si": missing_si,
+                "unverified_si": unverified_si,
+            }
+        )
 
     if context is not None:
         _save_weekly_queue(settings, context["conversation_id"], results)
 
+    exception_count = sum(1 for item in results if item.get("ready") is not True)
+    reconciliation_failed_count = sum(
+        1 for item in results if item.get("status") == "reconciliation_failed"
+    )
+    ro_unavailable_count = sum(
+        1 for item in results if item.get("status") == "ro_unavailable"
+    )
+    ready_count = sum(1 for item in results if item.get("ready") is True)
+    si_covered_count = sum(
+        1
+        for item in results
+        if item.get("coverage_status") == adas_artifact_catalog.COVERED
+    )
+    si_missing_count = sum(
+        1
+        for item in results
+        if item.get("coverage_status") == adas_artifact_catalog.MISSING
+    )
+    si_unverified_count = sum(
+        1
+        for item in results
+        if item.get("coverage_status") == adas_artifact_catalog.UNVERIFIED
+    )
+    adas_map_verified_count = sum(
+        1
+        for item in results
+        if (item.get("adas_map") or {}).get("status") == "verified"
+    )
+    adas_map_missing_count = sum(
+        1
+        for item in results
+        if (item.get("adas_map") or {}).get("status") == "not_found"
+    )
+    adas_map_unverified_count = (
+        len(results) - adas_map_verified_count - adas_map_missing_count
+    )
+    queue_candidates = sum(1 for item in results if item.get("missing_si"))
+    public_results, public_result_meta = _bounded_readiness_rows(results)
     return {
-        "status": "success",
+        "status": "success" if exception_count == 0 else "partial_success",
         "mode": "week_readiness",
-        "executed": added_total > 0,
+        "executed": executed_any,
         "success": True,
         "verified": True,
+        # `success`/`verified` describe the audit execution.  Readiness is a
+        # separate fact: an accurately verified audit can still prove that one
+        # or more ROs need attention.
+        "readiness_complete": exception_count == 0,
+        "exception_count": exception_count,
         "queue_count": len(results),
-        "ready_count": sum(1 for item in results if item.get("ready") is True),
-        "needs_si_count": sum(1 for item in results if item.get("missing_si")),
-        "adas_map_unavailable_count": sum(1 for item in results if (item.get("adas_map") or {}).get("status") != "verified"),
+        "ready_count": ready_count,
+        "si_covered_count": si_covered_count,
+        "needs_si_count": si_missing_count,
+        "si_missing_count": si_missing_count,
+        "si_unverified_count": si_unverified_count,
+        "adas_map_verified_count": adas_map_verified_count,
+        "adas_map_missing_count": adas_map_missing_count,
+        "adas_map_unverified_count": adas_map_unverified_count,
+        "adas_map_unavailable_count": (
+            adas_map_missing_count + adas_map_unverified_count
+        ),
+        "alldata_queued_count": queue_candidates if context is not None else 0,
+        "acquisition_status": (
+            "queued"
+            if context is not None and queue_candidates
+            else "not_needed"
+            if not queue_candidates
+            else "not_queued_context_missing"
+        ),
+        "reconciliation_failed_count": reconciliation_failed_count,
+        "ro_unavailable_count": ro_unavailable_count,
+        "ciq_mutations_processed_count": processed_total,
+        "ciq_receipt_count": receipt_total,
+        "ciq_verified_receipt_count": verified_receipt_total,
         "ciq_requirements_added_or_reactivated": added_total,
         "filters": filters,
-        "phase_scope": [str(args["phase"])] if explicit_phase else sorted(_WEEK_READY_DEFAULT_PHASES, key=int),
-        "repair_orders": results,
+        "phase_scope": [str(args["phase"])]
+        if explicit_phase
+        else sorted(_WEEK_READY_DEFAULT_PHASES, key=int),
+        **public_result_meta,
+        "repair_orders": public_results,
+    }
+
+
+async def _phase_coverage(
+    settings: Any, adas: Any, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Audit one explicit CIQ phase through the full ADAS Map/SI path."""
+    phase = str(args.get("phase") or "").strip()
+    if not phase:
+        return {
+            "status": "invalid_request",
+            "mode": "phase_coverage",
+            "success": False,
+            "verified": False,
+            "message": "Tell me which Calibration IQ phase to check for ADAS SI coverage.",
+        }
+    coverage_focus = str(args.get("coverage_focus") or "si_readiness").casefold()
+    if coverage_focus not in {"adas_map", "si_readiness"}:
+        coverage_focus = "si_readiness"
+    result = await _week_readiness(settings, adas, {**args, "phase": phase})
+    return {
+        **result,
+        "mode": "phase_coverage",
+        "coverage_focus": coverage_focus,
     }
 
 
@@ -825,6 +2102,8 @@ async def handle(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, An
         return await _ro_requirements(settings, adas, args)
     if mode == "week_readiness":
         return await _week_readiness(settings, adas, args)
+    if mode == "phase_coverage":
+        return await _phase_coverage(settings, adas, args)
     if mode == "queue_next":
         return await _queue_next_mode(settings, adas, args)
     raise ValueError("Unsupported Calibration IQ work-prep mode.")
@@ -1065,6 +2344,191 @@ async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> 
     }
 
 
+_SUMMARY_EXCEPTION_LIMIT = 3
+_SUMMARY_CALIBRATION_LIMIT = 3
+
+
+def _summary_value(value: object, *, limit: int = 140) -> str:
+    return " ".join(str(value or "").split()).strip()[:limit]
+
+
+def _readiness_exception_line(
+    item: dict[str, Any], *, map_focus: bool = False
+) -> str:
+    ro_number = _summary_value(item.get("ro_number"), limit=80) or "unknown"
+    vehicle = _summary_value(item.get("vehicle"), limit=160) or "vehicle unavailable"
+    lead = f"RO {ro_number} — {vehicle}:"
+    if item.get("status") == "ro_unavailable":
+        return f"{lead} Calibration IQ detail could not be verified."
+    map_status = str((item.get("adas_map") or {}).get("status") or "").casefold()
+    if map_focus:
+        if map_status == "not_found":
+            return f"{lead} ADAS Map report is genuinely missing after a complete exact scan."
+        if map_status == "ambiguous":
+            return f"{lead} ADAS Map evidence is ambiguous."
+        if map_status != "verified":
+            return f"{lead} ADAS Map evidence is unverified."
+    missing = [
+        _summary_value(entry.get("calibration"), limit=120)
+        for entry in (item.get("missing_si") or [])
+        if isinstance(entry, dict)
+        and _summary_value(entry.get("calibration"), limit=120)
+    ]
+    if missing:
+        shown = missing[:_SUMMARY_CALIBRATION_LIMIT]
+        suffix = (
+            f" (+{len(missing) - len(shown)} more)" if len(missing) > len(shown) else ""
+        )
+        return f"{lead} needs ADAS SI for {', '.join(shown)}{suffix}."
+    unverified = [
+        _summary_value(entry.get("calibration"), limit=120)
+        for entry in (item.get("unverified_si") or [])
+        if isinstance(entry, dict)
+        and _summary_value(entry.get("calibration"), limit=120)
+    ]
+    if unverified:
+        shown = unverified[:_SUMMARY_CALIBRATION_LIMIT]
+        suffix = (
+            f" (+{len(unverified) - len(shown)} more)"
+            if len(unverified) > len(shown)
+            else ""
+        )
+        return (
+            f"{lead} ADAS SI association is unverified for {', '.join(shown)}{suffix}."
+        )
+    if map_status != "verified":
+        return f"{lead} ADAS Map requirement data could not be verified."
+    if item.get("status") == "reconciliation_failed":
+        return f"{lead} CIQ requirement reconciliation was not verified."
+    return f"{lead} readiness was not verified."
+
+
+def _readiness_summary(mode: str, data: dict[str, Any]) -> str:
+    phase_scope = [
+        _summary_value(value, limit=20)
+        for value in (data.get("phase_scope") or [])
+        if _summary_value(value, limit=20)
+    ]
+    if mode == "phase_coverage":
+        phase = (
+            phase_scope[0]
+            if phase_scope
+            else _summary_value((data.get("filters") or {}).get("phase"), limit=20)
+        )
+        scope = f"in Phase {phase}" if phase else "in the requested phase"
+    elif len(phase_scope) > 1:
+        scope = f"in weekly phases {phase_scope[0]}–{phase_scope[-1]}"
+    elif phase_scope:
+        scope = f"in Phase {phase_scope[0]}"
+    else:
+        scope = "in the weekly queue"
+
+    rows = [
+        item for item in (data.get("repair_orders") or []) if isinstance(item, dict)
+    ]
+    queue_count = int(data.get("queue_count") or 0)
+    ready_count = int(data.get("ready_count") or 0)
+    map_unavailable_count = int(data.get("adas_map_unavailable_count") or 0)
+    map_missing_count = int(data.get("adas_map_missing_count") or 0)
+    raw_map_unverified = data.get("adas_map_unverified_count")
+    map_unverified_count = (
+        int(raw_map_unverified)
+        if isinstance(raw_map_unverified, int)
+        and not isinstance(raw_map_unverified, bool)
+        else max(0, map_unavailable_count - map_missing_count)
+    )
+    raw_map_verified = data.get("adas_map_verified_count")
+    map_verified_count = (
+        int(raw_map_verified)
+        if isinstance(raw_map_verified, int) and not isinstance(raw_map_verified, bool)
+        else max(0, queue_count - map_unavailable_count)
+    )
+    map_focus = mode == "phase_coverage" and data.get("coverage_focus") == "adas_map"
+    if map_focus:
+        exceptions = [
+            item
+            for item in rows
+            if isinstance(item.get("adas_map"), dict)
+            and item["adas_map"].get("status") != "verified"
+        ]
+        exception_count = max(
+            map_unavailable_count,
+            len(exceptions),
+            max(0, queue_count - map_verified_count),
+        )
+        coverage_complete = exception_count == 0 and map_verified_count == queue_count
+        if queue_count == 0 and coverage_complete:
+            lead = f"Yes — there are no active Calibration IQ ROs {scope} to check."
+        elif coverage_complete:
+            lead = (
+                f"Yes — all {queue_count} active Calibration IQ ROs {scope} "
+                "have verified ADAS Map reports."
+            )
+        else:
+            lead = (
+                f"No — {exception_count} of {queue_count} active Calibration IQ ROs "
+                f"{scope} do not have verified ADAS Map reports."
+            )
+    else:
+        exceptions = [item for item in rows if item.get("ready") is not True]
+        exception_count = max(
+            int(data.get("exception_count") or 0),
+            len(exceptions),
+            max(0, queue_count - ready_count),
+        )
+        readiness_complete = data.get("readiness_complete")
+        if not isinstance(readiness_complete, bool):
+            readiness_complete = exception_count == 0 and ready_count == queue_count
+        if queue_count == 0 and readiness_complete:
+            lead = f"Yes — there are no active Calibration IQ ROs {scope} to prepare."
+        elif readiness_complete:
+            lead = (
+                f"Yes — all {queue_count} active Calibration IQ ROs {scope} are SI-ready."
+            )
+        else:
+            lead = (
+                f"No — {exception_count} of {queue_count} active Calibration IQ ROs "
+                f"{scope} are not yet SI-ready."
+            )
+
+    lines = [
+        lead,
+        (
+            "ADAS Map: "
+            f"{map_verified_count} verified; "
+            f"{map_missing_count} genuinely missing; "
+            f"{map_unverified_count} unverified."
+        ),
+        (
+            "ADAS SI: "
+            f"{int(data.get('si_covered_count') or ready_count)} fully covered; "
+            f"{int(data.get('si_missing_count') or data.get('needs_si_count') or 0)} genuinely missing; "
+            f"{int(data.get('si_unverified_count') or 0)} unverified."
+        ),
+        (
+            "CIQ reconciliation: "
+            f"{int(data.get('ciq_requirements_added_or_reactivated') or 0)} "
+            "requirement(s) added/reactivated; "
+            f"{int(data.get('reconciliation_failed_count') or 0)} unverified."
+        ),
+        f"ALLDATA: {int(data.get('alldata_queued_count') or 0)} vehicle(s) queued.",
+    ]
+    for item in exceptions[:_SUMMARY_EXCEPTION_LIMIT]:
+        lines.append(_readiness_exception_line(item, map_focus=map_focus))
+    omitted = max(0, exception_count - min(len(exceptions), _SUMMARY_EXCEPTION_LIMIT))
+    if omitted:
+        if data.get("repair_orders_truncated") is True:
+            lines.append(
+                f"{omitted} additional RO exception(s) remain in the verified aggregate counts; "
+                "the structured row sample is explicitly marked truncated."
+            )
+        else:
+            lines.append(
+                f"{omitted} additional RO exception(s) are preserved in the structured readiness result."
+            )
+    return "\n".join(lines)
+
+
 def summarize(mode: str, result: Any) -> str:
     data = result if isinstance(result, dict) else {}
     message = str(data.get("message") or "").strip()
@@ -1086,51 +2550,41 @@ def summarize(mode: str, result: Any) -> str:
         rows = [row for row in (data.get("rows") or []) if isinstance(row, dict)]
         phase = str((data.get("filters") or {}).get("phase") or "")
         lead = f"Calibration IQ has {int(data.get('count') or 0)} active vehicle(s) in phase {phase}."
-        detail = "; ".join(
-            f"RO {row.get('RO')} — {row.get('Vehicle')}" for row in rows
-        )
+        detail = "; ".join(f"RO {row.get('RO')} — {row.get('Vehicle')}" for row in rows)
         return f"{lead} {detail}" if detail else lead
     if mode == "ro_requirements":
         if data.get("verified") is not True:
             return message or "Calibration IQ did not return a verified repair order."
-        labels = [str(item.get("label") or "") for item in (data.get("calibration_requirements") or []) if isinstance(item, dict) and item.get("label")]
+        labels = [
+            str(item.get("label") or "")
+            for item in (data.get("calibration_requirements") or [])
+            if isinstance(item, dict) and item.get("label")
+        ]
         base = f"RO {data.get('ro_number') or data.get('repair_order_id')} — {data.get('vehicle') or 'vehicle'}"
-        requirements = ", ".join(labels) if labels else "no active calibration requirements recorded"
+        requirements = (
+            ", ".join(labels)
+            if labels
+            else "no active calibration requirements recorded"
+        )
         additions = len(data.get("reconciliation_actions") or [])
-        suffix = f" I reconciled and added/reactivated {additions} requirement(s) from governing ADAS Map." if additions and (data.get("reconciliation") or {}).get("verified") is True else ""
+        suffix = (
+            f" I reconciled and added/reactivated {additions} requirement(s) from governing ADAS Map."
+            if additions and (data.get("reconciliation") or {}).get("verified") is True
+            else ""
+        )
         map_status = (data.get("adas_map") or {}).get("status")
         if map_status != "verified":
             suffix += " ADAS Map requirements were not machine-readable on this RO, so I did not invent any missing requirements."
         return f"{base}: {requirements}.{suffix}"
-    if mode == "week_readiness":
+    if mode in {"week_readiness", "phase_coverage"}:
         if data.get("verified") is not True:
-            return message or "The weekly Calibration IQ readiness audit was not verified."
-        phase_scope = [str(p) for p in (data.get("phase_scope") or []) if str(p).strip()]
-        if len(phase_scope) > 1:
-            scope_clause = (
-                f" (phase {phase_scope[0]}–{phase_scope[-1]} -- earlier phases aren't being worked this week)"
+            fallback = (
+                "The requested Phase coverage audit was not verified."
+                if mode == "phase_coverage"
+                else "The weekly Calibration IQ readiness audit was not verified."
             )
-        elif phase_scope:
-            scope_clause = f" (phase {phase_scope[0]})"
-        else:
-            scope_clause = ""
-        lines = [
-            f"I checked {int(data.get('queue_count') or 0)} active Calibration IQ RO(s){scope_clause}. "
-            f"{int(data.get('ready_count') or 0)} are SI-ready; {int(data.get('needs_si_count') or 0)} need ADAS SI; "
-            f"{int(data.get('adas_map_unavailable_count') or 0)} could not be verified against ADAS Map. "
-            f"I added/reactivated {int(data.get('ciq_requirements_added_or_reactivated') or 0)} missing CIQ requirement(s) from governing ADAS Map."
-        ]
-        for item in data.get("repair_orders") or []:
-            if not isinstance(item, dict) or item.get("ready") is True:
-                continue
-            missing = [str(entry.get("calibration") or "") for entry in (item.get("missing_si") or []) if isinstance(entry, dict) and entry.get("calibration")]
-            if missing:
-                lines.append(f"RO {item.get('ro_number')} — {item.get('vehicle')}: need ADAS SI for {', '.join(missing)}.")
-            elif (item.get("adas_map") or {}).get("status") != "verified":
-                lines.append(f"RO {item.get('ro_number')} — {item.get('vehicle')}: ADAS Map requirement data could not be verified.")
-            elif item.get("status") == "reconciliation_failed":
-                lines.append(f"RO {item.get('ro_number')} — {item.get('vehicle')}: CIQ requirement reconciliation failed verification.")
-        return "\n".join(lines)
+            return message or fallback
+        return _readiness_summary(mode, data)
     return message or "The requested Calibration IQ work-prep action completed."
 
 
@@ -1158,13 +2612,14 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Calibration IQ work-prep bridge. Use CIQ as the work queue, ADAS Map on each RO as the governing calibration-requirement source, and ADAS SI as procedure coverage. It can list a phase, report one RO's saved requirements, or audit/reconcile the active queue for weekly SI readiness. Missing CIQ calibrations proved by ADAS Map are added/reactivated through CIQ's verified routine operator contract."
+                    "Calibration IQ work-prep bridge. Use CIQ as the work queue, ADAS Map on each RO as the governing calibration-requirement source, and ADAS SI as procedure coverage. It can list a phase, run a full ADAS Map/SI coverage audit for one phase, report one RO's saved requirements, or audit/reconcile the active queue for weekly SI readiness. Missing CIQ calibrations proved by ADAS Map are added/reactivated through CIQ's verified routine operator contract."
                 ),
                 "parameters": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "mode": {"type": "string", "enum": ["phase_list", "ro_requirements", "week_readiness", "queue_next"]},
+                        "mode": {"type": "string", "enum": ["phase_list", "phase_coverage", "ro_requirements", "week_readiness", "queue_next"]},
+                        "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
                         "repair_order_id": {"type": "string"},
                         "phase": {"type": "string"},
                         "shop": {"type": "string"},
@@ -1284,6 +2739,8 @@ def install() -> None:
                     else:
                         tool_name = TOOL_NAME
                         tool_args = {"mode": mode}
+                        if mode == "phase_coverage":
+                            tool_args["coverage_focus"] = _phase_coverage_focus(user_message)
                         if (phase := _phase(user_message)):
                             tool_args["phase"] = phase
                         if (shop := _shop(user_message)):

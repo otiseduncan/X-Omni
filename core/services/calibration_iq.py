@@ -1632,6 +1632,42 @@ async def operator_snapshot(settings, repair_order_id: str) -> dict[str, Any]:
         return await _operator_snapshot_request(client, base, token, repair_order_id)
 
 
+async def operator_resolve_snapshot(
+    settings, repair_order_identifier: str
+) -> dict[str, Any]:
+    """Resolve an internal id or exact business RO number to one operator snapshot.
+
+    The operator snapshot endpoint accepts only Calibration IQ's internal id.  Field
+    workflows commonly start with the business RO number, so callers must not fall
+    back to the legacy collection summary (which omits optimistic versions and can
+    be ambiguous).  This public read wrapper reuses the same exhaustive, exact-match
+    resolver that protects operator mutations and returns only an authoritative
+    snapshot/id pair.
+    """
+    credentials = _operator_credentials(settings)
+    if isinstance(credentials, dict):
+        return credentials
+    _, token = credentials
+    base = await resolve_base(settings)
+    async with httpx.AsyncClient(
+        timeout=READ_TIMEOUT, trust_env=False, follow_redirects=False
+    ) as client:
+        resolved = await _resolve_operator_repair_order(
+            client, base, token, repair_order_identifier
+        )
+    if resolved.get("status") != "verified":
+        return resolved
+    return {
+        "status": "verified",
+        "executed": False,
+        "success": True,
+        "verified": True,
+        "repair_order_id": resolved["repair_order_id"],
+        "resolved_from": resolved.get("resolved_from"),
+        "snapshot": resolved["snapshot"],
+    }
+
+
 def _capability_operations(body: Any) -> set[str]:
     if not isinstance(body, dict):
         return set()
