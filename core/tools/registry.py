@@ -462,7 +462,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "description": (
             "List what the ADAS SI library actually contains -- documents and the "
             "vehicle applications they cover. Use this for coverage questions instead "
-            "of guessing whether a vehicle is supported."
+            "of guessing whether a vehicle is supported. Its artifact_kind_summary "
+            "field classifies each document as an ADAS Map report or OE service "
+            "information -- use that for document-type counts, never "
+            "summary.parsed_document_count, which only means filename identity was "
+            "readable and says nothing about document type."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },

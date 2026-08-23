@@ -1210,6 +1210,57 @@ def tool_result_for_model(name: str, result: Any) -> Any:
     return projected
 
 
+TOOL_RESULT_MODEL_CHAR_BUDGET = 12000
+
+
+def _bounded_tool_result_json(
+    value: Any, *, max_chars: int = TOOL_RESULT_MODEL_CHAR_BUDGET
+) -> str:
+    """Serialize a tool result for the model, preferring structural
+    truncation over a raw byte-level cut.
+
+    A flat ``json.dumps(value)[:max_chars]`` slice can amputate the JSON
+    mid-object -- for a large result (e.g. a library inventory over a
+    hundred-plus documents) this reliably lands inside a big list field and
+    silently deletes whatever comes after it, including any trailing
+    safety/evidence fields a tool author put there on purpose. Instead, when
+    the encoded result is too large, repeatedly shrink whichever top-level
+    list-valued field is currently largest -- keeping a leading slice of it
+    plus an explicit omitted-count marker -- until it fits. Scalar and dict
+    fields are never touched, so nothing that survives is ever more than
+    "some list got shorter"; the model always receives valid, complete JSON.
+    """
+    encoded = json.dumps(value, default=str)
+    if len(encoded) <= max_chars or not isinstance(value, dict):
+        return encoded[:max_chars]
+
+    trimmed = dict(value)
+    list_keys = [k for k, v in trimmed.items() if isinstance(v, list)]
+    while list_keys:
+        encoded = json.dumps(trimmed, default=str)
+        if len(encoded) <= max_chars:
+            break
+        biggest_key = max(
+            list_keys,
+            key=lambda k: len(json.dumps(trimmed.get(k), default=str)),
+        )
+        items = trimmed.get(biggest_key)
+        if not isinstance(items, list) or not items:
+            list_keys.remove(biggest_key)
+            continue
+        keep = len(items) - max(1, len(items) // 4)
+        removed = len(items) - keep
+        trimmed[biggest_key] = items[:keep]
+        omitted_key = f"{biggest_key}_omitted_count"
+        trimmed[omitted_key] = int(trimmed.get(omitted_key) or 0) + removed
+        if keep == 0:
+            list_keys.remove(biggest_key)
+    # A pathological case (e.g. one huge scalar string, no list fields left
+    # to shrink) falls back to the previous raw-cut behavior rather than
+    # emitting an even-larger-than-budget payload.
+    return encoded[:max_chars]
+
+
 def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
     """Choose media success cards only when result truth is self-consistent."""
     if name not in {"image_generate", "video_generate"}:
@@ -1901,9 +1952,9 @@ class Orchestrator:
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": name,
-                    "content": json.dumps(
-                        {"result": result, "execution_receipt": receipt}, default=str
-                    )[:12000],
+                    "content": _bounded_tool_result_json(
+                        {"result": result, "execution_receipt": receipt}
+                    ),
                 }
             )
             approved_events = [
@@ -2075,13 +2126,6 @@ class Orchestrator:
                 elif event["type"] == "tool_call":
                     tool_calls.append(event)
 
-            website_call_in_round = any(
-                call.get("name") == "website_preview_generate" for call in tool_calls
-            )
-            operator_call_in_round = any(
-                call.get("name") in _CALIBRATION_IQ_OPERATOR_TOOLS
-                for call in tool_calls
-            )
             operator_turn_active = bool(calibration_iq_operator_results)
             guarded_operator_response = bool(operator_turn_active and not tool_calls)
             guarded_web_response = bool(
@@ -2098,9 +2142,18 @@ class Orchestrator:
                     )
                 )
             )
+            # A round that produced a tool call may also have carried
+            # speculative prose ahead of it -- local models routinely narrate
+            # before deciding to call a tool, unlike tightly RLHF'd hosted
+            # models. That prose is provisional by construction: the model
+            # itself decided it needed more evidence in the same breath, so
+            # it must never reach the user or the persisted transcript as if
+            # it were a settled answer (a premature "I don't have access to
+            # X" is the observed failure mode). This subsumes the narrower
+            # website/operator-only checks this replaced -- any tool call
+            # this round, not just those two families, now seals its round.
             if (
-                not website_call_in_round
-                and not operator_call_in_round
+                not tool_calls
                 and not operator_turn_active
                 and not guarded_web_response
             ):
@@ -2118,7 +2171,7 @@ class Orchestrator:
                 guarded_text = web_research_fallback_summary(routed_result)
                 yield {"type": "token", "text": guarded_text}
                 full_text += guarded_text
-            elif not operator_call_in_round and not operator_turn_active:
+            elif not tool_calls and not operator_turn_active:
                 full_text += round_text
 
             if not tool_calls:
@@ -2297,7 +2350,7 @@ class Orchestrator:
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": name,
-                    "content": json.dumps(projected, default=str)[:12000],
+                    "content": _bounded_tool_result_json(projected),
                 }
             )
 

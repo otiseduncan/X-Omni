@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import unicodedata
 from contextlib import closing
 from dataclasses import dataclass
@@ -930,8 +931,18 @@ class AdasArtifactCatalog:
         )
         return "updated" if existing is not None else "added"
 
-    def reconcile_index(self) -> dict[str, Any]:
-        """Reconcile physical PDFs into the derived cache; never alter sources."""
+    def reconcile_index(self, *, max_seconds: Optional[float] = None) -> dict[str, Any]:
+        """Reconcile physical PDFs into the derived cache; never alter sources.
+
+        ``max_seconds`` bounds wall-clock time for an interactive caller: PDF
+        text extraction and hashing for a never-before-seen document is slow
+        (seconds per file), so an unbounded scan of a cold cache can run for
+        minutes. When the budget runs out mid-scan, already-processed rows
+        are committed and returned as a truthful partial result -- never as
+        a silent hang or a false "complete" count. A warm cache (everything
+        already indexed and unchanged) finishes almost immediately regardless
+        of the budget, since unchanged files are a cheap stat-only check.
+        """
 
         summary: dict[str, Any] = {
             "status": "success",
@@ -956,11 +967,17 @@ class AdasArtifactCatalog:
         )
         summary["physical_pdf_count"] = len(paths)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = None if max_seconds is None else time.monotonic() + max_seconds
+        scanned = 0
         with closing(sqlite3.connect(self.cache_path)) as db:
             db.row_factory = sqlite3.Row
             reindex_all = self._ensure_schema(db)
             current_paths = {str(path) for path in paths}
             for path in paths:
+                if deadline is not None and time.monotonic() >= deadline:
+                    summary["scan_complete"] = False
+                    summary["deadline_exceeded"] = True
+                    break
                 try:
                     existing = None
                     if not reindex_all:
@@ -979,6 +996,9 @@ class AdasArtifactCatalog:
                             "error": type(exc).__name__,
                         }
                     )
+                scanned += 1
+            summary["scanned_this_call"] = scanned
+            summary["unscanned_remaining"] = len(paths) - scanned
             rows = db.execute(
                 "SELECT path FROM artifact_catalog WHERE present=1"
             ).fetchall()
@@ -998,6 +1018,59 @@ class AdasArtifactCatalog:
         if summary["errors"]:
             summary["status"] = "partial_success"
         return summary
+
+    def artifact_kind_summary(self, *, max_seconds: float = 4.0) -> dict[str, Any]:
+        """Reconcile the physical index, then report counts by artifact kind.
+
+        This is the deterministic answer to "how many ADAS Map reports/OE
+        service documents are in the library" -- ``artifact_kind`` is decided
+        by ``_index_one`` from filename identity, a verified sidecar, or a
+        structural content match (never from a raw document count). A warm
+        cache (the common case once anything -- this call, or the weekly
+        Calibration IQ work-prep pass -- has indexed the library before)
+        costs one cheap directory walk. ``max_seconds`` bounds a cold-cache
+        first run so an interactive chat request can never hang for the
+        minutes a from-scratch PDF text/hash pass over the whole library can
+        take; an incomplete pass is reported honestly, not silently padded.
+        """
+        reconcile = self.reconcile_index(max_seconds=max_seconds)
+        by_kind: dict[str, dict[str, int]] = {}
+        with closing(sqlite3.connect(self.cache_path)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT artifact_kind,"
+                " COUNT(*) AS n,"
+                " SUM(CASE WHEN identity_verified=1 THEN 1 ELSE 0 END) AS identity_verified_n"
+                " FROM artifact_catalog WHERE present=1 GROUP BY artifact_kind"
+            ).fetchall()
+        for row in rows:
+            by_kind[str(row["artifact_kind"])] = {
+                "count": int(row["n"]),
+                "identity_verified_count": int(row["identity_verified_n"] or 0),
+            }
+        classified_count = sum(item["count"] for item in by_kind.values())
+        physical_pdf_count = int(reconcile.get("physical_pdf_count") or 0)
+        scan_complete = bool(reconcile.get("scan_complete"))
+        counts_are_final = bool(
+            scan_complete and classified_count >= physical_pdf_count
+        )
+        return {
+            "status": reconcile.get("status", "success"),
+            "scan_complete": scan_complete,
+            "counts_are_final": counts_are_final,
+            "physical_pdf_count": physical_pdf_count,
+            "classified_count": classified_count,
+            "unscanned_remaining": int(reconcile.get("unscanned_remaining") or 0),
+            "by_artifact_kind": by_kind,
+            "unreadable_count": int(reconcile.get("unreadable") or 0),
+            "reconcile_errors": reconcile.get("errors") or [],
+            "evidence_contract": {
+                "artifact_kind_is_a_content_classification_not_a_guess": True,
+                "unreadable_documents_are_not_excluded_from_physical_pdf_count": True,
+                "when_counts_are_final_is_false_the_by_artifact_kind_totals_are_"
+                "a_partial_scan_and_must_be_reported_as_partial": True,
+            },
+        }
 
     # ------------------------------------------------------------------
     # ScrapeX canonical provenance (strictly read-only)

@@ -297,6 +297,11 @@ class SourceInventory:
                 "source_documents": [d["title"] for d in supporting],
             })
 
+        # Field order matters here, not just content: a downstream transport
+        # bound (loop.py's model-facing tool feed) can truncate a large
+        # payload. Small, safety-critical fields (the evidence contract, the
+        # per-vehicle rollup) are ordered before the large per-document list
+        # so they survive even when "documents" itself gets cut.
         return {
             "status": "success",
             "authoritative_path": str(self.source_root),
@@ -306,13 +311,13 @@ class SourceInventory:
                 "parsed_document_count": len(docs) - len(unparsed),
                 "unparsed_document_count": len(unparsed),
             },
-            "documents": docs,
-            "applications": applications,
-            "unparsed_documents": unparsed,
             "evidence_contract": {
                 "authoritative_records_only": True,
                 "do_not_infer_records_from_counts": True,
             },
+            "applications": applications,
+            "unparsed_documents": unparsed,
+            "documents": docs,
         }
 
 
@@ -436,7 +441,44 @@ class AdasSI:
         snap = self.inventory.snapshot()
         snap["managed_path"] = str(self.managed_root)
         snap["cache_path"] = str(self.cache_path)
-        return snap
+        if snap.get("status") != "success":
+            return snap
+
+        # Rebuild in explicit key order rather than appending: the classifier
+        # summary is exactly the kind of small, high-value fact that a
+        # downstream transport-size truncation must not be allowed to cut
+        # before it reaches the model, so it belongs ahead of the large
+        # "documents" list, not after it.
+        ordered: dict[str, Any] = {}
+        for key in ("status", "authoritative_path", "summary", "evidence_contract"):
+            if key in snap:
+                ordered[key] = snap[key]
+        ordered["artifact_kind_summary"] = self._artifact_kind_summary()
+        for key, value in snap.items():
+            if key not in ordered:
+                ordered[key] = value
+        return ordered
+
+    def _artifact_kind_summary(self) -> dict[str, Any]:
+        """Deterministic ADAS Map vs. OE-service-information counts.
+
+        Deferred import: adas_artifact_catalog imports from this module, so
+        importing it at module scope here would be circular. A classifier
+        failure (e.g. the ScrapeX/pypdf runtime is unavailable) must not take
+        down the whole inventory read -- it degrades to an honest status
+        instead of a hard error on a read-only reporting tool.
+        """
+        try:
+            from . import adas_artifact_catalog
+        except ImportError as exc:
+            return {"status": "unavailable", "message": f"{type(exc).__name__}: {exc}"}
+        try:
+            catalog = adas_artifact_catalog.AdasArtifactCatalog(
+                self.source_root, self.cache_path
+            )
+            return catalog.artifact_kind_summary()
+        except Exception as exc:  # noqa: BLE001 - never break inventory_read on this
+            return {"status": "unavailable", "message": f"{type(exc).__name__}: {exc}"}
 
     def search(self, args: dict) -> dict[str, Any]:
         query = str(args.get("query") or "").strip()

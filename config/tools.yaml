@@ -129,7 +129,12 @@ tools:
 
   adas_si_inventory:
     tier: read_only
-    description: "List ADAS SI documents and the vehicle applications they cover."
+    description: >-
+      List ADAS SI documents and the vehicle applications they cover, plus an
+      artifact_kind_summary classifying each present document as an ADAS Map
+      report or OE service information. Use that summary for document-type
+      counts; parsed_document_count in the top-level summary is unrelated
+      (filename-identity readability only) and must not be used for that.
 
   adas_si_open:
     tier: read_only
