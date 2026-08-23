@@ -183,7 +183,10 @@ async def test_specific_ro_query_uses_full_operator_snapshot_and_proxy_urls(
     _install_transport(monkeypatch, handler)
     result = await ciq.get_repair_order(settings, {"repair_order_id": "ro-full"})
     assert result["status"] == "verified"
-    assert result["repair_order"]["Status"] == "RESEARCH"
+    # The operator snapshot's repair_order object carries no display_status
+    # of its own; a human label is derived from the raw enum rather than
+    # showing "RESEARCH" verbatim.
+    assert result["repair_order"]["Status"] == "Research"
     assert result["repair_order"]["Shop"] == "Macon"
     assert result["repair_order"]["requirements"][0]["id"] == "cal-1"
     assert result["raw"]["activity"][0]["id"] == "activity-1"

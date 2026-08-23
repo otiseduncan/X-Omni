@@ -15,7 +15,8 @@ than what blocks it:
     confirms the mutation completed
 
 Three XV12 bugs are deliberately not carried over; see the comments on
-_service_token, read_repair_orders, and _merge_counts.
+_service_token, read_repair_orders, and the page-merging logic in _collect
+(the pagination/dedup guard that replaced the old _merge_counts helper).
 
 The service token is read from the Calibration IQ project's own .env and
 never enters model context, the database, or the audit log.
@@ -446,8 +447,26 @@ def _shop_label(item: dict) -> str:
     return str(shop) if shop else "-"
 
 
+def _title_case_status(raw: Any) -> str:
+    """Best-effort human label from a SCREAMING_SNAKE_CASE status enum.
+
+    Calibration IQ's collection response pairs every raw status with its own
+    display_status (NEW_ARRIVAL / "New Arrival", CALIBRATION_COMPLETE /
+    "Calibration Complete", etc.) -- confirmed 1:1 against the live service.
+    This is only a fallback for shapes that omit the pretty label entirely
+    (the operator snapshot's repair_order object has no display_status at
+    all), so a raw enum is never shown, or matched against TERMINAL_STATUSES,
+    verbatim.
+    """
+    text = str(raw or "").strip()
+    return text.replace("_", " ").title() if text else ""
+
+
 def _status_of(item: dict) -> str:
-    return str(_dig(item, "display_status", "status_display", "status", default="")).strip()
+    label = _dig(item, "display_status", "status_display", default="")
+    if label:
+        return str(label).strip()
+    return _title_case_status(_dig(item, "status", default=""))
 
 
 def _normalized_label(value: Any) -> str:
@@ -525,7 +544,7 @@ def _ro_rows(items: list[dict]) -> list[dict]:
         rows.append({
             "RO": _dig(item, "ro_number", "roNumber", "number", "ro", default="-"),
             "Vehicle": _vehicle_label(item),
-            "Status": _dig(item, "display_status", "status_display", "status", default="-"),
+            "Status": _status_of(item) or "-",
             "Shop": _shop_label(item),
             "Phase": _phase_of(item),
             "id": _dig(item, "id", "repair_order_id", "uuid"),
@@ -832,7 +851,17 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
 
     Uses the first-class operator snapshot when available so history,
     research, managed documents, evidence and actors stay in session context.
-    Older detail/collection routes remain fallbacks for compatibility.
+    Both the snapshot route and the legacy detail route are keyed by
+    Calibration IQ's internal id (a strict primary-key lookup server-side),
+    not the human-facing RO number Otis actually uses in conversation --
+    confirmed against the live service, where both 404 for a bare RO number.
+    When neither identifier-shaped route resolves, the collection search
+    below is used to find the exact matching row, and its id is used for one
+    more snapshot request rather than settling for the collection row's
+    thinner shape. That row has no vin, activity, audit, prerequisites,
+    assessments, or photos -- silently returning it instead of retrying with
+    the resolved id would look like a complete, verified answer while
+    quietly dropping most of the detail Otis asked for.
     """
     base = await resolve_base(settings)
     token = _service_token(settings.calibration_iq_project_path)
@@ -850,23 +879,42 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=READ_TIMEOUT, trust_env=False) as client:
-            snapshot_url = f"{base}/operator/ros/{quote(ident, safe='')}/snapshot"
-            tried.append(snapshot_url)
-            resp = await client.get(snapshot_url, headers=_auth(token))
-            if resp.status_code == 200:
+
+            async def _try_snapshot(candidate: str) -> bool:
+                nonlocal item, raw_detail
+                snapshot_url = f"{base}/operator/ros/{quote(candidate, safe='')}/snapshot"
+                tried.append(snapshot_url)
+                resp = await client.get(snapshot_url, headers=_auth(token))
+                if resp.status_code != 200:
+                    return False
                 try:
                     snapshot_body = resp.json()
-                    raw_detail = _operator_snapshot_body(snapshot_body)
-                    ro = (raw_detail or {}).get("repair_order")
-                    if isinstance(ro, dict):
-                        item = dict(ro)
-                        if isinstance((raw_detail or {}).get("shop"), dict):
-                            item["shop"] = raw_detail["shop"]
-                        workflow = (raw_detail or {}).get("workflow")
-                        if isinstance(workflow, dict) and workflow.get("status"):
-                            item["status"] = workflow["status"]
                 except ValueError:
-                    raw_detail = None
+                    return False
+                detail = _operator_snapshot_body(snapshot_body)
+                ro = (detail or {}).get("repair_order")
+                if not isinstance(ro, dict):
+                    return False
+                built = dict(ro)
+                if isinstance((detail or {}).get("shop"), dict):
+                    built["shop"] = detail["shop"]
+                workflow = (detail or {}).get("workflow")
+                if isinstance(workflow, dict) and workflow.get("status"):
+                    workflow_status = workflow["status"]
+                    if _normalized_label(built.get("status")) != _normalized_label(
+                        workflow_status
+                    ):
+                        # workflow is the fresher source here, but it carries
+                        # only the raw enum, not a pretty label -- show that
+                        # honestly rather than keep a display_status that
+                        # described the status this is now overriding.
+                        built["display_status"] = None
+                    built["status"] = workflow_status
+                item = built
+                raw_detail = detail
+                return True
+
+            await _try_snapshot(ident)
 
             url = f"{base}/ros/{ident}"
             if item is None:
@@ -890,7 +938,10 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
                         item = None
 
             if item is None:
-                # Fall back to searching the board for that RO number.
+                # Neither identifier-shaped route recognized `ident` -- it is
+                # most likely the human RO number. Resolve it via search, then
+                # retry the rich snapshot with the id search proves is the
+                # exact match, instead of settling for the collection row.
                 url = f"{base}/collection/ros"
                 tried.append(f"{url}?q={ident}")
                 resp = await client.get(url, params={"q": ident, "limit": 5},
@@ -904,7 +955,19 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
                         f for f in found
                         if str(_dig(f, "ro_number", "roNumber", "number", default="")).strip() == ident
                     ]
-                    item = (exact or found or [None])[0]
+                    match = (exact or found or [None])[0]
+                    resolved_id = (
+                        str(_dig(match, "id", "repair_order_id", "uuid") or "").strip()
+                        if isinstance(match, dict)
+                        else ""
+                    )
+                    if not (
+                        resolved_id
+                        and resolved_id != ident
+                        and await _try_snapshot(resolved_id)
+                    ):
+                        item = match
+                        raw_detail = match if isinstance(match, dict) else None
     except httpx.HTTPError as exc:
         return {"status": "offline", "repair_order": None, "error": type(exc).__name__,
                 "message": f"Calibration IQ is not reachable at {base}."}
