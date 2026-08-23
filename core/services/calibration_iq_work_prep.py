@@ -1047,6 +1047,121 @@ def _valid_context(value: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def _research_state_and_version(snapshot: dict[str, Any]) -> tuple[str, Optional[int]]:
+    state = re.sub(
+        r"[\s-]+", "_",
+        str(calibration_iq._dig(  # noqa: SLF001
+            snapshot,
+            "research.state",
+            "research_case.state",
+            "research_state",
+            "repair_order.research_state",
+            default="",
+        ) or "").strip().casefold(),
+    )
+    version = calibration_iq._dig(  # noqa: SLF001
+        snapshot, "research.version", "research_case.version", default=None
+    )
+    if not isinstance(version, int) or isinstance(version, bool) or version <= 0:
+        version = None
+    return state, version
+
+
+def _operator_count(result: dict[str, Any], key: str) -> int:
+    value = result.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _operator_result_snapshot(result: Any, repair_order_id: str) -> Optional[dict[str, Any]]:
+    if not isinstance(result, dict):
+        return None
+    final_snapshots = result.get("final_snapshots")
+    if not isinstance(final_snapshots, dict):
+        return None
+    envelope = final_snapshots.get(repair_order_id)
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("status") != "verified"
+        or not isinstance(envelope.get("snapshot"), dict)
+    ):
+        return None
+    return dict(envelope["snapshot"])
+
+
+def _operator_may_have_executed(result: Any) -> bool:
+    return bool(
+        isinstance(result, dict)
+        and (
+            result.get("executed") is True
+            or result.get("may_have_executed") is True
+            or any(isinstance(item, dict) for item in (result.get("receipts") or []))
+        )
+    )
+
+
+def _merge_operator_results(
+    first: dict[str, Any],
+    second: dict[str, Any],
+    *,
+    second_requested_count: int,
+) -> dict[str, Any]:
+    receipts = [
+        receipt
+        for result in (first, second)
+        for receipt in (result.get("receipts") or [])
+        if isinstance(receipt, dict)
+    ]
+    requested_count = max(_operator_count(first, "requested_count"), 1) + max(
+        _operator_count(second, "requested_count"), second_requested_count
+    )
+    processed_count = sum(
+        max(
+            _operator_count(result, "processed_count"),
+            len([receipt for receipt in (result.get("receipts") or []) if isinstance(receipt, dict)]),
+        )
+        for result in (first, second)
+    )
+    verified_count = sum(
+        1
+        for receipt in receipts
+        if receipt.get("status") == "completed"
+        and receipt.get("success") is True
+        and isinstance(receipt.get("verification"), dict)
+        and receipt["verification"].get("verified") is True
+    )
+    success = bool(
+        first.get("success") is True
+        and first.get("verified") is True
+        and second.get("success") is True
+        and second.get("verified") is True
+    )
+    combined = {
+        **second,
+        "status": str(second.get("status") or "success")
+        if success else "partial_success" if verified_count else "failed",
+        "executed": first.get("executed") is True or second.get("executed") is True,
+        "success": success,
+        "verified": success,
+        "partial": not success and verified_count > 0,
+        "requested_count": requested_count,
+        "processed_count": processed_count,
+        "verified_count": verified_count,
+        "receipts": receipts,
+        "research_reopen_attempted": True,
+        "research_reopened": True,
+    }
+    if not isinstance(combined.get("error"), dict):
+        receipt_error = next(
+            (receipt.get("error") for receipt in receipts if isinstance(receipt.get("error"), dict)),
+            None,
+        )
+        if receipt_error is not None:
+            combined["error"] = receipt_error
+    return combined
+
+
 async def _reconcile_one(
     settings: Any,
     adas: Any,
@@ -1067,24 +1182,207 @@ async def _reconcile_one(
             "verified": False,
             "message": "X could identify missing CIQ requirements from ADAS Map but the authoritative turn identity was unavailable, so nothing was changed.",
         }
-    nested_context = {
-        **context,
-        "tool_call_id": f"{context['tool_call_id']}-adas-map-{ro_id[:12]}",
-    }
+
+    def nested_context(suffix: str) -> dict[str, Any]:
+        return {
+            **context,
+            "tool_call_id": f"{context['tool_call_id']}-adas-map-{suffix}-{ro_id[:12]}",
+        }
+
+    research_reopen_result: Optional[dict[str, Any]] = None
+    research_state, research_version = _research_state_and_version(snapshot)
+    if research_state in {"complete", "completed", "research_complete"}:
+        if research_version is None:
+            return snapshot, actions, {
+                "status": "research_version_missing",
+                "executed": False,
+                "success": False,
+                "verified": False,
+                "message": "Calibration IQ research is complete, but its authoritative version is unavailable; X did not reopen or change the RO.",
+            }
+        research_reopen_result = await calibration_iq.operator_execute(
+            settings,
+            adas,
+            {
+                "actions": [{
+                    "operation": "update_research",
+                    "repair_order_id": ro_id,
+                    "expected_version": research_version,
+                    "arguments": {
+                        "state": "research_in_progress",
+                        "reason": "Reopened by X to reconcile governing ADAS Map calibration requirements.",
+                    },
+                }],
+                "continue_on_error": False,
+                calibration_iq._INVOCATION_CONTEXT_KEY: nested_context("reopen"),  # noqa: SLF001
+            },
+        )
+        if not isinstance(research_reopen_result, dict):
+            reread = await calibration_iq.operator_snapshot(settings, ro_id)
+            post_snapshot = (
+                dict(reread["snapshot"])
+                if reread.get("status") == "verified" and isinstance(reread.get("snapshot"), dict)
+                else None
+            )
+            return post_snapshot or snapshot, actions, {
+                "status": "invalid_response",
+                "executed": True,
+                "success": False,
+                "verified": False,
+                "partial": False,
+                "requested_count": 1,
+                "processed_count": 0,
+                "receipts": [],
+                "may_have_executed": True,
+                "indeterminate": True,
+                "research_reopen_attempted": True,
+                "research_reopened": False,
+                "authoritative_reread": reread,
+            }
+
+        reopened_snapshot = _operator_result_snapshot(research_reopen_result, ro_id)
+        reopen_reread = (
+            (research_reopen_result.get("final_snapshots") or {}).get(ro_id)
+            if isinstance(research_reopen_result.get("final_snapshots"), dict)
+            else None
+        )
+        if reopened_snapshot is None and _operator_may_have_executed(research_reopen_result):
+            reopen_reread = await calibration_iq.operator_snapshot(settings, ro_id)
+            if reopen_reread.get("status") == "verified" and isinstance(reopen_reread.get("snapshot"), dict):
+                reopened_snapshot = dict(reopen_reread["snapshot"])
+
+        reopened_state, reopened_version = (
+            _research_state_and_version(reopened_snapshot)
+            if isinstance(reopened_snapshot, dict) else ("", None)
+        )
+        reopen_receipts = [
+            receipt for receipt in (research_reopen_result.get("receipts") or [])
+            if isinstance(receipt, dict)
+        ]
+        reopen_receipt = reopen_receipts[0] if len(reopen_receipts) == 1 else {}
+        receipt_state, receipt_version = _research_state_and_version(
+            {"research": reopen_receipt.get("after")}
+            if isinstance(reopen_receipt.get("after"), dict) else {}
+        )
+        reopen_verified = bool(
+            len(reopen_receipts) == 1
+            and _operator_count(research_reopen_result, "requested_count") == 1
+            and _operator_count(research_reopen_result, "processed_count") == 1
+            and calibration_iq._receipt_verified(reopen_receipt)  # noqa: SLF001
+            and reopen_receipt.get("operation") == "update_research"
+            and str(reopen_receipt.get("repair_order_id") or "").strip() == ro_id
+            and receipt_state == "research_in_progress"
+            and receipt_version is not None
+            and receipt_version > research_version
+            and reopened_snapshot is not None
+            and reopened_state == "research_in_progress"
+            and reopened_version is not None
+            and reopened_version > research_version
+        )
+        if not reopen_verified:
+            return reopened_snapshot or snapshot, actions, {
+                **research_reopen_result,
+                "status": "verification_failed"
+                if research_reopen_result.get("success") is True
+                else str(research_reopen_result.get("status") or "failed"),
+                "success": False,
+                "verified": False,
+                "research_reopen_attempted": True,
+                "research_reopened": False,
+                "message": "Calibration IQ did not prove the required research reopen; no calibration reconciliation was attempted.",
+                "authoritative_reread": reopen_reread
+                if isinstance(reopen_reread, dict)
+                else {"status": "unavailable", "message": "Calibration IQ did not return a verified final snapshot."},
+            }
+
+        research_reopen_result = {
+            **research_reopen_result,
+            "status": "success",
+            "success": True,
+            "verified": True,
+            "partial": False,
+            "requested_count": 1,
+            "processed_count": 1,
+            "final_snapshots": {
+                **(research_reopen_result.get("final_snapshots")
+                   if isinstance(research_reopen_result.get("final_snapshots"), dict) else {}),
+                ro_id: {"status": "verified", "snapshot": reopened_snapshot},
+            },
+            "verification_recovered_by_reread": bool(
+                reopen_reread is not None
+                and (research_reopen_result.get("success") is not True
+                     or research_reopen_result.get("verified") is not True)
+            ),
+        }
+        snapshot = dict(reopened_snapshot)
+        actions = build_reconciliation_actions(snapshot, map_info, ro_id)
+        if not actions:
+            return snapshot, [], {
+                **research_reopen_result,
+                "research_reopen_attempted": True,
+                "research_reopened": True,
+                "research_version_before": research_version,
+                "research_version_after": reopened_version,
+            }
+
     result = await calibration_iq.operator_execute(
         settings,
         adas,
         {
             "actions": actions,
             "continue_on_error": False,
-            calibration_iq._INVOCATION_CONTEXT_KEY: nested_context,  # noqa: SLF001
+            calibration_iq._INVOCATION_CONTEXT_KEY: nested_context("requirements"),  # noqa: SLF001
         },
     )
-    if not isinstance(result, dict) or result.get("success") is not True or result.get("verified") is not True:
-        return snapshot, actions, result if isinstance(result, dict) else {"status": "invalid_response"}
-    reread = await calibration_iq.operator_snapshot(settings, ro_id)
-    if reread.get("status") == "verified" and isinstance(reread.get("snapshot"), dict):
-        return dict(reread["snapshot"]), actions, result
+    if not isinstance(result, dict):
+        reread = await calibration_iq.operator_snapshot(settings, ro_id)
+        final_snapshot = (
+            dict(reread["snapshot"])
+            if reread.get("status") == "verified" and isinstance(reread.get("snapshot"), dict)
+            else None
+        )
+        invalid_result = {
+            "status": "invalid_response",
+            "executed": True,
+            "success": False,
+            "verified": False,
+            "partial": False,
+            "requested_count": len(actions),
+            "processed_count": 0,
+            "receipts": [],
+            "may_have_executed": True,
+            "indeterminate": True,
+            "authoritative_reread": reread,
+        }
+        if research_reopen_result is not None:
+            invalid_result = {
+                **_merge_operator_results(
+                    research_reopen_result, invalid_result,
+                    second_requested_count=len(actions),
+                ),
+                "research_version_before": research_version,
+                "research_version_after": _research_state_and_version(final_snapshot or snapshot)[1],
+            }
+        return final_snapshot or snapshot, actions, invalid_result
+
+    final_snapshot = _operator_result_snapshot(result, ro_id)
+    if final_snapshot is None and _operator_may_have_executed(result):
+        reread = await calibration_iq.operator_snapshot(settings, ro_id)
+        if reread.get("status") == "verified" and isinstance(reread.get("snapshot"), dict):
+            final_snapshot = dict(reread["snapshot"])
+    if research_reopen_result is not None:
+        result = {
+            **_merge_operator_results(
+                research_reopen_result, result,
+                second_requested_count=len(actions),
+            ),
+            "research_version_before": research_version,
+            "research_version_after": _research_state_and_version(final_snapshot or snapshot)[1],
+        }
+    if final_snapshot is not None:
+        return final_snapshot, actions, result
+    if result.get("success") is not True or result.get("verified") is not True:
+        return snapshot, actions, result
     return snapshot, actions, {
         **result,
         "status": "verification_failed",
@@ -1092,7 +1390,10 @@ async def _reconcile_one(
         "success": False,
         "verified": False,
         "message": "Calibration IQ accepted the ADAS Map reconciliation but the authoritative reread failed.",
-        "authoritative_reread": reread,
+        "authoritative_reread": {
+            "status": "unavailable",
+            "message": "Calibration IQ did not return a verified final snapshot.",
+        },
     }
 
 
@@ -1149,9 +1450,7 @@ async def _ro_requirements(
         )
     )
     reconciliation_executed = bool(
-        planned
-        and reconciliation is not None
-        and reconciliation.get("executed") is True
+        reconciliation is not None and reconciliation.get("executed") is True
     )
     return {
         "status": "success" if reconcile_ok else "partial_success",
@@ -1338,6 +1637,13 @@ def _compact_reconciliation_result(
             "processed_count",
             "verified_count",
             "stopped_on_error",
+            "research_reopen_attempted",
+            "research_reopened",
+            "research_version_before",
+            "research_version_after",
+            "may_have_executed",
+            "indeterminate",
+            "verification_recovered_by_reread",
         )
         if key in value
     }

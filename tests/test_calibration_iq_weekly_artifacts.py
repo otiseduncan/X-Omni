@@ -350,6 +350,9 @@ def test_readiness_compaction_prioritizes_receipt_risk_and_declares_list_samples
             "executed": True,
             "success": False,
             "verified": False,
+            "may_have_executed": True,
+            "indeterminate": True,
+            "verification_recovered_by_reread": False,
             "processed_count": 5,
             "receipts": receipts,
         },
@@ -361,6 +364,9 @@ def test_readiness_compaction_prioritizes_receipt_risk_and_declares_list_samples
 
     assert compact["reconciliation"]["receipt_count"] == 5
     assert compact["reconciliation"]["critical_receipt_count"] == 1
+    assert compact["reconciliation"]["may_have_executed"] is True
+    assert compact["reconciliation"]["indeterminate"] is True
+    assert compact["reconciliation"]["verification_recovered_by_reread"] is False
     assert compact["reconciliation"]["receipts"][0]["mutation_id"] == "critical-last"
     assert (
         compact["reconciliation"]["receipts"][0]["verification"]["reason"]
@@ -654,6 +660,317 @@ def test_weekly_summary_is_bounded_and_reports_three_state_counts():
     assert "ADAS SI: 6 fully covered; 1 genuinely missing; 3 unverified" in summary
     assert summary.count("\nRO ") == 3
     assert "7 additional RO exception(s)" in summary
+
+
+def _operator_context() -> dict:
+    return {
+        "conversation_id": 11,
+        "message_id": 22,
+        "tool_call_id": "weekly-reconcile",
+        "user_id": "owner",
+        "role": "owner",
+    }
+
+
+def _research_snapshot(state: str, version: int, calibrations=None) -> dict:
+    snapshot = _snapshot("ro-1", "100", "1HGCM82633A004352")
+    snapshot["calibrations"] = list(calibrations or [])
+    snapshot["research"] = {
+        "id": "research-1",
+        "state": state,
+        "version": version,
+    }
+    return snapshot
+
+
+def _completed_receipt(operation: str, after: dict) -> dict:
+    return {
+        "operation": operation,
+        "repair_order_id": "ro-1",
+        "status": "completed",
+        "success": True,
+        "verification": {"verified": True},
+        "after": after,
+    }
+
+
+def _failed_receipt(operation: str, code: str) -> dict:
+    return {
+        "operation": operation,
+        "repair_order_id": "ro-1",
+        "status": "failed",
+        "success": False,
+        "verification": {"verified": False},
+        "error": {"code": code},
+    }
+
+
+def _operator_result(receipt: dict, snapshot: dict, *, success: bool) -> dict:
+    return {
+        "status": "success" if success else "failed",
+        "executed": True,
+        "success": success,
+        "verified": success,
+        "partial": False,
+        "requested_count": 1,
+        "processed_count": 1,
+        "receipts": [receipt],
+        "final_snapshots": {"ro-1": {"status": "verified", "snapshot": snapshot}},
+        **({} if success else {"error": receipt.get("error")}),
+    }
+
+
+def _front_camera_map() -> dict:
+    return {
+        "status": "verified",
+        "requirements": [{"label": "Front Camera", "method": "STATIC"}],
+        "sources": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_completed_research_reopens_then_rebuilds_and_reconciles_requirements(
+    monkeypatch,
+):
+    initial = _research_snapshot("research_complete", 4)
+    reopened = _research_snapshot("research_in_progress", 5)
+    calibration = {
+        "id": "cal-front-camera",
+        "calibration_type": "Front Camera",
+        "determination": "REQUIRED",
+        "method": "STATIC",
+        "version": 1,
+    }
+    reconciled = _research_snapshot("research_in_progress", 5, [calibration])
+    calls: list[dict] = []
+
+    async def execute(_settings, _adas, arguments):
+        calls.append(arguments)
+        operation = arguments["actions"][0]["operation"]
+        if operation == "update_research":
+            return _operator_result(
+                _completed_receipt(operation, reopened["research"]),
+                reopened,
+                success=True,
+            )
+        assert operation == "add_calibration"
+        return _operator_result(
+            _completed_receipt(operation, calibration), reconciled, success=True
+        )
+
+    monkeypatch.setattr(prep.calibration_iq, "operator_execute", execute)
+    final, actions, result = await prep._reconcile_one(
+        SimpleNamespace(), SimpleNamespace(), initial, _front_camera_map(),
+        _operator_context(),
+    )
+
+    assert [call["actions"][0]["operation"] for call in calls] == [
+        "update_research", "add_calibration"
+    ]
+    reopen = calls[0]["actions"][0]
+    assert reopen["expected_version"] == 4
+    assert reopen["arguments"]["state"] == "research_in_progress"
+    assert "governing ADAS Map" in reopen["arguments"]["reason"]
+    context_key = prep.calibration_iq._INVOCATION_CONTEXT_KEY
+    assert calls[0][context_key]["tool_call_id"] != calls[1][context_key]["tool_call_id"]
+    assert actions[0]["operation"] == "add_calibration"
+    assert final == reconciled
+    assert prep._reconciliation_issues(final, _front_camera_map()) == []
+    assert result["success"] is result["verified"] is True
+    assert result["research_reopened"] is True
+    assert result["research_version_before"] == 4
+    assert result["research_version_after"] == 5
+    assert (result["requested_count"], result["processed_count"], result["verified_count"]) == (2, 2, 2)
+    assert [item["operation"] for item in result["receipts"]] == [
+        "update_research", "add_calibration"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_research_reopen_stops_and_returns_verified_post_state(monkeypatch):
+    initial = _research_snapshot("research_complete", 4)
+    post_state = _research_snapshot("research_complete", 5)
+    calls = 0
+
+    async def execute(_settings, _adas, _arguments):
+        nonlocal calls
+        calls += 1
+        receipt = _failed_receipt("update_research", "version_conflict")
+        return _operator_result(receipt, post_state, success=False)
+
+    monkeypatch.setattr(prep.calibration_iq, "operator_execute", execute)
+    final, actions, result = await prep._reconcile_one(
+        SimpleNamespace(), SimpleNamespace(), initial, _front_camera_map(),
+        _operator_context(),
+    )
+
+    assert calls == 1
+    assert actions[0]["operation"] == "add_calibration"
+    assert final == post_state
+    assert result["success"] is result["verified"] is False
+    assert result["research_reopened"] is False
+    assert result["receipts"][0]["error"]["code"] == "version_conflict"
+
+
+@pytest.mark.asyncio
+async def test_failed_reopen_without_final_snapshot_uses_authoritative_fallback(monkeypatch):
+    initial = _research_snapshot("research_complete", 4)
+    post_state = _research_snapshot("research_complete", 5)
+    execute_calls = snapshot_calls = 0
+
+    async def execute(_settings, _adas, _arguments):
+        nonlocal execute_calls
+        execute_calls += 1
+        receipt = _failed_receipt("update_research", "version_conflict")
+        result = _operator_result(receipt, post_state, success=False)
+        result.pop("final_snapshots")
+        return result
+
+    async def reread(_settings, _ro_id):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return {"status": "verified", "snapshot": post_state}
+
+    monkeypatch.setattr(prep.calibration_iq, "operator_execute", execute)
+    monkeypatch.setattr(prep.calibration_iq, "operator_snapshot", reread)
+    final, _actions, result = await prep._reconcile_one(
+        SimpleNamespace(), SimpleNamespace(), initial, _front_camera_map(),
+        _operator_context(),
+    )
+
+    assert (execute_calls, snapshot_calls) == (1, 1)
+    assert final == post_state
+    assert result["research_reopened"] is False
+    assert result["authoritative_reread"]["status"] == "verified"
+
+
+@pytest.mark.asyncio
+async def test_indeterminate_reopen_response_rereads_state_and_stops(monkeypatch):
+    initial = _research_snapshot("research_complete", 4)
+    post_state = _research_snapshot("research_in_progress", 5)
+    execute_calls = snapshot_calls = 0
+
+    async def execute(_settings, _adas, _arguments):
+        nonlocal execute_calls
+        execute_calls += 1
+        return None
+
+    async def reread(_settings, _ro_id):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return {"status": "verified", "snapshot": post_state}
+
+    monkeypatch.setattr(prep.calibration_iq, "operator_execute", execute)
+    monkeypatch.setattr(prep.calibration_iq, "operator_snapshot", reread)
+    final, _actions, result = await prep._reconcile_one(
+        SimpleNamespace(), SimpleNamespace(), initial, _front_camera_map(),
+        _operator_context(),
+    )
+
+    assert (execute_calls, snapshot_calls) == (1, 1)
+    assert final == post_state
+    assert result["status"] == "invalid_response"
+    assert result["may_have_executed"] is result["indeterminate"] is True
+    assert result["success"] is result["verified"] is False
+    assert result["research_reopened"] is False
+    assert result["authoritative_reread"]["status"] == "verified"
+
+
+@pytest.mark.asyncio
+async def test_verified_reopen_then_failed_calibration_preserves_partial_truth(monkeypatch):
+    initial = _research_snapshot("research_complete", 4)
+    reopened = _research_snapshot("research_in_progress", 5)
+    calls = 0
+
+    async def execute(_settings, _adas, arguments):
+        nonlocal calls
+        calls += 1
+        operation = arguments["actions"][0]["operation"]
+        if calls == 1:
+            return _operator_result(
+                _completed_receipt(operation, reopened["research"]),
+                reopened,
+                success=True,
+            )
+        return _operator_result(
+            _failed_receipt(operation, "prerequisite_missing"),
+            reopened,
+            success=False,
+        )
+
+    monkeypatch.setattr(prep.calibration_iq, "operator_execute", execute)
+    final, actions, result = await prep._reconcile_one(
+        SimpleNamespace(), SimpleNamespace(), initial, _front_camera_map(),
+        _operator_context(),
+    )
+
+    assert calls == 2
+    assert actions[0]["operation"] == "add_calibration"
+    assert final == reopened
+    assert prep._reconciliation_issues(final, _front_camera_map()) == [
+        {"code": "required_item_missing", "calibration": "Front Camera"}
+    ]
+    assert result["status"] == "partial_success"
+    assert result["executed"] is result["partial"] is True
+    assert result["success"] is result["verified"] is False
+    assert result["research_reopened"] is True
+    assert (result["requested_count"], result["processed_count"], result["verified_count"]) == (2, 2, 1)
+    assert result["error"]["code"] == "prerequisite_missing"
+
+
+@pytest.mark.asyncio
+async def test_weekly_partial_reopen_does_not_overstate_added_requirements(
+    monkeypatch, tmp_path
+):
+    snapshot = _research_snapshot("research_in_progress", 5)
+    reopen_receipt = _completed_receipt("update_research", snapshot["research"])
+    failed_receipt = _failed_receipt("add_calibration", "prerequisite_missing")
+
+    async def query(_settings, _filters):
+        return {"status": "verified", "items": [{"id": "ro-1", "ro_number": "100", "phase": 5}]}
+
+    async def load(_settings, _identifier):
+        return {"status": "verified", "snapshot": snapshot}
+
+    async def discover(_catalog, _snapshot):
+        return _front_camera_map()
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        action = {"operation": "add_calibration", "repair_order_id": "ro-1", "arguments": {}}
+        return current, [action], {
+            "status": "partial_success",
+            "executed": True,
+            "success": False,
+            "verified": False,
+            "partial": True,
+            "requested_count": 2,
+            "processed_count": 2,
+            "verified_count": 1,
+            "receipts": [reopen_receipt, failed_receipt],
+            "research_reopened": True,
+        }
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_for", lambda _adas: _Catalog())
+    result = await prep._week_readiness(
+        SimpleNamespace(root=tmp_path), SimpleNamespace(),
+        {"phase": "5", prep._CONTEXT_KEY: _operator_context()},
+    )
+
+    assert result["executed"] is True
+    assert result["ciq_mutations_processed_count"] == 2
+    assert result["ciq_receipt_count"] == 2
+    assert result["ciq_verified_receipt_count"] == 1
+    assert result["ciq_requirements_added_or_reactivated"] == 0
+    assert result["reconciliation_failed_count"] == 1
+    row = result["repair_orders"][0]
+    assert row["status"] == "reconciliation_failed"
+    assert row["reconciliation_issues"] == [
+        {"code": "required_item_missing", "calibration": "Front Camera"}
+    ]
 
 
 @pytest.mark.asyncio

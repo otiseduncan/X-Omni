@@ -1063,6 +1063,8 @@ def _operator_error(
     retryable: bool = False,
     details: Optional[dict[str, Any]] = None,
     executed: bool = False,
+    may_have_executed: bool = False,
+    indeterminate: bool = False,
 ) -> dict[str, Any]:
     error = {
         "code": str(code or "operation_failed"),
@@ -1071,7 +1073,7 @@ def _operator_error(
         "retryable": bool(retryable),
         "details": dict(details or {}),
     }
-    return {
+    result = {
         "status": error["code"],
         "executed": bool(executed),
         "success": False,
@@ -1081,9 +1083,19 @@ def _operator_error(
         "error": error,
         "message": error["message"],
     }
+    if may_have_executed:
+        result["may_have_executed"] = True
+    if indeterminate:
+        result["indeterminate"] = True
+    return result
 
 
-def _response_error(resp: httpx.Response, *, executed: bool = False) -> dict[str, Any]:
+def _response_error(
+    resp: httpx.Response,
+    *,
+    executed: bool = False,
+    may_have_executed: bool = False,
+) -> dict[str, Any]:
     mapping = {
         400: ("invalid_input", False),
         401: ("unauthorized", False),
@@ -1126,6 +1138,8 @@ def _response_error(resp: httpx.Response, *, executed: bool = False) -> dict[str
         retryable=retryable,
         details=details,
         executed=executed,
+        may_have_executed=may_have_executed,
+        indeterminate=may_have_executed,
     )
 
 
@@ -2609,12 +2623,17 @@ async def operator_execute(
         except httpx.HTTPError as exc:
             return _operator_error(
                 "temporary_service_failure",
-                "Calibration IQ is not reachable. No completed receipt was received.",
+                "Calibration IQ did not return an action receipt; the request may have reached the service, so authoritative state must be reread.",
                 retryable=True,
                 details={"exception": type(exc).__name__},
+                may_have_executed=True,
+                indeterminate=True,
             )
         if response.status_code >= 400:
-            return _response_error(response)
+            return _response_error(
+                response,
+                may_have_executed=response.status_code >= 500,
+            )
         try:
             payload = response.json()
         except ValueError:

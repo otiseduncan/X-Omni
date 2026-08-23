@@ -281,6 +281,50 @@ def test_operator_url_mapping_rewrites_only_explicit_genuine_backend_urls():
 
 
 @pytest.mark.asyncio
+async def test_operator_post_transport_failure_is_indeterminate_after_send(
+    settings, monkeypatch,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/operator/capabilities"):
+            return httpx.Response(200, json=_capabilities(["add_note"]))
+        if request.url.path.endswith("/operator/ros/ro-1/snapshot"):
+            return httpx.Response(200, json={
+                "repair_order": {"id": "ro-1", "ro_number": "100"},
+                "research": {"state": "research_in_progress", "version": 2},
+            })
+        if request.url.path.endswith("/operator/actions"):
+            raise httpx.ReadTimeout("response lost after send", request=request)
+        raise AssertionError(str(request.url))
+
+    _install_transport(monkeypatch, handler)
+    result = await ciq.operator_execute(settings, object(), {
+        "actions": [{
+            "operation": "add_note",
+            "repair_order_id": "ro-1",
+            "arguments": {"body": "ADAS Map reconciliation note"},
+        }],
+        ciq._INVOCATION_CONTEXT_KEY: _context("transport-ambiguous"),
+    })
+
+    assert result["status"] == "temporary_service_failure"
+    assert result["executed"] is False
+    assert result["success"] is result["verified"] is False
+    assert result["may_have_executed"] is True
+    assert result["indeterminate"] is True
+
+
+def test_operator_server_error_after_post_is_indeterminate():
+    response = httpx.Response(
+        503,
+        json={"detail": "upstream response unavailable"},
+        request=httpx.Request("POST", "http://ciq/operator/actions"),
+    )
+    result = ciq._response_error(response, may_have_executed=True)
+    assert result["status"] == "temporary_service_failure"
+    assert result["may_have_executed"] is result["indeterminate"] is True
+
+
+@pytest.mark.asyncio
 async def test_new_routine_parity_operations_reach_one_verified_backend_batch(
     settings, monkeypatch,
 ):
