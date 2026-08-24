@@ -39,6 +39,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -55,6 +56,15 @@ try:
     import pypdfium2 as pdfium
 except ImportError:  # pragma: no cover - page images degrade to the PDF link
     pdfium = None
+
+# PDFium's C library is not safe for concurrent use across threads. A search
+# runs several adas.search() calls in parallel (one per calibration
+# requirement, via asyncio.to_thread), and the chat UI opens several page
+# images at once -- both paths land here from different threads at the same
+# time. Without this lock, concurrent PdfDocument access crashes the native
+# library instead of raising a catchable Python exception, which is why a
+# page could fail to render with no error ever reaching the log.
+_PDFIUM_LOCK = threading.Lock()
 
 MANAGED_DIRNAME = "_xomni_managed"
 BACKUP_DIRNAME = "_xomni_backups"
@@ -102,12 +112,43 @@ PLATFORM_RE = re.compile(r"\(([^()]{1,24})\)")
 # ADAS abbreviations such as BSM/BSD/IPMA/CCM are topic markers, not part of a
 # vehicle model.  Recognizing them here keeps filenames such as
 # "2021 Jeep Cherokee BSM Calibration.pdf" indexed as model=\"Cherokee\".
+#
+# Filenames abbreviate inconsistently ("Prk Sens", "prk assit", "Millimeterwave
+# radar"). An unrecognized topic word doesn't just fail to score a topic bonus
+# -- it falls through to the "no boundary found" branch below, which folds the
+# whole remainder (topic word included) into the model, breaking the model
+# match for every other bonus too. Every real variant seen in the library
+# needs an entry here, or that one document silently loses to less relevant
+# ones that happen to use a spelled-out word already on this list.
 TOPIC_RE = re.compile(
-    r"\b(front camera|forward camera|forward facing camera|rear camera|surround view|"
-    r"blind spot|bsm|bsd|eyesight|ipma|ccm|adaptive cruise|lane keep|lane departure|"
-    r"park assist|night vision|radar|lidar|windshield|calibration|alignment|abs|airbag)\b",
+    r"\b(front camera|forward camera|forward facing camera|rear camera|rearview camera|"
+    r"surround view|360|"
+    r"blind spot|bsm|bsd|eyesight|ipma|ccm|acc|lkas|adaptive cruise|lane keep|lane departure|"
+    r"parking sensor|prk sens|parking assist|prk assit|prk asst|park assist|"
+    r"millimeter\s*wave\s*radar|mm[\s-]?wave radar|"
+    r"night vision|radar|lidar|windshield|calibration|alignment|abs|airbag)\b",
     re.IGNORECASE,
 )
+
+# Canonical labels for topic variants whose literal filename text would never
+# appear in a spelled-out query (e.g. a technician asking for "parking sensor
+# calibration" will never type "prk sens"). Only entries whose raw captured
+# text needs normalizing are listed; everything else keeps its title-cased
+# capture as before.
+TOPIC_CANONICAL = {
+    "Prk Sens": "Parking Sensor",
+    "Prk Assit": "Park Assist",
+    "Prk Asst": "Park Assist",
+    "Parking Assist": "Park Assist",
+    "Millimeterwave Radar": "Radar",
+    "Millimeter Wave Radar": "Radar",
+    "Mm Wave Radar": "Radar",
+    "Mm-Wave Radar": "Radar",
+    "Rearview Camera": "Rear Camera",
+    "360": "360 System",
+    "Acc": "Adaptive Cruise",
+    "Lkas": "Lane Keep",
+}
 SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
@@ -187,7 +228,8 @@ def describe_document(source_root: Path, path: Path) -> dict[str, Any]:
     drive_m = DRIVETRAIN_RE.search(remainder)
     plat_m = PLATFORM_RE.search(remainder)
     if topic_m:
-        descriptor["topic"] = _clean(topic_m.group(1)).title()
+        raw_topic = _clean(topic_m.group(1)).title()
+        descriptor["topic"] = TOPIC_CANONICAL.get(raw_topic, raw_topic)
     if drive_m:
         descriptor["drivetrain"] = drive_m.group(1).upper()
     if plat_m:
@@ -245,6 +287,14 @@ class SourceInventory:
             if len(t) > 1 and t not in IGNORE_TOKENS
         ]
         folded_query = query.casefold()
+        # A repair-order number is long and unique enough that finding it
+        # verbatim in a filename is unambiguous identity -- unlike an ADAS
+        # SI procedure PDF, an ADAS Map coverage report is filed under its RO
+        # number ("2400911731 ADAS Map.pdf") rather than a vehicle
+        # description, so it never parses a year/make/model and would
+        # otherwise never outscore an unrelated document that merely shares
+        # a few common words.
+        ro_number_tokens = [t for t in tokens if t.isdigit() and len(t) >= 6]
         scored = []
         for doc in self.documents():
             title_folded = doc["title"].casefold()
@@ -259,6 +309,8 @@ class SourceInventory:
                 score += 6
             if doc.get("drivetrain") and doc["drivetrain"].casefold() in folded_query:
                 score += 2
+            if any(ro_token in title_folded for ro_token in ro_number_tokens):
+                score += 15
             if title_folded and title_folded in folded_query:
                 score += 12
             if score > 0:
@@ -392,19 +444,20 @@ class AdasSI:
             pypdf_pages = pages
             document = None
             try:
-                document = pdfium.PdfDocument(str(path))
-                pdfium_pages: list[tuple[int, str]] = []
-                for index in range(len(document)):
-                    page = document[index]
-                    try:
-                        text_page = page.get_textpage()
+                with _PDFIUM_LOCK:
+                    document = pdfium.PdfDocument(str(path))
+                    pdfium_pages: list[tuple[int, str]] = []
+                    for index in range(len(document)):
+                        page = document[index]
                         try:
-                            text = text_page.get_text_range() or ""
+                            text_page = page.get_textpage()
+                            try:
+                                text = text_page.get_text_range() or ""
+                            finally:
+                                text_page.close()
                         finally:
-                            text_page.close()
-                    finally:
-                        page.close()
-                    pdfium_pages.append((index + 1, text[:MAX_PAGE_CHARS]))
+                            page.close()
+                        pdfium_pages.append((index + 1, text[:MAX_PAGE_CHARS]))
                 pages = pdfium_pages
             except Exception as exc:  # noqa: BLE001 - preserve a valid pypdf scan result
                 if pypdf_pages is None:
@@ -689,11 +742,12 @@ class AdasSI:
         if pdfium is None or path.suffix.lower() != ".pdf":
             return None
         try:
-            doc = pdfium.PdfDocument(str(path))
-            try:
-                return len(doc)
-            finally:
-                doc.close()
+            with _PDFIUM_LOCK:
+                doc = pdfium.PdfDocument(str(path))
+                try:
+                    return len(doc)
+                finally:
+                    doc.close()
         except Exception:  # noqa: BLE001 - a broken PDF still lists, just without a count
             return None
 
@@ -722,15 +776,16 @@ class AdasSI:
         if cached.is_file():
             return cached.read_bytes()
 
-        doc = pdfium.PdfDocument(str(path))
-        try:
-            if page > len(doc):
-                raise ValueError(f"Page {page} is past the end ({len(doc)} pages).")
-            pdf_page = doc[page - 1]
-            page_width = pdf_page.get_size()[0] or 612
-            image = pdf_page.render(scale=width / page_width).to_pil()
-        finally:
-            doc.close()
+        with _PDFIUM_LOCK:
+            doc = pdfium.PdfDocument(str(path))
+            try:
+                if page > len(doc):
+                    raise ValueError(f"Page {page} is past the end ({len(doc)} pages).")
+                pdf_page = doc[page - 1]
+                page_width = pdf_page.get_size()[0] or 612
+                image = pdf_page.render(scale=width / page_width).to_pil()
+            finally:
+                doc.close()
 
         buffer = io.BytesIO()
         image.save(buffer, format="PNG", optimize=True)

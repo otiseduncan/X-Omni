@@ -89,7 +89,7 @@ function Get-CoreHealth {
     }
 }
 
-function Stop-VerifiedDegradedCore {
+function Stop-VerifiedCore {
     param([Parameter(Mandatory)][int]$Port)
     $owner = Get-PortOwner -Port $Port
     if (-not $owner) { return }
@@ -97,7 +97,7 @@ function Stop-VerifiedDegradedCore {
         throw "Port $Port is held by unverified PID $($owner.ProcessId). X Omni will not replace it."
     }
 
-    Write-LauncherLog "Stopping verified degraded X Omni Core listener PID $($owner.ProcessId)."
+    Write-LauncherLog "Stopping existing verified X Omni Core PID $($owner.ProcessId) for a fresh restart."
     Stop-Process -Id ([int]$owner.ProcessId) -Force -ErrorAction Stop
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     do {
@@ -213,6 +213,25 @@ function Open-XOmni {
     }
 }
 
+function Invoke-UiRebuild {
+    $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
+    if (-not $npmCmd) {
+        Write-LauncherLog 'npm was not found on PATH; launching with the interface already on disk instead of rebuilding.'
+        return
+    }
+    Write-LauncherLog 'Rebuilding the UI so this launch always serves the current source.'
+    Push-Location (Join-Path $root 'ui')
+    try {
+        & $npmCmd.Source run build 2>&1 | ForEach-Object { Write-LauncherLog "[ui build] $_" }
+        if ($LASTEXITCODE -ne 0) {
+            throw "UI build failed with exit code $LASTEXITCODE. See $($script:launcherLog) for the build log."
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 try {
     $hasMutex = $mutex.WaitOne(0)
     if (-not $hasMutex) { return }
@@ -232,22 +251,23 @@ try {
     $corePort = Get-CorePort
     Write-LauncherLog "Launch requested for $localOrigin`:$corePort."
 
+    # Double-clicking the launcher means "give me a known-good, current X
+    # Omni" -- not "tell me whether the old one still happens to be alive."
+    # Every launch stops whatever is running, rebuilds the UI from source,
+    # and starts clean, so there is exactly one behavior to reason about
+    # instead of a reuse path and a restart path that can drift apart.
     $owner = Get-PortOwner -Port $corePort
-    $health = Get-CoreHealth -Port $corePort
     if ($owner -and -not (Test-XOmniCoreProcess -Process $owner)) {
         throw "Port $corePort is held by unverified PID $($owner.ProcessId). X Omni will not replace it."
-    }
-    if ($health -and $health.StatusCode -eq 200 -and $health.Payload.ok -eq $true) {
-        Write-LauncherLog "Reusing healthy X Omni Core PID $($owner.ProcessId), worker '$($health.Payload.worker)'."
-        Open-XOmni -Port $corePort
-        return
     }
 
     Stop-VerifiedLegacyModel
     Stop-VerifiedLegacyComfyUI
     if ($owner) {
-        Stop-VerifiedDegradedCore -Port $corePort
+        Stop-VerifiedCore -Port $corePort
     }
+
+    Invoke-UiRebuild
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $stdout = Join-Path $logDirectory "core-$stamp.out.log"

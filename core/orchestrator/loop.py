@@ -59,13 +59,6 @@ _WEBSITE_CREATE_ACTION_RE = re.compile(
     r"\b(?:create|build|generate|design|render|display|make|show)\b",
     re.IGNORECASE,
 )
-_IMAGE_GENERATION_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:generate|create|make|render)\s+"
-    r"(?:(?:an?\s+)?(?:image|picture|illustration|artwork|painting|portrait|drawing|"
-    r"photograph)\b|(?=[^.!?\n]{0,120}\b(?:image|picture|illustration|artwork|painting|"
-    r"portrait|drawing|photograph|figure\s+study)\b))",
-    re.IGNORECASE,
-)
 _CIQ_COUNT_RE = re.compile(r"\b(?:how\s+many|count)\b", re.IGNORECASE)
 _CIQ_LIST_RE = re.compile(
     r"\b(?:show|list|display|pull\s+up)\b",
@@ -160,38 +153,6 @@ _CIQ_RESEARCH_READ_ONLY_RE = re.compile(
     r"\bread[-\s]?only\b"
     r"|\b(?:do\s+not|don't|without)\b[^.!?\n]{0,80}"
     r"\b(?:change|persist|save|attach|import|link|update|write|record)\b",
-    re.IGNORECASE,
-)
-_EXPLICIT_WEB_RESEARCH_RE = re.compile(
-    r"\b(?:search|browse)\s+(?:the\s+)?(?:web|internet)\b"
-    r"|\b(?:search|look\s+up|find)\b.{0,120}\b(?:online|on\s+the\s+(?:web|internet))\b"
-    r"|\b(?:research|find)\b.{0,120}\b(?:sources?|literature|papers?|studies|court\s+cases?)\b"
-    r"|\b(?:where|where's|wheres|were)\s+can\s+i\s+find\b.{0,120}\bonline\b"
-    r"|\blook\s+(?:it|this|that)\s+up\b"
-    r"|\bgoogle\s+(?:it|this|that|for)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-_WEB_SOURCE_REQUEST_RE = re.compile(
-    r"\b(?:what|which)\s+(?:websites?|sites?|online\s+sources?)\b"
-    r".{0,120}\b(?:information|discuss|cover|about)\b"
-    r"|\bfind\s+(?:websites?|sites?|online\s+sources?|sources?)\b"
-    r"|\bwhere\s+can\s+i\s+(?:read|learn)\s+about\b"
-    r"|\bwhat\s+online\s+sources?\s+(?:cover|discuss|have)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-_CURRENT_INFORMATION_RE = re.compile(
-    r"\b(?:current(?:ly)?|latest|newest|recent|breaking|right\s+now|today(?:'s)?|as\s+of\s+today)\b",
-    re.IGNORECASE,
-)
-_CURRENT_INFORMATION_SUBJECT_RE = re.compile(
-    r"\b(?:news|release|version|price|stock|market|office(?:holder)?|president|"
-    r"governor|mayor|ceo|election|law|regulation|conflict|war|recall|score|"
-    r"standings|public\s+schedule)\b",
-    re.IGNORECASE,
-)
-_SPECIALIZED_CURRENT_LANE_RE = re.compile(
-    r"\b(?:weather|forecast|temperature|radar|calendar|appointment|my\s+schedule|"
-    r"repair\s+orders?|calibration\s+iq|adas)\b",
     re.IGNORECASE,
 )
 _WEB_ACCESS_DENIAL_RE = re.compile(
@@ -474,48 +435,46 @@ def website_result_summary(result: Any, *, update: bool) -> str:
 def deterministic_read_tool(user_message: object) -> Optional[str]:
     """Route only explicit, high-confidence read-only intents.
 
-    Model tool choice remains the general path. This narrow guard prevents an
-    explicit exterior-camera observation request from being answered from stale
-    context without first rendering the live, server-backed camera card.
+    Model tool choice is the general path for everything else, including
+    website generation/update -- the model already has a clear tool
+    description to work from and has proven capable of choosing correctly
+    without a regex pre-empting it. This one narrow exception stays: it
+    prevents an explicit exterior-camera observation request from being
+    answered from stale context without first rendering the live,
+    server-backed camera card, which is a hardware-timing concern the model
+    can't fix by reasoning about it after the fact.
     """
 
     text = str(user_message or "").strip()
-    website_intent = website_update_intent(text) or website_generation_intent(text)
     if not text or not _EXTERIOR_CAMERA_SOURCE_RE.search(text):
-        return "website_preview_generate" if website_intent else None
+        return None
     if _EXTERIOR_CAMERA_ACTION_RE.search(text):
         return "exterior_camera_request"
-    return "website_preview_generate" if website_intent else None
+    return None
 
 
 def image_generation_request(user_message: object) -> Optional[dict[str, Any]]:
-    """Return bounded args for an unmistakable request to create visual media."""
-    prompt = str(user_message or "").strip()
-    if not prompt or not _IMAGE_GENERATION_RE.search(prompt):
-        return None
-    return {"prompt": prompt[:2000]}
+    """Deliberately inert: image generation is now model-chosen, not regex-routed.
+
+    image_generate is a confirm_required tool -- an approval card stands
+    between any request and an actual ComfyUI run regardless of how the call
+    got chosen, so pre-empting the model's own tool choice here bought
+    nothing but a second place a real request could fail to match a pattern.
+    """
+    return None
 
 
 def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
-    """Return bounded arguments for explicit or high-confidence current-web reads."""
-    # Architectural invariant: conversation subject matter is runtime input only.
-    # Persistent changes to policies, capabilities, prompts, routing, or source
-    # code require an explicit owner-directed development change.
-    text = str(user_message or "").strip()
-    if not text:
-        return None
-    explicit = bool(
-        _EXPLICIT_WEB_RESEARCH_RE.search(text) or _WEB_SOURCE_REQUEST_RE.search(text)
-    )
-    temporal = bool(
-        _CURRENT_INFORMATION_RE.search(text)
-        and _CURRENT_INFORMATION_SUBJECT_RE.search(text)
-        and not _SPECIALIZED_CURRENT_LANE_RE.search(text)
-    )
-    if not explicit and not temporal:
-        return None
-    query = text[:400].strip()
-    return {"query": query, "max_results": 6} if query else None
+    """Deliberately inert: web research is now model-chosen, not regex-routed.
+
+    The false-capability-denial guard this used to gate (see
+    guarded_web_response and last_web_research_result in _run) still works --
+    it now triggers off any web_research_current call the model actually
+    makes this turn, not off this detector, so relaxing routing here didn't
+    cost the one thing that genuinely mattered: never letting the model deny
+    having web access right after a tool call just proved it does.
+    """
+    return None
 
 
 def web_research_result_is_verified(result: Any) -> bool:
@@ -1621,6 +1580,11 @@ class Orchestrator:
         last_calibration_iq_operator_result: Optional[dict[str, Any]] = None
         calibration_iq_operator_results: list[dict[str, Any]] = []
         calibration_iq_truth_emitted = False
+        # Tracks the most recent web_research_current result across rounds
+        # regardless of whether the call was model-chosen or (formerly)
+        # deterministically routed, so the false-capability-denial guard
+        # below still works now that routing is the model's own choice.
+        last_web_research_result: Optional[dict[str, Any]] = None
 
         # Qwen's tool choice can occasionally spend every tool round on source
         # reads before a requested persisted RO-research action. Pre-route only
@@ -2160,12 +2124,12 @@ class Orchestrator:
             operator_turn_active = bool(calibration_iq_operator_results)
             guarded_operator_response = bool(operator_turn_active and not tool_calls)
             guarded_web_response = bool(
-                routed_is_web
+                last_web_research_result is not None
                 and not tool_calls
                 and (
                     _WEB_ACCESS_DENIAL_RE.search(round_text)
                     or (
-                        web_research_result_is_verified(routed_result)
+                        web_research_result_is_verified(last_web_research_result)
                         and (
                             not round_text.strip()
                             or _WEB_RESEARCH_REFUSAL_RE.search(round_text)
@@ -2199,7 +2163,7 @@ class Orchestrator:
                 full_text = guarded_text
                 calibration_iq_truth_emitted = True
             elif guarded_web_response:
-                guarded_text = web_research_fallback_summary(routed_result)
+                guarded_text = web_research_fallback_summary(last_web_research_result)
                 yield {"type": "token", "text": guarded_text}
                 full_text += guarded_text
             elif not tool_calls and not operator_turn_active:
@@ -2265,6 +2229,14 @@ class Orchestrator:
                         )
                         calibration_iq_operator_results.append(
                             last_calibration_iq_operator_result
+                        )
+                    if (
+                        call.get("name") == "web_research_current"
+                        and ev.get("type") == "tool_result"
+                    ):
+                        web_result = ev.get("result")
+                        last_web_research_result = (
+                            web_result if isinstance(web_result, dict) else {"ok": False}
                         )
                     if is_website_call:
                         sealed_events.append(ev)
@@ -2385,9 +2357,35 @@ class Orchestrator:
                 }
             )
 
+        # research_ro is a search-and-import composite, not a plain mutation:
+        # calling it twice for the same RO re-runs the same ADAS SI search
+        # and reports the same result (import_document is already
+        # idempotent on its own). It sits at operator_authorized tier, not
+        # read_only, so it's excluded from the dedupe cache below by
+        # default -- deliberately, since most operator-tier calls are real
+        # mutations that must never be silently replayed from a stale
+        # cache. A composite made up entirely of research_ro actions is the
+        # one safe exception: when the model retries the same RO after
+        # seeing "missing documentation" hoping for a different answer, this
+        # lets the existing cache absorb the repeat instead of re-searching
+        # and re-embedding a full receipt, which is what was blowing the
+        # turn's context budget on multi-RO sweeps.
+        def _is_pure_research_ro_call(tool_name: str, tool_args: Any) -> bool:
+            if tool_name != "calibration_iq_operator":
+                return False
+            actions = tool_args.get("actions") if isinstance(tool_args, dict) else None
+            if not isinstance(actions, list) or not actions:
+                return False
+            return all(
+                isinstance(a, dict) and a.get("operation") == "research_ro" for a in actions
+            )
+
         dedupe_key: Optional[tuple[str, str]] = None
         tier_fn = getattr(self.registry, "tier", None)
-        if call_cache is not None and callable(tier_fn) and tier_fn(name) == "read_only":
+        is_dedupeable = (callable(tier_fn) and tier_fn(name) == "read_only") or (
+            _is_pure_research_ro_call(name, args)
+        )
+        if call_cache is not None and is_dedupeable:
             try:
                 canonical_args = json.dumps(args, sort_keys=True, default=str)
             except TypeError:

@@ -10,9 +10,7 @@ import pytest
 from core.orchestrator.loop import (
     ARTIFACT_FOR_TOOL,
     Orchestrator,
-    deterministic_read_tool,
     tool_result_for_model,
-    website_update_intent,
 )
 from core.orchestrator.prompt import system_prompt
 from core.services.website import (
@@ -344,75 +342,6 @@ async def test_website_update_failure_keeps_prior_revision_and_never_claims_succ
     assert "Do not claim success" in projected["assistant_instruction"]
 
 
-def test_exact_glass_followup_is_deterministic_durable_and_skips_synthesis():
-    source = _source_website()
-    request_text = (
-        "change all the csrds on the website to a translucent glass effect"
-    )
-    store = _WebsiteStore(source)
-    store.messages.append({
-        "id": 3,
-        "role": "user",
-        "content": request_text,
-        "artifacts": [],
-    })
-    client = _NoWebsiteModel()
-    registry = Registry("config/tools.yaml")
-    registry.register("website_preview_generate", make_website_preview(client, store))
-
-    class Router:
-        active_name = "omni"
-
-        @staticmethod
-        def active_config():
-            return SimpleNamespace(supports_vision=True, supports_audio=True)
-
-    orchestrator = Orchestrator(
-        Router(),
-        client,
-        registry,
-        store,
-        SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
-    )
-
-    async def collect():
-        stream = orchestrator.run_turn(15, request_text)
-        first = await anext(stream)
-        # Website success is durable before the first success-bearing socket
-        # event, so disconnecting here cannot leave a phantom UI-only card.
-        assert store.saved and store.saved[-1]["artifacts"]
-        return [first, *[event async for event in stream]]
-
-    events = asyncio.run(collect())
-    assert website_update_intent(request_text) is True
-    assert deterministic_read_tool(request_text) == "website_preview_generate"
-    assert (
-        deterministic_read_tool("display a website preview for Jimmy")
-        == "website_preview_generate"
-    )
-    assert [event["type"] for event in events] == [
-        "tool_start", "tool_result", "artifact", "token", "done"
-    ]
-    args = events[0]["args"]
-    assert args == {
-        "prompt": request_text,
-        "operation": "update_latest",
-    }
-    assert "html" not in json.dumps(args)
-    artifact = events[2]["artifact"]
-    assert artifact["type"] == "website_preview"
-    assert artifact["data"]["parent_sha256"] == source["sha256"]
-    assert artifact["data"]["ok"] is True
-    assert "html" not in events[1]["result"]
-    assert "translucent glass effect" in events[3]["text"]
-    assert "No files were written or deployed" in events[3]["text"]
-    assert client.complete_calls == 0
-    assert client.stream_calls == 0
-    saved = store.saved[-1]
-    assert saved["content"] == events[3]["text"]
-    assert saved["artifacts"] == [artifact]
-
-
 @pytest.mark.asyncio
 async def test_registry_binds_website_update_to_authoritative_conversation():
     source = _source_website()
@@ -444,7 +373,7 @@ async def test_registry_binds_website_update_to_authoritative_conversation():
     assert result["ok"] is True
 
 
-def test_deterministic_initial_website_is_persisted_before_artifact_event():
+def test_initial_website_is_persisted_before_artifact_event():
     class InitialClient:
         def __init__(self):
             self.stream_calls = 0
@@ -511,7 +440,10 @@ def test_deterministic_initial_website_is_persisted_before_artifact_event():
     assert "html" not in events[1]["result"]
     assert "Generated Jimmy's Jumpers and Trampolines" in events[3]["text"]
     assert client.complete_calls == 1
-    assert client.stream_calls == 0
+    # Website generation is model-chosen now, not deterministically
+    # pre-routed -- the model gets one real round to pick the tool, unlike
+    # before when routing bypassed the model for this call entirely.
+    assert client.stream_calls == 1
 
 
 def test_model_preamble_is_not_emitted_when_website_persistence_fails():

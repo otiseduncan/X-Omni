@@ -66,7 +66,7 @@ export function AdasDocumentCard({ data }) {
  * The "Open PDF" link stays, because the real viewer is where print,
  * download and copy live.
  */
-export function DocumentViewer({ doc, alternatives, compact = false }) {
+export function DocumentViewer({ doc, alternatives, matchedPages, compact = false }) {
   const total = doc.pages_total || null;
   const [page, setPage] = useState(doc.page || 1);
   const [zoom, setZoom] = useState(false);
@@ -87,6 +87,21 @@ export function DocumentViewer({ doc, alternatives, compact = false }) {
   return (
     <>
       {vehicle && <p className="card-note field-vehicle">{vehicle}</p>}
+
+      {matchedPages?.length > 1 && (
+        <div className="field-actions" style={{ marginBottom: 6 }}>
+          {matchedPages.map((n) => (
+            <button
+              key={n}
+              type="button"
+              className={n === page ? "is-active" : ""}
+              onClick={() => go(n)}
+            >
+              p.{n}
+            </button>
+          ))}
+        </div>
+      )}
 
       {canRender && !failed ? (
         <div
@@ -187,29 +202,57 @@ export function AdasResultsCard({ data }) {
     );
   }
 
+  // Group passages by document -- the same PDF hitting on several pages is
+  // one thing to review, not several unrelated cards.
+  const groups = [];
+  const bySource = new Map();
+  for (const r of results) {
+    const key = r.source || r.title;
+    let group = bySource.get(key);
+    if (!group) {
+      group = { key, title: r.title, url: r.url, vehicle: r.vehicle, hits: [] };
+      bySource.set(key, group);
+      groups.push(group);
+    }
+    group.hits.push(r);
+  }
+
   return (
-    <Card icon={BookOpen} title="ADAS SI" meta={`${results.length} passages`}>
-      {results.map((r, i) => {
-        const v = r.vehicle || {};
-        const vehicle = [v.year, v.make, v.model, v.topic].filter(Boolean).join(" · ");
+    <Card
+      icon={BookOpen}
+      title="ADAS SI"
+      meta={`${groups.length} document${groups.length === 1 ? "" : "s"} · ${results.length} passages`}
+    >
+      {groups.map((g, i) => {
+        const pages = g.hits.map((h) => h.page).sort((a, b) => a - b);
+        // The extracted excerpt is often a mangled diagram/table dump --
+        // real field reading is the actual page image, not that text.
+        const doc = {
+          title: g.title,
+          url: g.url ? `${g.url}#page=${pages[0]}` : g.url,
+          page_url: g.url ? g.url.replace("/document?", "/page?") : null,
+          page: pages[0],
+          renderable: true,
+          vehicle: g.vehicle,
+        };
         return (
-          <details className="field-hit" key={`${r.source}-${r.page}-${i}`} open={i === 0}>
+          <details className="field-hit" key={g.key} open={i === 0}>
             <summary>
-              <strong>{r.title}</strong>
-              <span className="field-page">p.{r.page}</span>
+              <strong>{g.title}</strong>
+              <span className="field-page">
+                {pages.length > 1 ? `${pages.length} pages` : `p.${pages[0]}`}
+              </span>
             </summary>
-            {vehicle && <p className="card-note field-vehicle">{vehicle}</p>}
-            <pre className="pre field-excerpt">{r.excerpt}</pre>
-            {r.url && (
-              <a
-                href={`${r.url}#page=${r.page}`}
-                target="_blank"
-                rel="noreferrer"
-                className="field-link"
-              >
-                <ExternalLink size={12} /> Open at page {r.page}
-              </a>
-            )}
+            <DocumentViewer doc={doc} matchedPages={pages} compact />
+            <details className="field-alts" style={{ marginTop: 8 }}>
+              <summary>Extracted text</summary>
+              {g.hits.map((h, hi) => (
+                <div key={`${h.page}-${hi}`} style={{ marginTop: hi ? 10 : 0 }}>
+                  <span className="field-page">p.{h.page}</span>
+                  <pre className="pre field-excerpt">{h.excerpt}</pre>
+                </div>
+              ))}
+            </details>
           </details>
         );
       })}
@@ -427,8 +470,15 @@ export function CalibrationRoCard({ data }) {
   }
   const blockers = Array.isArray(ro.blockers) ? ro.blockers : [];
   const reqs = Array.isArray(ro.requirements) ? ro.requirements : [];
-  const label = (x) =>
-    typeof x === "string" ? x : x?.name || x?.title || x?.description || JSON.stringify(x);
+  const humanize = (v) =>
+    String(v || "").toLowerCase().replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+  const label = (x) => {
+    if (typeof x === "string") return x;
+    if (x?.calibration_type) {
+      return x.determination ? `${x.calibration_type} — ${humanize(x.determination)}` : x.calibration_type;
+    }
+    return x?.name || x?.title || x?.description || x?.reason || "Untitled item";
+  };
 
   return (
     <Card icon={ClipboardList} title={`RO ${ro.RO}`} meta={ro.Shop}>

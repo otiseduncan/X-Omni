@@ -47,21 +47,33 @@
             $processInfo.Name -ieq "python.exe" -and
             $commandLine.IndexOf($expectedPythonToken, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
             $commandLine -match '(?i)(?:^|\s)-m\s+core\.main(?:\s|$)'
+        # A verified process can still miss one health check under load (e.g.
+        # a concurrent build/test run competing for CPU). Retry before
+        # concluding anything is actually wrong -- one slow response must
+        # never be reported the same way as a genuinely foreign process.
         $probeMatches = $false
-        try {
-            $probe = Invoke-WebRequest -Uri "http://127.0.0.1:$corePort/healthz" `
-                -TimeoutSec 5 -SkipHttpErrorCheck
-            $payload = $probe.Content | ConvertFrom-Json
-            $probeMatches = $payload.core -eq "running"
-        } catch {
-            $probeMatches = $false
+        if ($identityMatches) {
+            for ($attempt = 1; $attempt -le 4 -and -not $probeMatches; $attempt++) {
+                try {
+                    $probe = Invoke-WebRequest -Uri "http://127.0.0.1:$corePort/healthz" `
+                        -TimeoutSec 5 -SkipHttpErrorCheck
+                    $payload = $probe.Content | ConvertFrom-Json
+                    $probeMatches = $payload.core -eq "running"
+                } catch {
+                    $probeMatches = $false
+                }
+                if (-not $probeMatches -and $attempt -lt 4) { Start-Sleep -Seconds 2 }
+            }
         }
         if ($identityMatches -and $probeMatches) {
             Write-Host "X Omni is already running at http://127.0.0.1:$corePort" -ForegroundColor Green
             Write-Host "Reusing verified Core pid $listenerProcessId; no process was restarted."
             return
         }
-        throw "Port $corePort is held by unverified pid $listenerProcessId. X Omni will not replace it."
+        if (-not $identityMatches) {
+            throw "Port $corePort is held by pid $listenerProcessId, which is not X Omni's own Core process (command line does not match). X Omni will not replace it."
+        }
+        throw "Port $corePort is held by X Omni's own Core (pid $listenerProcessId), but it did not answer a healthy /healthz after several attempts. It may be mid-swap or stuck -- check logs\launcher before stopping it yourself."
     }
 
     $workerConfig = Get-Content (Join-Path $root "config\workers.json") -Raw | ConvertFrom-Json

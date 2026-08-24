@@ -90,6 +90,12 @@
   color: var(--text);
 }
 
+.field-actions button.is-active {
+  border-color: var(--blue-bright);
+  background: rgba(40, 120, 255, 0.16);
+  color: var(--text);
+}
+
 .field-page {
   color: var(--text-muted);
   font-size: 0.72rem;
@@ -155,13 +161,15 @@
   margin: 8px 0 0;
   padding: 10px 11px;
   overflow: auto;
-  font-size: 0.73rem;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 0.78rem;
   line-height: 1.5 !important;
   white-space: pre-wrap !important;
   overflow-wrap: anywhere;
   word-break: break-word;
   font-variant-ligatures: none;
   isolation: isolate;
+  color: var(--text-primary, #dce6f2);
 }
 
 .field-alts {

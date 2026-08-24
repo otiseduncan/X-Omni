@@ -161,3 +161,76 @@ def test_operator_authorized_tool_is_never_deduplicated(tmp_path):
     asyncio.run(run())
     assert len(calls) == 2
     store.close()
+
+
+def test_research_ro_composite_is_deduplicated_like_a_read(tmp_path):
+    # research_ro is the one operator_authorized exception: retrying it for
+    # the same RO after a "missing documentation" result re-runs the same
+    # ADAS SI search and reports the same finding, and doing that repeatedly
+    # inside one sweep is what blew a turn's context budget. It must be
+    # absorbed by the same cache read_only calls use.
+    store = Store(tmp_path / "dedup-research-ro.sqlite")
+    conversation_id = store.create_conversation("Calibration IQ")
+    message_id = store.add_message(conversation_id, "user", "research this RO")
+    calls: list = []
+    orchestrator = _orchestrator(store, calls, handler_name="calibration_iq_operator")
+
+    messages: list = []
+    artifacts: list = []
+    call_cache: dict = {}
+    args = {"actions": [{"operation": "research_ro", "repair_order_id": "ro-1", "arguments": {}}]}
+    approval_context = {"message_id": message_id, "user_id": "local-dev", "role": "owner"}
+
+    async def run():
+        await _drain(
+            orchestrator, "calibration_iq_operator", args, messages, artifacts,
+            conversation_id=conversation_id, call_id="call_0", call_cache=call_cache,
+            approval_context=approval_context,
+        )
+        return await _drain(
+            orchestrator, "calibration_iq_operator", args, messages, artifacts,
+            conversation_id=conversation_id, call_id="call_1", call_cache=call_cache,
+            approval_context=approval_context,
+        )
+
+    second_events = asyncio.run(run())
+    assert len(calls) == 1
+    assert any(event.get("deduplicated") for event in second_events if event["type"] == "tool_result")
+    store.close()
+
+
+def test_research_ro_mixed_with_another_operation_is_not_deduplicated(tmp_path):
+    # Only a composite made up entirely of research_ro actions is safe to
+    # absorb -- one mixed in with a real mutation must always run for real.
+    store = Store(tmp_path / "dedup-research-ro-mixed.sqlite")
+    conversation_id = store.create_conversation("Calibration IQ")
+    message_id = store.add_message(conversation_id, "user", "research and add a note")
+    calls: list = []
+    orchestrator = _orchestrator(store, calls, handler_name="calibration_iq_operator")
+
+    messages: list = []
+    artifacts: list = []
+    call_cache: dict = {}
+    args = {
+        "actions": [
+            {"operation": "research_ro", "repair_order_id": "ro-1", "arguments": {}},
+            {"operation": "add_note", "repair_order_id": "ro-1", "arguments": {"body": "hi"}},
+        ]
+    }
+    approval_context = {"message_id": message_id, "user_id": "local-dev", "role": "owner"}
+
+    async def run():
+        await _drain(
+            orchestrator, "calibration_iq_operator", args, messages, artifacts,
+            conversation_id=conversation_id, call_id="call_0", call_cache=call_cache,
+            approval_context=approval_context,
+        )
+        await _drain(
+            orchestrator, "calibration_iq_operator", args, messages, artifacts,
+            conversation_id=conversation_id, call_id="call_1", call_cache=call_cache,
+            approval_context=approval_context,
+        )
+
+    asyncio.run(run())
+    assert len(calls) == 2
+    store.close()

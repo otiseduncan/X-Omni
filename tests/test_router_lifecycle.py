@@ -162,10 +162,11 @@ def test_repository_workers_use_dedicated_port_and_both_gpus() -> None:
     assert default == "omni"
     assert {cfg.port for cfg in configs.values()} == {8131}
     assert all(cfg.gpu_indices == (0, 1) for cfg in configs.values())
-    # GPU1 drives the Windows desktop and has ~7040 MiB free at the clean
-    # no-model baseline. 6500 still decisively distinguishes that state from
-    # the loaded worker (~380 MiB free) without making release impossible.
-    assert all(cfg.gpu_thresholds == {0: 15000, 1: 6500} for cfg in configs.values())
+    # GPU1 drives the Windows desktop. Its no-model baseline varies with
+    # ordinary desktop apps and can be ~6300 MiB free; 6000 still decisively
+    # distinguishes that state from the loaded worker (~380 MiB free) without
+    # making release impossible.
+    assert all(cfg.gpu_thresholds == {0: 15000, 1: 6000} for cfg in configs.values())
 
 
 def test_exact_listener_is_adopted_only_after_live_alias_context_gpu_and_start_time(

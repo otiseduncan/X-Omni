@@ -16,7 +16,7 @@
       "ngl": 99,
       "parallel": 1,
       "gpu_indices": [0, 1],
-      "gpu_free_thresholds_mib": {"0": 15000, "1": 6500},
+      "gpu_free_thresholds_mib": {"0": 15000, "1": 6000},
       "extra_args": ["--no-webui"]
     },
     "coder": {
@@ -32,7 +32,7 @@
       "ngl": 99,
       "parallel": 1,
       "gpu_indices": [0, 1],
-      "gpu_free_thresholds_mib": {"0": 15000, "1": 6500},
+      "gpu_free_thresholds_mib": {"0": 15000, "1": 6000},
       "extra_args": ["--no-webui"]
     }
   },

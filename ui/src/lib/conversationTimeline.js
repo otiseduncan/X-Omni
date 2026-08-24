@@ -96,6 +96,44 @@ export function coalesceWebsiteRevisions(items) {
   return items.reduce((current, item) => upsertTimelineItem(current, item), []);
 }
 
+function isAdasSiResultsArtifact(item) {
+  return item?.kind === "artifact" && item?.artifact?.type === "adas_si_results";
+}
+
+/** research_ro searches ADAS SI once per calibration requirement. When two
+ * searches in the same turn land back-to-back, merge them into one card
+ * instead of showing the same (or overlapping) passages twice. */
+function mergeAdasSiResultsArtifacts(existing, incoming) {
+  const existingResults = Array.isArray(existing?.data?.results) ? existing.data.results : [];
+  const incomingResults = Array.isArray(incoming?.data?.results) ? incoming.data.results : [];
+  const seen = new Set();
+  const results = [];
+  for (const r of [...existingResults, ...incomingResults]) {
+    const key = `${r?.source ?? ""}::${r?.page ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    results.push(r);
+  }
+  return { ...existing, data: { ...existing.data, results } };
+}
+
+/** Collapse consecutive ADAS SI search cards from the same turn into one. */
+export function coalesceAdasSiResults(items) {
+  const out = [];
+  for (const item of items) {
+    const prev = out[out.length - 1];
+    if (isAdasSiResultsArtifact(item) && isAdasSiResultsArtifact(prev)) {
+      out[out.length - 1] = {
+        ...prev,
+        artifact: mergeAdasSiResultsArtifacts(prev.artifact, item.artifact),
+      };
+      continue;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
 /**
  * A successful write is shown only when the durable receipt says all three
  * things: it reached the success terminal, it executed, and it succeeded.
@@ -405,7 +443,7 @@ export function timelineFromHistory(payload) {
     });
   });
 
-  return coalesceWebsiteRevisions(out);
+  return coalesceAdasSiResults(coalesceWebsiteRevisions(out));
 }
 
 function signature(item) {
@@ -446,7 +484,7 @@ export function mergeTimelines(authoritative, live) {
     merged.push(item);
   });
 
-  return coalesceWebsiteRevisions(merged);
+  return coalesceAdasSiResults(coalesceWebsiteRevisions(merged));
 }
 
 export function updateApproval(items, id, update) {

@@ -1903,7 +1903,7 @@ def _research_calibrations(snapshot: dict[str, Any], arguments: dict[str, Any]) 
 
 
 def _research_queries(
-    vehicle: str, specs: list[dict[str, str]], arguments: dict[str, Any]
+    vehicle: str, specs: list[dict[str, str]], arguments: dict[str, Any], ro_number: str = ""
 ) -> list[dict[str, str]]:
     explicit_queries = arguments.get("queries")
     global_query = str(arguments.get("query") or "").strip()
@@ -1928,11 +1928,18 @@ def _research_queries(
                 part for part in (vehicle, spec["label"], global_query) if part
             )
             output.append({**spec, "query": query_value.strip()})
-        return output
-    query_value = global_query or " ".join(
-        part for part in (vehicle, "OEM calibration procedures") if part
-    )
-    return [{"id": "", "label": "vehicle calibration research", "query": query_value}]
+    else:
+        query_value = global_query or " ".join(
+            part for part in (vehicle, "OEM calibration procedures") if part
+        )
+        output.append({"id": "", "label": "vehicle calibration research", "query": query_value})
+    # ADAS Map coverage reports in this library are filed under the repair
+    # order's own number ("2400911731 ADAS Map.pdf"), not under a vehicle
+    # description, so none of the calibration-type queries above can ever
+    # find one -- they need a query built from the RO number itself.
+    if ro_number:
+        output.append({"id": "", "label": "ADAS Map", "query": f"{ro_number} ADAS Map"})
+    return output
 
 
 def _research_requirement_key(item: dict[str, Any]) -> str:
@@ -2027,7 +2034,14 @@ async def _expand_research_action(
     arguments = dict(action.get("arguments") or {})
     vehicle = _research_vehicle_label(snapshot)
     specs = _research_calibrations(snapshot, arguments)
-    queries = _research_queries(vehicle, specs, arguments)
+    ro_number = str(
+        _dig(
+            snapshot,
+            "repair_order.ro_number", "repair_order.number",
+            "ro_number", "roNumber", "number", "ro",
+        ) or ""
+    ).strip()
+    queries = _research_queries(vehicle, specs, arguments, ro_number=ro_number)
     search_results = await asyncio.gather(*[
         asyncio.to_thread(adas.search, {"query": item["query"]})
         for item in queries
@@ -2069,9 +2083,12 @@ async def _expand_research_action(
                 "calibration_item_ids": set(),
                 "queries": set(),
                 "validated": False,
+                "is_adas_map": False,
             })
             record["pages"].update(int(hit["page"]) for hit in doc_hits)
             record["queries"].add(spec["query"])
+            if spec.get("label") == "ADAS Map":
+                record["is_adas_map"] = True
             if document_supported:
                 record["validated"] = True
                 if spec.get("id"):
@@ -2122,9 +2139,10 @@ async def _expand_research_action(
         pages = sorted(record["pages"])
         calibration_ids = sorted(record["calibration_item_ids"])
         canonical_source_uri = f"adas-si:///{quote(record['relative_path'])}"
+        default_document_type = "adas_map_report" if record.get("is_adas_map") else "oem_procedure"
         import_arguments: dict[str, Any] = {
             "source_path": record["source_path"],
-            "document_type": str(arguments.get("document_type") or "oem_procedure"),
+            "document_type": str(arguments.get("document_type") or default_document_type),
             "title": record["title"],
             "source_uri": canonical_source_uri,
             "source_name": record["source_name"],
@@ -2270,12 +2288,31 @@ async def _expand_research_action(
             "reason": str(arguments.get("reason") or "X source-backed research completion"),
         }
         research_version = _nested(snapshot, "research.version", "research_case.version")
-        if isinstance(research_version, int) and not isinstance(research_version, bool):
-            update_arguments["version"] = research_version
+        # Calibration IQ's optimistic-concurrency check reads expected_version
+        # off the action itself, not out of arguments (the backend overwrites
+        # any "version" placed there with its own freshly observed value
+        # before dispatch, so a copy inside arguments is inert). research_ro
+        # is a composite the caller issues without ever having fetched the
+        # research case directly, so nothing else would ever populate this --
+        # it has to come from the pre-fetched snapshot here, or Calibration
+        # IQ rejects every completion with "expected_version is required".
+        #
+        # It also has to account for everything queued ahead of it in this
+        # same batch: ensure_case_workspace, and every import_document /
+        # update_document / link_document above all touch the same
+        # ResearchCase row and each bump its version by exactly one as a side
+        # effect, so by the time this action actually dispatches the real
+        # version is the pre-batch snapshot plus one per prior queued action
+        # -- not the pre-batch snapshot value itself.
+        expected_version = (
+            research_version + len(expanded)
+            if isinstance(research_version, int) and not isinstance(research_version, bool)
+            else action.get("expected_version")
+        )
         expanded.append({
             "operation": "update_research",
             "repair_order_id": ro_id,
-            "expected_version": action.get("expected_version"),
+            "expected_version": expected_version,
             "arguments": update_arguments,
         })
 
