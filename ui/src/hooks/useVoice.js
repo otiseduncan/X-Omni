@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toSpeechText } from "../lib/speechText.js";
+import { speechRecognitionResultsText } from "../lib/speechTranscript.js";
 
 /**
  * Voice I/O with two selectable speech-to-text engines.
@@ -25,7 +26,6 @@ import { toSpeechText } from "../lib/speechText.js";
 const STT_KEY = "xomni.sttMode";
 const VOICE_KEY = "xomni.voiceName";
 const BROWSER_END_SILENCE_MS = 1800;
-const BROWSER_RESTART_DELAY_MS = 120;
 const LOCAL_AUDIO_CONSTRAINTS = {
   channelCount: 1,
   echoCancellation: true,
@@ -77,7 +77,6 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
   const recorderRef = useRef(null);
   const chunksRef = useRef([]);
   const streamRef = useRef(null);
-  const finalRef = useRef("");
 
   const cb = useRef({ onTranscript, onSpeakingChange, onError, onInterim });
   cb.current = { onTranscript, onSpeakingChange, onError, onInterim };
@@ -138,23 +137,22 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
 
   // ---------- STT: browser (Chrome / Google) ----------
   const startBrowserStt = useCallback(() => {
-    if (!SpeechRecognitionImpl) return;
+    if (!SpeechRecognitionImpl || browserSessionRef.current || recognitionRef.current) {
+      return;
+    }
 
-    finalRef.current = "";
     const session = {
       active: true,
       finishing: false,
+      latestText: "",
       idleTimer: null,
-      restartTimer: null,
       finalize: null,
     };
     browserSessionRef.current = session;
 
     const clearTimers = () => {
       if (session.idleTimer != null) window.clearTimeout(session.idleTimer);
-      if (session.restartTimer != null) window.clearTimeout(session.restartTimer);
       session.idleTimer = null;
-      session.restartTimer = null;
     };
 
     const finalize = () => {
@@ -165,8 +163,8 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       browserSessionRef.current = null;
       recognitionRef.current = null;
       setRecording(false);
-      const text = finalRef.current.trim();
-      finalRef.current = "";
+      const text = session.latestText.trim();
+      session.latestText = "";
       cb.current.onInterim?.("");
       if (text) cb.current.onTranscript?.(text);
     };
@@ -197,24 +195,22 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       const recognition = new SpeechRecognitionImpl();
       recognitionRef.current = recognition;
       recognition.lang = "en-US";
-      // Chrome can end an individual recognition stream after a short pause.
-      // Continuous mode plus a guarded restart keeps the user's dictation
-      // session alive until X's own silence grace period decides they are done.
+      // Keep one guarded recognition instance. Android Chrome can end a
+      // continuous stream itself; restarting from onend can replay cumulative
+      // hypotheses and system tones, so onend finalizes exactly once instead.
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.maxAlternatives = 3;
 
       recognition.onresult = (event) => {
-        let interim = "";
-        for (let i = event.resultIndex; i < event.results.length; i += 1) {
-          const chunk = event.results[i][0]?.transcript || "";
-          if (event.results[i].isFinal) {
-            finalRef.current += `${chunk} `;
-          } else {
-            interim += chunk;
-          }
+        if (
+          browserSessionRef.current !== session ||
+          recognitionRef.current !== recognition
+        ) {
+          return;
         }
-        cb.current.onInterim?.(`${finalRef.current}${interim}`.trim());
+        session.latestText = speechRecognitionResultsText(event.results);
+        cb.current.onInterim?.(session.latestText);
         requestFinishAfterSilence();
       };
 
@@ -226,8 +222,9 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
             "Chrome's speech recognition needs internet access. Switch STT to Local (Omni) to run offline.",
         };
 
-        // Chrome routinely emits no-speech when it rotates a continuous
-        // recognizer. That is not a reason to throw away the current session.
+        // Chrome can emit no-speech immediately before ending a continuous
+        // recognizer. onend owns the one-time finalization; this event itself
+        // is not a user-facing failure.
         if (event.error === "no-speech") return;
         if (event.error === "aborted" && (session.finishing || !session.active)) return;
 
@@ -237,14 +234,10 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       };
 
       recognition.onend = () => {
-        if (recognitionRef.current === recognition) recognitionRef.current = null;
-        if (session.finishing || !session.active) {
-          finalize();
-          return;
-        }
-        // Chrome may still rotate/end the recognizer itself. Restart quickly
-        // while preserving accumulated final text and the silence timer.
-        session.restartTimer = window.setTimeout(launch, BROWSER_RESTART_DELAY_MS);
+        if (browserSessionRef.current !== session) return;
+        if (recognitionRef.current && recognitionRef.current !== recognition) return;
+        recognitionRef.current = null;
+        finalize();
       };
 
       try {
@@ -345,7 +338,6 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       browserSession.active = false;
       browserSession.finishing = true;
       if (browserSession.idleTimer != null) window.clearTimeout(browserSession.idleTimer);
-      if (browserSession.restartTimer != null) window.clearTimeout(browserSession.restartTimer);
       const recognition = recognitionRef.current;
       if (recognition) {
         try {
@@ -392,7 +384,6 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       browserSession.active = false;
       browserSession.finishing = true;
       if (browserSession.idleTimer != null) window.clearTimeout(browserSession.idleTimer);
-      if (browserSession.restartTimer != null) window.clearTimeout(browserSession.restartTimer);
     }
     try {
       recognitionRef.current?.abort();
