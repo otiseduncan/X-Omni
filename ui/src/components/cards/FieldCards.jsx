@@ -15,6 +15,7 @@ import {
   calibrationSummaryScopeLabel,
   calibrationStatusTone as statusTone,
 } from "../../lib/calibrationIqPresentation.js";
+import { scrapexCardPresentation } from "../../lib/scrapexCardPresentation.js";
 import { ResearchProviderCard } from "./ResearchCards.jsx";
 
 /*
@@ -936,6 +937,169 @@ export function AdasRecordCard({ data }) {
   );
 }
 
+/* ---------------- ScrapeX: bounded ADAS Map acquisition ---------------- */
+
+export function ScrapeXCard({ data }) {
+  const {
+    objectPayload,
+    readinessRows,
+    provenance,
+    authenticationRequired,
+    warning,
+    batches,
+    completionLabel,
+  } = scrapexCardPresentation(data);
+
+  return (
+    <Card
+      icon={Layers}
+      title="ScrapeX · ADAS Map"
+      meta={data?.action || "status"}
+      tone={warning ? "warn" : undefined}
+    >
+      <div className="kv">
+        <div><span>State</span><strong>{data?.status || "unknown"}</strong></div>
+        <div><span>Request executed</span><strong>{data?.executed === true ? "yes" : "no"}</strong></div>
+        {data?.work_complete != null && (
+          <div><span>{completionLabel}</span><strong>{data.work_complete ? "yes" : "no"}</strong></div>
+        )}
+        {(objectPayload?.id || objectPayload?.batch_id || objectPayload?.batch?.id) && (
+          <div><span>Batch</span><strong>{objectPayload.id || objectPayload.batch_id || objectPayload.batch.id}</strong></div>
+        )}
+        {readinessRows.map((row) => (
+          <div key={row.key}><span>{row.label}</span><strong>{row.value}</strong></div>
+        ))}
+      </div>
+
+      {authenticationRequired && (
+        <p className="card-note ciq-incomplete" style={{ marginTop: 9 }}>
+          Interactive ADAS Map sign-in is required in ScrapeX&apos;s managed work browser.
+          Credentials never pass through chat or the model.
+        </p>
+      )}
+      {data?.message && !authenticationRequired && (
+        <p className="card-note" style={{ marginTop: 9 }}>{data.message}</p>
+      )}
+      {data?.error?.message && (
+        <p className="card-note ciq-incomplete" style={{ marginTop: 9 }}>{data.error.message}</p>
+      )}
+      {batches.length > 0 && (
+        <details className="field-alts" style={{ marginTop: 9 }}>
+          <summary>{batches.length} ADAS Map batch{batches.length === 1 ? "" : "es"}</summary>
+          <div className="ro-list">
+            {batches.slice(0, 25).map((batch, index) => (
+              <div className="ro-item" key={batch?.id || index}>
+                <div className="ro-line">
+                  <strong className="ro-num">{batch?.name || batch?.id || `Batch ${index + 1}`}</strong>
+                  <span className="ro-pill">{batch?.state || batch?.status || "unknown"}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+      {(provenance?.inspection_id || provenance?.source_url || provenance?.checked_at) && (
+        <details className="field-alts" style={{ marginTop: 9 }} open>
+          <summary>Source provenance</summary>
+          <div className="kv" style={{ marginTop: 7 }}>
+            {provenance.inspection_id && <div><span>Inspection</span><strong>{provenance.inspection_id}</strong></div>}
+            {provenance.checked_at && <div><span>Checked</span><strong>{provenance.checked_at}</strong></div>}
+            <div><span>Requirements proven</span><strong>{provenance.requirements_proven ? "yes" : "no"}</strong></div>
+          </div>
+          {provenance.source_url && <p className="card-note">{provenance.source_url}</p>}
+        </details>
+      )}
+    </Card>
+  );
+}
+
+/* ---------------- Durable automotive knowledge ---------------- */
+
+function KnowledgeRecord({ record }) {
+  const application = record?.application || {};
+  const requirement = record?.requirement || {};
+  const evidence = Array.isArray(record?.evidence) ? record.evidence : [];
+  const years = application.year_start === application.year_end
+    ? application.year_start
+    : [application.year_start, application.year_end].filter(Boolean).join("–");
+  const vehicle = [years, application.manufacturer, application.model, application.trim]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <div className="research-source-row">
+      <div className="research-source-line">
+        <strong>{vehicle || record?.id || "Automotive knowledge"}</strong>
+        <span className={`ro-pill ${record?.lifecycle === "verified" ? "ok" : "warn"}`}>
+          {record?.lifecycle || "unknown"}
+        </span>
+      </div>
+      <div className="research-source-detail">
+        {record?.system?.name && <span>{record.system.name}</span>}
+        {record?.component?.name && <span>{record.component.name}</span>}
+        {requirement.calibration_type && <span>{requirement.calibration_type}</span>}
+      </div>
+      {requirement.text && <p className="card-note research-public-snippet">{requirement.text}</p>}
+      {evidence.length > 0 && (
+        <details className="research-evidence-group">
+          <summary>{evidence.length} provenance source{evidence.length === 1 ? "" : "s"}</summary>
+          {evidence.map((item, index) => (
+            <div className="research-evidence-item" key={item?.id || index}>
+              <div className="research-evidence-title">
+                <strong>{item?.source?.source_name || item?.source?.document_id || "Source"}</strong>
+                <span className={`ro-pill ${item?.verification_status === "verified" ? "ok" : "warn"}`}>
+                  {item?.verification_status || "unverified"}
+                </span>
+              </div>
+              <div className="research-source-detail">
+                {item?.page_start != null && <span>page {item.page_start}</span>}
+                {item?.section && <span>{item.section}</span>}
+                {item?.source?.source_revision && <span>rev. {item.source.source_revision}</span>}
+              </div>
+              {item?.source?.source_uri && <p className="card-note">{item.source.source_uri}</p>}
+            </div>
+          ))}
+        </details>
+      )}
+    </div>
+  );
+}
+
+export function AutomotiveKnowledgeCard({ data }) {
+  const records = Array.isArray(data?.records)
+    ? data.records
+    : data?.record
+      ? [data.record]
+      : [];
+  const warning = data?.status === "no_result" || records.some((record) => record?.lifecycle !== "verified");
+
+  return (
+    <Card
+      icon={BookOpen}
+      title="Automotive knowledge"
+      meta={`${records.length} record${records.length === 1 ? "" : "s"}`}
+      tone={warning ? "warn" : undefined}
+    >
+      {records.length === 0 ? (
+        <p className="card-note">
+          {data?.message || "No matching durable knowledge was found in this source."}
+        </p>
+      ) : (
+        <div className="research-source-ledger">
+          {records.slice(0, 25).map((record, index) => (
+            <KnowledgeRecord record={record} key={record?.id || index} />
+          ))}
+        </div>
+      )}
+      {data?.verification_deferred && (
+        <p className="card-note ciq-incomplete" style={{ marginTop: 9 }}>
+          Candidate evidence was preserved as unverified; trusted review is still required.
+        </p>
+      )}
+    </Card>
+  );
+}
+
 export const FIELD_CARDS = {
   adas_si_document: AdasDocumentCard,
   adas_si_results: AdasResultsCard,
@@ -949,4 +1113,6 @@ export const FIELD_CARDS = {
   calibration_iq_status: CalibrationStatusCard,
   calibration_iq_work_prep: CalibrationWorkPrepCard,
   research_provider: ResearchProviderCard,
+  scrapex: ScrapeXCard,
+  automotive_knowledge: AutomotiveKnowledgeCard,
 };

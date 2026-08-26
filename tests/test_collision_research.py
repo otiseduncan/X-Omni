@@ -4,8 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from core.orchestrator import loop as loop_mod
-from core.services import research_capture, research_operator, research_setup
+from core.services import (
+    research_alldata_navigation,
+    research_capture,
+    research_operator,
+)
 from core.tools.registry import Registry, TOOL_SCHEMAS
 
 
@@ -21,19 +24,13 @@ def _policy_text(*, include_research: bool = True) -> str:
     return f"roots: []\nwrite_roots: []\ntools:\n{tools or '  {}\n'}"
 
 
-def test_alldata_setup_language_routes_directly_to_secure_card():
-    phrases = [
-        "Set up AllData for me",
-        "add my ALLDATA credentials",
-        "I need to log in to all data",
-        "configure alldata password",
-    ]
-    for phrase in phrases:
-        assert loop_mod.deterministic_read_tool(phrase) == "research_provider_setup"
-
-
-def test_unrelated_requests_keep_existing_deterministic_router_behavior():
-    assert loop_mod.deterministic_read_tool("what time is it") is None
+def test_alldata_setup_is_exposed_as_a_model_selectable_secure_capability():
+    schema = TOOL_SCHEMAS["research_provider_setup"]
+    assert schema["parameters"] == {"type": "object", "properties": {}, "required": []}
+    description = schema["description"].casefold()
+    assert "alldata" in description
+    assert "credential" in description
+    assert "never enters model context" in description
 
 
 def test_research_tools_are_registered_with_separate_policy_tiers(tmp_path: Path):
@@ -109,10 +106,57 @@ def test_collision_tool_schema_has_no_password_argument_and_can_capture_public_o
     assert "credential" not in properties
     assert "action" in properties
     assert "public_capture" in properties["action"]["enum"]
+    assert "alldata_vehicle_research" in properties["action"]["enum"]
+    assert "full_research" not in properties["action"]["enum"]
+    assert {"vehicle_year", "vehicle_make", "vehicle_model", "topic"} <= set(
+        properties
+    )
 
 
-def test_setup_regex_does_not_capture_generic_web_login():
-    assert research_setup._SETUP_RE.search("log in to my bank") is None
+@pytest.mark.asyncio
+async def test_alldata_vehicle_research_executes_model_supplied_structured_fields(
+    tmp_path, monkeypatch
+):
+    browser = research_operator.LicensedBrowser(tmp_path)
+    received: dict = {}
+
+    async def structured_search(browser_arg, query="", *, vehicle=None, topic=None):
+        assert browser_arg is browser
+        assert query == ""
+        received.update({"vehicle": vehicle, "topic": topic})
+        return {
+            "status": "success",
+            "searched": True,
+            "verified": True,
+            "vehicle": vehicle,
+            "topic": topic,
+        }
+
+    monkeypatch.setattr(
+        research_alldata_navigation,
+        "search_alldata_vehicle_first",
+        structured_search,
+    )
+    result = await browser.operator_action(
+        {
+            "action": "alldata_vehicle_research",
+            "vehicle_year": 2020,
+            "vehicle_make": "Toyota",
+            "vehicle_model": "Camry",
+            "vehicle_trim": "LE",
+            "topic": "front radar calibration prerequisites",
+        }
+    )
+    assert result["verified"] is True
+    assert received == {
+        "vehicle": {
+            "year": 2020,
+            "make": "Toyota",
+            "model": "Camry",
+            "trim": "LE",
+        },
+        "topic": "front radar calibration prerequisites",
+    }
 
 
 def test_windows_vault_validation_does_not_require_windows_api():

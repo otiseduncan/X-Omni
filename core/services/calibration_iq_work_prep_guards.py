@@ -1,7 +1,7 @@
 """Narrow safety and compatibility corrections for Calibration IQ work prep.
 
 These guards keep the bridge production-scoped, preserve ADAS Map authority,
-accept observed field dictation, and let an inline ALLDATA card survive a Core
+and let an inline ALLDATA card survive a Core
 restart without hammering a dead in-memory browser session id.
 """
 
@@ -40,20 +40,6 @@ def _strict_adas_map_marker(value: Any, path: tuple[str, ...]) -> bool:
     return False
 
 
-def _safe_phase(text: object):
-    """Parse numeric or spoken phase values without eager fallback evaluation."""
-    match = prep._PHASE_RE.search(str(text or ""))  # noqa: SLF001
-    if not match:
-        return None
-    token = match.group("phase").casefold()
-    if token in prep._PHASE_WORDS:  # noqa: SLF001
-        return prep._PHASE_WORDS[token]  # noqa: SLF001
-    try:
-        return str(int(token))
-    except ValueError:
-        return None
-
-
 def _policy_declares_work_prep(policy_path: object) -> bool:
     """Only production policies that explicitly declare the tool may expose it."""
     try:
@@ -82,24 +68,7 @@ async def _restore_browser_session_if_stale(browser: Any, session_id: str) -> No
 
 
 def install() -> None:
-    # Speech-to-text has produced "8 oz quick reference" and "8 ass quick
-    # reference" in real field turns (both mishearings of "ADAS"). Keep this
-    # deliberately specific to Quick Reference; it must not make arbitrary
-    # "8 oz"/"8 ass" utterances enter the licensed research lane.
-    prep._QUICK_REFERENCE_RE = re.compile(  # noqa: SLF001
-        r"\b(?:adas|ados|a\s*d\s*a\s*s|8\s*oz|8\s*ass|a\s*dash)\s+quick\s+reference\b|"
-        r"\bquick\s+reference\b.{0,60}\b(?:adas|ados|a\s*d\s*a\s*s|a\s*dash)\b",
-        re.IGNORECASE | re.DOTALL,
-    )
-    # Field trace: "collect the a dash information for this car" -- the same
-    # "ADAS" mishearing outside the Quick Reference phrase. Widen the bare
-    # marker _ADAS_MARKER_RE also relies on so both patterns stay consistent.
-    prep._ADAS_MARKER_RE = re.compile(  # noqa: SLF001
-        r"\b(?:adas|ados|a\s*d\s*a\s*s|8\s*oz|8\s*ass|a\s*dash)\b",
-        re.IGNORECASE,
-    )
     prep._node_has_adas_map_marker = _strict_adas_map_marker  # noqa: SLF001
-    prep._phase = _safe_phase  # noqa: SLF001
 
     # Work prep used to inject itself into every Registry instance. That made a
     # tiny isolated test policy advertise a production tool it never declared.

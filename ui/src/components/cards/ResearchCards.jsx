@@ -471,6 +471,6 @@ export function ResearchProviderCard({ data }) {
   if (data?.action === "full_research") return <FullResearchResult data={data} />;
   if (data?.action === "public_search" || data?.action === "public_read") return <ExternalResults data={data} />;
   if (data?.action === "capture_to_adas" || data?.action === "public_capture") return <CaptureResult data={data} />;
-  if (data?.action === "extract" || data?.action === "snapshot") return <ExtractResult data={data} />;
+  if (["extract", "snapshot", "alldata_vehicle_research"].includes(data?.action)) return <ExtractResult data={data} />;
   return <AccessCard data={data} />;
 }

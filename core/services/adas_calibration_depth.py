@@ -2,10 +2,11 @@
 
 Calibration requirements are often buried in a late-page note, sidebar, warning,
 or one-line applicability statement.  Normal ranking is still useful for finding
-the right documents, but a calibration question must not stop at the first high-
-scoring page.  This wrapper scans every page of the relevant OEM PDFs (using the
-existing native+OCR page path) for calibration-trigger language and folds those
-findings back into ordinary ADAS SI results.
+the right documents, but an explicitly requested calibration-requirement search
+must not stop at the first high-scoring page.  This wrapper scans every page of
+the relevant OEM PDFs (using the existing native+OCR page path) for
+calibration-trigger language and folds those findings back into ordinary ADAS SI
+results.
 
 Because it wraps ``AdasSI.search`` itself, the behavior automatically applies to
 chat research, Calibration IQ ``research_ro``, and any future consumer of the
@@ -17,35 +18,12 @@ from __future__ import annotations
 import re
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from . import adas_identity_guard
 
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
-
-_CALIBRATION_INTENT_RE = re.compile(
-    r"\b(?:calibrat(?:e|ed|es|ing|ion|ions)?|recalibrat(?:e|ed|ion)?|"
-    r"aim(?:ing|ment)?|beam\s+axis|target\s+(?:placement|setting)|"
-    r"camera\s+(?:aim|alignment)|radar\s+(?:aim|alignment|adjustment)|"
-    r"adas\s+(?:calibration|aiming)|eyesight|blind\s+spot\s+(?:monitor|radar)|"
-    r"forward\s+recognition\s+camera|millimeter\s+wave\s+radar|"
-    # These are standalone ADAS system names (same tier as eyesight / blind
-    # spot monitor above) so a plain "I need the 360 camera procedure for X"
-    # routes into research without also requiring collision-context language
-    # -- a real reported gap: that exact phrasing matched neither this regex
-    # nor the collision-context fallback below, so ALLDATA was never even
-    # attempted and the turn silently dead-ended at a local ADAS SI miss.
-    r"360[\s-]?(?:degree\s+)?(?:view\s+)?camera|surround\s+(?:view|vision)\s+camera|"
-    r"parking\s+aid\s+camera)\b",
-    re.IGNORECASE,
-)
-_COLLISION_CONTEXT_RE = re.compile(
-    r"\b(?:collision|accident|impact|body\s+repair|sheet\s+metal|"
-    r"windshield|bumper|suspension|alignment|remove|removed|removal|"
-    r"replace|replaced|replacement|repair|repaired|installation|installed)\b",
-    re.IGNORECASE,
-)
 
 # These are deliberately phrased as requirement/trigger language rather than
 # one OEM-specific sentence.  The goal is to find small policy statements such
@@ -118,23 +96,6 @@ _RULE_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
         9,
     ),
 )
-
-
-def calibration_intent(query: object) -> bool:
-    text = str(query or "")
-    if not text.strip():
-        return False
-    if _CALIBRATION_INTENT_RE.search(text):
-        return True
-    # Some field questions omit the word calibration but pair an ADAS system
-    # with collision/replacement language.  Treat those as calibration research.
-    system = re.search(
-        r"\b(?:adas|eyesight|blind\s+spot|lane\s+(?:keep|departure)|front\s+camera|"
-        r"forward\s+camera|radar|rear\s+corner\s+radar)\b",
-        text,
-        re.IGNORECASE,
-    )
-    return bool(system and _COLLISION_CONTEXT_RE.search(text))
 
 
 def _query_tokens(query: str) -> set[str]:
@@ -212,7 +173,6 @@ def _deep_documents(adas: Any, adas_mod: Any, query: str) -> list[tuple[dict[str
         return output
 
     # Without a named make, stay bounded to the normal identity-ranked set.
-    by_path = {str((doc.get("_path") or "")): doc for doc in docs if isinstance(doc, dict)}
     for raw_path, score in score_map.items():
         doc = next(
             (
@@ -244,7 +204,14 @@ def install(adas_mod: Any) -> None:
             if not isinstance(result, dict):
                 return result
             query = str((args or {}).get("query") or "").strip()
-            if not calibration_intent(query) or not self.available():
+            # The model-facing adapter supplies this structured mode after the
+            # model has decided what kind of evidence it needs.  This module
+            # never infers conversational intent from words in ``query``.
+            if (
+                str((args or {}).get("search_mode") or "standard")
+                != "calibration_requirements"
+                or not self.available()
+            ):
                 return result
 
             query_tokens = _query_tokens(query)

@@ -61,6 +61,24 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
 
+-- Structured, conversation-scoped working subject. This is context for the
+-- model, not a text-rewrite rule: authoritative tool results update the row,
+-- and prompt assembly may expose the compact JSON on later turns.
+CREATE TABLE IF NOT EXISTS conversation_subjects (
+    conversation_id    INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    subject_type       TEXT NOT NULL,
+    resource_id        TEXT NOT NULL,
+    payload_json       TEXT NOT NULL,
+    source_tool_name   TEXT NOT NULL,
+    source_tool_call_id TEXT,
+    source_message_id  INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    version            INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_subjects_resource
+    ON conversation_subjects(subject_type, resource_id);
+
 CREATE TABLE IF NOT EXISTS tool_calls (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,

@@ -21,7 +21,6 @@ from core.orchestrator import prompt as prompt_module
 from core.orchestrator.loop import (
     ARTIFACT_FOR_TOOL,
     Orchestrator,
-    deterministic_read_tool,
 )
 from core.services import camera
 from core.services import exterior_camera
@@ -1443,7 +1442,7 @@ def test_exterior_camera_tool_is_read_only_inline_and_starts_nothing():
     assert "only a separately submitted exterior-camera observation artifact" in system
 
 
-def test_explicit_exterior_camera_observation_is_deterministically_routed_inline():
+def test_exterior_camera_observation_is_model_selected_inline():
     request_text = (
         "Look through the exterior camera and tell me what you can see "
         "in the current frame."
@@ -1488,6 +1487,14 @@ def test_explicit_exterior_camera_observation_is_deterministically_routed_inline
 
         async def stream(self, messages, tools=None):
             self.calls.append((messages, tools))
+            if len(self.calls) == 1:
+                yield {
+                    "type": "tool_call",
+                    "id": "model-exterior-camera",
+                    "name": "exterior_camera_request",
+                    "arguments": json.dumps({"prompt": request_text}),
+                }
+                return
             yield {
                 "type": "content",
                 "text": "The exterior camera controls are ready in chat.",
@@ -1513,9 +1520,6 @@ def test_explicit_exterior_camera_observation_is_deterministically_routed_inline
         ]
 
     events = asyncio.run(collect())
-    assert deterministic_read_tool(request_text) == "exterior_camera_request"
-    assert deterministic_read_tool("Explain exterior-camera security.") is None
-    assert deterministic_read_tool("Look through the PC camera.") is None
     assert invocations == [{"prompt": request_text}]
     assert [
         event["type"] for event in events[:3]
@@ -1525,12 +1529,13 @@ def test_explicit_exterior_camera_observation_is_deterministically_routed_inline
     assert artifact["data"]["configured"] is True
     assert artifact["data"]["status"] == "awaiting_stream_start"
     assert not any(event["type"] == "approval" for event in events)
-    assert len(client.calls) == 1
-    model_messages, model_tools = client.calls[0]
-    assert not any(
+    assert len(client.calls) == 2
+    _initial_messages, model_tools = client.calls[0]
+    assert any(
         item.get("function", {}).get("name") == "exterior_camera_request"
         for item in model_tools
     )
+    model_messages, _model_tools = client.calls[1]
     synthetic = next(message for message in model_messages if message.get("tool_calls"))
     assert synthetic["tool_calls"][0]["function"]["name"] == "exterior_camera_request"
     tool_result = next(message for message in model_messages if message["role"] == "tool")

@@ -156,6 +156,32 @@ tools:
     tier: confirm_required
     description: "Update an ADAS SI annotation record. Version-checked. Requires approval."
 
+  # ---- Durable source-backed automotive knowledge ----
+  automotive_knowledge_search:
+    tier: read_only
+    description: >-
+      Search durable structured automotive knowledge. Verified, non-superseded
+      records are the safe default; an empty result is only a miss in this store.
+
+  automotive_knowledge_read:
+    tier: read_only
+    description: >-
+      Read one durable automotive knowledge record with its lifecycle, exact
+      application, prerequisites, procedures, and source provenance.
+
+  automotive_knowledge_capture:
+    tier: operator_authorized
+    description: >-
+      Preserve source-located candidate automotive knowledge or add evidence to
+      an existing record. Model-directed evidence cannot self-verify a claim.
+
+  automotive_knowledge_lifecycle:
+    tier: confirm_required
+    description: >-
+      Promote or supersede durable automotive knowledge with optimistic
+      versioning. Requires Owner approval and still fails closed unless the
+      repository already contains deterministically validated evidence.
+
   # ---- Post-collision research: setup is passive, operator use is authorized ----
   research_provider_setup:
     tier: read_only
@@ -171,6 +197,27 @@ tools:
       and public OEM/manufacturer sources. Preserve selected ALLDATA or public OEM
       evidence into ADAS SI with provenance. Do not bypass CAPTCHA, access controls,
       subscription limits, or other provider boundaries.
+
+  # ---- ScrapeX: loopback-only ADAS Map acquisition and CIQ reconciliation ----
+  scrapex_status:
+    tier: read_only
+    description: >-
+      Read ScrapeX health, managed Work Chrome authentication state, and bounded
+      batch status without starting browser work or changing Calibration IQ.
+
+  scrapex_read:
+    tier: read_only
+    description: >-
+      Read ScrapeX batches, exact-RO ADAS Map provenance, exceptions, summaries,
+      or a non-mutating Calibration IQ queue preview.
+
+  scrapex_adas_map:
+    tier: operator_authorized
+    description: >-
+      Run a structured ScrapeX ADAS Map queue or exact-RO action through the
+      loopback-only service. ScrapeX verifies exact inspection provenance and
+      Calibration IQ reconciliation; authentication-required and partial states
+      are returned truthfully and never converted to success.
 
   # ---- Calibration IQ: routine operator work is authorized; destructive deletes are gated ----
   calibration_iq_status:

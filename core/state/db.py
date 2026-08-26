@@ -84,6 +84,10 @@ class WebsiteRevisionConflict(RuntimeError):
     """The website lineage advanced before a child revision could commit."""
 
 
+class ConversationSubjectConflict(RuntimeError):
+    """The active conversation subject changed before a state write committed."""
+
+
 class Store:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -846,6 +850,227 @@ class Store:
             d["artifacts"] = json.loads(d.pop("artifacts_json") or "[]")
             out.append(d)
         return out
+
+    # ---------- conversation subject ----------
+
+    @staticmethod
+    def _conversation_subject_row(row: sqlite3.Row | None) -> Optional[dict]:
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            payload = json.loads(item.pop("payload_json"))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("Stored conversation subject is invalid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Stored conversation subject payload is not an object.")
+        item["payload"] = payload
+        return item
+
+    def get_conversation_subject(
+        self,
+        conversation_id: int,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Return the structured active subject if the caller owns the chat."""
+        clauses = ["cs.conversation_id = ?"]
+        params: list[Any] = [conversation_id]
+        if user_id is not None:
+            clauses.append("c.user_id = ?")
+            params.append(user_id)
+        row = self._one(
+            """
+            SELECT cs.*
+            FROM conversation_subjects cs
+            JOIN conversations c ON c.id = cs.conversation_id
+            WHERE """
+            + " AND ".join(clauses),
+            tuple(params),
+        )
+        return self._conversation_subject_row(row)
+
+    def set_conversation_subject(
+        self,
+        conversation_id: int,
+        subject: dict,
+        *,
+        source_tool_name: str,
+        source_tool_call_id: Optional[str] = None,
+        source_message_id: Optional[int] = None,
+        user_id: Optional[str] = None,
+        expected_version: Optional[int] = None,
+    ) -> dict:
+        """Insert or replace a subject with ownership and optimistic locking.
+
+        ``subject`` must carry stable ``type`` and ``resource_id`` fields. The
+        whole compact payload is retained, while the two identity fields are
+        duplicated as indexed columns for deterministic lookup and auditing.
+        """
+        if not isinstance(subject, dict):
+            raise ValueError("conversation subject must be an object")
+        subject_type = str(subject.get("type") or "").strip()
+        resource_id = str(subject.get("resource_id") or "").strip()
+        tool_name = str(source_tool_name or "").strip()
+        if not subject_type or len(subject_type) > 120:
+            raise ValueError("conversation subject type is required and must be <= 120 characters")
+        if not resource_id or len(resource_id) > 300:
+            raise ValueError("conversation subject resource_id is required and must be <= 300 characters")
+        if not tool_name or len(tool_name) > 160:
+            raise ValueError("source_tool_name is required and must be <= 160 characters")
+        tool_call_id = str(source_tool_call_id or "").strip() or None
+        if tool_call_id and len(tool_call_id) > 300:
+            raise ValueError("source_tool_call_id must be <= 300 characters")
+        try:
+            payload_json = _canonical_json(subject)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("conversation subject must be JSON serializable") from exc
+        if len(payload_json.encode("utf-8")) > 16_384:
+            raise ValueError("conversation subject exceeds 16384 bytes")
+        if expected_version is not None and (
+            isinstance(expected_version, bool) or int(expected_version) < 1
+        ):
+            raise ValueError("expected_version must be a positive integer")
+
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                conversation = self.conn.execute(
+                    "SELECT user_id FROM conversations WHERE id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if not conversation or (
+                    user_id is not None and conversation["user_id"] != user_id
+                ):
+                    raise ValueError("conversation does not exist for this user")
+                if source_message_id is not None:
+                    message = self.conn.execute(
+                        "SELECT 1 FROM messages WHERE id = ? AND conversation_id = ?",
+                        (source_message_id, conversation_id),
+                    ).fetchone()
+                    if not message:
+                        raise ValueError("source message does not belong to this conversation")
+
+                current = self.conn.execute(
+                    "SELECT version FROM conversation_subjects WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if expected_version is not None and (
+                    not current or int(current["version"]) != int(expected_version)
+                ):
+                    raise ConversationSubjectConflict(
+                        "The conversation subject changed before this update committed."
+                    )
+                next_version = int(current["version"]) + 1 if current else 1
+                self.conn.execute(
+                    """
+                    INSERT INTO conversation_subjects
+                        (conversation_id, subject_type, resource_id, payload_json,
+                         source_tool_name, source_tool_call_id, source_message_id,
+                         version, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(conversation_id) DO UPDATE SET
+                        subject_type = excluded.subject_type,
+                        resource_id = excluded.resource_id,
+                        payload_json = excluded.payload_json,
+                        source_tool_name = excluded.source_tool_name,
+                        source_tool_call_id = excluded.source_tool_call_id,
+                        source_message_id = excluded.source_message_id,
+                        version = excluded.version,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        conversation_id,
+                        subject_type,
+                        resource_id,
+                        payload_json,
+                        tool_name,
+                        tool_call_id,
+                        source_message_id,
+                        next_version,
+                    ),
+                )
+                row = self.conn.execute(
+                    "SELECT * FROM conversation_subjects WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                self.conn.execute(
+                    "INSERT INTO audit_log(event_type,detail_json) VALUES(?,?)",
+                    (
+                        "conversation_subject.updated",
+                        _canonical_json(
+                            {
+                                "conversation_id": conversation_id,
+                                "subject_type": subject_type,
+                                "resource_id": resource_id,
+                                "source_tool_name": tool_name,
+                                "source_tool_call_id": tool_call_id,
+                                "version": next_version,
+                            }
+                        ),
+                    ),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        result = self._conversation_subject_row(row)
+        assert result is not None
+        return result
+
+    def clear_conversation_subject(
+        self,
+        conversation_id: int,
+        *,
+        user_id: Optional[str] = None,
+        expected_version: Optional[int] = None,
+    ) -> bool:
+        """Clear a subject only within the caller's conversation boundary."""
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                conversation = self.conn.execute(
+                    "SELECT user_id FROM conversations WHERE id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if not conversation or (
+                    user_id is not None and conversation["user_id"] != user_id
+                ):
+                    self.conn.rollback()
+                    return False
+                current = self.conn.execute(
+                    "SELECT version FROM conversation_subjects WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if expected_version is not None and (
+                    not current or int(current["version"]) != int(expected_version)
+                ):
+                    raise ConversationSubjectConflict(
+                        "The conversation subject changed before it could be cleared."
+                    )
+                cursor = self.conn.execute(
+                    "DELETE FROM conversation_subjects WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                if cursor.rowcount:
+                    self.conn.execute(
+                        "INSERT INTO audit_log(event_type,detail_json) VALUES(?,?)",
+                        (
+                            "conversation_subject.cleared",
+                            _canonical_json(
+                                {
+                                    "conversation_id": conversation_id,
+                                    "version": int(current["version"]),
+                                }
+                            ),
+                        ),
+                    )
+                self.conn.commit()
+                return bool(cursor.rowcount)
+            except Exception:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
 
     # ---------- tool calls ----------
 

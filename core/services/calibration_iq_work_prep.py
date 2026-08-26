@@ -5,17 +5,9 @@ is the governing calibration-requirement source. ADAS SI owns procedure
 availability. This module joins those existing contracts without creating a
 second queue or teaching the model to guess at job scope.
 
-High-confidence conversational workflows are handled directly:
-* "check what cars are in phase five" -> Calibration IQ phase list
-* "which phase five cars need ADAS SI" -> full phase-scoped readiness audit
-* "what does RO ... need/have" -> the RO's saved CIQ calibration requirements
-* "make sure we're prepared for the week" -> active CIQ queue + ADAS Map
-  reconciliation + exact ADAS SI coverage report
-* "collect/retrieve ADAS Quick Reference" -> the currently selected ALLDATA
-  vehicle is resolved to exactly one active CIQ RO before the existing low-rate
-  Quick Reference collector is allowed to save anything
-* "log in to ALLDATA" -> the existing inline licensed-browser card, with a
-  truthful fixed instruction instead of model-authored desktop-browser advice
+The model selects this capability and supplies its structured mode and filters.
+This module validates and executes those fields; it does not infer them from the
+user's conversational wording.
 
 Requirement reconciliation is routine operator work. If a machine-readable
 ADAS Map on an RO contains a calibration missing from CIQ, X uses CIQ's own
@@ -30,7 +22,7 @@ import json
 import re
 import threading
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, Optional
 
 from . import adas_artifact_catalog
 from . import calibration_iq
@@ -47,119 +39,6 @@ _INSTALLED = False
 _ACTIVE_DETERMINATIONS = {"REQUIRED", "LIKELY_REQUIRED", "NEEDS_RESEARCH"}
 _METHODS = {"STATIC", "DYNAMIC", "BOTH", "INSPECTION_ONLY", "UNKNOWN"}
 
-_RO_RE = re.compile(
-    r"\b(?:repair\s+order|ro)\s*(?:number|no\.?|#|id)?\s*[:#]?\s*[`\"']?"
-    r"(?P<identifier>"
-    r"XOP-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*|"
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|"
-    r"(?=[A-Za-z0-9-]{5,64}\b)(?=[A-Za-z0-9-]*\d)"
-    r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
-    r")\b",
-    re.IGNORECASE,
-)
-_PHASE_RE = re.compile(
-    r"\bphase\s*(?:number\s*)?"
-    r"(?P<phase>\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten)\b",
-    re.IGNORECASE,
-)
-_PHASE_WORDS = {
-    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
-    "ten": "10",
-}
-_SHOPS = (
-    (re.compile(r"\bwarner\s+robins\b", re.IGNORECASE), "Warner Robins"),
-    (re.compile(r"\bmacon\b", re.IGNORECASE), "Macon"),
-    (re.compile(r"\bperry\b", re.IGNORECASE), "Perry"),
-)
-_QUICK_REFERENCE_RE = re.compile(
-    r"\badas\s+quick\s+reference\b|\bquick\s+reference\b.{0,60}\badas\b",
-    re.IGNORECASE | re.DOTALL,
-)
-_QUICK_ACTION_RE = re.compile(
-    r"\b(?:collect|retrieve|pull|capture|save|load|import|get|grab|download)\b",
-    re.IGNORECASE,
-)
-# Broader than _QUICK_REFERENCE_RE: matches a bare "ADAS" mention (patched by
-# calibration_iq_work_prep_guards for observed field mishearings) without
-# requiring the literal "quick reference" phrase. Combined with an
-# acquisition verb and an explicit reference to the vehicle in front of the
-# tech, "collect the ADAS information for this car" is unambiguously the same
-# request as "collect the ADAS Quick Reference" -- the tech should not have to
-# know that exact phrase. Requiring the vehicle reference keeps this from
-# capturing a generic knowledge question like "get the ADAS calibration
-# steps", which is an ADAS SI search, not an ALLDATA acquisition.
-_ADAS_MARKER_RE = re.compile(r"\b(?:adas|ados|a\s*d\s*a\s*s)\b", re.IGNORECASE)
-_VEHICLE_REFERENCE_RE = re.compile(r"\b(?:this|that)\s+(?:car|vehicle|one)\b", re.IGNORECASE)
-_WEEK_READY_RE = re.compile(
-    r"\b(?:prepared|prepare|prep|ready|readiness)\b.{0,90}"
-    r"\b(?:weekly\s+queue|queue|repair\s+orders?|ros?|si|adas|calibration\s+iq|ciq)\b|"
-    r"\b(?:what|which)\b.{0,60}\b(?:adas\s+si|si)\b.{0,60}\b(?:missing|need|needed)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-# Whole-utterance aliases for the ordinary weekly command.  Week/work alone is
-# not sufficient because this is an operator-authorized lane: phrases such as
-# "prepare a presentation for work" and "ready for a week-long trip" must stay
-# in normal conversation.
-_WEEK_COMMAND_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:let(?:'s|\s+us)\s+)?(?:"
-    r"(?:prepare|prep)(?:\s+(?:me|us|everything|all\s+cars|the\s+cars))?"
-    r"(?:\s+for)?\s+(?:(?:this|the)\s+)?week|"
-    r"get(?:\s+(?:me|us|all\s+cars|the\s+cars))?\s+ready\s+for\s+"
-    r"(?:(?:this|the)\s+)?week|"
-    r"make\s+sure\s+(?:we(?:'re|\s+are)|(?:all|the)\s+(?:cars|vehicles)\s+are)"
-    r"\s+(?:prepared|ready)\s+for\s+(?:(?:this|the)\s+)?week"
-    r")\s*[.!?]?\s*$",
-    re.IGNORECASE,
-)
-# Speech-to-text can turn the final word in the terse field command
-# "prepare week" into "weak".  Keep this alias anchored to the complete
-# utterance so ordinary phrases such as "prepare a weak argument" never enter
-# the Calibration IQ workflow.
-_WEEK_WEAK_ALIAS_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:let(?:'s|\s+us)\s+)?(?:prepare|prep)(?:\s+(?:me|us))?"
-    r"(?:\s+for)?\s+(?:the\s+)?weak\s*[.!?]?\s*$",
-    re.IGNORECASE,
-)
-_PHASE_COVERAGE_RE = re.compile(
-    r"\b(?:coverage|covered|si[-\s]?ready)\b|"
-    r"\badas\s+map\s+(?:reports?|evidence|results?)\b.{0,60}\badas\s+si\b|"
-    r"\badas\s+si\b.{0,60}\badas\s+map\s+(?:reports?|evidence|results?)\b|"
-    r"\b(?:missing|need|needs|needed|requiring)\b.{0,50}"
-    r"\b(?:adas\s+si|si|coverage)\b|"
-    r"\b(?:adas\s+si|si|coverage)\b.{0,50}"
-    r"\b(?:missing|needed|required|available|ready|covered)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-_COUNT_INTENT_RE = re.compile(r"\b(?:how\s+many|count)\b", re.IGNORECASE)
-_PHASE_LIST_RE = re.compile(
-    r"\b(?:check|what|which|show|list|display|see|pull\s+up)\b.{0,100}"
-    r"\b(?:cars?|vehicles?|repair\s+orders?|ros?)\b|"
-    r"\b(?:cars?|vehicles?|repair\s+orders?|ros?)\b.{0,100}"
-    r"\b(?:in|at|on)\s+phase\b",
-    re.IGNORECASE | re.DOTALL,
-)
-_RO_REQUIREMENT_RE = re.compile(
-    r"\b(?:what|which|tell\s+me|show|check)\b.{0,100}"
-    r"\b(?:calibrations?|requirements?|needs?|has|have)\b|"
-    r"\b(?:what\s+does|what's|whats)\b.{0,80}\b(?:ro|repair\s+order|this)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-_THIS_RO_RE = re.compile(r"\b(?:this|that|current)\s+(?:ro|repair\s+order)\b", re.IGNORECASE)
-_ALLDATA_ACCESS_RE = re.compile(
-    r"\b(?:log\s*in|login|open|resume|start|set\s*up|setup)\b.{0,50}\ball\s*data\b|"
-    r"\ball\s*data\b.{0,50}\b(?:log\s*in|login|open|resume|start|setup)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-# "download the SI for the [vehicle] that's open in ALLDATA" describes the
-# already-open browser state; it is not a request to open/log in to it. Only
-# the login-card verbs immediately followed by "in" + ALLDATA are excluded --
-# "open ALLDATA", "open the ALLDATA browser", and "log in to ALLDATA" all
-# still match the access request above.
-_ALLDATA_DESCRIPTIVE_STATE_RE = re.compile(
-    r"\b(?:open|resumed|started|running|loaded|showing|pulled\s+up)\s+(?:up\s+)?in\s+all\s*data\b",
-    re.IGNORECASE,
-)
 _ADAS_MAP_MARKER_RE = re.compile(r"\badas\s*[-_ ]?map\b|\badasmap\b", re.IGNORECASE)
 _REQUIREMENT_KEY_RE = re.compile(
     r"calibrat|requirement|required|system|service|operation|procedure|aim|align|reset|relearn|initial",
@@ -172,198 +51,6 @@ _CALIBRATION_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
-
-# Walking a weekly-readiness missing-SI queue one vehicle at a time: pick a
-# vehicle in ALLDATA, say "next" instead of repeating the RO or vehicle every
-# turn. Deliberately anchored to the whole message so "next" embedded in an
-# unrelated longer sentence never matches -- this is a bare go-ahead cue, not
-# a topic word.
-_QUEUE_NEXT_RE = re.compile(
-    r"^\s*(?:ok(?:ay)?[,.]?\s*)?(?:go\s+to\s+)?(?:the\s+)?next(?:\s+(?:one|car|vehicle|up))?\s*[.!]?\s*$|"
-    r"^\s*who'?s\s+next\s*[?.!]?\s*$",
-    re.IGNORECASE,
-)
-
-# Reading the persisted weekly-readiness SI queue instantly, without
-# re-running the live (write-capable) audit just to redisplay it. Live field
-# trace: "show me a list of the ones needing SI" -- a plain follow-up to
-# "prepare for the week" -- matched no existing branch here, fell through to
-# ordinary model tool choice, and the model answered from stored artifact
-# context in unbounded prose with no card, instead of this cheap disk read.
-_QUEUE_LIST_RE = re.compile(
-    r"\b(?:show|list|give|pull\s+up|see)\b.{0,60}"
-    r"\b(?:ones?|ros?|repair\s+orders?|vehicles?|cars?)\b.{0,40}"
-    r"\b(?:need(?:ing|s)?|missing|requir(?:e|ing|ed))\b.{0,20}\b(?:adas\s+si|si)\b|"
-    r"\b(?:what|which)\b.{0,60}"
-    r"\b(?:ones?|ros?|repair\s+orders?|vehicles?|cars?)\b.{0,40}"
-    r"\b(?:need(?:ing|s)?|missing|requir(?:e|ing|ed))\b.{0,20}\b(?:adas\s+si|si)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-
-# Conversational continuity for the ALLDATA acquisition flow: once "log in to
-# ALLDATA" has run, a follow-up like "retrieve SI information please" carries
-# no ALLDATA/quick-reference/RO wording of its own and would otherwise fall
-# through to the model's own (unrouted) tool choice -- which is exactly what
-# produced repeated adas_si_inventory calls in the field. The active stage is
-# recorded as an invisible artifact (no UI card is registered for its type) on
-# the assistant turn that ran alldata_access/quick_reference, then read back
-# here so a short, low-content follow-up resolves against it instead of
-# needing its own exact phrasing.
-_WORK_PREP_STATE_ARTIFACT = "work_prep_state"
-_WORK_PREP_MODE = "ciq_si_preparation"
-_CONTINUATION_LOOKBACK_MESSAGES = 8
-_CONTINUATION_PHRASE_RE = re.compile(
-    r"\b(?:go\s+ahead|do\s+it|do\s+this\s+one|pull\s+it|ready|proceed|okay|"
-    r"go\s+for\s+it|sounds\s+good)\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_work_prep_continuation(text: str) -> bool:
-    # Deliberately narrow: only an explicit acquisition verb (collect, pull,
-    # retrieve, ...) or one of a short list of unmistakable go-ahead phrases
-    # counts. A bare "yes"/"ok" is excluded -- it is too generic and could be
-    # answering something unrelated (a calendar prompt, an approval card)
-    # that happens to fall within the same lookback window.
-    value = " ".join(str(text or "").split()).strip()
-    if not value or len(value) > 160:
-        return False
-    return bool(_QUICK_ACTION_RE.search(value) or _CONTINUATION_PHRASE_RE.search(value))
-
-
-def _active_work_prep_stage(history: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    for index, message in enumerate(reversed(history or [])):
-        if index >= _CONTINUATION_LOOKBACK_MESSAGES:
-            break
-        artifacts = message.get("artifacts") or []
-        if not isinstance(artifacts, list):
-            continue
-        for artifact in reversed(artifacts):
-            if isinstance(artifact, dict) and artifact.get("type") == _WORK_PREP_STATE_ARTIFACT:
-                data = artifact.get("data")
-                if isinstance(data, dict):
-                    return data
-    return None
-
-
-def classify_request(
-    text: object, history: Optional[list[dict[str, Any]]] = None
-) -> Optional[str]:
-    value = str(text or "").strip()
-    if not value:
-        return None
-    if (
-        _ALLDATA_ACCESS_RE.search(value)
-        and not _QUICK_REFERENCE_RE.search(value)
-        and not _ALLDATA_DESCRIPTIVE_STATE_RE.search(value)
-    ):
-        return "alldata_access"
-    if _QUICK_REFERENCE_RE.search(value) and _QUICK_ACTION_RE.search(value):
-        return "quick_reference"
-    if (
-        _ADAS_MARKER_RE.search(value)
-        and _QUICK_ACTION_RE.search(value)
-        and _VEHICLE_REFERENCE_RE.search(value)
-    ):
-        return "quick_reference"
-    if _PHASE_RE.search(value) and _PHASE_COVERAGE_RE.search(value):
-        return "phase_coverage"
-    if (
-        _WEEK_READY_RE.search(value)
-        or _WEEK_COMMAND_RE.fullmatch(value)
-        or _WEEK_WEAK_ALIAS_RE.fullmatch(value)
-    ):
-        return "week_readiness"
-    if (
-        _PHASE_RE.search(value)
-        and _PHASE_LIST_RE.search(value)
-        and not _COUNT_INTENT_RE.search(value)
-    ):
-        return "phase_list"
-    if (
-        _RO_RE.search(value) or _THIS_RO_RE.search(value)
-    ) and _RO_REQUIREMENT_RE.search(value):
-        return "ro_requirements"
-    if _QUEUE_LIST_RE.search(value):
-        # Whether a queue was actually saved is checked downstream
-        # (_queue_list_mode); no active queue fails closed with a clear
-        # message instead of guessing at board-wide filters.
-        return "queue_list"
-    if _QUEUE_NEXT_RE.search(value):
-        # Whether an active weekly-readiness queue actually exists is
-        # checked downstream (resolve_queue_next); a bare "next" with none
-        # active fails closed with a clear message instead of guessing.
-        return "queue_next"
-    if history:
-        stage = _active_work_prep_stage(history)
-        if (
-            stage
-            and stage.get("mode") == _WORK_PREP_MODE
-            and stage.get("stage")
-            in {"awaiting_vehicle_selection", "awaiting_ro_disambiguation"}
-            and _looks_like_work_prep_continuation(value)
-        ):
-            return "quick_reference"
-    return None
-
-
-def _phase(text: object) -> Optional[str]:
-    match = _PHASE_RE.search(str(text or ""))
-    if not match:
-        return None
-    token = match.group("phase").casefold()
-    return _PHASE_WORDS.get(token, str(int(token)))
-
-
-def _phase_coverage_focus(text: object) -> str:
-    value = str(text or "")
-    if _ADAS_MAP_MARKER_RE.search(value) and re.search(
-        r"\b(?:reports?|evidence|results?)\b", value, re.IGNORECASE
-    ):
-        return "adas_map"
-    return "si_readiness"
-
-
-def _shop(text: object) -> Optional[str]:
-    value = str(text or "")
-    for pattern, label in _SHOPS:
-        if pattern.search(value):
-            return label
-    return None
-
-
-def _explicit_ro(text: object) -> Optional[str]:
-    match = _RO_RE.search(str(text or ""))
-    return match.group("identifier") if match else None
-
-
-def _latest_ro_identifier(history: list[dict[str, Any]]) -> Optional[str]:
-    for message in reversed(history or []):
-        artifacts = message.get("artifacts") or []
-        if isinstance(artifacts, list):
-            for artifact in reversed(artifacts):
-                if not isinstance(artifact, dict):
-                    continue
-                data = artifact.get("data")
-                if not isinstance(data, dict):
-                    continue
-                if artifact.get("type") == "calibration_iq_ro":
-                    ro = data.get("repair_order")
-                    if isinstance(ro, dict):
-                        ident = ro.get("id") or ro.get("RO") or ro.get("ro_number")
-                        if ident:
-                            return str(ident)
-                if artifact.get("type") == "calibration_iq_ros":
-                    rows = data.get("rows")
-                    if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
-                        ident = rows[0].get("id") or rows[0].get("RO")
-                        if ident:
-                            return str(ident)
-        text = str(message.get("content") or message.get("text") or "")
-        ident = _explicit_ro(text)
-        if ident:
-            return ident
-    return None
 
 
 def _plain(value: object) -> str:
@@ -1025,7 +712,16 @@ async def _adas_coverage(adas: Any, vehicle: str, requirements: list[dict[str, A
         label = _requirement_label(item)
         query = f"{vehicle} {label}".strip()
         try:
-            result = await asyncio.to_thread(adas.search, {"query": query})
+            result = await asyncio.to_thread(
+                adas.search,
+                {
+                    "query": query,
+                    # This helper is entered only from an explicit structured
+                    # SI-readiness operation. Preserve the exhaustive OEM
+                    # calibration scan without re-inferring depth from text.
+                    "search_mode": "calibration_requirements",
+                },
+            )
         except Exception as exc:  # noqa: BLE001
             return {"calibration": label, "query": query, "available": False, "reason": type(exc).__name__}
         payload = result if isinstance(result, dict) else {}
@@ -2107,6 +1803,36 @@ async def _week_readiness(
         rows = [
             row for row in rows if _row_phase_token(row) in _WEEK_READY_DEFAULT_PHASES
         ]
+    if len(rows) > weekly_queue.MAX_QUEUE_ITEMS:
+        # Capacity is a preflight safety boundary, not a persistence error.
+        # Check it before loading any RO snapshots or running reconciliation:
+        # otherwise the first 100+ ROs could be mutated before the durable
+        # queue rejects the oversized result.
+        phase_scope = (
+            [str(args["phase"])]
+            if explicit_phase
+            else sorted(_WEEK_READY_DEFAULT_PHASES, key=int)
+        )
+        return {
+            "status": "queue_capacity_exceeded",
+            "mode": "week_readiness",
+            "executed": False,
+            "success": False,
+            "verified": True,
+            "readiness_complete": False,
+            "candidate_count": len(rows),
+            "queue_count": 0,
+            "queue_capacity": weekly_queue.MAX_QUEUE_ITEMS,
+            "filters": filters,
+            "phase_scope": phase_scope,
+            "repair_orders": [],
+            "message": (
+                f"Calibration IQ returned {len(rows)} in-scope repair orders, "
+                f"exceeding the bounded weekly queue capacity of "
+                f"{weekly_queue.MAX_QUEUE_ITEMS}. No repair orders were "
+                "reconciled or queued. Narrow the phase or shop and retry."
+            ),
+        }
     context = _valid_context(args.get(_CONTEXT_KEY))
     catalog = _catalog_for(adas)
 
@@ -2133,9 +1859,12 @@ async def _week_readiness(
     results: list[dict[str, Any]] = []
     added_total = 0
     executed_any = False
+    requested_total = 0
     processed_total = 0
     receipt_total = 0
     verified_receipt_total = 0
+    indeterminate_reconciliation_total = 0
+    may_have_executed_reconciliation_total = 0
     for row, envelope in loaded:
         if envelope.get("status") != "verified":
             results.append(
@@ -2177,6 +1906,14 @@ async def _week_readiness(
                 and isinstance(item.get("verification"), dict)
                 and item["verification"].get("verified") is True
             )
+            requested = reconciliation.get("requested_count")
+            if (
+                not isinstance(requested, int)
+                or isinstance(requested, bool)
+                or requested < 0
+            ):
+                requested = len(receipts)
+            requested_total += requested
             processed = reconciliation.get("processed_count")
             if (
                 not isinstance(processed, int)
@@ -2185,6 +1922,10 @@ async def _week_readiness(
             ):
                 processed = len(receipts)
             processed_total += processed
+            if reconciliation.get("indeterminate") is True:
+                indeterminate_reconciliation_total += 1
+            if reconciliation.get("may_have_executed") is True:
+                may_have_executed_reconciliation_total += 1
             if reconciliation.get("executed") is True:
                 executed_any = True
             if reconciliation.get("verified") is True:
@@ -2279,8 +2020,23 @@ async def _week_readiness(
             }
         )
 
+    queue_persistence_error: Optional[dict[str, str]] = None
     if context is not None:
-        _save_weekly_queue(settings, context["conversation_id"], results)
+        try:
+            _save_weekly_queue(settings, context["conversation_id"], results)
+        except Exception as exc:  # noqa: BLE001 - retain completed mutation truth
+            # Reconciliation crosses the authoritative CIQ boundary before
+            # the derived local queue is written.  A disk/replace failure
+            # must not discard the receipts or make the whole tool call look
+            # as if nothing executed.
+            queue_persistence_error = {
+                "code": "queue_persistence_error",
+                "exception_type": type(exc).__name__,
+                "message": (
+                    "The readiness audit completed, but the derived weekly "
+                    "queue could not be persisted locally."
+                ),
+            }
 
     exception_count = sum(1 for item in results if item.get("ready") is not True)
     reconciliation_failed_count = sum(
@@ -2320,15 +2076,27 @@ async def _week_readiness(
     )
     queue_candidates = sum(1 for item in results if item.get("missing_si"))
     public_results, public_result_meta = _bounded_readiness_rows(results)
+    queue_persistence_failed = queue_persistence_error is not None
+    ciq_change_possible = bool(
+        executed_any
+        or requested_total
+        or indeterminate_reconciliation_total
+        or may_have_executed_reconciliation_total
+    )
     return {
-        "status": "success" if exception_count == 0 else "partial_success",
+        "status": (
+            "partial_success"
+            if queue_persistence_failed or exception_count
+            else "success"
+        ),
         "mode": "week_readiness",
         "executed": executed_any,
-        "success": True,
+        "success": not queue_persistence_failed,
         "verified": True,
         # `success`/`verified` describe the audit execution.  Readiness is a
         # separate fact: an accurately verified audit can still prove that one
-        # or more ROs need attention.
+        # or more ROs need attention. A verified queue-persistence failure is
+        # reported separately and makes the end-to-end operation unsuccessful.
         "readiness_complete": exception_count == 0,
         "exception_count": exception_count,
         "queue_count": len(results),
@@ -2343,8 +2111,15 @@ async def _week_readiness(
         "adas_map_unavailable_count": (
             adas_map_missing_count + adas_map_unverified_count
         ),
-        "alldata_queued_count": queue_candidates if context is not None else 0,
+        "alldata_queued_count": (
+            queue_candidates
+            if context is not None and not queue_persistence_failed
+            else 0
+        ),
         "acquisition_status": (
+            "queue_persistence_error"
+            if queue_persistence_failed
+            else
             "queued"
             if context is not None and queue_candidates
             else "not_needed"
@@ -2353,10 +2128,43 @@ async def _week_readiness(
         ),
         "reconciliation_failed_count": reconciliation_failed_count,
         "ro_unavailable_count": ro_unavailable_count,
+        "ciq_mutations_requested_count": requested_total,
         "ciq_mutations_processed_count": processed_total,
         "ciq_receipt_count": receipt_total,
         "ciq_verified_receipt_count": verified_receipt_total,
+        "ciq_indeterminate_reconciliation_count": (
+            indeterminate_reconciliation_total
+        ),
+        "ciq_may_have_executed_reconciliation_count": (
+            may_have_executed_reconciliation_total
+        ),
         "ciq_requirements_added_or_reactivated": added_total,
+        "queue_persistence_status": (
+            "queue_persistence_error"
+            if queue_persistence_failed
+            else "persisted"
+            if context is not None
+            else "not_requested"
+        ),
+        "queue_persistence_verified": not queue_persistence_failed,
+        **(
+            {
+                "queue_persistence_error": queue_persistence_error,
+                "message": (
+                    queue_persistence_error["message"]
+                    + (
+                        " CIQ reconciliation occurred before the local "
+                        "persistence failure and CIQ may already have changed; "
+                        "the included mutation counts and receipts remain "
+                        "authoritative for this attempt."
+                        if ciq_change_possible
+                        else " No CIQ mutation was reported for this attempt."
+                    )
+                ),
+            }
+            if queue_persistence_error is not None
+            else {}
+        ),
         "filters": filters,
         "phase_scope": [str(args["phase"])]
         if explicit_phase
@@ -2402,6 +2210,12 @@ def _save_weekly_queue(settings: Any, conversation_id: int, results: list[dict[s
     decision, not a default) -- category records which one it actually was,
     since the two are not the same claim.
     """
+    store = weekly_queue.get_store(Path(settings.root))
+    existing = store.get(str(conversation_id))
+    prior_by_ro = {
+        item.repair_order_id: item
+        for item in (existing.items if existing is not None else [])
+    }
     items: list[weekly_queue.WeeklyQueueItem] = []
     for row in results:
         repair_order_id = str(row.get("repair_order_id") or "").strip()
@@ -2419,7 +2233,7 @@ def _save_weekly_queue(settings: Any, conversation_id: int, results: list[dict[s
             continue
         vehicle_label = str(row.get("vehicle") or "").strip()
         parsed_vehicle = nav.vehicle_from_query(vehicle_label)
-        items.append(weekly_queue.WeeklyQueueItem(
+        item = weekly_queue.WeeklyQueueItem(
             repair_order_id=repair_order_id,
             ro_number=str(row.get("ro_number") or ""),
             vehicle_label=vehicle_label,
@@ -2429,8 +2243,25 @@ def _save_weekly_queue(settings: Any, conversation_id: int, results: list[dict[s
             missing_calibrations=missing,
             unverified_calibrations=unverified,
             category="missing" if missing else "unverified",
-        ))
-    store = weekly_queue.get_store(Path(settings.root))
+        )
+        prior = prior_by_ro.get(repair_order_id)
+        if (
+            prior is not None
+            and prior.missing_calibrations == item.missing_calibrations
+            and prior.unverified_calibrations == item.unverified_calibrations
+        ):
+            # A repeated live audit must not erase a durable failure or make a
+            # completed collection look unattempted. A materially changed SI
+            # gap is a new unit of work and therefore starts queued.
+            item.status = prior.status
+            item.attempts = prior.attempts
+            item.last_error = prior.last_error
+            item.created_at = prior.created_at
+            item.updated_at = prior.updated_at
+            item.status_changed_at = prior.status_changed_at
+            item.last_attempt_at = prior.last_attempt_at
+            item.completed_at = prior.completed_at
+        items.append(item)
     if not items:
         store.clear(str(conversation_id))
         return
@@ -2488,31 +2319,68 @@ async def _queue_list_mode(settings: Any, args: dict[str, Any]) -> dict[str, Any
             ),
             "items": [],
         }
-    if queue.is_stale():
+    raw_statuses = args.get("statuses")
+    if raw_statuses is not None and not isinstance(raw_statuses, list):
         return {
-            "status": "queue_stale",
+            "status": "invalid_request",
             "mode": "queue_list",
-            "success": True,
-            "verified": True,
-            "message": (
-                "The weekly readiness queue from earlier is stale. "
-                "Run \"make sure we're prepared for the week\" again."
-            ),
+            "success": False,
+            "verified": False,
+            "message": "statuses must be an array of weekly queue lifecycle values.",
             "items": [],
         }
-    pending = queue.pending()
-    done = [item for item in queue.items if item.status != "pending"]
+    requested_statuses = {
+        str(status or "").strip().casefold()
+        for status in (raw_statuses or [])
+    }
+    if requested_statuses - weekly_queue.LIFECYCLE_STATUSES:
+        return {
+            "status": "invalid_request",
+            "mode": "queue_list",
+            "success": False,
+            "verified": False,
+            "message": "One or more weekly queue lifecycle statuses are invalid.",
+            "items": [],
+        }
+    unresolved = queue.unresolved()
+    failures = queue.failures()
+    actionable = queue.actionable()
+    completed = queue.completed()
+    selected = (
+        queue.with_statuses(requested_statuses)
+        if requested_statuses
+        else unresolved
+    )
+    status_counts = {
+        status: sum(1 for item in queue.items if item.status == status)
+        for status in sorted(weekly_queue.LIFECYCLE_STATUSES)
+    }
+    stale = queue.is_stale()
     return {
-        "status": "success",
+        "status": "queue_stale" if stale else "success",
         "mode": "queue_list",
         "success": True,
         "verified": True,
+        "stale": stale,
+        "message": (
+            "The retained weekly readiness queue is stale; refresh it with a new live readiness audit before executing more rows."
+            if stale
+            else "Weekly readiness queue state loaded from this conversation."
+        ),
         "queue_count": len(queue.items),
-        "pending_count": len(pending),
-        "missing_count": sum(1 for item in pending if item.category == "missing"),
-        "unverified_count": sum(1 for item in pending if item.category == "unverified"),
-        "done_count": len(done),
-        "items": [item.to_dict() for item in pending],
+        "unresolved_count": len(unresolved),
+        "actionable_count": len(actionable),
+        "failure_count": len(failures),
+        "completed_count": len(completed),
+        # Compatibility fields for existing cards/clients. Pending means
+        # actionable now; done means completed, never merely non-pending.
+        "pending_count": len(actionable),
+        "done_count": len(completed),
+        "missing_count": sum(1 for item in unresolved if item.category == "missing"),
+        "unverified_count": sum(1 for item in unresolved if item.category == "unverified"),
+        "selected_statuses": sorted(requested_statuses),
+        "status_counts": status_counts,
+        "items": [item.to_dict() for item in selected],
     }
 
 
@@ -2628,6 +2496,47 @@ def _queue_item_matches_signals(item: "weekly_queue.WeeklyQueueItem", signals: l
     return any(quick._identity_matches_text(signal, vehicle) for signal in signals)  # noqa: SLF001
 
 
+_QUEUE_AUTH_STATUSES = frozenset({"authentication_required", "human_action_required"})
+_QUEUE_RETRYABLE_STATUSES = frozenset(
+    {
+        "browser_unavailable",
+        "ciq_unavailable",
+        "failed",
+        "partial_success",
+        "provider_unavailable",
+        "temporary_failure",
+        "timeout",
+    }
+)
+
+
+def _collector_lifecycle(result: Any) -> str:
+    """Map a collector's structured machine outcome to the queue lifecycle."""
+
+    if isinstance(result, dict):
+        if result.get("success") is True and result.get("verified") is True:
+            return weekly_queue.STATUS_COMPLETED
+        status = str(result.get("status") or "").strip().casefold()
+        if status in _QUEUE_AUTH_STATUSES:
+            return weekly_queue.STATUS_AUTHENTICATION_REQUIRED
+        if result.get("retryable") is True or status in _QUEUE_RETRYABLE_STATUSES:
+            return weekly_queue.STATUS_RETRYABLE
+    return weekly_queue.STATUS_BLOCKED
+
+
+def _collector_error(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "Collector returned an invalid result."
+    error = result.get("error")
+    if isinstance(error, dict):
+        detail = error.get("message") or error.get("code")
+    else:
+        detail = error
+    return " ".join(
+        str(detail or result.get("message") or result.get("status") or "Collection was not verified.").split()
+    )[:1000]
+
+
 async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> dict[str, Any]:
     """Walk the weekly-readiness missing-SI queue: resolve whatever vehicle
     is currently selected in ALLDATA against the remaining pending items,
@@ -2657,8 +2566,23 @@ async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> 
                 "Run \"make sure we're prepared for the week\" again."
             ),
         }
-    pending = queue.pending()
+    pending = queue.actionable()
     if not pending:
+        unresolved = queue.unresolved()
+        if unresolved:
+            failures = queue.failures()
+            return {
+                "status": "queue_blocked",
+                "success": False,
+                "verified": True,
+                "unresolved_count": len(unresolved),
+                "failure_count": len(failures),
+                "items": [item.to_dict() for item in unresolved],
+                "message": (
+                    "The weekly readiness queue still has unresolved rows, but none are currently actionable. "
+                    "Review the retained running or blocked rows before continuing."
+                ),
+            }
         return {
             "status": "queue_complete",
             "success": True,
@@ -2670,9 +2594,11 @@ async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> 
     state = await browser.start(auto_login=False)
     if not state.get("authenticated") or browser._page is None:  # noqa: SLF001
         return {
-            "status": "human_action_required",
+            "status": "authentication_required",
             "success": False,
             "verified": False,
+            "unresolved_count": len(queue.unresolved()),
+            "items": [item.to_dict() for item in queue.unresolved()],
             "message": "Open/resume the ALLDATA browser and sign in first.",
         }
     signals = await _bounded_selected_vehicle_signals(browser._page)  # noqa: SLF001
@@ -2717,19 +2643,49 @@ async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> 
         }
     matched = matching[0]
 
-    result = await quick.collect_for_calibration_iq_ro(settings, adas, {"repair_order_id": matched.repair_order_id})
-    verified = isinstance(result, dict) and result.get("verified") is True and result.get("success") is True
-    matched.status = "complete" if verified else "failed"
+    # Persist the attempt before crossing the external browser/CIQ boundary.
+    # A process interruption is therefore visible as running instead of being
+    # mistaken for an unattempted row.
+    matched.transition(weekly_queue.STATUS_RUNNING, begin_attempt=True)
+    store.save(queue)
+    try:
+        result = await quick.collect_for_calibration_iq_ro(
+            settings,
+            adas,
+            {"repair_order_id": matched.repair_order_id},
+        )
+    except Exception as exc:  # noqa: BLE001 - convert boundary failure to durable state
+        result = {
+            "status": "temporary_failure",
+            "success": False,
+            "verified": False,
+            "retryable": True,
+            "error": {"code": type(exc).__name__},
+            "message": "The ALLDATA collector stopped unexpectedly; this row remains retryable.",
+        }
+    item_status = _collector_lifecycle(result)
+    verified = item_status == weekly_queue.STATUS_COMPLETED
+    matched.transition(
+        item_status,
+        error=None if verified else _collector_error(result),
+    )
     store.save(queue)
 
-    remaining_after = queue.pending()
-    done_count = sum(1 for item in queue.items if item.status == "complete")
+    remaining_after = [item for item in queue.actionable() if item is not matched]
+    unresolved_after = queue.unresolved()
+    failures_after = queue.failures()
+    done_count = len(queue.completed())
     total = len(queue.items)
     if remaining_after:
         next_item = remaining_after[0]
         next_line = (
             f"Next: RO {next_item.ro_number} — {next_item.vehicle_label} "
             f"(needs {', '.join(next_item.missing_calibrations) or 'SI'})."
+        )
+    elif unresolved_after:
+        next_line = (
+            f"{len(unresolved_after)} row(s) remain unresolved, including "
+            f"{len(failures_after)} authentication/retryable/blocked row(s)."
         )
     else:
         next_line = "That was the last one -- the weekly readiness queue is complete."
@@ -2739,12 +2695,16 @@ async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> 
         else f"RO {matched.ro_number} — {matched.vehicle_label}: collection was not verified."
     )
     return {
-        "status": "success" if verified else "collection_failed",
+        "status": "success" if verified else item_status,
         "success": verified,
         "verified": verified,
+        "item_status": item_status,
         "repair_order_id": matched.repair_order_id,
         "vehicle": matched.vehicle_label,
+        "attempts": matched.attempts,
         "done_count": done_count,
+        "unresolved_count": len(unresolved_after),
+        "failure_count": len(failures_after),
         "total_count": total,
         "collector_result": result,
         "message": f"{lead} {done_count} of {total} done. {next_line}",
@@ -2984,26 +2944,34 @@ def summarize(mode: str, result: Any) -> str:
             suffix += " ADAS Map requirements were not machine-readable on this RO, so I did not invent any missing requirements."
         return f"{base}: {requirements}.{suffix}"
     if mode == "queue_list":
-        if data.get("status") in {"no_active_queue", "queue_stale", "context_missing"}:
+        if data.get("status") in {"no_active_queue", "context_missing", "invalid_request"}:
             return message or "The weekly readiness queue is unavailable."
         items = [item for item in (data.get("items") or []) if isinstance(item, dict)]
-        pending_count = int(data.get("pending_count") or len(items))
+        unresolved_count = int(data.get("unresolved_count") or 0)
+        failure_count = int(data.get("failure_count") or 0)
         missing_count = int(data.get("missing_count") or 0)
         unverified_count = int(data.get("unverified_count") or 0)
         if not items:
+            if unresolved_count:
+                return f"{unresolved_count} RO(s) remain unresolved; none match the requested lifecycle statuses."
             return "The weekly readiness queue is complete -- every RO that needed SI has been collected."
-        lead = (
-            f"{pending_count} RO(s) still need SI: {missing_count} confirmed missing, "
-            f"{unverified_count} unverified."
-        )
+        selected_statuses = set(data.get("selected_statuses") or [])
+        if selected_statuses and selected_statuses <= weekly_queue.FAILURE_STATUSES:
+            lead = f"{len(items)} RO(s) could not finish and remain reportable."
+        else:
+            lead = (
+                f"{unresolved_count} RO(s) remain unresolved: {missing_count} confirmed missing, "
+                f"{unverified_count} unverified, and {failure_count} currently failed or blocked."
+            )
         detail = "; ".join(
             f"RO {item.get('ro_number') or item.get('repair_order_id')} — "
-            f"{item.get('vehicle_label') or 'vehicle'}"
+            f"{item.get('vehicle_label') or 'vehicle'} [{item.get('status') or 'unknown'}]"
             for item in items[:_SUMMARY_EXCEPTION_LIMIT]
         )
         omitted = max(0, len(items) - _SUMMARY_EXCEPTION_LIMIT)
         tail = f" {omitted} more in the card above." if omitted else ""
-        return f"{lead} {detail}.{tail}" if detail else lead
+        stale = " This retained queue is stale and needs a live refresh before more execution." if data.get("stale") else ""
+        return f"{lead} {detail}.{tail}{stale}" if detail else f"{lead}{stale}"
     if mode in {"week_readiness", "phase_coverage"}:
         if data.get("verified") is not True:
             fallback = (
@@ -3014,19 +2982,6 @@ def summarize(mode: str, result: Any) -> str:
             return message or fallback
         return _readiness_summary(mode, data)
     return message or "The requested Calibration IQ work-prep action completed."
-
-
-def _message_id(history: list[dict[str, Any]], approval_context: Optional[dict[str, Any]]) -> Optional[int]:
-    value = (approval_context or {}).get("message_id")
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    for item in reversed(history or []):
-        if str(item.get("role") or "") != "user":
-            continue
-        candidate = item.get("id") or item.get("message_id")
-        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
-            return candidate
-    return None
 
 
 def install() -> None:
@@ -3040,7 +2995,7 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Calibration IQ work-prep bridge. Use CIQ as the work queue, ADAS Map on each RO as the governing calibration-requirement source, and ADAS SI as procedure coverage. It can list a phase, run a full ADAS Map/SI coverage audit for one phase, report one RO's saved requirements, or audit/reconcile the active queue for weekly SI readiness. Missing CIQ calibrations proved by ADAS Map are added/reactivated through CIQ's verified routine operator contract. mode: queue_list re-displays the persisted missing/unverified-SI queue from the most recent week_readiness/phase_coverage call in this conversation instantly, with no live re-audit -- use it for a same-conversation 'show me the list' follow-up instead of re-running week_readiness."
+                    "Calibration IQ work-prep bridge. Use CIQ as the work queue, ADAS Map on each RO as the governing calibration-requirement source, and ADAS SI as procedure coverage. It can list a phase, run a full ADAS Map/SI coverage audit for one phase, report one RO's saved requirements, or audit/reconcile the active queue for weekly SI readiness. Missing CIQ calibrations proved by ADAS Map are added/reactivated through CIQ's verified routine operator contract. mode: queue_list reads the durable conversation-scoped queue without a live re-audit. Supply statuses to select exact lifecycle rows, including authentication_required, retryable, or blocked work that could not finish."
                 ),
                 "parameters": {
                     "type": "object",
@@ -3051,6 +3006,16 @@ def install() -> None:
                         "repair_order_id": {"type": "string"},
                         "phase": {"type": "string"},
                         "shop": {"type": "string"},
+                        "statuses": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "uniqueItems": True,
+                            "items": {
+                                "type": "string",
+                                "enum": sorted(weekly_queue.LIFECYCLE_STATUSES),
+                            },
+                            "description": "For queue_list only: exact persisted lifecycle statuses to return. Omit to return every unresolved row.",
+                        },
                     },
                     "required": ["mode"],
                 },
@@ -3120,169 +3085,5 @@ def install() -> None:
 
             collect_for_calibration_iq_ro._xomni_selected_ciq_resolution = True  # type: ignore[attr-defined]
             quick.collect_for_calibration_iq_ro = collect_for_calibration_iq_ro
-
-        # One narrow pre-route owns the field workflow so explicit work-prep
-        # requests cannot fall back to generic ADAS SI searches. Everything else
-        # continues through the normal agent loop.
-        try:
-            from ..orchestrator import loop as loop_mod
-            previous_run = loop_mod.Orchestrator._run
-            if not getattr(previous_run, "_xomni_ciq_work_prep", False):
-                async def routed_run(
-                    self,
-                    conversation_id: int,
-                    user_message: str,
-                    approved_tool: Optional[dict],
-                    approval_context: Optional[dict],
-                ) -> AsyncIterator[dict]:
-                    history = self.store.get_messages(conversation_id)
-                    mode = None if approved_tool else classify_request(user_message, history)
-                    if mode is None:
-                        async for event in previous_run(
-                            self, conversation_id, user_message, approved_tool, approval_context
-                        ):
-                            yield event
-                        return
-
-                    effective_context = dict(approval_context or {})
-                    message_id = _message_id(history, approval_context)
-                    if message_id is not None:
-                        effective_context["message_id"] = message_id
-                    call_id = f"routed_work_prep_{mode}_{conversation_id}_{len(history)}"
-                    artifacts: list[dict[str, Any]] = []
-                    messages: list[dict[str, Any]] = []
-
-                    if mode == "alldata_access":
-                        tool_name = "research_provider_setup"
-                        tool_args: dict[str, Any] = {}
-                    elif mode == "quick_reference":
-                        tool_name = "collision_research"
-                        tool_args = {
-                            "action": "collect_alldata_quick_reference",
-                            "max_documents": 40,
-                            "delay_seconds": 1.25,
-                        }
-                        if (identifier := _explicit_ro(user_message)):
-                            tool_args["repair_order_id"] = identifier
-                    else:
-                        tool_name = TOOL_NAME
-                        tool_args = {"mode": mode}
-                        if mode == "phase_coverage":
-                            tool_args["coverage_focus"] = _phase_coverage_focus(user_message)
-                        if (phase := _phase(user_message)):
-                            tool_args["phase"] = phase
-                        if (shop := _shop(user_message)):
-                            tool_args["shop"] = shop
-                        identifier = _explicit_ro(user_message)
-                        if mode == "ro_requirements" and not identifier:
-                            identifier = _latest_ro_identifier(history)
-                        if identifier:
-                            tool_args["repair_order_id"] = identifier
-                        context = {
-                            "conversation_id": conversation_id,
-                            "message_id": message_id,
-                            "tool_call_id": call_id,
-                            "user_id": str(effective_context.get("user_id") or "local-dev"),
-                            "role": str(effective_context.get("role") or "owner"),
-                        }
-                        if _valid_context(context):
-                            tool_args[_CONTEXT_KEY] = context
-                        if mode == "ro_requirements" and not tool_args.get("repair_order_id"):
-                            result = {
-                                "status": "missing_context",
-                                "mode": mode,
-                                "success": False,
-                                "verified": False,
-                                "message": "Tell me the RO number, or pull that RO up in Calibration IQ first.",
-                            }
-                            summary = summarize(mode, result)
-                            saved_id = self.store.add_message(
-                                conversation_id,
-                                "assistant",
-                                summary,
-                                worker_used=self.router.active_name,
-                                artifacts=[],
-                            )
-                            yield {"type": "token", "text": summary}
-                            yield {"type": "done", "message_id": saved_id, "worker": self.router.active_name, "artifacts": []}
-                            return
-
-                    result: Any = None
-                    buffered_events: list[dict[str, Any]] = []
-                    async for event in self._execute(
-                        tool_name,
-                        tool_args,
-                        messages,
-                        artifacts,
-                        conversation_id=conversation_id,
-                        approval_context=effective_context,
-                        call_id=call_id,
-                    ):
-                        if event.get("type") == "tool_result":
-                            result = event.get("result")
-                        # The generic research_provider card renders an access
-                        # panel for an unknown collector result. Suppress only
-                        # that misleading card; the collector's verified prose
-                        # below is the user-facing result.
-                        if (
-                            mode == "quick_reference"
-                            and event.get("type") == "artifact"
-                            and (event.get("artifact") or {}).get("type") == "research_provider"
-                        ):
-                            continue
-                        buffered_events.append(event)
-                    if mode == "quick_reference":
-                        artifacts[:] = [
-                            artifact for artifact in artifacts
-                            if artifact.get("type") != "research_provider"
-                        ]
-
-                    # Tag the turn with the active ALLDATA acquisition stage so
-                    # a later low-content follow-up ("retrieve SI information
-                    # please", "go ahead") can resolve against it without
-                    # needing its own exact wording. The artifact type has no
-                    # registered UI card, so this is invisible in chat.
-                    if mode == "alldata_access":
-                        artifacts.append({
-                            "type": _WORK_PREP_STATE_ARTIFACT,
-                            "data": {"mode": _WORK_PREP_MODE, "stage": "awaiting_vehicle_selection"},
-                        })
-                    elif mode == "quick_reference":
-                        payload = result if isinstance(result, dict) else {}
-                        if payload.get("verified") is True and payload.get("success") is True:
-                            stage = "complete"
-                        elif payload.get("status") == "ciq_vehicle_ambiguous":
-                            stage = "awaiting_ro_disambiguation"
-                        else:
-                            stage = "awaiting_vehicle_selection"
-                        artifacts.append({
-                            "type": _WORK_PREP_STATE_ARTIFACT,
-                            "data": {"mode": _WORK_PREP_MODE, "stage": stage},
-                        })
-
-                    summary = summarize(mode, result)
-                    saved_id = self.store.add_message(
-                        conversation_id,
-                        "assistant",
-                        summary,
-                        worker_used=self.router.active_name,
-                        artifacts=artifacts,
-                    )
-                    if len(history) <= 1 and summary:
-                        self.store.touch_conversation(conversation_id, title=user_message[:60])
-                    for event in buffered_events:
-                        yield event
-                    yield {"type": "token", "text": summary}
-                    yield {
-                        "type": "done",
-                        "message_id": saved_id,
-                        "worker": self.router.active_name,
-                        "artifacts": artifacts,
-                    }
-
-                routed_run._xomni_ciq_work_prep = True  # type: ignore[attr-defined]
-                loop_mod.Orchestrator._run = routed_run
-        except Exception:  # noqa: BLE001
-            pass
 
         _INSTALLED = True

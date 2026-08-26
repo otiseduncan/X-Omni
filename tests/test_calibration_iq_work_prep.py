@@ -9,71 +9,6 @@ from core.services import calibration_iq_work_prep as prep
 from core.tools import registry as registry_mod
 
 
-def test_request_classifier_routes_field_workflows_without_generic_adas_search():
-    assert prep.classify_request("check what cars are in phase five") == "phase_list"
-    assert prep.classify_request("make sure we're prepared for the week") == "week_readiness"
-    assert prep.classify_request("what calibrations does RO 2400911667 have?") == "ro_requirements"
-    assert prep.classify_request("retrieve all ADAS SI information out of ADAS Quick Reference for the Acura") == "quick_reference"
-    assert prep.classify_request("log in to ALLDATA") == "alldata_access"
-    assert prep.classify_request("what is the weather") is None
-
-
-def test_week_typo_alias_is_narrow_and_does_not_capture_ordinary_weak_language():
-    for text in (
-        "prepare week",
-        "prepare the week",
-        "let's prepare for the week",
-        "get us ready for the week",
-        "prepare everything for this week",
-        "prepare weak",
-        "prepare the weak",
-        "please prep us for the weak",
-        "let's prepare for the weak",
-    ):
-        assert prep.classify_request(text) == "week_readiness", text
-
-    for text in (
-        "prepare a weak argument",
-        "prepare weak evidence",
-        "prepare a weak argument for work",
-        "prepare weak evidence for next week",
-        "prepare a presentation for work",
-        "help me get ready for a week-long trip",
-        "I'm ready for work",
-        "the signal is weak",
-    ):
-        assert prep.classify_request(text) is None, text
-
-
-def test_explicit_phase_coverage_uses_coverage_mode_and_counts_stay_on_count_lane():
-    for text in (
-        "what Phase 5 cars need ADAS SI?",
-        "which phase 5 vehicles are missing ADAS SI coverage?",
-        "what ADAS SI is missing for phase 5 vehicles?",
-        "check phase 5 coverage",
-        "is phase 5 covered?",
-    ):
-        assert prep.classify_request(text) == "phase_coverage", text
-
-    assert prep.classify_request("how many vehicles are in phase 5?") is None
-    assert (
-        prep._phase_coverage_focus(
-            "do all cars in phase 5 have an ADAS Map report in ADAS SI?"
-        )
-        == "adas_map"
-    )
-    assert (
-        prep._phase_coverage_focus("which phase 5 cars need ADAS SI coverage?")
-        == "si_readiness"
-    )
-    assert prep.classify_request("show vehicles in phase 5") == "phase_list"
-
-
-def test_phase_parser_accepts_spoken_number():
-    assert prep._phase("check phase five") == "5"
-    assert prep._phase("show phase 6") == "6"
-
-
 def test_adas_map_is_only_promoted_when_explicitly_marked():
     snapshot = {
         "calibrations": [
@@ -202,6 +137,40 @@ def test_selected_alldata_signal_matches_same_vehicle_not_same_make_only():
         row,
         ["Vehicle Information - 2023 Acura MDX Type S AWD - ALLDATA Collision"],
     ) is False
+
+
+@pytest.mark.asyncio
+async def test_structured_work_prep_si_scan_requests_calibration_depth():
+    seen: list[dict] = []
+
+    class FakeAdas:
+        @staticmethod
+        def search(args):
+            seen.append(dict(args))
+            return {
+                "exact_source_matched": True,
+                "results": [
+                    {
+                        "excerpt": "Front camera aiming procedure",
+                        "source_match_score": 10,
+                        "relative_path": "OEM/front-camera.pdf",
+                    }
+                ],
+            }
+
+    result = await prep._adas_coverage(  # noqa: SLF001
+        FakeAdas(),
+        "2024 Ford F-150",
+        [{"label": "Front camera calibration"}],
+    )
+
+    assert seen == [
+        {
+            "query": "2024 Ford F-150 Front camera calibration",
+            "search_mode": "calibration_requirements",
+        }
+    ]
+    assert result[0]["available"] is True
 
 
 def test_week_summary_names_each_ro_that_needs_si():
@@ -389,90 +358,6 @@ def test_phase_map_report_summary_separates_missing_from_unverified_ros():
     assert "RO 100" not in text
 
 
-def test_describing_the_already_open_vehicle_does_not_replay_the_login_card():
-    # Field trace: "download the adas si for the 2022 nissan altima that's
-    # open in alldata" was re-triggering the login card because "open" fell
-    # within 50 characters of "alldata" -- even though the user was
-    # describing an already-open vehicle, not asking to log in.
-    assert prep.classify_request(
-        "down load the adas si for the 2022 nissan altima thats open in alldata"
-    ) != "alldata_access"
-    # An actual login/open command must still route normally.
-    assert prep.classify_request("open alldata") == "alldata_access"
-    assert prep.classify_request("open the alldata browser") == "alldata_access"
-    assert prep.classify_request("log in to ALLDATA") == "alldata_access"
-
-
-def test_descriptive_open_state_falls_through_to_continuation_when_stage_active():
-    history = [_alldata_login_turn()]
-    assert prep.classify_request(
-        "down load the adas si for the 2022 nissan altima thats open in alldata",
-        history,
-    ) == "quick_reference"
-
-
-def _alldata_login_turn():
-    return {
-        "role": "assistant",
-        "artifacts": [{
-            "type": "work_prep_state",
-            "data": {"mode": "ciq_si_preparation", "stage": "awaiting_vehicle_selection"},
-        }],
-    }
-
-
-def test_bare_followup_without_active_stage_does_not_route_to_quick_reference():
-    # Case A precondition: with no active ALLDATA stage recorded, a message
-    # that names none of ALLDATA/quick reference/RO stays unclassified so it
-    # falls through to ordinary model tool choice, not a guessed collector.
-    assert prep.classify_request("retrieve SI information please") is None
-    assert prep.classify_request("retrieve SI information please", []) is None
-
-
-def test_low_specificity_followup_after_alldata_login_resolves_to_quick_reference():
-    # Case B: once "log in to ALLDATA" has run, a natural continuation that
-    # names no ALLDATA/quick-reference/RO wording of its own must still route
-    # to the collector so the already-selected vehicle resolves automatically.
-    history = [_alldata_login_turn()]
-    for text in (
-        "retrieve SI information please",
-        "Get the information.",
-        "Go ahead.",
-        "Pull it.",
-        "Do this one.",
-        "Okay, selected.",
-        "Ready.",
-    ):
-        assert prep.classify_request(text, history) == "quick_reference", text
-
-
-def test_unrelated_short_message_after_alldata_login_is_not_swept_in():
-    # A bare "yes"/"ok" or an unrelated short message must not be treated as
-    # an ALLDATA continuation just because a login happened recently -- it
-    # could be answering something else entirely (e.g. a calendar prompt).
-    history = [_alldata_login_turn()]
-    for text in ("yes", "ok", "what's the weather", "how many are in Macon"):
-        assert prep.classify_request(text, history) != "quick_reference", text
-
-
-def test_stage_falls_outside_lookback_window_stops_being_active():
-    history = [_alldata_login_turn()] + [
-        {"role": "assistant", "artifacts": []} for _ in range(10)
-    ]
-    assert prep.classify_request("retrieve SI information please", history) is None
-
-
-def test_completed_stage_does_not_keep_absorbing_later_short_messages():
-    history = [{
-        "role": "assistant",
-        "artifacts": [{
-            "type": "work_prep_state",
-            "data": {"mode": "ciq_si_preparation", "stage": "complete"},
-        }],
-    }]
-    assert prep.classify_request("retrieve SI information please", history) is None
-
-
 def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
     schema = registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]
     assert set(schema["parameters"]["properties"]["mode"]["enum"]) == {
@@ -483,39 +368,9 @@ def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
         "queue_list",
         "queue_next",
     }
-
-
-def test_bare_next_routes_to_queue_next_mode():
-    for text in ("next", "Next.", "next one", "next car", "next vehicle", "who's next?", "okay, next"):
-        assert prep.classify_request(text) == "queue_next", text
-
-
-def test_next_embedded_in_a_longer_sentence_does_not_trigger_queue_walk():
-    # _QUEUE_NEXT_RE is deliberately anchored to the whole message -- "next"
-    # as a topic word elsewhere must not hijack an unrelated turn.
-    assert prep.classify_request("what's next on my calendar today") != "queue_next"
-
-
-def test_show_me_the_ones_needing_si_routes_to_queue_list():
-    """Live field trace: a plain follow-up to "prepare for the week" matched
-    no existing branch, fell through to ordinary model tool choice, and the
-    model answered from stored artifact context in unbounded prose with no
-    card -- instead of this cheap, always-instant disk read."""
-    for text in (
-        "show me a list of the ones needing SI",
-        "give me the list of the ones that need SI",
-        "list the ROs missing SI",
-        "which vehicles need SI",
-        "show me those cars requiring SI",
-        "can you pull up the ones needing SI",
-    ):
-        assert prep.classify_request(text) == "queue_list", text
-
-
-def test_queue_list_does_not_capture_the_week_command_or_bare_next():
-    assert prep.classify_request("let's prepare for the week") == "week_readiness"
-    assert prep.classify_request("next") == "queue_next"
-    assert prep.classify_request("how many cars need calibration today") != "queue_list"
+    assert set(schema["parameters"]["properties"]["statuses"]["items"]["enum"]) == set(
+        weekly_queue.LIFECYCLE_STATUSES
+    )
 
 
 @pytest.mark.asyncio
@@ -582,7 +437,7 @@ async def test_queue_list_mode_returns_missing_and_unverified_items(tmp_path, mo
     assert "2400612455" not in ro_numbers  # already complete -- not "pending"
 
     summary = prep.summarize("queue_list", result)
-    assert "2 RO(s) still need SI" in summary
+    assert "2 RO(s) remain unresolved" in summary
     assert "1 confirmed missing" in summary
     assert "1 unverified" in summary
 
@@ -616,9 +471,6 @@ def test_save_weekly_queue_persists_missing_and_unverified_rows_with_category(tm
     assert by_ro["2400612490"].missing_calibrations == ["Passenger Seat Weight Sensor"]
     assert by_ro["2400612471"].category == "unverified"
     assert by_ro["2400612471"].unverified_calibrations == ["Windshield mono-camera calibration"]
-    assert prep.classify_request("I'll do the next RO after lunch") != "queue_next"
-
-
 def test_row_phase_token_normalizes_numeric_and_string_phases():
     assert prep._row_phase_token({"phase": 5}) == "5"
     assert prep._row_phase_token({"phase": "5.0"}) == "5"
@@ -781,6 +633,252 @@ async def test_week_readiness_explicit_phase_overrides_default_scope(monkeypatch
     assert result["phase_scope"] == ["3"]
 
 
+@pytest.mark.asyncio
+async def test_week_readiness_capacity_fails_before_snapshot_or_reconciliation(monkeypatch):
+    rows = [
+        {
+            "id": f"ro-{index}",
+            "ro_number": f"RO{index}",
+            "phase": "5",
+            "source_presence": {"active_on_source": True},
+        }
+        for index in range(weekly_queue.MAX_QUEUE_ITEMS + 1)
+    ]
+
+    async def query_repair_orders(_settings, args):
+        assert args == {"include_completed": True}
+        return {"status": "verified", "items": rows}
+
+    calls = {"snapshot": 0, "reconcile": 0, "save": 0}
+
+    async def load_snapshot(*_args, **_kwargs):
+        calls["snapshot"] += 1
+        raise AssertionError("capacity preflight must run before snapshot loading")
+
+    async def reconcile(*_args, **_kwargs):
+        calls["reconcile"] += 1
+        raise AssertionError("oversized readiness audit must not reconcile")
+
+    def save_queue(*_args, **_kwargs):
+        calls["save"] += 1
+        raise AssertionError("oversized readiness audit must not persist a queue")
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_save_weekly_queue", save_queue)
+
+    result = await prep._week_readiness(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {
+            prep._CONTEXT_KEY: {  # noqa: SLF001
+                "conversation_id": 7,
+                "message_id": 11,
+                "tool_call_id": "capacity-guard",
+            }
+        },
+    )
+
+    assert result["status"] == "queue_capacity_exceeded"
+    assert result["executed"] is False
+    assert result["success"] is False
+    assert result["verified"] is True
+    assert result["readiness_complete"] is False
+    assert result["candidate_count"] == weekly_queue.MAX_QUEUE_ITEMS + 1
+    assert result["queue_count"] == 0
+    assert result["queue_capacity"] == weekly_queue.MAX_QUEUE_ITEMS
+    assert result["repair_orders"] == []
+    assert calls == {"snapshot": 0, "reconcile": 0, "save": 0}
+
+
+@pytest.mark.asyncio
+async def test_week_readiness_preserves_requested_indeterminate_mutation_truth(
+    monkeypatch,
+):
+    row = {
+        "id": "ro-indeterminate",
+        "ro_number": "RO-INDETERMINATE",
+        "phase": "5",
+        "source_presence": {"active_on_source": True},
+    }
+    snapshot = {
+        "repair_order": {"id": "ro-indeterminate", "ro_number": "RO-INDETERMINATE"},
+        "calibrations": [],
+    }
+
+    async def query_repair_orders(_settings, _args):
+        return {"status": "verified", "items": [row]}
+
+    async def load_snapshot(_settings, _identifier):
+        return {"status": "verified", "snapshot": snapshot}
+
+    async def discover_map(_catalog, _snapshot):
+        return {
+            "status": "verified",
+            "requirements": [
+                {"label": "Front camera calibration", "method": "STATIC"}
+            ],
+        }
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [{"operation": "add_calibration"}], {
+            "status": "invalid_response",
+            "executed": True,
+            "success": False,
+            "verified": False,
+            "partial": False,
+            "requested_count": 1,
+            "processed_count": 0,
+            "receipts": [],
+            "indeterminate": True,
+            "may_have_executed": True,
+            "message": "The CIQ transport ended before a receipt was returned.",
+        }
+
+    async def catalog_coverage(_catalog, _snapshot, _map_info):
+        return []
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_coverage", catalog_coverage)
+
+    result = await prep._week_readiness(
+        SimpleNamespace(), SimpleNamespace(), {"phase": "5"}
+    )
+
+    assert result["executed"] is True
+    assert result["ciq_mutations_requested_count"] == 1
+    assert result["ciq_mutations_processed_count"] == 0
+    assert result["ciq_receipt_count"] == 0
+    assert result["ciq_verified_receipt_count"] == 0
+    assert result["ciq_indeterminate_reconciliation_count"] == 1
+    assert result["ciq_may_have_executed_reconciliation_count"] == 1
+    assert result["reconciliation_failed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_week_readiness_queue_write_failure_retains_all_ciq_receipt_truth(
+    monkeypatch,
+):
+    row = {
+        "id": "ro-persistence-failure",
+        "ro_number": "RO-PERSISTENCE-FAILURE",
+        "phase": "5",
+        "source_presence": {"active_on_source": True},
+    }
+    snapshot = {
+        "repair_order": {
+            "id": "ro-persistence-failure",
+            "ro_number": "RO-PERSISTENCE-FAILURE",
+        },
+        "calibrations": [],
+    }
+
+    async def query_repair_orders(_settings, _args):
+        return {"status": "verified", "items": [row]}
+
+    async def load_snapshot(_settings, _identifier):
+        return {"status": "verified", "snapshot": snapshot}
+
+    async def discover_map(_catalog, _snapshot):
+        return {
+            "status": "verified",
+            "requirements": [
+                {"label": "Front camera calibration", "method": "STATIC"}
+            ],
+        }
+
+    receipts = [
+        {
+            "status": "completed",
+            "success": True,
+            "verification": {"verified": True},
+            "operation": "add_calibration",
+            "mutation_id": "mutation-verified",
+        },
+        {
+            "status": "failed",
+            "success": False,
+            "verification": {"verified": False},
+            "operation": "update_calibration",
+            "mutation_id": "mutation-indeterminate",
+            "indeterminate": True,
+            "may_have_executed": True,
+        },
+    ]
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [{"operation": "add_calibration"}], {
+            "status": "partial_success",
+            "executed": True,
+            "success": False,
+            "verified": False,
+            "requested_count": 2,
+            "processed_count": 2,
+            "receipts": receipts,
+            "indeterminate": True,
+            "may_have_executed": True,
+        }
+
+    async def catalog_coverage(_catalog, _snapshot, _map_info):
+        return [
+            {
+                "calibration": "Front camera calibration",
+                "state": "MISSING",
+            }
+        ]
+
+    def fail_queue_write(*_args, **_kwargs):
+        raise OSError("injected atomic replace failure")
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_coverage", catalog_coverage)
+    monkeypatch.setattr(prep, "_save_weekly_queue", fail_queue_write)
+
+    result = await prep._week_readiness(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {
+            "phase": "5",
+            prep._CONTEXT_KEY: {  # noqa: SLF001
+                "conversation_id": 7,
+                "message_id": 12,
+                "tool_call_id": "persistence-failure",
+            },
+        },
+    )
+
+    assert result["status"] == "partial_success"
+    assert result["success"] is False
+    assert result["verified"] is True
+    assert result["executed"] is True
+    assert result["queue_persistence_status"] == "queue_persistence_error"
+    assert result["queue_persistence_verified"] is False
+    assert result["queue_persistence_error"] == {
+        "code": "queue_persistence_error",
+        "exception_type": "OSError",
+        "message": (
+            "The readiness audit completed, but the derived weekly queue "
+            "could not be persisted locally."
+        ),
+    }
+    assert result["acquisition_status"] == "queue_persistence_error"
+    assert result["alldata_queued_count"] == 0
+    assert "CIQ may already have changed" in result["message"]
+    assert result["ciq_mutations_requested_count"] == 2
+    assert result["ciq_mutations_processed_count"] == 2
+    assert result["ciq_receipt_count"] == 2
+    assert result["ciq_verified_receipt_count"] == 1
+    assert result["ciq_indeterminate_reconciliation_count"] == 1
+    assert result["ciq_may_have_executed_reconciliation_count"] == 1
+
+
 def test_weekly_queue_round_trips_through_dict():
     item = weekly_queue.WeeklyQueueItem(
         repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Acura TLX",
@@ -896,7 +994,7 @@ async def test_resolve_queue_next_fails_closed_on_ambiguous_match(tmp_path, monk
     assert result["status"] == "ambiguous_match"
     assert collected is False
     reloaded = store.get("10")
-    assert all(item.status == "pending" for item in reloaded.items)
+    assert all(item.status == weekly_queue.STATUS_QUEUED for item in reloaded.items)
 
 
 @pytest.mark.asyncio
@@ -944,5 +1042,181 @@ async def test_resolve_queue_next_collects_marks_complete_and_names_the_next_veh
     assert "Jeep Cherokee" in result["message"]
 
     reloaded = store.get("9")
-    assert reloaded.items[0].status == "complete"
-    assert reloaded.items[1].status == "pending"
+    assert reloaded.items[0].status == weekly_queue.STATUS_COMPLETED
+    assert reloaded.items[1].status == weekly_queue.STATUS_QUEUED
+
+
+@pytest.mark.asyncio
+async def test_queue_list_structured_status_filter_reports_which_rows_could_not_finish(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    store.save(
+        weekly_queue.WeeklyQueue(
+            conversation_id="91",
+            items=[
+                weekly_queue.WeeklyQueueItem(repair_order_id="queued", ro_number="Q", status="queued"),
+                weekly_queue.WeeklyQueueItem(
+                    repair_order_id="auth", ro_number="A", status="authentication_required", last_error="Sign in"
+                ),
+                weekly_queue.WeeklyQueueItem(
+                    repair_order_id="retry", ro_number="R", status="retryable", last_error="Timed out"
+                ),
+                weekly_queue.WeeklyQueueItem(
+                    repair_order_id="blocked", ro_number="B", status="blocked", last_error="No exact match"
+                ),
+                weekly_queue.WeeklyQueueItem(repair_order_id="done", ro_number="D", status="completed"),
+            ],
+        )
+    )
+
+    result = await prep._queue_list_mode(  # noqa: SLF001
+        settings,
+        {
+            prep._CONTEXT_KEY: {"conversation_id": 91, "message_id": 1, "tool_call_id": "call-1"},  # noqa: SLF001
+            "statuses": ["authentication_required", "retryable", "blocked"],
+        },
+    )
+
+    assert result["verified"] is True
+    assert result["failure_count"] == 3
+    assert result["unresolved_count"] == 4
+    assert {item["repair_order_id"] for item in result["items"]} == {"auth", "retry", "blocked"}
+    assert all(item["last_error"] for item in result["items"])
+    assert result["status_counts"]["completed"] == 1
+    assert "3 RO(s) could not finish" in prep.summarize("queue_list", result)
+
+
+@pytest.mark.asyncio
+async def test_stale_queue_list_retains_items_for_failure_reporting(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    old = weekly_queue.WeeklyQueue(
+        conversation_id="92",
+        items=[weekly_queue.WeeklyQueueItem(repair_order_id="blocked", status="blocked")],
+        updated_at=0.0,
+    )
+    store._write_all({"92": old.to_dict()})  # noqa: SLF001
+
+    result = await prep._queue_list_mode(  # noqa: SLF001
+        settings,
+        {
+            prep._CONTEXT_KEY: {"conversation_id": 92, "message_id": 1, "tool_call_id": "call-1"},  # noqa: SLF001
+            "statuses": ["blocked"],
+        },
+    )
+
+    assert result["status"] == "queue_stale"
+    assert result["stale"] is True
+    assert [item["repair_order_id"] for item in result["items"]] == ["blocked"]
+
+
+@pytest.mark.asyncio
+async def test_queue_next_persists_running_attempt_then_retryable_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    item = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-1",
+        ro_number="RO1",
+        vehicle_label="2023 Acura TLX",
+        vehicle_year="2023",
+        vehicle_make="Acura",
+        vehicle_model_trim="TLX",
+    )
+    store.save(weekly_queue.WeeklyQueue(conversation_id="93", items=[item]))
+
+    class Browser:
+        _page = object()
+
+        async def start(self, auto_login=False):  # noqa: ARG002
+            return {"authenticated": True}
+
+    monkeypatch.setattr(prep.research_operator, "get_browser", lambda *_a, **_k: Browser())
+
+    async def signals(_page):
+        return ["Vehicle Information - 2023 Acura TLX Type S - ALLDATA Collision"]
+
+    monkeypatch.setattr(prep, "_bounded_selected_vehicle_signals", signals)
+
+    async def collect(_settings, _adas, _args):
+        in_flight = store.get("93").items[0]
+        assert in_flight.status == weekly_queue.STATUS_RUNNING
+        assert in_flight.attempts == 1
+        return {
+            "status": "partial_success",
+            "success": False,
+            "verified": False,
+            "message": "One document timed out.",
+        }
+
+    monkeypatch.setattr(prep.quick, "collect_for_calibration_iq_ro", collect)
+
+    result = await prep.resolve_queue_next(settings, SimpleNamespace(), 93)
+    assert result["status"] == weekly_queue.STATUS_RETRYABLE
+    assert result["item_status"] == weekly_queue.STATUS_RETRYABLE
+    assert result["attempts"] == 1
+    assert result["failure_count"] == 1
+    reloaded = store.get("93").items[0]
+    assert reloaded.status == weekly_queue.STATUS_RETRYABLE
+    assert reloaded.attempts == 1
+    assert reloaded.last_error == "One document timed out."
+
+
+@pytest.mark.asyncio
+async def test_queue_next_never_calls_blocked_only_queue_complete(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    store.save(
+        weekly_queue.WeeklyQueue(
+            conversation_id="94",
+            items=[weekly_queue.WeeklyQueueItem(repair_order_id="ro-1", status="blocked")],
+        )
+    )
+
+    result = await prep.resolve_queue_next(settings, SimpleNamespace(), 94)
+
+    assert result["status"] == "queue_blocked"
+    assert result["verified"] is True
+    assert result["unresolved_count"] == 1
+    assert result["items"][0]["status"] == weekly_queue.STATUS_BLOCKED
+
+
+def test_repeated_weekly_audit_preserves_same_failure_but_requeues_changed_gap(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path)
+    store = weekly_queue.get_store(tmp_path)
+    prior = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-1",
+        ro_number="RO1",
+        vehicle_label="2023 Acura TLX",
+        missing_calibrations=["Forward camera"],
+        status="blocked",
+        attempts=2,
+        last_error="No exact procedure",
+    )
+    store.save(weekly_queue.WeeklyQueue(conversation_id="95", items=[prior]))
+
+    base = {
+        "repair_order_id": "ro-1",
+        "ro_number": "RO1",
+        "vehicle": "2023 Acura TLX",
+        "missing_si": [{"calibration": "Forward camera"}],
+        "unverified_si": [],
+    }
+    prep._save_weekly_queue(settings, 95, [base])  # noqa: SLF001
+    retained = store.get("95").items[0]
+    assert retained.status == weekly_queue.STATUS_BLOCKED
+    assert retained.attempts == 2
+    assert retained.last_error == "No exact procedure"
+
+    changed = {**base, "missing_si": [{"calibration": "Blind spot monitor"}]}
+    prep._save_weekly_queue(settings, 95, [changed])  # noqa: SLF001
+    requeued = store.get("95").items[0]
+    assert requeued.status == weekly_queue.STATUS_QUEUED
+    assert requeued.attempts == 0
+    assert requeued.last_error == ""

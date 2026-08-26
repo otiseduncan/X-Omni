@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -137,7 +136,7 @@ async def test_uuid_identifier_never_touches_collection_search(
 
 
 @pytest.mark.asyncio
-async def test_collection_match_without_a_usable_id_falls_back_to_the_row(
+async def test_collection_match_without_a_usable_id_fails_closed(
     settings, monkeypatch
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -153,8 +152,57 @@ async def test_collection_match_without_a_usable_id_falls_back_to_the_row(
     _install_transport(monkeypatch, handler)
     result = await ciq.get_repair_order(settings, {"repair_order_id": "2400612490"})
 
-    assert result["status"] == "verified"
-    assert result["repair_order"]["Status"] == "New Arrival"
+    assert result["status"] == "conflict"
+    assert result["repair_order"] is None
+    assert "authoritative id" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_collection_row_is_not_accepted_as_the_requested_ro(
+    settings, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(path)
+        if path.endswith("/snapshot") or path.endswith("/ros/2400612490"):
+            return httpx.Response(404, json={"detail": "not_found"})
+        if path.endswith("/collection/ros"):
+            return httpx.Response(200, json={"items": [
+                {"id": "wrong-uuid", "ro_number": "2400612499"},
+            ]})
+        raise AssertionError(f"unexpected request: {path}")
+
+    _install_transport(monkeypatch, handler)
+    result = await ciq.get_repair_order(settings, {"repair_order_id": "2400612490"})
+
+    assert result["status"] == "no_result"
+    assert result["repair_order"] is None
+    assert not any("wrong-uuid" in path for path in calls)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_exact_collection_rows_are_ambiguous(
+    settings, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/snapshot") or path.endswith("/ros/2400612490"):
+            return httpx.Response(404, json={"detail": "not_found"})
+        if path.endswith("/collection/ros"):
+            return httpx.Response(200, json={"items": [
+                {"id": "uuid-a", "ro_number": "2400612490"},
+                {"id": "uuid-b", "ro_number": "2400612490"},
+            ]})
+        raise AssertionError(f"unexpected request: {path}")
+
+    _install_transport(monkeypatch, handler)
+    result = await ciq.get_repair_order(settings, {"repair_order_id": "2400612490"})
+
+    assert result["status"] == "conflict"
+    assert result["repair_order"] is None
+    assert "more than one" in result["message"].casefold()
 
 
 @pytest.mark.asyncio

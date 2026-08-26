@@ -159,6 +159,9 @@ async def test_truncation_is_reported_honestly(settings, monkeypatch):
     assert result["count"] == 50          # every match counted...
     assert result["shown_count"] == 20    # ...but only a page displayed
     assert result["truncated"] is True
+    assert result["result_scope"] == "board_list_only"
+    assert result["exact_ro_detail_included"] is False
+    assert result["next_capability_for_one_ro_detail"] == "calibration_iq_ro"
 
 
 @pytest.mark.asyncio

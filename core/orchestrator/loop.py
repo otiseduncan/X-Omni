@@ -30,131 +30,8 @@ from . import prompt as prompt_mod
 log = logging.getLogger("xomni.loop")
 
 MAX_TOOL_ROUNDS = 6
+MAX_TOOL_CALLS_PER_ROUND = 8
 
-_EXTERIOR_CAMERA_SOURCE_RE = re.compile(
-    r"\b(?:exterior|outside|outdoor|driveway|tris(?:\s+home)?)\s+camera\b"
-    r"|\bcamera\s+(?:outside|outdoors|exterior)\b",
-    re.IGNORECASE,
-)
-_EXTERIOR_CAMERA_ACTION_RE = re.compile(
-    r"\b(?:look|looking|view|see|show|watch|inspect|check|use|open|start|turn|"
-    r"stream|feed|frame|describe|tell|status|configured|connected|working)\b",
-    re.IGNORECASE,
-)
-_WEBSITE_REFERENCE_RE = re.compile(
-    r"\b(?:website|web\s*site|site|web\s*page|preview)\b",
-    re.IGNORECASE,
-)
-_WEBSITE_EDIT_ACTION_RE = re.compile(
-    r"\b(?:change|update|edit|modify|apply|convert|restyle|redesign|re-design)\b",
-    re.IGNORECASE,
-)
-_WEBSITE_DESIGN_TARGET_RE = re.compile(
-    r"\b(?:cards?|cords?|csrds?|sections?|colors?|palette|fonts?|typography|"
-    r"buttons?|background|layout|header|footer|glass(?:morphism)?|translucent|frosted)\b",
-    re.IGNORECASE,
-)
-_WEBSITE_MAKE_EDIT_RE = re.compile(r"\b(?:make|turn|set)\b", re.IGNORECASE)
-_WEBSITE_CREATE_ACTION_RE = re.compile(
-    r"\b(?:create|build|generate|design|render|display|make|show)\b",
-    re.IGNORECASE,
-)
-_CIQ_COUNT_RE = re.compile(r"\b(?:how\s+many|count)\b", re.IGNORECASE)
-_CIQ_LIST_RE = re.compile(
-    r"\b(?:show|list|display|pull\s+up)\b",
-    re.IGNORECASE,
-)
-_CIQ_SUBJECT_RE = re.compile(
-    r"\b(?:cars?|vehicles?|repair\s+orders?|ros?|calibration\s+iq|active\s+work)\b",
-    re.IGNORECASE,
-)
-_CIQ_DEICTIC_RE = re.compile(
-    r"\b(?:those|them|these|that\s+list|the\s+results)\b",
-    re.IGNORECASE,
-)
-_CIQ_PHASE_RE = re.compile(
-    r"\bphase\s*(?:number\s*)?"
-    r"(?P<phase>\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten)\b",
-    re.IGNORECASE,
-)
-_CIQ_ALL_WORK_RE = re.compile(
-    r"\b(?:all\s+(?:work|cars?|vehicles?|repair\s+orders?)|"
-    r"include\s+(?:completed|finished)|including\s+(?:completed|finished))\b",
-    re.IGNORECASE,
-)
-_CIQ_NO_CALIBRATION_RE = re.compile(
-    r"\bno\s+calibration\s+required\b",
-    re.IGNORECASE,
-)
-_CIQ_COMPLETED_CATEGORY_RE = re.compile(
-    r"\b(?:calibration\s+complete|completed)\b",
-    re.IGNORECASE,
-)
-_CIQ_TERMINAL_WORK_RE = re.compile(
-    r"\b(?:closed|finished|terminal)\s+(?:work|cars?|vehicles?|repair\s+orders?)\b",
-    re.IGNORECASE,
-)
-_CIQ_SHOPS = (
-    (re.compile(r"\bwarner\s+robins\b", re.IGNORECASE), "Warner Robins"),
-    (re.compile(r"\bmacon\b", re.IGNORECASE), "Macon"),
-    (re.compile(r"\bperry\b", re.IGNORECASE), "Perry"),
-)
-_CIQ_PHASE_WORDS = {
-    "zero": "0",
-    "one": "1",
-    "two": "2",
-    "three": "3",
-    "four": "4",
-    "five": "5",
-    "six": "6",
-    "seven": "7",
-    "eight": "8",
-    "nine": "9",
-    "ten": "10",
-}
-_CIQ_CONTEXT_STRING_FILTERS = ("shop", "phase", "status", "insurance", "q")
-_CIQ_EXPLICIT_SUBJECT_RE = re.compile(
-    r"\b(?:calibration\s+iq|ciq)\b",
-    re.IGNORECASE,
-)
-_CIQ_RO_IDENTIFIER_RE = re.compile(
-    r"\b(?:repair\s+order|ro)\s*(?:number|no\.?|#|id)?\s*[:#]?\s*[`\"']?"
-    r"(?P<identifier>"
-    r"XOP-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*|"
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|"
-    r"(?=[A-Za-z0-9-]{5,64}\b)(?=[A-Za-z0-9-]*\d)"
-    r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
-    r")\b",
-    re.IGNORECASE,
-)
-_CIQ_RESEARCH_INTENT_RE = re.compile(
-    r"\b(?:research|oem\s+evidence|adas\s+si)\b",
-    re.IGNORECASE,
-)
-_CIQ_RESEARCH_PERSIST_RE = re.compile(
-    r"\b(?:complete|finish(?:ed)?|re[-\s]?run|rerun|redo|repeat|persist|"
-    r"attach|import|link|save|record|update)\b"
-    r"|\b(?:verify|validate|confirm)\b[^.!?\n]{0,100}"
-    r"\b(?:persisted|evidence|documents?|citations?|pages?|research)\b"
-    r"|\bresearch\s+(?:this|that|the)\s+(?:calibration\s+iq\s+)?"
-    r"(?:repair\s+order|ro)\b",
-    re.IGNORECASE,
-)
-_CIQ_RESEARCH_COMPLETE_RE = re.compile(
-    r"\b(?:complete|completed|finish|finished)\b",
-    re.IGNORECASE,
-)
-_CIQ_RESEARCH_NO_COMPLETE_RE = re.compile(
-    r"\b(?:do\s+not|don't|without)\b[^.!?\n]{0,40}"
-    r"\b(?:complete|finish|mark(?:ing)?\s+(?:the\s+)?research\s+complete)\b",
-    re.IGNORECASE,
-)
-_CIQ_RESEARCH_READ_ONLY_RE = re.compile(
-    r"\bread[-\s]?only\b"
-    r"|\b(?:do\s+not|don't|without)\b[^.!?\n]{0,80}"
-    r"\b(?:change|persist|save|attach|import|link|update|write|record)\b",
-    re.IGNORECASE,
-)
 _WEB_ACCESS_DENIAL_RE = re.compile(
     r"\b(?:don't|do\s+not|doesn't|does\s+not|can't|cannot|unable\s+to)\b"
     r"[^.!?]{0,80}\b(?:access|browse|connect)\b[^.!?]{0,40}"
@@ -168,236 +45,6 @@ _WEB_RESEARCH_REFUSAL_RE = re.compile(
     r"(?:provide|help|assist|comply|share|give|discuss|answer|support)\b",
     re.IGNORECASE,
 )
-
-
-def _safe_calibration_filters(raw: Any, *, result: Any = None) -> dict[str, Any]:
-    """Keep only schema-compatible filter values from a prior CIQ artifact."""
-    source = raw if isinstance(raw, dict) else {}
-    safe: dict[str, Any] = {}
-    for key in _CIQ_CONTEXT_STRING_FILTERS:
-        value = source.get(key)
-        if isinstance(value, (str, int)) and str(value).strip():
-            safe[key] = str(value).strip()[:200]
-    limit = source.get("limit")
-    if isinstance(limit, int) and not isinstance(limit, bool):
-        safe["limit"] = min(max(limit, 1), 100)
-    include_completed = source.get("include_completed")
-    if not isinstance(include_completed, bool) and isinstance(result, dict):
-        include_completed = result.get("include_completed")
-    if isinstance(include_completed, bool):
-        safe["include_completed"] = include_completed
-    terminal_only = source.get("terminal_only")
-    if not isinstance(terminal_only, bool) and isinstance(result, dict):
-        terminal_only = result.get("terminal_only")
-    if terminal_only is True:
-        safe["terminal_only"] = True
-    return safe
-
-
-def latest_calibration_iq_filters(history: list[dict]) -> dict[str, Any]:
-    """Find the latest successful CIQ scope in this conversation only."""
-    for message in reversed(history or []):
-        artifacts = message.get("artifacts") or []
-        if not isinstance(artifacts, list):
-            continue
-        for artifact in reversed(artifacts):
-            if not isinstance(artifact, dict) or artifact.get("type") not in {
-                "calibration_iq_summary",
-                "calibration_iq_ros",
-            }:
-                continue
-            data = artifact.get("data")
-            if not isinstance(data, dict) or data.get("status") != "verified":
-                continue
-            return _safe_calibration_filters(data.get("filters"), result=data)
-    return {}
-
-
-def _mentioned_shops(text: str) -> list[str]:
-    return [label for pattern, label in _CIQ_SHOPS if pattern.search(text)]
-
-
-def _mentioned_phases(text: str) -> list[str]:
-    tokens = {m.group("phase").casefold() for m in _CIQ_PHASE_RE.finditer(text)}
-    return sorted(
-        _CIQ_PHASE_WORDS[t] if t in _CIQ_PHASE_WORDS else str(int(t)) for t in tokens
-    )
-
-
-def calibration_iq_filter_is_ambiguous(text: str) -> bool:
-    """True when a message names more than one shop or phase.
-
-    Live field trace: "you're only showing Warner Robins, what about Macon
-    and Perry" mentions Warner Robins (referencing what was just shown)
-    alongside the actually-requested Macon and Perry. A fixed-priority
-    first-match scan grabbed "Warner Robins" -- the wrong one -- and
-    answered deterministically before the model ever saw the message. A
-    message with an unambiguous single shop/phase mention still routes
-    deterministically; only a genuinely ambiguous one defers to the model,
-    which already handles a multi-shop ask correctly as separate calls.
-    """
-    return len(_mentioned_shops(text)) > 1 or len(_mentioned_phases(text)) > 1
-
-
-def _explicit_calibration_filters(text: str) -> dict[str, Any]:
-    filters: dict[str, Any] = {}
-    shops = _mentioned_shops(text)
-    if len(shops) == 1:
-        filters["shop"] = shops[0]
-    phases = _mentioned_phases(text)
-    if len(phases) == 1:
-        filters["phase"] = phases[0]
-    if _CIQ_ALL_WORK_RE.search(text):
-        filters["include_completed"] = True
-        filters["terminal_only"] = False
-    elif _CIQ_NO_CALIBRATION_RE.search(text):
-        filters["status"] = "No Calibration Required"
-        filters["include_completed"] = True
-        filters["terminal_only"] = True
-    elif _CIQ_COMPLETED_CATEGORY_RE.search(text):
-        filters["status"] = "Calibration Complete"
-        filters["include_completed"] = True
-        filters["terminal_only"] = True
-    elif _CIQ_TERMINAL_WORK_RE.search(text):
-        filters["include_completed"] = True
-        filters["terminal_only"] = True
-    elif re.search(r"\bactive\b", text, re.IGNORECASE):
-        filters["include_completed"] = False
-        filters["terminal_only"] = False
-    return filters
-
-
-def calibration_iq_read_request(
-    user_message: object,
-    history: list[dict],
-) -> Optional[tuple[str, dict[str, Any]]]:
-    """Deterministically route explicit CIQ counts/lists and deictic follow-ups."""
-    text = str(user_message or "").strip()
-    if not text:
-        return None
-    count_intent = bool(_CIQ_COUNT_RE.search(text))
-    list_intent = bool(_CIQ_LIST_RE.search(text))
-    if not count_intent and not list_intent:
-        return None
-    if calibration_iq_filter_is_ambiguous(text):
-        return None
-
-    explicit = _explicit_calibration_filters(text)
-    deictic = bool(_CIQ_DEICTIC_RE.search(text))
-    inherited = latest_calibration_iq_filters(history) if deictic else {}
-    if not (_CIQ_SUBJECT_RE.search(text) or explicit or inherited):
-        return None
-
-    args = {**inherited, **explicit}
-    if "terminal_only" in explicit and "status" not in explicit:
-        # An explicit active/all/generic-terminal scope replaces an inherited
-        # exact terminal category instead of accidentally retaining it.
-        args.pop("status", None)
-    tool = "calibration_iq_summary" if count_intent else "calibration_iq_read"
-    return tool, args
-
-
-def calibration_iq_research_request(
-    user_message: object,
-) -> Optional[dict[str, Any]]:
-    """Build one composite operator action for explicit persisted RO research.
-
-    Ordinary ADAS SI questions remain model-selected read-only work. This lane
-    requires Calibration IQ, an exact RO identifier, research language, and a
-    persistence/completion instruction so a procedure lookup cannot mutate a
-    repair order accidentally.
-    """
-    text = str(user_message or "").strip()
-    if (
-        not text
-        or not _CIQ_EXPLICIT_SUBJECT_RE.search(text)
-        or not _CIQ_RESEARCH_INTENT_RE.search(text)
-        or not _CIQ_RESEARCH_PERSIST_RE.search(text)
-        or _CIQ_RESEARCH_READ_ONLY_RE.search(text)
-    ):
-        return None
-    match = _CIQ_RO_IDENTIFIER_RE.search(text)
-    if match is None:
-        return None
-    complete_research = bool(
-        _CIQ_RESEARCH_COMPLETE_RE.search(text)
-        and not _CIQ_RESEARCH_NO_COMPLETE_RE.search(text)
-    )
-    return {
-        "actions": [
-            {
-                "operation": "research_ro",
-                "repair_order_id": match.group("identifier"),
-                "arguments": {"complete_research": complete_research},
-            }
-        ]
-    }
-
-
-def _joined_breakdown(entries: list[tuple[str, Any]]) -> str:
-    parts = [f"{count} {label}" for label, count in entries[:3]]
-    if len(entries) > 3:
-        parts.append(f"{len(entries) - 3} other statuses")
-    if len(parts) <= 1:
-        return "".join(parts)
-    return ", ".join(parts[:-1]) + f", and {parts[-1]}"
-
-
-def calibration_iq_result_summary(result: Any, *, listing: bool) -> str:
-    """Fixed concise prose; the single inline card owns the row detail."""
-    payload = result if isinstance(result, dict) else {}
-    if payload.get("status") != "verified":
-        return str(
-            payload.get("message") or "Calibration IQ did not return a verified result."
-        ).strip()[:600]
-
-    count = int(payload.get("count") or 0)
-    raw_filters = payload.get("filters")
-    filters = raw_filters if isinstance(raw_filters, dict) else {}
-    scope_parts = []
-    if filters.get("shop"):
-        scope_parts.append(str(filters["shop"]))
-    if filters.get("phase") not in (None, ""):
-        scope_parts.append(f"phase {filters['phase']}")
-    scope = " in " + " ".join(scope_parts) if scope_parts else ""
-    noun = "repair order" if count == 1 else "repair orders"
-    active = (
-        " terminal"
-        if payload.get("terminal_only")
-        else ("" if payload.get("include_completed") else " active")
-    )
-
-    if listing:
-        shown = int(payload.get("shown_count") or 0)
-        if payload.get("truncated"):
-            return f"Showing {shown} of {count}{active} {noun}{scope}."
-        return f"Showing all {count}{active} {noun}{scope}."
-
-    lead = f"{count}{active} {noun}{scope}"
-    by_status = (payload.get("breakdown") or {}).get("by_status") or {}
-    breakdown = _joined_breakdown(list(by_status.items()))
-    return f"{lead} — {breakdown}." if breakdown else f"{lead}."
-
-
-def website_update_intent(user_message: object) -> bool:
-    text = str(user_message or "").strip()
-    if not text or not _WEBSITE_REFERENCE_RE.search(text):
-        return False
-    if _WEBSITE_EDIT_ACTION_RE.search(text):
-        return True
-    return bool(
-        _WEBSITE_MAKE_EDIT_RE.search(text) and _WEBSITE_DESIGN_TARGET_RE.search(text)
-    )
-
-
-def website_generation_intent(user_message: object) -> bool:
-    text = str(user_message or "").strip()
-    return bool(
-        text
-        and _WEBSITE_REFERENCE_RE.search(text)
-        and _WEBSITE_CREATE_ACTION_RE.search(text)
-        and not website_update_intent(text)
-    )
 
 
 def website_result_summary(result: Any, *, update: bool) -> str:
@@ -430,51 +77,6 @@ def website_result_summary(result: Any, *, update: bool) -> str:
         f"Generated {title} as a buffered website preview in chat. No files were written "
         "or deployed."
     )
-
-
-def deterministic_read_tool(user_message: object) -> Optional[str]:
-    """Route only explicit, high-confidence read-only intents.
-
-    Model tool choice is the general path for everything else, including
-    website generation/update -- the model already has a clear tool
-    description to work from and has proven capable of choosing correctly
-    without a regex pre-empting it. This one narrow exception stays: it
-    prevents an explicit exterior-camera observation request from being
-    answered from stale context without first rendering the live,
-    server-backed camera card, which is a hardware-timing concern the model
-    can't fix by reasoning about it after the fact.
-    """
-
-    text = str(user_message or "").strip()
-    if not text or not _EXTERIOR_CAMERA_SOURCE_RE.search(text):
-        return None
-    if _EXTERIOR_CAMERA_ACTION_RE.search(text):
-        return "exterior_camera_request"
-    return None
-
-
-def image_generation_request(user_message: object) -> Optional[dict[str, Any]]:
-    """Deliberately inert: image generation is now model-chosen, not regex-routed.
-
-    image_generate is a confirm_required tool -- an approval card stands
-    between any request and an actual ComfyUI run regardless of how the call
-    got chosen, so pre-empting the model's own tool choice here bought
-    nothing but a second place a real request could fail to match a pattern.
-    """
-    return None
-
-
-def web_research_request(user_message: object) -> Optional[dict[str, Any]]:
-    """Deliberately inert: web research is now model-chosen, not regex-routed.
-
-    The false-capability-denial guard this used to gate (see
-    guarded_web_response and last_web_research_result in _run) still works --
-    it now triggers off any web_research_current call the model actually
-    makes this turn, not off this detector, so relaxing routing here didn't
-    cost the one thing that genuinely mattered: never letting the model deny
-    having web access right after a tool call just proved it does.
-    """
-    return None
 
 
 def web_research_result_is_verified(result: Any) -> bool:
@@ -545,13 +147,17 @@ ARTIFACT_FOR_TOOL = {
     "calibration_iq_update": "calibration_iq_receipt",
     "calibration_iq_operator": "calibration_iq_receipt",
     "calibration_iq_destructive": "calibration_iq_receipt",
-    # Persist the work-prep audit result so a later-turn follow-up ("which
-    # ones need SI") can be answered from the stored artifact instead of the
-    # model falling back to a generic board query with guessed filters --
-    # the tool's own result already has nothing else to lose it to (no UI
-    # card renders this type yet; storage and later-turn context still work,
-    # per conversationTimeline.js: "Unknown types safely render null.").
+    # Persist and render the work-prep audit so a later-turn follow-up can use
+    # the same structured queue state instead of reconstructing it from prose.
     "calibration_iq_work_prep": "calibration_iq_work_prep",
+    "collision_research": "research_provider",
+    "scrapex_status": "scrapex",
+    "scrapex_read": "scrapex",
+    "scrapex_adas_map": "scrapex",
+    "automotive_knowledge_search": "automotive_knowledge",
+    "automotive_knowledge_read": "automotive_knowledge",
+    "automotive_knowledge_capture": "automotive_knowledge",
+    "automotive_knowledge_lifecycle": "automotive_knowledge",
 }
 
 _CALIBRATION_IQ_OPERATOR_TOOLS = frozenset(
@@ -560,6 +166,8 @@ _CALIBRATION_IQ_OPERATOR_TOOLS = frozenset(
         "calibration_iq_destructive",
     }
 )
+
+_CALIBRATION_IQ_WORK_PREP_TOOL = "calibration_iq_work_prep"
 
 
 def _calibration_iq_operator_payload(result: Any) -> dict[str, Any]:
@@ -686,6 +294,180 @@ def calibration_iq_operator_failure_summary(result: Any) -> str:
         else "Verified actions: 0; processed actions: 0."
     )
     return f"{lead}{exact} {counts}"
+
+
+def _calibration_iq_work_prep_reconciliation_counts(
+    payload: dict[str, Any],
+) -> tuple[int, int, int, int]:
+    """Return requested/processed/returned/verified counts without guessing.
+
+    Weekly/phase audits expose complete aggregate receipt counts even when the
+    bounded row sample omits reconciliation details.  RO-scoped work prep keeps
+    the same truth inside its single nested reconciliation result.
+    """
+    receipt_total = _bounded_nonnegative_int(payload.get("ciq_receipt_count"), 0)
+    requested_total = _bounded_nonnegative_int(
+        payload.get("ciq_mutations_requested_count"), receipt_total
+    )
+    processed_total = _bounded_nonnegative_int(
+        payload.get("ciq_mutations_processed_count"), receipt_total
+    )
+    verified_total = _bounded_nonnegative_int(
+        payload.get("ciq_verified_receipt_count"), 0
+    )
+    if any(
+        field in payload
+        for field in (
+            "ciq_receipt_count",
+            "ciq_mutations_requested_count",
+            "ciq_mutations_processed_count",
+            "ciq_verified_receipt_count",
+        )
+    ):
+        return (
+            requested_total,
+            processed_total,
+            receipt_total,
+            min(verified_total, requested_total),
+        )
+
+    reconciliation = payload.get("reconciliation")
+    if not isinstance(reconciliation, dict):
+        return 0, 0, 0, 0
+    receipts = [
+        receipt
+        for receipt in (reconciliation.get("receipts") or [])
+        if isinstance(receipt, dict)
+    ]
+    requested_total = _bounded_nonnegative_int(
+        reconciliation.get("requested_count"), len(receipts)
+    )
+    processed_total = _bounded_nonnegative_int(
+        reconciliation.get("processed_count"), len(receipts)
+    )
+    explicit_verified = reconciliation.get("verified_count")
+    if isinstance(explicit_verified, int) and not isinstance(explicit_verified, bool):
+        verified_total = max(0, explicit_verified)
+    else:
+        verified_total = sum(
+            1 for receipt in receipts if _calibration_iq_receipt_is_verified(receipt)
+        )
+    return (
+        requested_total,
+        processed_total,
+        len(receipts),
+        min(verified_total, requested_total),
+    )
+
+
+def calibration_iq_work_prep_terminal_summary(results: Any) -> str:
+    """Seal work-prep turns with the service's structured audit truth.
+
+    Work prep can perform receipt-bound CIQ reconciliation while also returning
+    a truthful *partial* readiness audit.  The model still sees the structured
+    result for tool choice, but it cannot replace the final aggregate counts,
+    named exceptions, omissions, or receipt state with optimistic prose.
+    """
+    from ..services import calibration_iq_work_prep as work_prep
+
+    raw_results = results if isinstance(results, list) else [results]
+    summaries: list[str] = []
+    for result in raw_results:
+        if not isinstance(result, dict):
+            summaries.append(
+                "The Calibration IQ work-prep result was not verified. "
+                "CIQ mutation receipts: 0 verified; 0 processed."
+            )
+            continue
+        mode = _calibration_iq_summary_value(result.get("mode"), limit=80)
+        if not mode:
+            mode = "unknown"
+        result_verified = bool(
+            result.get("verified") is True
+            or (mode == "phase_list" and result.get("status") == "verified")
+        )
+        if result.get("success") is False and result.get("message"):
+            summary = _calibration_iq_summary_value(
+                result.get("message"), limit=500
+            )
+        elif result_verified:
+            summary = work_prep.summarize(mode, result)
+        else:
+            detail = _calibration_iq_summary_value(
+                result.get("message"), limit=400
+            )
+            summary = (
+                detail
+                or "The requested Calibration IQ work-prep action was not verified."
+            )
+
+        requested, processed, receipt_total, verified = (
+            _calibration_iq_work_prep_reconciliation_counts(result)
+        )
+        reconciliation_failed = _bounded_nonnegative_int(
+            result.get("reconciliation_failed_count"), 0
+        )
+        indeterminate = _bounded_nonnegative_int(
+            result.get("ciq_indeterminate_reconciliation_count"), 0
+        )
+        may_have_executed = _bounded_nonnegative_int(
+            result.get("ciq_may_have_executed_reconciliation_count"), 0
+        )
+        reconciliation = result.get("reconciliation")
+        reconciliation_attempted = bool(
+            requested
+            or processed
+            or verified
+            or receipt_total
+            or reconciliation_failed
+            or indeterminate
+            or may_have_executed
+            or result.get("executed") is True
+            or (
+                isinstance(reconciliation, dict)
+                and (
+                    reconciliation.get("executed") is True
+                    or reconciliation.get("may_have_executed") is True
+                    or _bounded_nonnegative_int(
+                        reconciliation.get("requested_count"), 0
+                    )
+                    > 0
+                )
+            )
+        )
+        if reconciliation_attempted:
+            unverified = max(requested, processed) - verified
+            receipt_line = (
+                "CIQ mutation receipts: "
+                f"{verified} verified of {requested} requested; "
+                f"{processed} processed; {receipt_total} returned; "
+                f"{max(0, unverified)} unverified."
+            )
+            if reconciliation_failed:
+                receipt_line += (
+                    f" Reconciliation exceptions: {reconciliation_failed}."
+                )
+            if indeterminate or may_have_executed:
+                receipt_line += (
+                    " Indeterminate reconciliation outcomes: "
+                    f"{indeterminate}; may-have-executed outcomes: "
+                    f"{may_have_executed}."
+                )
+            summary = f"{summary}\n{receipt_line}"
+        summaries.append(summary)
+    return "\n\n".join(summaries)
+
+
+def _calibration_iq_protected_terminal_summary(
+    operator_results: list[dict[str, Any]],
+    work_prep_results: list[dict[str, Any]],
+) -> str:
+    sections: list[str] = []
+    if operator_results:
+        sections.append(calibration_iq_operator_terminal_summary(operator_results))
+    if work_prep_results:
+        sections.append(calibration_iq_work_prep_terminal_summary(work_prep_results))
+    return "\n\n".join(section for section in sections if section)
 
 
 def _calibration_iq_receipt_is_verified(receipt: Any) -> bool:
@@ -1562,13 +1344,59 @@ class Orchestrator:
         approval_context: Optional[dict],
     ) -> AsyncIterator[dict]:
         history = self.store.get_messages(conversation_id)
+        effective_context = dict(approval_context or {})
+        if not approved_tool:
+            # The user message is persisted before run_turn starts. Bind every
+            # model-selected call to that authoritative message/conversation
+            # identity even when no approval payload was supplied. A session
+            # id remains necessary only if Registry asks Core to create a
+            # confirmation card.
+            current_user_message = next(
+                (
+                    item
+                    for item in reversed(history)
+                    if isinstance(item, dict) and item.get("role") == "user"
+                ),
+                None,
+            )
+            if isinstance(current_user_message, dict):
+                message_id = current_user_message.get("id") or current_user_message.get(
+                    "message_id"
+                )
+                if isinstance(message_id, int) and not isinstance(message_id, bool):
+                    effective_context["message_id"] = message_id
+
+            conversation_user_id = None
+            if hasattr(self.store, "conversation_user_id"):
+                conversation_user_id = self.store.conversation_user_id(conversation_id)
+            if conversation_user_id:
+                effective_context["user_id"] = str(conversation_user_id)
+                if hasattr(self.store, "get_user"):
+                    persisted_user = self.store.get_user(str(conversation_user_id))
+                    if isinstance(persisted_user, dict) and persisted_user.get("role"):
+                        effective_context["role"] = str(persisted_user["role"])
+
+        effective_context.setdefault("role", "owner")
+        active_subject = None
+        if hasattr(self.store, "get_conversation_subject"):
+            try:
+                active_subject = self.store.get_conversation_subject(
+                    conversation_id,
+                    user_id=effective_context.get("user_id"),
+                )
+            except Exception:  # noqa: BLE001 - context continuity must not break a turn
+                log.exception(
+                    "Could not load active subject for conversation %s",
+                    conversation_id,
+                )
         messages = prompt_mod.build_messages(
             self.router,
             history,
             self.settings.context_tokens,
             self.settings.max_response_tokens,
+            active_subject=active_subject,
         )
-        role = str((approval_context or {}).get("role") or "owner")
+        role = str(effective_context["role"])
         try:
             tools = self.registry.model_tools(role)
         except TypeError:
@@ -1579,306 +1407,13 @@ class Orchestrator:
         full_text = ""
         last_calibration_iq_operator_result: Optional[dict[str, Any]] = None
         calibration_iq_operator_results: list[dict[str, Any]] = []
+        calibration_iq_work_prep_results: list[dict[str, Any]] = []
         calibration_iq_truth_emitted = False
         # Tracks the most recent web_research_current result across rounds
         # regardless of whether the call was model-chosen or (formerly)
         # deterministically routed, so the false-capability-denial guard
         # below still works now that routing is the model's own choice.
         last_web_research_result: Optional[dict[str, Any]] = None
-
-        # Qwen's tool choice can occasionally spend every tool round on source
-        # reads before a requested persisted RO-research action. Pre-route only
-        # high-confidence intents through the same Registry/_execute boundary
-        # used by model-selected calls, so policy, audit, artifact, and chat
-        # rendering semantics stay identical.
-        base_routed_tool = (
-            None if approved_tool else deterministic_read_tool(user_message)
-        )
-        ciq_research = (
-            calibration_iq_research_request(user_message)
-            if not approved_tool and base_routed_tool is None
-            else None
-        )
-        ciq_request = (
-            calibration_iq_read_request(user_message, history)
-            if (not approved_tool and base_routed_tool is None and ciq_research is None)
-            else None
-        )
-        image_request = (
-            image_generation_request(user_message)
-            if not approved_tool and base_routed_tool is None and ciq_request is None
-            else None
-        )
-        web_request = (
-            web_research_request(user_message)
-            if (
-                not approved_tool
-                and base_routed_tool is None
-                and ciq_request is None
-                and image_request is None
-            )
-            else None
-        )
-        routed_tool = (
-            base_routed_tool
-            or ("calibration_iq_operator" if ciq_research else None)
-            or (ciq_request[0] if ciq_request else None)
-            or ("image_generate" if image_request else None)
-            or ("web_research_current" if web_request else None)
-        )
-        advertised_names = {
-            str(item.get("function", {}).get("name") or "") for item in tools
-        }
-        routed_is_website = routed_tool == "website_preview_generate"
-        routed_is_website_update = routed_is_website and website_update_intent(
-            user_message
-        )
-        routed_is_ciq = routed_tool in {
-            "calibration_iq_summary",
-            "calibration_iq_read",
-        }
-        routed_is_ciq_research = routed_tool == "calibration_iq_operator" and bool(
-            ciq_research
-        )
-        routed_is_image = routed_tool == "image_generate"
-        routed_is_web = routed_tool == "web_research_current"
-        routed_result = None
-        routed_tier = self.registry.tier(routed_tool) if routed_tool else None
-        if (
-            routed_tool
-            and routed_tool in advertised_names
-            and (
-                routed_tier == "read_only"
-                or (routed_is_image and routed_tier == "confirm_required")
-                or (routed_is_ciq_research and routed_tier == "operator_authorized")
-            )
-        ):
-            if routed_is_ciq_research and ciq_research:
-                routed_args = dict(ciq_research)
-            elif routed_is_ciq and ciq_request:
-                routed_args = dict(ciq_request[1])
-            elif routed_is_image and image_request:
-                routed_args = dict(image_request)
-            elif routed_is_web and web_request:
-                routed_args = dict(web_request)
-            else:
-                routed_args = {"prompt": str(user_message or "")[:2000]}
-                if routed_is_website_update:
-                    routed_args["operation"] = "update_latest"
-            routed_call_id = (
-                f"routed_{routed_tool}_{int(conversation_id)}_{len(history)}"
-            )
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": routed_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": routed_tool,
-                                "arguments": json.dumps(routed_args),
-                            },
-                        }
-                    ],
-                }
-            )
-            routed_events: list[dict] = []
-            routed_paused = False
-            async for event in self._execute(
-                routed_tool,
-                routed_args,
-                messages,
-                artifacts,
-                conversation_id=conversation_id,
-                approval_context=approval_context,
-                call_id=routed_call_id,
-            ):
-                if event.get("type") == "approval":
-                    routed_paused = True
-                if event.get("type") == "tool_result":
-                    routed_result = event.get("result")
-                if event.get("type") == "artifact":
-                    artifact = event.get("artifact") or {}
-                    if artifact.get("type") in {
-                        "website_preview",
-                        "calibration_iq_summary",
-                        "calibration_iq_ros",
-                        "calibration_iq_receipt",
-                    }:
-                        routed_result = artifact.get("data")
-                if routed_is_website or routed_is_ciq or routed_is_ciq_research:
-                    routed_events.append(event)
-                else:
-                    yield event
-            tools = [
-                item
-                for item in tools
-                if item.get("function", {}).get("name") != routed_tool
-            ]
-
-            if routed_paused:
-                message_id = self.store.add_message(
-                    conversation_id,
-                    "assistant",
-                    "",
-                    worker_used=self.router.active_name,
-                    artifacts=artifacts,
-                )
-                yield {
-                    "type": "done",
-                    "message_id": message_id,
-                    "worker": self.router.active_name,
-                    "artifacts": artifacts,
-                }
-                return
-
-            # The composite research operator already performed its own ADAS
-            # searches, imports/links, final snapshot reread, and evidence
-            # verification. Seal this turn with receipt-derived prose instead
-            # of returning to the model for another sequence of read calls.
-            if routed_is_ciq_research:
-                result = (
-                    routed_result
-                    if isinstance(routed_result, dict)
-                    else {
-                        "status": "failed",
-                        "success": False,
-                        "verified": False,
-                        "partial": False,
-                        "error": {
-                            "code": "invalid_response",
-                            "message": (
-                                "Calibration IQ returned no usable operator result."
-                            ),
-                        },
-                    }
-                )
-                summary = calibration_iq_research_result_summary(result)
-                message_id = self.store.add_message(
-                    conversation_id,
-                    "assistant",
-                    summary,
-                    worker_used=self.router.active_name,
-                    artifacts=artifacts,
-                )
-                if len(history) <= 1 and summary:
-                    self.store.touch_conversation(
-                        conversation_id, title=user_message[:60]
-                    )
-                # Persist the result card and nonempty receipt-grounded prose
-                # before either is emitted. A disconnect or model round cap
-                # therefore cannot recreate the observed blank assistant turn.
-                for routed_event in routed_events:
-                    yield routed_event
-                yield {"type": "token", "text": summary}
-                yield {
-                    "type": "done",
-                    "message_id": message_id,
-                    "worker": self.router.active_name,
-                    "artifacts": artifacts,
-                }
-                return
-
-            # Website revisions are already complete, chat-renderable results.
-            # Persist them before any optional prose synthesis so a worker
-            # disconnect cannot leave a client-only phantom card. A fixed
-            # truthful summary also prevents an unreceipted "updated" claim.
-            if routed_is_website:
-                result = routed_result if isinstance(routed_result, dict) else {}
-                summary = website_result_summary(
-                    result, update=routed_is_website_update
-                )
-                message_id, summary, artifacts, result = self._persist_website_turn(
-                    conversation_id,
-                    summary,
-                    artifacts,
-                    result,
-                    update=routed_is_website_update,
-                )
-                routed_events = self._rewrite_website_events(routed_events, result)
-                full_text = summary
-                if len(history) <= 1 and summary:
-                    self.store.touch_conversation(
-                        conversation_id, title=user_message[:60]
-                    )
-                # The revision and its fixed truth summary are durable before
-                # the first success-bearing event reaches the socket. A client
-                # disconnect can therefore reconcile server truth rather than
-                # retain a phantom live-only card.
-                for routed_event in routed_events:
-                    yield routed_event
-                yield {"type": "token", "text": summary}
-                yield {
-                    "type": "done",
-                    "message_id": message_id,
-                    "worker": self.router.active_name,
-                    "artifacts": artifacts,
-                }
-                return
-
-            if routed_is_ciq:
-                result = (
-                    routed_result
-                    if isinstance(routed_result, dict)
-                    else {
-                        "status": "error",
-                        "message": "Calibration IQ returned no usable result.",
-                    }
-                )
-                card_type = ARTIFACT_FOR_TOOL[routed_tool]
-                matching_artifacts = [
-                    artifact
-                    for artifact in artifacts
-                    if artifact.get("type") == card_type
-                ]
-                if not matching_artifacts:
-                    artifact = {"type": card_type, "data": result}
-                    artifacts.append(artifact)
-                    routed_events.append({"type": "artifact", "artifact": artifact})
-                elif len(matching_artifacts) > 1:
-                    # The deterministic lane owns exactly one logical result.
-                    keep = matching_artifacts[-1]
-                    artifacts[:] = [
-                        artifact
-                        for artifact in artifacts
-                        if artifact.get("type") != card_type or artifact is keep
-                    ]
-                    routed_events = [
-                        event
-                        for event in routed_events
-                        if event.get("type") != "artifact"
-                        or (event.get("artifact") or {}) is keep
-                    ]
-
-                summary = calibration_iq_result_summary(
-                    result,
-                    listing=routed_tool == "calibration_iq_read",
-                )
-                message_id = self.store.add_message(
-                    conversation_id,
-                    "assistant",
-                    summary,
-                    worker_used=self.router.active_name,
-                    artifacts=artifacts,
-                )
-                if len(history) <= 1 and summary:
-                    self.store.touch_conversation(
-                        conversation_id, title=user_message[:60]
-                    )
-                # Persist the one result card before emitting it, so reconnects
-                # recover the same scope and "Show me those" remains durable.
-                for routed_event in routed_events:
-                    yield routed_event
-                yield {"type": "token", "text": summary}
-                yield {
-                    "type": "done",
-                    "message_id": message_id,
-                    "worker": self.router.active_name,
-                    "artifacts": artifacts,
-                }
-                return
 
         # The approval resolver already executed exactly once and persisted a
         # terminal receipt. Reconstruct the protocol pair without calling the
@@ -1929,6 +1464,13 @@ class Orchestrator:
                     last_calibration_iq_operator_result
                 )
             call_id = approved_tool.get("call_id") or "approved_call"
+            self._track_active_subject(
+                conversation_id=conversation_id,
+                name=name,
+                result=result,
+                call_id=call_id,
+                invocation_context=effective_context,
+            )
             messages.append(
                 {
                     "role": "assistant",
@@ -2121,8 +1663,22 @@ class Orchestrator:
                 elif event["type"] == "tool_call":
                     tool_calls.append(event)
 
+            if len(tool_calls) > MAX_TOOL_CALLS_PER_ROUND:
+                log.warning(
+                    "Model requested %d tools in one round; executing the first %d",
+                    len(tool_calls),
+                    MAX_TOOL_CALLS_PER_ROUND,
+                )
+                tool_calls = tool_calls[:MAX_TOOL_CALLS_PER_ROUND]
+
             operator_turn_active = bool(calibration_iq_operator_results)
-            guarded_operator_response = bool(operator_turn_active and not tool_calls)
+            work_prep_turn_active = bool(calibration_iq_work_prep_results)
+            calibration_iq_protected_turn_active = bool(
+                operator_turn_active or work_prep_turn_active
+            )
+            guarded_calibration_iq_response = bool(
+                calibration_iq_protected_turn_active and not tool_calls
+            )
             guarded_web_response = bool(
                 last_web_research_result is not None
                 and not tool_calls
@@ -2149,15 +1705,16 @@ class Orchestrator:
             # this round, not just those two families, now seals its round.
             if (
                 not tool_calls
-                and not operator_turn_active
+                and not calibration_iq_protected_turn_active
                 and not guarded_web_response
             ):
                 for token_event in sealed_round_tokens:
                     yield token_event
 
-            if guarded_operator_response:
-                guarded_text = calibration_iq_operator_terminal_summary(
-                    calibration_iq_operator_results
+            if guarded_calibration_iq_response:
+                guarded_text = _calibration_iq_protected_terminal_summary(
+                    calibration_iq_operator_results,
+                    calibration_iq_work_prep_results,
                 )
                 yield {"type": "token", "text": guarded_text}
                 full_text = guarded_text
@@ -2166,7 +1723,7 @@ class Orchestrator:
                 guarded_text = web_research_fallback_summary(last_web_research_result)
                 yield {"type": "token", "text": guarded_text}
                 full_text += guarded_text
-            elif not tool_calls and not operator_turn_active:
+            elif not tool_calls and not calibration_iq_protected_turn_active:
                 full_text += round_text
 
             if not tool_calls:
@@ -2211,7 +1768,7 @@ class Orchestrator:
                     messages,
                     artifacts,
                     conversation_id=conversation_id,
-                    approval_context=approval_context,
+                    approval_context=effective_context,
                     call_id=call_id,
                     call_cache=read_only_call_cache,
                 ):
@@ -2229,6 +1786,21 @@ class Orchestrator:
                         )
                         calibration_iq_operator_results.append(
                             last_calibration_iq_operator_result
+                        )
+                    if (
+                        call.get("name") == _CALIBRATION_IQ_WORK_PREP_TOOL
+                        and ev.get("type") == "tool_result"
+                    ):
+                        work_prep_result = ev.get("result")
+                        calibration_iq_work_prep_results.append(
+                            work_prep_result
+                            if isinstance(work_prep_result, dict)
+                            else {
+                                "mode": args.get("mode"),
+                                "status": "unverified_result",
+                                "success": False,
+                                "verified": False,
+                            }
                         )
                     if (
                         call.get("name") == "web_research_current"
@@ -2281,6 +1853,13 @@ class Orchestrator:
                     }
                     return
 
+                if paused:
+                    # An approval is a hard turn boundary. Do not execute any
+                    # later call the model happened to emit in the same batch;
+                    # those calls were selected without the user's decision
+                    # and may themselves mutate state.
+                    break
+
             if paused:
                 # Stop here. The UI shows the approval card; approving it
                 # starts a new turn carrying approved_tool.
@@ -2291,14 +1870,18 @@ class Orchestrator:
         if (
             paused
             and not calibration_iq_truth_emitted
-            and calibration_iq_operator_results
+            and (
+                calibration_iq_operator_results
+                or calibration_iq_work_prep_results
+            )
         ):
             # A routine operator action may complete before a later destructive
             # action pauses the turn for approval. Preserve the completed
             # receipt truth in this turn instead of saving a blank assistant
             # message; the approval continuation owns only the protected call.
-            guarded_text = calibration_iq_operator_terminal_summary(
-                calibration_iq_operator_results
+            guarded_text = _calibration_iq_protected_terminal_summary(
+                calibration_iq_operator_results,
+                calibration_iq_work_prep_results,
             )
             yield {"type": "token", "text": guarded_text}
             full_text = guarded_text
@@ -2307,10 +1890,14 @@ class Orchestrator:
         if (
             not paused
             and not calibration_iq_truth_emitted
-            and calibration_iq_operator_results
-        ):
-            guarded_text = calibration_iq_operator_terminal_summary(
+            and (
                 calibration_iq_operator_results
+                or calibration_iq_work_prep_results
+            )
+        ):
+            guarded_text = _calibration_iq_protected_terminal_summary(
+                calibration_iq_operator_results,
+                calibration_iq_work_prep_results,
             )
             yield {"type": "token", "text": guarded_text}
             full_text = guarded_text
@@ -2519,6 +2106,13 @@ class Orchestrator:
             yield {"type": "tool_result", "name": name, "result": payload}
             return
 
+        self._track_active_subject(
+            conversation_id=conversation_id,
+            name=name,
+            result=result,
+            call_id=call_id,
+            invocation_context=approval_context or {},
+        )
         feed(result)
         event_result = (
             tool_result_for_model(name, result)
@@ -2534,3 +2128,38 @@ class Orchestrator:
             artifact = {"type": card_type, "data": result}
             artifacts.append(artifact)
             yield {"type": "artifact", "artifact": artifact}
+
+    def _track_active_subject(
+        self,
+        *,
+        conversation_id: int,
+        name: str,
+        result: Any,
+        call_id: str,
+        invocation_context: dict[str, Any],
+    ) -> None:
+        """Persist only a subject proven by one non-cached authoritative result."""
+        if not hasattr(self.store, "set_conversation_subject"):
+            return
+        try:
+            # Local import avoids a package-load cycle: services import the
+            # orchestrator while registering execution-only capabilities.
+            from ..services.conversation_subjects import (
+                track_active_subject_from_tool_result,
+            )
+
+            track_active_subject_from_tool_result(
+                self.store,
+                conversation_id=conversation_id,
+                tool_name=name,
+                result=result,
+                tool_call_id=call_id,
+                message_id=invocation_context.get("message_id"),
+                user_id=invocation_context.get("user_id"),
+            )
+        except Exception:  # noqa: BLE001 - subject continuity is fail-soft
+            log.exception(
+                "Could not update active subject from %s in conversation %s",
+                name,
+                conversation_id,
+            )

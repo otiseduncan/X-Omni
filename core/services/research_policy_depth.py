@@ -31,11 +31,6 @@ from . import research_workflow
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
 
-_POLICY_RE = re.compile(
-    r"\b(?:recycled|aftermarket|salvage|used\s+(?:part|parts|module|sensor)|"
-    r"remanufactured|non[-\s]?oem|genuine\s+parts?)\b",
-    re.IGNORECASE,
-)
 _POLICY_TERMS = (
     "methods not approved",
     "not approved",
@@ -370,10 +365,16 @@ async def _read_deep_source(
     )
 
 
-def _focused_queries(query: str, make: Optional[str], *, calibration_mode: bool) -> list[str]:
+def _focused_queries(
+    query: str,
+    make: Optional[str],
+    *,
+    calibration_mode: bool,
+    policy_mode: bool,
+) -> list[str]:
     output: list[str] = []
     prefix = (make or "").strip()
-    if _POLICY_RE.search(query):
+    if policy_mode:
         output.extend([
             f"{prefix} Collision Pros approved repair methods recycled parts",
             f"{prefix} methods not approved aftermarket recycled parts collision repair",
@@ -405,17 +406,31 @@ def _focused_queries(query: str, make: Optional[str], *, calibration_mode: bool)
     return cleaned
 
 
-async def deep_search_public_oem(query: str, make: Optional[str]) -> dict[str, Any]:
+async def deep_search_public_oem(
+    query: str,
+    make: Optional[str],
+    *,
+    source_depth: str = "standard",
+) -> dict[str, Any]:
     """Run normal OEM discovery plus exhaustive calibration/policy reading."""
-    primary = await _PREVIOUS_SEARCH(query, make)
-    calibration_mode = adas_calibration_depth.calibration_intent(query)
+    # The previous implementation is the standard bounded discovery path.
+    # Passing the nonstandard depth back into it would delegate straight back
+    # to this function and recurse forever.
+    primary = await _PREVIOUS_SEARCH(query, make, source_depth="standard")
+    calibration_mode = source_depth == "calibration_requirements"
+    policy_mode = source_depth == "repair_policy"
 
     merged: dict[str, dict[str, Any]] = {}
     for item in primary.get("sources") or []:
         if isinstance(item, dict) and item.get("url"):
             merged[str(item["url"])] = dict(item)
 
-    for focused in _focused_queries(query, make, calibration_mode=calibration_mode):
+    for focused in _focused_queries(
+        query,
+        make,
+        calibration_mode=calibration_mode,
+        policy_mode=policy_mode,
+    ):
         try:
             result = await ro.public_search({"query": focused, "manufacturer": make or ""})
         except Exception:
@@ -477,14 +492,21 @@ async def deep_search_public_oem(query: str, make: Optional[str]) -> dict[str, A
     result["read_results"] = read_results[:30]
     result["policy_findings"] = policy_findings[:12]
     result["calibration_findings"] = calibration_findings[:20]
-    result["deep_policy_read"] = bool(_POLICY_RE.search(query))
+    result["deep_policy_read"] = policy_mode
     result["deep_calibration_read"] = calibration_mode
     result["deep_read_metrics"] = {
         "full_pdf_pages_inspected": pdf_pages_inspected,
         "same_host_links_read": same_host_links_read,
         "source_pages_not_limited_to_first_page": True,
         "ocr_fallback_for_scan_only_pdf_pages": True,
-        "targeted_public_search_variants": len(_focused_queries(query, make, calibration_mode=calibration_mode)),
+        "targeted_public_search_variants": len(
+            _focused_queries(
+                query,
+                make,
+                calibration_mode=calibration_mode,
+                policy_mode=policy_mode,
+            )
+        ),
     }
     return result
 
@@ -493,13 +515,8 @@ _PREVIOUS_SEARCH = research_workflow.search_public_oem
 
 
 def install() -> None:
-    global _INSTALLED, _PREVIOUS_SEARCH
+    """Keep legacy deep-read helpers available without patching source routing."""
+
+    global _INSTALLED
     with _INSTALL_LOCK:
-        if _INSTALLED:
-            return
-        previous = research_workflow.search_public_oem
-        _PREVIOUS_SEARCH = previous
-        if not getattr(previous, "_xomni_deep_policy", False):
-            deep_search_public_oem._xomni_deep_policy = True  # type: ignore[attr-defined]
-            research_workflow.search_public_oem = deep_search_public_oem
         _INSTALLED = True

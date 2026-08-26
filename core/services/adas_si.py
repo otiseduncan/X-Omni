@@ -533,6 +533,103 @@ class AdasSI:
         except Exception as exc:  # noqa: BLE001 - never break inventory_read on this
             return {"status": "unavailable", "message": f"{type(exc).__name__}: {exc}"}
 
+    def model_search(self, args: dict) -> dict[str, Any]:
+        """Search from model-supplied structured automotive semantics.
+
+        The conversation model decides the vehicle, repair event, component,
+        and evidence depth.  This adapter only validates those structured
+        decisions and serializes them for the existing local document index;
+        it never classifies the user's original wording or chooses a route.
+        """
+
+        if not isinstance(args, dict):
+            raise ValueError("structured ADAS SI search arguments are required")
+        allowed = {
+            "vehicle",
+            "system",
+            "component",
+            "repair_event",
+            "requirement_type",
+            "question",
+            "search_mode",
+        }
+        unknown = sorted(str(key) for key in args if key not in allowed)
+        if unknown:
+            raise ValueError(f"unsupported ADAS SI search fields: {', '.join(unknown)}")
+
+        vehicle = args.get("vehicle") or {}
+        if not isinstance(vehicle, dict):
+            raise ValueError("vehicle must be an object")
+        vehicle_allowed = {"year", "make", "model", "trim", "platform"}
+        vehicle_unknown = sorted(
+            str(key) for key in vehicle if key not in vehicle_allowed
+        )
+        if vehicle_unknown:
+            raise ValueError(
+                f"unsupported vehicle fields: {', '.join(vehicle_unknown)}"
+            )
+
+        structured: dict[str, Any] = {}
+        query_parts: list[str] = []
+        raw_year = vehicle.get("year")
+        if raw_year not in (None, ""):
+            if isinstance(raw_year, bool):
+                raise ValueError("vehicle.year must be a four-digit year")
+            try:
+                year = int(raw_year)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("vehicle.year must be a four-digit year") from exc
+            if year < 1900 or year > 2100:
+                raise ValueError("vehicle.year must be between 1900 and 2100")
+            structured.setdefault("vehicle", {})["year"] = year
+            query_parts.append(str(year))
+
+        for key in ("make", "model", "trim", "platform"):
+            raw_value = vehicle.get(key)
+            if raw_value in (None, ""):
+                continue
+            value = " ".join(str(raw_value).split()).strip()
+            if not value or len(value) > 160:
+                raise ValueError(f"vehicle.{key} must be 1 through 160 characters")
+            structured.setdefault("vehicle", {})[key] = value
+            query_parts.append(value)
+
+        for key in (
+            "system",
+            "component",
+            "repair_event",
+            "requirement_type",
+            "question",
+        ):
+            raw_value = args.get(key)
+            if raw_value in (None, ""):
+                continue
+            value = " ".join(str(raw_value).split()).strip()
+            if not value or len(value) > 500:
+                raise ValueError(f"{key} must be 1 through 500 characters")
+            structured[key] = value
+            query_parts.append(value)
+
+        mode = str(args.get("search_mode") or "standard").strip()
+        if mode not in {"standard", "calibration_requirements"}:
+            raise ValueError(
+                "search_mode must be standard or calibration_requirements"
+            )
+        structured["search_mode"] = mode
+        if not query_parts:
+            raise ValueError(
+                "supply at least one vehicle, system, component, repair event, "
+                "requirement type, or question field"
+            )
+
+        result = self.search(
+            {"query": " ".join(query_parts)[:2_000], "search_mode": mode}
+        )
+        if isinstance(result, dict):
+            result = dict(result)
+            result["structured_query"] = structured
+        return result
+
     def search(self, args: dict) -> dict[str, Any]:
         query = str(args.get("query") or "").strip()
         if not query:
@@ -673,6 +770,50 @@ class AdasSI:
             raise ValueError("record_id is required and must be alphanumeric")
         self.managed_root.mkdir(parents=True, exist_ok=True)
         return self.managed_root / f"{safe}.json"
+
+    def record_list(self, _args: Optional[dict] = None) -> dict[str, Any]:
+        """List bounded operator annotations without touching OEM sources."""
+        if not self.available():
+            return {
+                "status": "unavailable",
+                "records": [],
+                "message": "The ADAS SI source library is not reachable.",
+            }
+        if not self.managed_root.is_dir():
+            return {"status": "success", "records": [], "count": 0}
+
+        records: list[dict[str, Any]] = []
+        invalid_count = 0
+        for path in sorted(self.managed_root.glob("*.json"))[:500]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                invalid_count += 1
+                continue
+            if not isinstance(payload, dict):
+                invalid_count += 1
+                continue
+            records.append(
+                {
+                    key: payload.get(key)
+                    for key in (
+                        "record_id",
+                        "title",
+                        "content",
+                        "version",
+                        "created_by",
+                        "updated_by",
+                        "updated_at",
+                    )
+                    if payload.get(key) is not None
+                }
+            )
+        return {
+            "status": "success" if invalid_count == 0 else "partial_success",
+            "records": records,
+            "count": len(records),
+            "invalid_count": invalid_count,
+        }
 
     def record_write(self, args: dict, user: Optional[dict] = None) -> dict[str, Any]:
         if not self.available():

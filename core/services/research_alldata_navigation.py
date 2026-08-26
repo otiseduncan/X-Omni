@@ -503,7 +503,19 @@ async def _click_best_result(page: Any, topic: str) -> tuple[str | None, int]:
         return None, score
 
 
-async def search_alldata_vehicle_first(browser: Any, query: str) -> dict[str, Any]:
+async def search_alldata_vehicle_first(
+    browser: Any,
+    query: str = "",
+    *,
+    vehicle: Optional[dict[str, Any]] = None,
+    topic: Optional[str] = None,
+) -> dict[str, Any]:
+    """Execute the bounded vehicle-first provider protocol.
+
+    Legacy direct callers may still supply ``query``. Production model tool
+    calls supply the already-interpreted vehicle and topic fields, so this
+    executor does not manufacture business arguments from user prose.
+    """
     state = await browser.start(auto_login=True)
     page = browser._page  # noqa: SLF001 - provider automation owned by this service
     if page is None:
@@ -518,8 +530,31 @@ async def search_alldata_vehicle_first(browser: Any, query: str) -> dict[str, An
             "status": state,
         }
 
-    vehicle = vehicle_from_query(query)
-    topic = topic_from_query(query, vehicle)
+    if vehicle is None:
+        vehicle = vehicle_from_query(query)
+        topic = topic_from_query(query, vehicle)
+    else:
+        raw_year = str(vehicle.get("year") or "").strip()
+        raw_make = " ".join(str(vehicle.get("make") or "").split()).strip()
+        raw_model = " ".join(
+            str(vehicle.get("model_trim") or vehicle.get("model") or "").split()
+        ).strip()
+        raw_trim = " ".join(str(vehicle.get("trim") or "").split()).strip()
+        if not re.fullmatch(r"(?:19|20|21)\d{2}", raw_year):
+            raise ValueError("vehicle.year must be a four-digit year")
+        if not raw_make or not raw_model:
+            raise ValueError("vehicle.make and vehicle.model are required")
+        model_trim = " ".join(part for part in (raw_model, raw_trim) if part)
+        vehicle = {
+            "year": raw_year,
+            "make": raw_make,
+            "model_trim": model_trim,
+            "label": f"{raw_year} {raw_make} {model_trim}",
+        }
+        topic = " ".join(str(topic or "").split()).strip()
+        if not topic:
+            raise ValueError("topic is required")
+        topic = topic[:220]
     entered = await _enter_product(page)
     if not entered:
         return {

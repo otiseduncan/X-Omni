@@ -1,43 +1,16 @@
-"""X Omni service package wiring.
+"""Execution-only wiring for X Omni service capabilities.
 
-ADAS SI OCR is installed at package import so every AdasSI instance—including
-search, Calibration IQ research, and direct document opening—uses the same
-page-level OCR path without a parallel OCR-only service. Explicit vehicle
-queries are identity-filtered by year/make/model so cross-vehicle topic matches
-cannot become repair evidence, and calibration questions deep-scan every page of
-the relevant OEM PDFs for buried requirement/trigger language.
+The conversation orchestrator and Qwen own ordinary-language interpretation and
+tool selection.  Installers in this package may add schemas, handlers, HTTP
+routes, source adapters, OCR, identity checks, provenance checks, and execution
+guards; they must not inspect a user turn to pre-route it or manufacture business
+arguments from prose.
 
-The post-collision research operator adds licensed ALLDATA/public-OEM research,
-mobile browser handoff, preservation into ADAS SI, and a verified composite
-workflow that records which sources were actually searched. Ordinary calibration
-questions automatically enter that deep lane unless explicitly local-only.
-ALLDATA research follows the documented vehicle-first Repair/Collision workflow;
-when a live model client is available it drives that workflow turn-by-turn
-through the same collision_research tool actions available in ordinary chat
-(research_alldata_agent), falling back to a fixed navigation sequence otherwise.
-Either way, "verified" is decided once, centrally, by research_verification --
-never by whether the browser merely stayed on an alldata.com URL. A persistent
-ResearchTask (research_task/research_task_continuity) carries vehicle/subject
-continuity across follow-ups generically, from message shape and parsed vehicle
-identity, rather than an enumerated table of follow-up phrasings.
-When an exact calibration/reset procedure is missing locally and ALLDATA produces
-a verified exact-vehicle procedure, that source is acquired into ADAS SI with
-URL-based deduplication and a second, independent vehicle-identity check at the
-moment of capture. The cooperative Quick Reference collector provides a separate,
-low-rate path for the weekly Calibration IQ queue: the operator manually selects
-the exact CIQ vehicle in ALLDATA, then X enumerates that vehicle's ADAS Quick
-Reference procedure links sequentially, skips duplicates by canonical URL/hash
-(and conservative same-vehicle/title identity), preserves real revisions, OCRs
-and indexes new PDFs, and tells X to run the existing CIQ research_ro contract to
-link the refreshed ADAS SI evidence back to the repair order. Calibration IQ work
-prep is CIQ-first: ADAS Map on each RO is treated as the governing calibration
-requirement source, missing CIQ requirements are reconciled through CIQ's own
-verified routine operator actions, and ADAS SI is checked only for the resulting
-job requirements. Calibration and policy research deep-read later PDF
-pages/sidebars and bounded same-host OEM web pages, while chat presentation stays
-concise and conversation-first. Calibration IQ RO research remains on its existing
-verified operator lane and inherits the same exact-vehicle deep ADAS PDF search.
-Final policy and audit guards keep execution truthful and fail closed.
+ADAS SI keeps one shared OCR/search implementation.  Calibration IQ keeps its
+authorization, idempotency, optimistic-concurrency, receipt, and reread gates.
+ALLDATA remains a licensed, vehicle-first operator with interactive human access.
+ScrapeX remains a loopback-only ADAS Map acquisition service.  Durable subject
+state is injected as trusted context and the model resolves follow-up language.
 """
 
 from . import adas_si as _adas_si

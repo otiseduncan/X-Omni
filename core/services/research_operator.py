@@ -523,10 +523,49 @@ class LicensedBrowser:
                     "licensed_session": True,
                 },
             }
+        if action == "alldata_vehicle_research":
+            from . import research_alldata_navigation as navigation
+
+            result = await navigation.search_alldata_vehicle_first(
+                self,
+                vehicle={
+                    "year": args.get("vehicle_year"),
+                    "make": args.get("vehicle_make"),
+                    "model": args.get("vehicle_model"),
+                    "trim": args.get("vehicle_trim"),
+                },
+                topic=str(args.get("topic") or ""),
+            )
+            # Keep the structured business operation on the result so the
+            # chat artifact renderer can present this bounded ALLDATA lookup
+            # as research evidence instead of falling back to access setup.
+            result["action"] = action
+            return result
         if action == "capture_to_adas":
             return await self._capture_to_adas(args)
         if action == "public_search":
-            return await public_search(args)
+            source_depth = str(args.get("source_depth") or "standard").strip().casefold()
+            if source_depth not in {
+                "standard",
+                "calibration_requirements",
+                "repair_policy",
+            }:
+                raise ValueError(
+                    "source_depth must be standard, calibration_requirements, or repair_policy"
+                )
+            if source_depth == "standard":
+                return await public_search(args)
+            from . import research_policy_depth
+
+            result = await research_policy_depth.deep_search_public_oem(
+                str(args.get("query") or ""),
+                str(args.get("manufacturer") or "").strip() or None,
+                source_depth=source_depth,
+            )
+            result["status"] = "success" if result.get("verified") else "no_result"
+            result["action"] = action
+            result["source_depth"] = source_depth
+            return result
         if action == "public_read":
             return await public_read(args)
         raise ValueError(f"Unsupported collision research action: {action}")
@@ -874,6 +913,8 @@ def install() -> None:
             {
                 "description": (
                     "Post-collision research operator. Use setup/status/start for ALLDATA access; "
+                    "use alldata_vehicle_research with explicit year/make/model/topic for one "
+                    "bounded vehicle-first licensed-source search; "
                     "snapshot/extract/goto/click_text/fill/press to operate the licensed ALLDATA "
                     "session without exposing credentials; capture_to_adas to preserve a targeted "
                     "licensed source in ADAS SI; public_search/public_read for official OEM collision "
@@ -895,7 +936,7 @@ def install() -> None:
                             "enum": [
                                 "setup", "status", "start", "snapshot", "goto", "click_text",
                                 "fill", "press", "extract", "capture_to_adas", "public_search",
-                                "public_read",
+                                "public_read", "alldata_vehicle_research",
                             ],
                         },
                         "query": {"type": "string"},
@@ -905,7 +946,24 @@ def install() -> None:
                         "selector": {"type": "string"},
                         "key": {"type": "string"},
                         "vehicle": {"type": "string"},
+                        "vehicle_year": {"type": "integer", "minimum": 1900, "maximum": 2199},
+                        "vehicle_make": {"type": "string"},
+                        "vehicle_model": {"type": "string"},
+                        "vehicle_trim": {"type": "string"},
                         "topic": {"type": "string"},
+                        "source_depth": {
+                            "type": "string",
+                            "enum": [
+                                "standard",
+                                "calibration_requirements",
+                                "repair_policy",
+                            ],
+                            "description": (
+                                "For public_search only: explicitly request the bounded full-PDF "
+                                "and one-hop same-host reader for buried calibration requirements "
+                                "or collision repair policy. Default standard."
+                            ),
+                        },
                     },
                     "required": ["action"],
                     "additionalProperties": False,

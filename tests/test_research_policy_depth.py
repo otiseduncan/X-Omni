@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.services import research_conversation, research_policy_depth, research_workflow
+from core.services import (
+    research_conversation,
+    research_operator,
+    research_policy_depth,
+    research_workflow,
+)
 
 
 class _Page:
@@ -49,6 +54,104 @@ async def test_deep_pdf_policy_reader_finds_later_page(monkeypatch):
     assert findings[0]["authority"] == "official_manufacturer"
     assert "recycled" in findings[0]["excerpt"].casefold()
     assert "not approved" in findings[0]["excerpt"].casefold()
+
+
+@pytest.mark.asyncio
+async def test_collision_research_explicit_depth_uses_bounded_deep_reader(
+    monkeypatch, tmp_path
+):
+    captured = {}
+
+    async def deep(query, make, *, source_depth):
+        captured.update({"query": query, "make": make, "source_depth": source_depth})
+        return {
+            "verified": True,
+            "sources": [{"url": "https://oem.example/calibration.pdf"}],
+            "calibration_findings": [{"page": 7, "matched_term": "must calibrate"}],
+            "deep_read_metrics": {
+                "full_pdf_pages_inspected": 9,
+                "same_host_links_read": 1,
+            },
+        }
+
+    monkeypatch.setattr(research_policy_depth, "deep_search_public_oem", deep)
+    browser = research_operator.LicensedBrowser(tmp_path)
+    result = await browser.operator_action(
+        {
+            "action": "public_search",
+            "query": "windshield camera calibration",
+            "manufacturer": "Toyota",
+            "source_depth": "calibration_requirements",
+        }
+    )
+
+    assert captured == {
+        "query": "windshield camera calibration",
+        "make": "Toyota",
+        "source_depth": "calibration_requirements",
+    }
+    assert result["status"] == "success"
+    assert result["action"] == "public_search"
+    assert result["source_depth"] == "calibration_requirements"
+    assert result["calibration_findings"][0]["page"] == 7
+
+
+@pytest.mark.asyncio
+async def test_nonstandard_workflow_depth_enters_standard_discovery_once(monkeypatch):
+    calls = {"search": 0, "read": 0, "fetch": 0}
+
+    async def public_search(_args):
+        calls["search"] += 1
+        return {
+            "query": "camera calibration",
+            "external_network": True,
+            "source_bounded": True,
+            "providers": ["fixture"],
+            "sources": [
+                {
+                    "title": "Toyota calibration requirements",
+                    "url": "https://toyota.example/calibration",
+                    "snippet": "OEM collision camera calibration requirement",
+                }
+            ],
+        }
+
+    async def public_read(args):
+        calls["read"] += 1
+        return {
+            "url": args["url"],
+            "title": "Toyota calibration requirements",
+            "content_type": "text/html",
+            "page_text": "The forward camera must be calibrated after windshield replacement.",
+        }
+
+    async def bounded_fetch(url):
+        calls["fetch"] += 1
+        return (
+            url,
+            b"<html><body>The forward camera must be calibrated after windshield replacement.</body></html>",
+            "text/html",
+        )
+
+    monkeypatch.setattr(research_operator, "public_search", public_search)
+    monkeypatch.setattr(research_operator, "public_read", public_read)
+    monkeypatch.setattr(
+        research_policy_depth.research_capture,
+        "_bounded_public_fetch",
+        bounded_fetch,
+    )
+
+    result = await research_workflow.search_public_oem(
+        "forward camera after windshield replacement",
+        "Toyota",
+        source_depth="calibration_requirements",
+    )
+
+    assert result["deep_calibration_read"] is True
+    assert result["calibration_findings"]
+    assert calls["search"] >= 1
+    assert calls["read"] == 1
+    assert calls["fetch"] >= 1
 
 
 def test_conversation_distillation_keeps_policy_finding_and_hides_debug_bulk():

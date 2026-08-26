@@ -55,6 +55,8 @@ VALID_POLICY_TIERS = frozenset({
 })
 
 _CALIBRATION_IQ_CONTEXT_KEY = "__xomni_invocation"
+_CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY = "__xomni_work_prep_context"
+_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY = "__xomni_actor"
 
 CALIBRATION_IQ_ROUTINE_OPERATIONS = (
     "create_ro",
@@ -442,20 +444,56 @@ TOOL_SCHEMAS: dict[str, dict] = {
     # ---------------- ADAS SI ----------------
     "adas_si_search": {
         "description": (
-            "Search the authoritative ADAS SI source library for a calibration or "
-            "alignment procedure. Include year, make, model and the system "
-            "(e.g. 'front camera') for the best match. Returns page excerpts with "
-            "the source document and page number. Cite those; never invent a procedure."
+            "Search the local authoritative ADAS SI source library using structured "
+            "vehicle, system, component, and repair-event facts. Returns source-backed "
+            "page excerpts and document provenance. Use calibration_requirements mode "
+            "when buried trigger, prerequisite, inspection, or calibration rules must "
+            "be scanned across the complete relevant OEM documents. A no_result means "
+            "only that this source did not establish the answer. This library establishes "
+            "source requirements, not which calibrations are currently saved on a CIQ "
+            "repair order; read that exact RO first for a current one-RO question."
         ),
         "parameters": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
-                "query": {
+                "vehicle": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "minProperties": 1,
+                    "properties": {
+                        "year": {"type": "integer", "minimum": 1900, "maximum": 2100},
+                        "make": {"type": "string", "minLength": 1, "maxLength": 160},
+                        "model": {"type": "string", "minLength": 1, "maxLength": 160},
+                        "trim": {"type": "string", "minLength": 1, "maxLength": 160},
+                        "platform": {"type": "string", "minLength": 1, "maxLength": 160},
+                    },
+                },
+                "system": {"type": "string", "minLength": 1, "maxLength": 500},
+                "component": {"type": "string", "minLength": 1, "maxLength": 500},
+                "repair_event": {"type": "string", "minLength": 1, "maxLength": 500},
+                "requirement_type": {"type": "string", "minLength": 1, "maxLength": 500},
+                "question": {
                     "type": "string",
-                    "description": "e.g. '2021 Ford F-150 front camera calibration'",
-                }
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "description": "The unresolved technical fact to locate in the sources.",
+                },
+                "search_mode": {
+                    "type": "string",
+                    "enum": ["standard", "calibration_requirements"],
+                    "description": "Evidence depth selected by the model. Default standard.",
+                },
             },
-            "required": ["query"],
+            "required": [],
+            "anyOf": [
+                {"required": ["vehicle"]},
+                {"required": ["system"]},
+                {"required": ["component"]},
+                {"required": ["repair_event"]},
+                {"required": ["requirement_type"]},
+                {"required": ["question"]},
+            ],
         },
     },
     "adas_si_inventory": {
@@ -478,12 +516,23 @@ TOOL_SCHEMAS: dict[str, dict] = {
         ),
         "parameters": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
-                "document": {"type": "string",
-                             "description": "e.g. '2021 Ford F-150 front camera'"},
+                "relative_path": {
+                    "type": "string",
+                    "description": "Exact relative_path returned by an ADAS SI result.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Document identity to resolve when no relative_path is known.",
+                },
                 "page": {"type": "integer", "description": "Page to open at. Default 1."},
             },
-            "required": ["document"],
+            "required": [],
+            "anyOf": [
+                {"required": ["relative_path"]},
+                {"required": ["query"]},
+            ],
         },
     },
     "adas_si_file_write": {
@@ -538,6 +587,237 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
 
+    # ---------------- Durable automotive knowledge ----------------
+    "automotive_knowledge_search": {
+        "description": (
+            "Search durable source-backed automotive knowledge using model-supplied "
+            "vehicle, system, component, repair-event, and requirement filters. "
+            "Verified non-superseded records are returned by default. A no_result is "
+            "a miss in this source, not proof that the information does not exist. For "
+            "an application-specific requirement, copy all known active-RO year, make, "
+            "and model facts into year, manufacturer, and model, and put a known repair "
+            "event in event or event_type; query text alone is not structured scope."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional semantic retrieval terms within the structured scope.",
+                },
+                "year": {"type": "integer", "minimum": 1900, "maximum": 2200},
+                "manufacturer": {"type": "string"},
+                "model": {"type": "string"},
+                "platform": {"type": "string"},
+                "trim": {"type": "string"},
+                "system": {"type": "string"},
+                "component": {"type": "string"},
+                "event_type": {
+                    "type": "string",
+                    "description": "Structured repair-event category when known.",
+                },
+                "event": {
+                    "type": "string",
+                    "description": "Structured repair event from the RO or user request.",
+                },
+                "requirement_type": {"type": "string"},
+                "calibration_type": {"type": "string"},
+                "lifecycles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["discovered", "evidence_backed", "verified", "superseded"],
+                    },
+                    "description": "Defaults to verified only.",
+                },
+                "include_superseded": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": [],
+        },
+    },
+    "automotive_knowledge_read": {
+        "description": (
+            "Read one durable automotive knowledge record by exact record id, including "
+            "application, requirement, prerequisites, procedure references, lifecycle, "
+            "confidence, and source evidence."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"record_id": {"type": "string"}},
+            "required": ["record_id"],
+        },
+    },
+    "automotive_knowledge_capture": {
+        "description": (
+            "Preserve structured, source-located candidate automotive knowledge or "
+            "add evidence to an existing record with optimistic versioning. "
+            "Model-provided evidence is always stored unverified and cannot make a "
+            "claim verified."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["capture", "add_evidence"],
+                },
+                "record_id": {"type": "string"},
+                "expected_version": {"type": "integer", "minimum": 1},
+                "record": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "application": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "year": {"type": "integer", "minimum": 1900, "maximum": 2200},
+                                "year_start": {"type": "integer", "minimum": 1900, "maximum": 2200},
+                                "year_end": {"type": "integer", "minimum": 1900, "maximum": 2200},
+                                "manufacturer": {"type": "string"},
+                                "model": {"type": "string"},
+                                "platform": {"type": "string"},
+                                "trim": {"type": "string"},
+                                "option_codes": {"type": "array", "items": {"type": "string"}},
+                                "vin_pattern": {"type": "string"},
+                                "build_from": {"type": "string"},
+                                "build_to": {"type": "string"},
+                            },
+                            "required": ["manufacturer", "model"],
+                        },
+                        "system": {"type": "string"},
+                        "component": {"type": "string"},
+                        "repair_event": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "event_type": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["description"],
+                        },
+                        "requirement": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "type": {"type": "string"},
+                                "text": {"type": "string"},
+                                "calibration_type": {"type": "string"},
+                                "inspection_required": {"type": "boolean"},
+                                "procedure_summary": {"type": "string"},
+                                "applicability_notes": {"type": "string"},
+                            },
+                            "required": ["type", "text"],
+                        },
+                        "prerequisites": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "sequence": {"type": "integer", "minimum": 0},
+                                },
+                                "required": ["description"],
+                            },
+                        },
+                        "procedures": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "procedure_identifier": {"type": "string"},
+                                    "summary": {"type": "string"},
+                                },
+                                "required": ["title"],
+                            },
+                        },
+                        "lifecycle": {
+                            "type": "string",
+                            "enum": ["discovered", "evidence_backed", "verified"],
+                        },
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "evidence": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "object"},
+                        },
+                    },
+                    "required": [
+                        "application", "system", "repair_event", "requirement", "evidence"
+                    ],
+                },
+                "evidence": {"type": "object"},
+            },
+            "required": ["action"],
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"action": {"const": "capture"}},
+                        "required": ["action"],
+                    },
+                    "then": {"required": ["record"]},
+                },
+                {
+                    "if": {
+                        "properties": {"action": {"const": "add_evidence"}},
+                        "required": ["action"],
+                    },
+                    "then": {
+                        "required": ["record_id", "expected_version", "evidence"]
+                    },
+                },
+            ],
+        },
+    },
+    "automotive_knowledge_lifecycle": {
+        "description": (
+            "Promote or supersede one durable automotive knowledge record using its "
+            "current version. Promotion to verified still fails unless the repository "
+            "already contains deterministically validated authoritative evidence. "
+            "Requires Owner approval."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["promote", "supersede"],
+                },
+                "record_id": {"type": "string"},
+                "expected_version": {"type": "integer", "minimum": 1},
+                "lifecycle": {
+                    "type": "string",
+                    "enum": ["evidence_backed", "verified"],
+                },
+                "replacement_id": {"type": "string"},
+            },
+            "required": ["action", "record_id", "expected_version"],
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"action": {"const": "promote"}},
+                        "required": ["action"],
+                    },
+                    "then": {"required": ["lifecycle"]},
+                },
+                {
+                    "if": {
+                        "properties": {"action": {"const": "supersede"}},
+                        "required": ["action"],
+                    },
+                    "then": {"required": ["replacement_id"]},
+                },
+            ],
+        },
+    },
+
     # ---------------- Calibration IQ ----------------
     "calibration_iq_status": {
         "description": "Check whether Calibration IQ is running and the service token is accepted.",
@@ -545,12 +825,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_summary": {
         "description": (
-            "COUNT repair orders without listing them. Use this for any 'how many' "
-            "question, and whenever Otis is likely listening rather than looking -- "
-            "it returns a total plus a breakdown by status, phase and shop. Finished "
-            "work is excluded unless include_completed is true. Prefer this over "
-            "calibration_iq_read; only list rows when he actually asks to see them. "
-            "Totals are verified only after the complete upstream collection is read."
+            "Return a verified aggregate count and status/phase/shop breakdown for a "
+            "structured Calibration IQ repair-order scope without returning rows. "
+            "Finished work is excluded unless include_completed is true."
         ),
         "parameters": {
             "type": "object",
@@ -577,11 +854,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_read": {
         "description": (
-            "LIST repair orders with their details. Only use when Otis asks to see, "
-            "list, or show the vehicles -- for 'how many', use calibration_iq_summary "
-            "instead. Every match is collected in one call; do not page with offset. "
-            "Finished work is excluded unless include_completed is true. A contextual "
-            "'show me those' keeps the latest successful Calibration IQ filters."
+            "Return a bounded visible list from the complete verified Calibration IQ "
+            "repair-order collection matching structured filters. Finished work is "
+            "excluded unless include_completed is true. Use the active subject context "
+            "for follow-ups; do not invent filters from wording. This board-list result "
+            "does not include exact-RO calibration detail. If it is used as a safe identity "
+            "discovery detour for a one-RO question, continue with calibration_iq_ro using "
+            "the exact returned id; never answer current calibrations from a list row."
         ),
         "parameters": {
             "type": "object",
@@ -609,10 +888,15 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_ro": {
         "description": (
-            "Pull up one repair order in full and display it in chat: vehicle, "
-            "status, phase, shop, insurance, blockers and calibration requirements. "
-            "Use this whenever Otis names or asks about a specific RO, rather than "
-            "listing the whole board."
+            "Retrieve one repair order by the exact model-supplied RO number or internal "
+            "identifier, including vehicle, workflow, blockers, calibration requirements, "
+            "research, documents, and provenance. A verified result becomes the active "
+            "conversation subject for later model reasoning. This is the only CIQ read for "
+            "the current saved calibration set on one active RO; use it first for that "
+            "question. When active-subject metadata says current calibration detail is not "
+            "included, call this tool now for any one-RO calibration activity/requirements "
+            "question; do not answer from status/phase or merely offer a read. A board list "
+            "or ADAS SI source search cannot substitute for it."
         ),
         "parameters": {
             "type": "object",
@@ -653,8 +937,14 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_operator": {
         "description": (
-            "Perform one or more routine, authorized Calibration IQ business actions in a "
+            "The only model capability that performs routine Calibration IQ writes; a request "
+            "to change/close an RO or put evidence in its case requires this tool and cannot "
+            "be completed by prose. Perform one or more authorized business actions in a "
             "single verified batch. Existing query tools remain preferable for ordinary reads. "
+            "Completing or removing a whole repair order from the active board is routine "
+            "close_ro work here, never deletion of an inferred child prerequisite. "
+            "research_ro writes source evidence into the case; use it for an explicit research, "
+            "import, or persistence request, not merely to show or read an OEM procedure. "
             "Use operation research_ro to search ADAS SI, import matched OEM PDFs with page/source "
             "provenance, link evidence to supplied or discovered calibration ids, and report missing "
             "documentation. Set arguments.complete_research=true only when the user explicitly asks "
@@ -686,8 +976,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                     "actions manage product-owned files; document actions support metadata, "
                                     "link/unlink, replacement, archive, and restore. undo_status uses the "
                                     "product's history-aware correction, while no-calibration decisions use "
-                                    "their dedicated business actions. Verified file URLs are returned "
-                                    "through authenticated X proxies."
+                                    "their dedicated business actions. close_ro completes the whole repair "
+                                    "order and removes it from the active board. Verified file URLs are "
+                                    "returned through authenticated X proxies."
                                 ),
                             },
                             "repair_order_id": {
@@ -723,9 +1014,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_destructive": {
         "description": (
-            "Remove a calibration requirement, blocker, photo, or general prerequisite through "
-            "Calibration IQ's explicit destructive operations. These actions require owner "
-            "confirmation. Archive and reversible restore operations remain routine operator work."
+            "Delete one explicitly identified child calibration requirement, blocker, photo, "
+            "or general prerequisite through Calibration IQ's destructive operations. Each "
+            "action requires that child's authoritative target_id and Owner confirmation; "
+            "never invent a target or use this capability to complete, close, or remove a whole "
+            "repair order from the active board. Archive, restore, and whole-RO close remain "
+            "routine operator work."
         ),
         "parameters": {
             "type": "object",
@@ -741,7 +1035,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
                             "operation": {
                                 "type": "string",
                                 "enum": list(CALIBRATION_IQ_DESTRUCTIVE_OPERATIONS),
-                                "description": "Exact backend-declared destructive operation.",
+                                "description": (
+                                    "Exact deletion operation for an explicitly identified child "
+                                    "resource; never a whole-repair-order close operation."
+                                ),
                             },
                             "repair_order_id": {
                                 "type": "string",
@@ -750,11 +1047,17 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                     "exact displayed RO number for unique fail-closed resolution."
                                 ),
                             },
-                            "target_id": {"type": "string"},
+                            "target_id": {
+                                "type": "string",
+                                "description": (
+                                    "Authoritative id of the exact child calibration, blocker, "
+                                    "photo, or prerequisite from a current snapshot. Never invent it."
+                                ),
+                            },
                             "expected_version": {"type": "integer", "minimum": 1},
                             "arguments": {"type": "object"},
                         },
-                        "required": ["operation"],
+                        "required": ["operation", "target_id"],
                     },
                 },
                 "continue_on_error": {"type": "boolean"},
@@ -994,6 +1297,20 @@ class Registry:
                 f"Update ADAS SI annotation '{args.get('record_id')}' "
                 f"from version {args.get('expected_version')}"
             )
+        if name == "automotive_knowledge_lifecycle":
+            action = str(args.get("action") or "update")
+            record_id = str(args.get("record_id") or "?")
+            if action == "supersede":
+                return (
+                    f"Supersede automotive knowledge {record_id} with "
+                    f"{args.get('replacement_id') or '?'} at version "
+                    f"{args.get('expected_version')}"
+                )
+            return (
+                f"Promote automotive knowledge {record_id} to "
+                f"{args.get('lifecycle') or '?'} at version "
+                f"{args.get('expected_version')}"
+            )
         return f"Run {name}"
 
     def public_approval(
@@ -1085,6 +1402,174 @@ class Registry:
         reports process failure in its result rather than raising, so classify
         that result before the approval is finalized.
         """
+        if name == "scrapex_adas_map":
+            if not isinstance(result, dict):
+                return "ScrapeX returned an invalid execution result."
+            if not (
+                result.get("success") is True
+                and result.get("executed") is True
+                and result.get("verified") is True
+                and result.get("status")
+                in {"verified", "queued", "running", "paused", "completed"}
+            ):
+                error = result.get("error") if isinstance(result.get("error"), dict) else {}
+                return str(
+                    result.get("message")
+                    or error.get("message")
+                    or "ScrapeX did not provide verified execution proof."
+                )
+            return None
+        if name == "calibration_iq_work_prep":
+            if not isinstance(result, dict):
+                return "Calibration IQ work prep returned an invalid result."
+
+            def count(field: str, default: int = 0) -> int:
+                value = result.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+                return default
+
+            mode = str(result.get("mode") or "").casefold()
+            status = str(result.get("status") or "").casefold()
+            error = result.get("error") if isinstance(result.get("error"), dict) else {}
+            message = str(
+                result.get("message")
+                or error.get("message")
+                or "Calibration IQ work prep did not provide verified completion proof."
+            )
+            if mode == "phase_list":
+                if status != "verified":
+                    return message
+            elif result.get("verified") is not True:
+                return message
+            if mode != "phase_list" and result.get("success") is False:
+                return message
+
+            # A readiness audit may truthfully succeed while proving that
+            # some vehicles are not ready.  That is not an execution failure.
+            # CIQ reconciliation is different: every attempted mutation must
+            # have a matching positive receipt, or this invocation is logged
+            # failed even though the surrounding audit counts are valid.
+            receipt_fields_present = any(
+                field in result
+                for field in (
+                    "ciq_receipt_count",
+                    "ciq_mutations_requested_count",
+                    "ciq_mutations_processed_count",
+                    "ciq_verified_receipt_count",
+                )
+            )
+            if receipt_fields_present:
+                receipt_total = count("ciq_receipt_count")
+                requested_total = count(
+                    "ciq_mutations_requested_count", receipt_total
+                )
+                processed_total = count(
+                    "ciq_mutations_processed_count", receipt_total
+                )
+                verified_total = count("ciq_verified_receipt_count")
+                indeterminate_total = count(
+                    "ciq_indeterminate_reconciliation_count"
+                )
+                may_have_executed_total = count(
+                    "ciq_may_have_executed_reconciliation_count"
+                )
+                if not (
+                    requested_total
+                    == receipt_total
+                    == processed_total
+                    == verified_total
+                    and count("reconciliation_failed_count") == 0
+                    and indeterminate_total == 0
+                    and may_have_executed_total == 0
+                ):
+                    return (
+                        "Calibration IQ work prep did not fully verify its CIQ "
+                        f"reconciliation receipts ({verified_total} verified of "
+                        f"{requested_total} requested; {processed_total} processed; "
+                        f"{receipt_total} receipts; {indeterminate_total} indeterminate; "
+                        f"{may_have_executed_total} may have executed)."
+                    )
+
+            reconciliations: list[tuple[dict[str, Any], bool]] = []
+            top_reconciliation = result.get("reconciliation")
+            reconciliations.append(
+                (
+                    top_reconciliation
+                    if isinstance(top_reconciliation, dict)
+                    else {},
+                    bool(result.get("reconciliation_actions")),
+                )
+            )
+            for row in result.get("repair_orders") or []:
+                if not isinstance(row, dict):
+                    continue
+                nested = row.get("reconciliation")
+                reconciliations.append(
+                    (
+                        nested if isinstance(nested, dict) else {},
+                        bool(row.get("reconciliation_actions")),
+                    )
+                )
+            for reconciliation, actions_planned in reconciliations:
+                if not reconciliation and not actions_planned:
+                    continue
+                receipts = [
+                    receipt
+                    for receipt in (reconciliation.get("receipts") or [])
+                    if isinstance(receipt, dict)
+                ]
+                requested = reconciliation.get("requested_count")
+                requested = (
+                    requested
+                    if isinstance(requested, int)
+                    and not isinstance(requested, bool)
+                    and requested >= 0
+                    else len(receipts)
+                )
+                processed = reconciliation.get("processed_count")
+                processed = (
+                    processed
+                    if isinstance(processed, int)
+                    and not isinstance(processed, bool)
+                    and processed >= 0
+                    else len(receipts)
+                )
+                verified = sum(
+                    1
+                    for receipt in receipts
+                    if (
+                        receipt.get("status") == "completed"
+                        and receipt.get("success") is True
+                        and isinstance(receipt.get("verification"), dict)
+                        and receipt["verification"].get("verified") is True
+                    )
+                )
+                attempted = bool(
+                    actions_planned
+                    or requested
+                    or processed
+                    or receipts
+                    or reconciliation.get("executed") is True
+                    or reconciliation.get("may_have_executed") is True
+                )
+                if attempted and not (
+                    reconciliation.get("success") is True
+                    and reconciliation.get("verified") is True
+                    and reconciliation.get("partial") is not True
+                    and requested == processed == verified
+                ):
+                    nested_error = (
+                        reconciliation.get("error")
+                        if isinstance(reconciliation.get("error"), dict)
+                        else {}
+                    )
+                    return str(
+                        reconciliation.get("message")
+                        or nested_error.get("message")
+                        or "Calibration IQ work prep did not fully verify CIQ reconciliation."
+                    )
+            return None
         if name in {
             "calibration_iq_update",
             "calibration_iq_operator",
@@ -1363,12 +1848,25 @@ class Registry:
         user_id: Optional[str] = None,
         role: Optional[str] = None,
     ) -> Any:
-        if name in {"calibration_iq_operator", "calibration_iq_destructive"}:
+        if name in {
+            "calibration_iq_operator",
+            "calibration_iq_destructive",
+            "calibration_iq_work_prep",
+        }:
             # This namespace is Registry-owned. Drop a model-provided value
             # before approval persistence, summaries, audit logging, or handler
             # execution; an authoritative value is injected later.
             args = dict(args)
-            args.pop(_CALIBRATION_IQ_CONTEXT_KEY, None)
+            if name == "calibration_iq_work_prep":
+                args.pop(_CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY, None)
+            else:
+                args.pop(_CALIBRATION_IQ_CONTEXT_KEY, None)
+        if name in {
+            "automotive_knowledge_capture",
+            "automotive_knowledge_lifecycle",
+        }:
+            args = dict(args)
+            args.pop(_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY, None)
         tier = self.tier(name)
 
         if self.store and conversation_id is not None:
@@ -1414,6 +1912,9 @@ class Registry:
         if name in {"get_weather", "list_tasks", "add_task", "update_task_status"}:
             handler_args = dict(args)
             handler_args["__xomni_user_id"] = user_id or "local-dev"
+        if name == "automotive_knowledge_capture":
+            handler_args = dict(args)
+            handler_args[_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY] = user_id or "local-dev"
         if name in {"calibration_iq_operator", "calibration_iq_destructive"}:
             handler_args = dict(args)
             # Overwrite (never merge) the reserved field. The model cannot
@@ -1424,6 +1925,17 @@ class Registry:
                 message_id=message_id,
                 user_id=user_id,
                 role=role,
+            )
+        if name == "calibration_iq_work_prep":
+            handler_args = dict(args)
+            handler_args[_CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY] = (
+                self._calibration_iq_invocation_context(
+                    conversation_id=conversation_id,
+                    tool_call_id=tool_call_id,
+                    message_id=message_id,
+                    user_id=user_id,
+                    role=role,
+                )
             )
         if name == "website_preview_generate" and args.get("operation") == "update_latest":
             if isinstance(conversation_id, bool) or not isinstance(conversation_id, int):
@@ -1551,6 +2063,9 @@ class Registry:
             if name in {"add_task", "update_task_status"}:
                 handler_args = dict(args)
                 handler_args["__xomni_user_id"] = user_id
+            if name == "automotive_knowledge_lifecycle":
+                handler_args = dict(args)
+                handler_args[_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY] = user_id
             if name == "calibration_iq_destructive":
                 handler_args = dict(args)
                 handler_args[_CALIBRATION_IQ_CONTEXT_KEY] = (

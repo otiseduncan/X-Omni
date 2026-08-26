@@ -2,45 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
-import pytest
-
-from core.services import research_auto_acquire
-
-
-def _verified_result(local_count: int = 0) -> dict:
-    return {
-        "query": "2024 Ford Transit forward facing calibration procedure",
-        "requested_manufacturer": "Ford",
-        "adas_si": {"result_count": local_count, "hits": []},
-        "alldata": {
-            "verified": True,
-            "searched": True,
-            "query_submitted": True,
-            "vehicle_selection": {"selected": True},
-            "vehicle": {"label": "2024 Ford Transit"},
-            "topic": "forward facing calibration",
-            "result_title": "Forward Facing Camera Calibration",
-            "relevance_score": 12,
-            "page_text": "Exact OEM procedure text " * 20,
-        },
-        "captures": [],
-    }
-
-
-def test_missing_local_exact_procedure_is_acquisition_candidate():
-    assert research_auto_acquire.acquisition_candidate(_verified_result(0)) is True
-
-
-def test_existing_local_exact_procedure_is_not_reacquired():
-    assert research_auto_acquire.acquisition_candidate(_verified_result(1)) is False
-
-
-def test_unverified_alldata_result_is_not_acquired():
-    result = _verified_result(0)
-    result["alldata"]["verified"] = False
-    assert research_auto_acquire.acquisition_candidate(result) is False
+from core.services import research_auto_acquire, research_workflow
 
 
 def test_existing_capture_deduplicates_by_alldata_url(tmp_path: Path):
@@ -62,35 +25,7 @@ def test_existing_capture_deduplicates_by_alldata_url(tmp_path: Path):
     assert found["sidecar"] == sidecar
 
 
-@pytest.mark.asyncio
-async def test_full_research_auto_saves_verified_missing_procedure(monkeypatch):
-    result = _verified_result(0)
-
-    async def previous(_args, *, adas, browser):
-        return dict(result)
-
-    class Browser:
-        def __init__(self):
-            self.calls = []
-
-        async def _capture_to_adas(self, args):
-            self.calls.append(args)
-            return {
-                "status": "success",
-                "saved": True,
-                "relative_path": "Acquired/ALLDATA/2024 Ford Transit Camera.pdf",
-            }
-
-    browser = Browser()
-    monkeypatch.setattr(research_auto_acquire, "_PREVIOUS_FULL", previous)
-    output = await research_auto_acquire.full_research_with_acquisition(
-        {"query": result["query"]},
-        adas=SimpleNamespace(),
-        browser=browser,
-    )
-
-    assert output["auto_acquired_to_adas_si"] is True
-    assert browser.calls
-    assert browser.calls[0]["vehicle"] == "2024 Ford Transit"
-    assert output["captures"][0]["source"] == "ALLDATA"
-    assert output["captures"][0]["auto_acquired"] is True
+def test_auto_acquire_install_preserves_explicit_model_owned_persistence():
+    research_auto_acquire.install()
+    assert research_workflow.full_research.__module__ == "core.services.research_workflow"
+    assert not getattr(research_workflow.full_research, "_xomni_auto_acquire", False)

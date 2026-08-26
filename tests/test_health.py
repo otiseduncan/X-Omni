@@ -29,6 +29,7 @@ def _settings(tmp_path: Path) -> Settings:
         context_tokens=32768,
         max_response_tokens=128,
         temperature=0.1,
+        automotive_knowledge_db=tmp_path / "automotive-knowledge.sqlite",
     )
 
 
@@ -66,4 +67,5 @@ async def test_health_is_503_until_full_model_contract_is_ready(tmp_path):
         assert ready.status_code == 200
         assert ready.json()["ok"] is True
 
+    app.state.automotive_knowledge.repository.close()
     app.state.store.close()

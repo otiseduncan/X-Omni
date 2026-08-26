@@ -1,16 +1,11 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from core.orchestrator.loop import (
-    Orchestrator,
-    calibration_iq_filter_is_ambiguous,
-    calibration_iq_read_request,
-    calibration_iq_result_summary,
-    latest_calibration_iq_filters,
-)
+from core.orchestrator.loop import Orchestrator
 from core.state.db import Store
 from core.tools.registry import Registry
 
@@ -23,77 +18,44 @@ class _Router:
         return SimpleNamespace(supports_vision=True, supports_audio=True)
 
 
-class _NoModel:
-    def __init__(self):
-        self.stream_calls = 0
+class _ScriptedModel:
+    def __init__(self, rounds: list[list[dict]]):
+        self.rounds = list(rounds)
+        self.calls = 0
+        self.messages: list[list[dict]] = []
 
-    async def stream(self, _messages, tools=None):
-        self.stream_calls += 1
-        raise AssertionError("Explicit Calibration IQ reads must use the deterministic lane")
-        yield  # pragma: no cover
+    async def stream(self, messages, tools=None):
+        assert tools
+        self.calls += 1
+        self.messages.append(list(messages))
+        for event in self.rounds.pop(0):
+            yield event
 
 
-class _CalibrationHandlers:
-    def __init__(self):
-        self.calls: list[tuple[str, dict]] = []
+def _orchestrator(store: Store, client: _ScriptedModel, calls: list[tuple[str, dict]]):
+    registry = Registry("config/tools.yaml", store=store)
 
-    @staticmethod
-    def _filters(args: dict) -> dict:
-        return {
-            key: value
-            for key, value in args.items()
-            if key in {"shop", "phase", "status", "insurance", "q"}
-        }
-
-    async def summary(self, args: dict) -> dict:
-        self.calls.append(("calibration_iq_summary", dict(args)))
-        filters = self._filters(args)
-        count = 6 if filters.get("phase") == "5" else 15
-        return {
-            "status": "verified",
-            "count": count,
-            "active_count": count,
-            "completed_count": 2,
-            "include_completed": bool(args.get("include_completed")),
-            "terminal_only": bool(args.get("terminal_only")),
-            "scope": "active work only",
-            "filters": filters,
-            "breakdown": {
-                "by_status": {"New Arrival": count},
-                "by_phase": {filters.get("phase", "unspecified"): count},
-                "by_shop": {filters.get("shop", "Macon"): count},
-            },
-            "collection_complete": True,
-        }
-
-    async def listing(self, args: dict) -> dict:
-        self.calls.append(("calibration_iq_read", dict(args)))
-        filters = self._filters(args)
+    async def summary(args: dict) -> dict:
+        calls.append(("calibration_iq_summary", dict(args)))
         return {
             "status": "verified",
             "count": 6,
-            "active_count": 6,
-            "completed_count": 2,
-            "include_completed": bool(args.get("include_completed")),
-            "terminal_only": bool(args.get("terminal_only")),
-            "scope": "active work only",
-            "filters": filters,
-            "breakdown": {
-                "by_status": {"New Arrival": 6},
-                "by_phase": {filters.get("phase", "unspecified"): 6},
-                "by_shop": {filters.get("shop", "Macon"): 6},
-            },
-            "rows": [{"id": str(i), "RO": f"RO{i}"} for i in range(6)],
-            "shown_count": 6,
-            "truncated": False,
+            "filters": dict(args),
             "collection_complete": True,
         }
 
+    async def listing(args: dict) -> dict:
+        calls.append(("calibration_iq_read", dict(args)))
+        return {
+            "status": "verified",
+            "count": 1,
+            "filters": dict(args),
+            "rows": [{"id": "ro-1", "RO": "2400911667"}],
+            "collection_complete": True,
+        }
 
-def _orchestrator(store: Store, handlers: _CalibrationHandlers, client: _NoModel):
-    registry = Registry("config/tools.yaml", store=store)
-    registry.register("calibration_iq_summary", handlers.summary)
-    registry.register("calibration_iq_read", handlers.listing)
+    registry.register("calibration_iq_summary", summary)
+    registry.register("calibration_iq_read", listing)
     return Orchestrator(
         _Router(),
         client,
@@ -103,338 +65,283 @@ def _orchestrator(store: Store, handlers: _CalibrationHandlers, client: _NoModel
     )
 
 
-async def _run_user_turn(
-    store: Store,
-    conversation_id: int,
-    orchestrator: Orchestrator,
-    text: str,
-) -> list[dict]:
+async def _run(store: Store, conversation_id: int, orchestrator: Orchestrator, text: str):
     store.add_message(conversation_id, "user", text)
     return [event async for event in orchestrator.run_turn(conversation_id, text)]
 
 
-def test_latest_scope_ignores_failed_artifacts_and_other_conversations(tmp_path):
-    failed_history = [{
-        "artifacts": [{
-            "type": "calibration_iq_summary",
-            "data": {"status": "offline", "filters": {"shop": "Perry"}},
-        }],
-    }]
-    assert latest_calibration_iq_filters(failed_history) == {}
-    assert calibration_iq_read_request("Show me those.", failed_history) is None
-
-    successful_history = [{
-        "artifacts": [{
-            "type": "calibration_iq_summary",
-            "data": {
-                "status": "verified",
-                "filters": {"shop": "Macon", "phase": "5", "offset": 40},
-                "include_completed": False,
-            },
-        }],
-    }]
-    assert latest_calibration_iq_filters(successful_history) == {
-        "shop": "Macon",
-        "phase": "5",
-        "include_completed": False,
-    }
-    assert calibration_iq_read_request(
-        "Show me those in Perry.", successful_history
-    ) == (
-        "calibration_iq_read",
-        {"shop": "Perry", "phase": "5", "include_completed": False},
-    )
-
-
-@pytest.mark.parametrize(
-    ("utterance", "expected"),
-    [
-        (
-            "How many completed vehicles are in Macon?",
-            {
-                "shop": "Macon",
-                "status": "Calibration Complete",
-                "include_completed": True,
-                "terminal_only": True,
-            },
-        ),
-        (
-            "How many No Calibration Required vehicles are in Macon?",
-            {
-                "shop": "Macon",
-                "status": "No Calibration Required",
-                "include_completed": True,
-                "terminal_only": True,
-            },
-        ),
-        (
-            "How many finished vehicles are in Macon?",
-            {
-                "shop": "Macon",
-                "include_completed": True,
-                "terminal_only": True,
-            },
-        ),
-        (
-            "How many closed repair orders are in Macon?",
-            {
-                "shop": "Macon",
-                "include_completed": True,
-                "terminal_only": True,
-            },
-        ),
-        (
-            "How many vehicles are in all work in Macon?",
-            {
-                "shop": "Macon",
-                "include_completed": True,
-                "terminal_only": False,
-            },
-        ),
-    ],
-)
-def test_explicit_terminal_and_all_work_scopes(utterance, expected):
-    assert calibration_iq_read_request(utterance, []) == (
-        "calibration_iq_summary",
-        expected,
-    )
-
-
-def test_phase_count_with_vehicle_noun_still_uses_count_summary():
-    assert calibration_iq_read_request("How many vehicles are in phase 5?", []) == (
-        "calibration_iq_summary",
-        {"phase": "5"},
-    )
-
-
-def test_terminal_scope_is_inherited_and_explicit_active_clears_category():
-    history = [{
-        "artifacts": [{
-            "type": "calibration_iq_summary",
-            "data": {
-                "status": "verified",
-                "filters": {"shop": "Macon", "status": "Calibration Complete"},
-                "include_completed": True,
-                "terminal_only": True,
-            },
-        }],
-    }]
-    assert calibration_iq_read_request("Show me those.", history) == (
-        "calibration_iq_read",
-        {
-            "shop": "Macon",
-            "status": "Calibration Complete",
-            "include_completed": True,
-            "terminal_only": True,
-        },
-    )
-    assert calibration_iq_read_request("Show me those active vehicles.", history) == (
-        "calibration_iq_read",
-        {"shop": "Macon", "include_completed": False, "terminal_only": False},
-    )
-
-
-def test_fixed_list_summary_preserves_visible_vs_total_without_rows():
-    text = calibration_iq_result_summary(
-        {
-            "status": "verified",
-            "count": 59,
-            "shown_count": 20,
-            "truncated": True,
-            "include_completed": False,
-            "filters": {"shop": "Macon"},
-            "rows": [{"RO": "must-not-be-spoken"}],
-        },
-        listing=True,
-    )
-    assert text == "Showing 20 of 59 active repair orders in Macon."
-    assert "must-not-be-spoken" not in text
-
-
 @pytest.mark.asyncio
-async def test_three_turn_scope_is_durable_and_each_turn_has_one_card(tmp_path):
-    store = Store(tmp_path / "ciq-routing.sqlite")
+async def test_calibration_iq_read_is_selected_by_model_not_prerouted(tmp_path):
+    store = Store(tmp_path / "ciq-model-first.sqlite")
     conversation_id = store.create_conversation("Calibration IQ")
-    handlers = _CalibrationHandlers()
-    client = _NoModel()
-
-    first = await _run_user_turn(
-        store,
-        conversation_id,
-        _orchestrator(store, handlers, client),
-        "How many cars are active in Macon?",
-    )
-    second = await _run_user_turn(
-        store,
-        conversation_id,
-        _orchestrator(store, handlers, client),
-        "How many are in Macon phase 5?",
-    )
-
-    # Build a fresh orchestrator/registry for the follow-up. Its only scope
-    # source is the durable same-conversation artifact in SQLite.
-    third_orchestrator = _orchestrator(store, handlers, client)
-    store.add_message(conversation_id, "user", "Show me those.")
-    stream = third_orchestrator.run_turn(conversation_id, "Show me those.")
-    first_third_event = await anext(stream)
-    latest = store.get_messages(conversation_id)[-1]
-    assert latest["role"] == "assistant"
-    assert len(latest["artifacts"]) == 1
-    third = [first_third_event, *[event async for event in stream]]
-
-    assert handlers.calls == [
-        (
-            "calibration_iq_summary",
-            {
-                "shop": "Macon",
-                "include_completed": False,
-                "terminal_only": False,
-            },
-        ),
-        ("calibration_iq_summary", {"shop": "Macon", "phase": "5"}),
-        (
-            "calibration_iq_read",
-            {"shop": "Macon", "phase": "5", "include_completed": False},
-        ),
-    ]
-    for events, expected_type in (
-        (first, "calibration_iq_summary"),
-        (second, "calibration_iq_summary"),
-        (third, "calibration_iq_ros"),
-    ):
-        assert [event["type"] for event in events] == [
-            "tool_start",
-            "tool_result",
-            "artifact",
-            "token",
-            "done",
-        ]
-        artifacts = [event for event in events if event["type"] == "artifact"]
-        assert len(artifacts) == 1
-        assert artifacts[0]["artifact"]["type"] == expected_type
-        assert len(events[-1]["artifacts"]) == 1
-
-    assert third[0]["args"] == {
-        "shop": "Macon",
-        "phase": "5",
-        "include_completed": False,
-    }
-    assert third[-2]["text"] == "Showing all 6 active repair orders in Macon phase 5."
-    assert "RO0" not in third[-2]["text"]
-    assert client.stream_calls == 0
-
-    persisted = store.get_messages(conversation_id)
-    assistant_cards = [
-        message["artifacts"]
-        for message in persisted
-        if message["role"] == "assistant"
-    ]
-    assert [len(cards) for cards in assistant_cards] == [1, 1, 1]
-
-
-def test_context_is_never_inherited_across_conversations(tmp_path):
-    store = Store(tmp_path / "ciq-conversations.sqlite")
-    source_conversation = store.create_conversation("Source")
-    other_conversation = store.create_conversation("Other")
-    store.add_message(
-        source_conversation,
-        "assistant",
-        "Six active.",
-        artifacts=[{
-            "type": "calibration_iq_summary",
-            "data": {
-                "status": "verified",
-                "filters": {"shop": "Macon", "phase": "5"},
-                "include_completed": False,
-            },
+    calls: list[tuple[str, dict]] = []
+    client = _ScriptedModel([
+        [{
+            "type": "tool_call",
+            "id": "call-summary",
+            "name": "calibration_iq_summary",
+            "arguments": '{"shop":"Macon","phase":"5"}',
         }],
+        [{"type": "content", "text": "There are six matching repair orders."}],
+    ])
+    orchestrator = _orchestrator(store, client, calls)
+
+    events = await _run(
+        store,
+        conversation_id,
+        orchestrator,
+        "Could you tell me how many Macon vehicles are sitting in phase five?",
     )
-    other_history = store.get_messages(other_conversation)
-    assert calibration_iq_read_request("Show me those.", other_history) is None
 
-
-# --------------------------------------------------------------------------
-# Live field trace: "you're only showing Warner Robins, what about Macon and
-# Perry" mentioned Warner Robins (referencing what was already shown)
-# alongside the actually-requested Macon and Perry. The fixed-priority
-# first-match shop scan grabbed "Warner Robins" -- the wrong one -- and
-# answered deterministically, before the model ever read the message.
-# --------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "you're only showing Warner Robins, what about Macon and Perry",
-        "what about Perry and Macon",
-        "compare Macon to Warner Robins",
-    ],
-)
-def test_multi_shop_mention_is_ambiguous(text):
-    assert calibration_iq_filter_is_ambiguous(text) is True
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "how many are active in Macon",
-        "show me those",
-        "how many are in phase 5",
-    ],
-)
-def test_single_or_no_shop_mention_is_not_ambiguous(text):
-    assert calibration_iq_filter_is_ambiguous(text) is False
-
-
-def test_multi_shop_message_declines_the_deterministic_route_entirely():
-    text = "you're only showing Warner Robins, what about Macon and Perry"
-    assert calibration_iq_read_request(text, []) is None
-
-
-def test_multi_phase_message_declines_the_deterministic_route_entirely():
-    text = "what about phase 6 instead of phase 5"
-    assert calibration_iq_read_request(text, []) is None
+    assert client.calls == 2
+    assert calls == [("calibration_iq_summary", {"shop": "Macon", "phase": "5"})]
+    assert [event["name"] for event in events if event["type"] == "tool_start"] == [
+        "calibration_iq_summary"
+    ]
+    assert any(event.get("text") == "There are six matching repair orders." for event in events)
+    store.close()
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_shop_message_falls_through_to_correct_model_tool_choice(
+async def test_model_selected_truncated_list_preserves_truth_and_single_card_order(
     tmp_path,
 ):
-    """The model already handles this correctly as two separate calls once
-    the router gets out of the way -- reproduced live once this fix landed."""
-    store = Store(tmp_path / "ciq-ambiguous.sqlite")
+    store = Store(tmp_path / "ciq-truncated-card.sqlite")
     conversation_id = store.create_conversation("Calibration IQ")
-    handlers = _CalibrationHandlers()
+    rows = [
+        {
+            "id": f"ro-{index}",
+            "RO": f"24009{index:05d}",
+            "Vehicle": f"Vehicle {index}",
+            "Status": "Research",
+            "Shop": "Macon",
+            "Phase": 5,
+        }
+        for index in range(20)
+    ]
+    result = {
+        "status": "verified",
+        "count": 59,
+        "shown_count": 20,
+        "truncated": True,
+        "include_completed": False,
+        "filters": {"shop": "Macon", "phase": "5"},
+        "rows": rows,
+        "collection_complete": True,
+    }
+    invoked: list[dict] = []
     registry = Registry("config/tools.yaml", store=store)
-    registry.register("calibration_iq_summary", handlers.summary)
 
-    class ModelClient:
-        def __init__(self):
-            self.calls = 0
+    async def listing(args: dict) -> dict:
+        invoked.append(dict(args))
+        return result
 
-        async def stream(self, _messages, tools=None):
-            self.calls += 1
-            if self.calls == 1:
-                yield {
-                    "type": "tool_call", "id": "call-perry",
-                    "name": "calibration_iq_summary", "arguments": '{"shop": "Perry"}',
+    registry.register("calibration_iq_read", listing)
+    client = _ScriptedModel(
+        [
+            [
+                {
+                    "type": "tool_call",
+                    "id": "call-truncated-list",
+                    "name": "calibration_iq_read",
+                    "arguments": '{"shop":"Macon","phase":"5"}',
                 }
-                yield {
-                    "type": "tool_call", "id": "call-macon",
-                    "name": "calibration_iq_summary", "arguments": '{"shop": "Macon"}',
+            ],
+            [
+                {
+                    "type": "content",
+                    "text": "Showing 20 of 59 active repair orders in Macon phase 5.",
                 }
-                return
-            yield {"type": "content", "text": "Perry and Macon breakdown above."}
-
-    client = ModelClient()
+            ],
+        ]
+    )
     orchestrator = Orchestrator(
-        _Router(), client, registry, store,
+        _Router(),
+        client,
+        registry,
+        store,
         SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
     )
-    events = await _run_user_turn(
-        store, conversation_id, orchestrator,
-        "you're only showing Warner Robins, what about Macon and Perry",
+
+    events = await _run(
+        store,
+        conversation_id,
+        orchestrator,
+        "List the active Macon phase-five work.",
     )
 
-    tool_calls = [e for e in events if e["type"] == "tool_start"]
-    assert [c["args"] for c in tool_calls] == [{"shop": "Perry"}, {"shop": "Macon"}]
+    assert invoked == [{"shop": "Macon", "phase": "5"}]
+    assert [event["type"] for event in events] == [
+        "tool_start",
+        "tool_result",
+        "artifact",
+        "token",
+        "done",
+    ]
+    assert events[1]["result"] == result
+    expected_artifact = {"type": "calibration_iq_ros", "data": result}
+    assert events[2]["artifact"] == expected_artifact
+    assert events[3]["text"] == (
+        "Showing 20 of 59 active repair orders in Macon phase 5."
+    )
+    assert events[4]["artifacts"] == [expected_artifact]
+
+    model_tool_result = next(
+        message for message in client.messages[1] if message.get("role") == "tool"
+    )
+    model_payload = json.loads(model_tool_result["content"])
+    assert model_payload["count"] == 59
+    assert model_payload["shown_count"] == 20
+    assert model_payload["truncated"] is True
+    assert len(model_payload["rows"]) == 20
+
+    persisted = store.get_messages(conversation_id)[-1]
+    assert persisted["role"] == "assistant"
+    assert persisted["content"] == events[3]["text"]
+    assert persisted["artifacts"] == [expected_artifact]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_model_can_select_multiple_calibration_iq_calls_in_one_round(tmp_path):
+    store = Store(tmp_path / "ciq-multi-tool.sqlite")
+    conversation_id = store.create_conversation("Calibration IQ")
+    calls: list[tuple[str, dict]] = []
+    client = _ScriptedModel([
+        [
+            {
+                "type": "tool_call",
+                "id": "call-perry",
+                "name": "calibration_iq_summary",
+                "arguments": '{"shop":"Perry"}',
+            },
+            {
+                "type": "tool_call",
+                "id": "call-macon",
+                "name": "calibration_iq_summary",
+                "arguments": '{"shop":"Macon"}',
+            },
+        ],
+        [{"type": "content", "text": "Here is the Perry and Macon comparison."}],
+    ])
+    orchestrator = _orchestrator(store, client, calls)
+
+    await _run(
+        store,
+        conversation_id,
+        orchestrator,
+        "You're only showing Warner Robins; compare Macon with Perry instead.",
+    )
+
+    assert calls == [
+        ("calibration_iq_summary", {"shop": "Perry"}),
+        ("calibration_iq_summary", {"shop": "Macon"}),
+    ]
     assert client.calls == 2
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_one_model_round_has_a_hard_tool_call_limit(tmp_path):
+    store = Store(tmp_path / "ciq-bounded-multi-tool.sqlite")
+    conversation_id = store.create_conversation("Calibration IQ")
+    calls: list[tuple[str, dict]] = []
+    requested = [
+        {
+            "type": "tool_call",
+            "id": f"call-{index}",
+            "name": "calibration_iq_summary",
+            "arguments": json.dumps({"shop": f"shop-{index}"}),
+        }
+        for index in range(12)
+    ]
+    client = _ScriptedModel(
+        [requested, [{"type": "content", "text": "I completed the bounded comparison."}]]
+    )
+    orchestrator = _orchestrator(store, client, calls)
+
+    await _run(store, conversation_id, orchestrator, "Compare the relevant shops.")
+
+    assert len(calls) == 8
+    assert [args["shop"] for _, args in calls] == [f"shop-{index}" for index in range(8)]
+    assistant_call = next(
+        message for message in client.messages[1] if message.get("tool_calls")
+    )
+    assert len(assistant_call["tool_calls"]) == 8
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_no_result_returns_to_model_for_next_source_selection(tmp_path):
+    store = Store(tmp_path / "model-escalation.sqlite")
+    conversation_id = store.create_conversation("Research")
+    invocations: list[tuple[str, dict]] = []
+
+    class RegistryForEscalation:
+        @staticmethod
+        def model_tools(_role="owner"):
+            return [
+                {
+                    "type": "function",
+                    "function": {"name": name, "parameters": {"type": "object"}},
+                }
+                for name in ("adas_si_search", "collision_research")
+            ]
+
+        @staticmethod
+        def tier(_name):
+            return "read_only"
+
+        async def invoke(self, name, args, **_context):
+            invocations.append((name, dict(args)))
+            if name == "adas_si_search":
+                return {"status": "no_result", "results": []}
+            return {
+                "status": "success",
+                "verified": True,
+                "sources": [{"url": "https://oem.example/procedure"}],
+            }
+
+    client = _ScriptedModel([
+        [{
+            "type": "tool_call",
+            "id": "local-first",
+            "name": "adas_si_search",
+            "arguments": '{"query":"2024 example camera calibration"}',
+        }],
+        [{
+            "type": "tool_call",
+            "id": "oem-next",
+            "name": "collision_research",
+            "arguments": '{"action":"public_search","query":"2024 example camera calibration"}',
+        }],
+        [{"type": "content", "text": "I found the verified OEM source."}],
+    ])
+    orchestrator = Orchestrator(
+        _Router(),
+        client,
+        RegistryForEscalation(),
+        store,
+        SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
+    )
+
+    await _run(
+        store,
+        conversation_id,
+        orchestrator,
+        "Find the camera calibration procedure and use another source if needed.",
+    )
+
+    assert invocations == [
+        ("adas_si_search", {"query": "2024 example camera calibration"}),
+        (
+            "collision_research",
+            {"action": "public_search", "query": "2024 example camera calibration"},
+        ),
+    ]
+    assert client.calls == 3
+    first_tool_result = next(
+        message for message in client.messages[1] if message.get("role") == "tool"
+    )
+    assert json.loads(first_tool_result["content"])["status"] == "no_result"
+    store.close()

@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.services import adas_identity_guard
 from core.services import adas_si as adas_mod
 from core.services import research_workflow
+from core.tools.registry import TOOL_SCHEMAS
 
 
 def test_explicit_toyota_search_never_returns_hyundai(tmp_path: Path, monkeypatch):
@@ -52,19 +52,10 @@ def test_broad_blind_spot_search_can_still_span_manufacturers(tmp_path: Path, mo
     assert {item["descriptor"]["make"] for item in results} == {"Toyota", "Hyundai"}
 
 
-def test_post_collision_request_routes_to_composite_workflow():
-    prompt = (
-        "Research whether Toyota permits the use of a recycled blind spot monitor module. "
-        "Check ADAS SI first, then ALLDATA, then official Toyota collision sources if necessary. "
-        "Preserve any authoritative documentation we're missing in ADAS SI."
-    )
-    assert research_workflow.full_research_request(prompt) is True
-    assert research_workflow.preserve_requested(prompt) is True
-    assert research_workflow.focused_query(prompt).startswith("whether Toyota permits")
-
-
-def test_plain_calibration_iq_ro_research_is_not_hijacked():
-    assert research_workflow.full_research_request("Research this RO and attach the OEM evidence") is False
+def test_fixed_source_sequence_is_not_exposed_as_a_model_tool_action():
+    research_workflow.install()
+    actions = TOOL_SCHEMAS["collision_research"]["parameters"]["properties"]["action"]["enum"]
+    assert "full_research" not in actions
 
 
 def test_fixed_summary_never_claims_unverified_alldata_search():
@@ -110,7 +101,7 @@ async def test_full_workflow_emits_three_lane_source_ledger(monkeypatch):
             "page_text": "Toyota recycled blind spot module",
         }
 
-    async def fake_public(query, make):
+    async def fake_public(query, make, **_kwargs):
         assert make == "Toyota"
         return {
             "searched": True,
@@ -156,7 +147,7 @@ async def test_ledger_surfaces_verification_reason_when_a_result_was_found_but_n
             "vehicle": {"label": "2019 Ford F-150"},
         }
 
-    async def fake_public(_query, _make):
+    async def fake_public(_query, _make, **_kwargs):
         return {"searched": False, "verified": False, "sources": [], "read_results": [], "result_count": 0}
 
     monkeypatch.setattr(research_workflow, "search_alldata", fake_alldata)

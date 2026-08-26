@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from core.services import adas_calibration_depth, adas_si, research_conversation, research_policy_depth
+from core.services import adas_si, research_conversation, research_policy_depth
 
 
 class _Page:
@@ -25,15 +25,6 @@ class _SixPageReader:
             _Page("IMPORTANT: EyeSight calibration is required after all collisions."),
             _Page("End of document."),
         ]
-
-
-def test_calibration_intent_includes_system_plus_collision_without_magic_word():
-    assert adas_calibration_depth.calibration_intent(
-        "Does Subaru EyeSight require service after a collision?"
-    ) is True
-    assert adas_calibration_depth.calibration_intent(
-        "What color is a 2024 Subaru Outback?"
-    ) is False
 
 
 def test_local_adas_scan_reads_every_page_and_finds_buried_collision_rule(tmp_path: Path, monkeypatch):
@@ -70,7 +61,10 @@ def test_local_adas_scan_reads_every_page_and_finds_buried_collision_rule(tmp_pa
     ]
     monkeypatch.setattr(service, "_pages", lambda path: pages if path == subaru_path else [(1, "Toyota")])
 
-    result = service.search({"query": "2024 Subaru EyeSight calibration after collision"})
+    result = service.search({
+        "query": "2024 Subaru EyeSight calibration after collision",
+        "search_mode": "calibration_requirements",
+    })
     scan = result["calibration_deep_scan"]
     assert scan["enabled"] is True
     assert scan["scanned_full_documents"] is True
@@ -115,6 +109,7 @@ def test_calibration_web_discovery_explicitly_searches_any_and_all_collision_lan
         "Subaru EyeSight calibration requirements",
         "Subaru",
         calibration_mode=True,
+        policy_mode=False,
     )
     folded = "\n".join(queries).casefold()
     assert "after any collision" in folded

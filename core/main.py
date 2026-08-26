@@ -28,18 +28,20 @@ from .config import Settings
 from .models.client import ModelClient
 from .models.router import ModelRouter, WorkerSwapError
 from .services import adas_si as adas_si_svc
+from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
 from .services import camera as camera_svc
 from .services import calendar as calendar_svc
 from .services import exterior_camera as exterior_camera_svc
 from .services import image_generation as image_svc
 from .services import research as research_svc
+from .services import scrapex as scrapex_svc
 from .services import video_generation as video_svc
 from .services import website as website_svc
 from .services import weather as weather_svc
 from .state.db import Store
 from .tools.builtin import system as builtin
-from .tools.registry import Registry
+from .tools.registry import Registry, TOOL_SCHEMAS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +65,10 @@ def build_app(settings: Settings) -> FastAPI:
         temperature=settings.temperature,
         max_tokens=settings.max_response_tokens,
     )
+    # Capability-owned schemas are still advertised through the one Registry
+    # catalog.  Keeping their implementation modules independent avoids
+    # importing external-service clients into the security gateway itself.
+    TOOL_SCHEMAS.update(scrapex_svc.SCRAPEX_TOOL_SCHEMAS)
     registry = Registry(settings.tools_config, store=store)
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
     image_config = None
@@ -100,6 +106,9 @@ def build_app(settings: Settings) -> FastAPI:
         builtin.make_assistant_capabilities(router, registry),
     )
     registry.register("web_research_current", research_svc.search_current)
+    registry.register("scrapex_status", lambda a: scrapex_svc.status(settings, a))
+    registry.register("scrapex_read", lambda a: scrapex_svc.read(settings, a))
+    registry.register("scrapex_adas_map", lambda a: scrapex_svc.adas_map(settings, a))
     registry.register(
         "website_preview_generate",
         website_svc.make_website_preview(client, store),
@@ -148,17 +157,60 @@ def build_app(settings: Settings) -> FastAPI:
         settings.adas_si_root,
         settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite",
     )
+    knowledge_repository = automotive_knowledge_svc.AutomotiveKnowledgeRepository(
+        getattr(settings, "automotive_knowledge_db", None)
+        or (
+            settings.root
+            / "data"
+            / "capabilities"
+            / "automotive_knowledge"
+            / "knowledge.sqlite"
+        ),
+        authoritative_roots=(settings.adas_si_root,),
+    )
+    automotive_knowledge = automotive_knowledge_svc.AutomotiveKnowledgeService(
+        knowledge_repository
+    )
     if not adas.available():
         log.warning("ADAS SI library not found at %s -- tools will report unavailable.",
                     settings.adas_si_root)
 
-    registry.register("adas_si_search", lambda a: adas.search(a))
+    registry.register("adas_si_search", lambda a: adas.model_search(a))
     registry.register("adas_si_open", lambda a: adas.open_document(a))
     registry.register("adas_si_inventory", lambda a: adas.inventory_read(a))
     registry.register("adas_si_records", lambda a: adas.record_list(a))
     registry.register("adas_si_file_write", lambda a: adas.file_write(a))
     registry.register("adas_si_record_write", lambda a: adas.record_write(a))
     registry.register("adas_si_record_modify", lambda a: adas.record_modify(a))
+
+    registry.register("automotive_knowledge_search", automotive_knowledge.search)
+    registry.register("automotive_knowledge_read", automotive_knowledge.read)
+
+    def automotive_knowledge_capture(args: dict) -> dict:
+        payload = dict(args)
+        actor = str(payload.pop("__xomni_actor", None) or "operator")
+        action = str(payload.pop("action", "")).strip().casefold()
+        if action == "capture":
+            record = payload.get("record")
+            if not isinstance(record, dict):
+                raise ValueError("record is required for automotive knowledge capture")
+            return automotive_knowledge.store(record, actor=actor)
+        if action == "add_evidence":
+            return automotive_knowledge.add_evidence(payload, actor=actor)
+        raise ValueError("Unsupported automotive knowledge capture action.")
+
+    def automotive_knowledge_lifecycle(args: dict) -> dict:
+        payload = dict(args)
+        actor = str(payload.pop("__xomni_actor", None) or "operator")
+        action = str(payload.pop("action", "")).strip().casefold()
+        if action == "promote":
+            return automotive_knowledge.promote(payload, actor=actor)
+        if action == "supersede":
+            return automotive_knowledge.supersede(payload, actor=actor)
+        raise ValueError("Unsupported automotive knowledge lifecycle action.")
+
+    registry.register("automotive_knowledge_capture", automotive_knowledge_capture)
+    registry.register("automotive_knowledge_lifecycle", automotive_knowledge_lifecycle)
 
     async def calibration_iq_status(_args: dict) -> dict:
         return await ciq_svc.status(settings)
@@ -222,7 +274,10 @@ def build_app(settings: Settings) -> FastAPI:
                 try:
                     await router.shutdown()
                 finally:
-                    store.close()
+                    try:
+                        knowledge_repository.close()
+                    finally:
+                        store.close()
 
     app = FastAPI(
         title="X Omni",
@@ -236,6 +291,7 @@ def build_app(settings: Settings) -> FastAPI:
     app.state.router = router
     app.state.client = client
     app.state.registry = registry
+    app.state.automotive_knowledge = automotive_knowledge
     app.state.exterior_camera = exterior_camera
     app.state.image_generation = image_generation
     app.state.image_generation_config = image_config

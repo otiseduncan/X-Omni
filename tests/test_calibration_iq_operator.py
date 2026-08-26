@@ -810,6 +810,7 @@ class FakeAdas:
         return self.source
 
     def search(self, args: dict[str, Any]) -> dict[str, Any]:
+        assert args.get("search_mode") == "calibration_requirements"
         if not self.supported:
             return {
                 "status": "no_result",
@@ -1927,6 +1928,11 @@ def test_parity_operations_are_explicitly_split_between_routine_and_destructive_
     assert routine.isdisjoint(destructive)
     assert routine == ciq.ROUTINE_OPERATOR_OPERATIONS
     assert destructive == ciq.DESTRUCTIVE_OPERATOR_OPERATIONS
+    destructive_required = set(
+        TOOL_SCHEMAS["calibration_iq_destructive"]["parameters"]["properties"]
+        ["actions"]["items"]["required"]
+    )
+    assert destructive_required == {"operation", "target_id"}
 
 
 def test_operator_context_fails_closed_without_positive_persisted_message_id():

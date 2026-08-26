@@ -1,0 +1,1519 @@
+"""Bounded, loopback-only client for the local ScrapeX ADAS Map worker.
+
+The model chooses these operations through structured tool arguments.  This
+module deliberately contains no language/keyword router and accepts neither a
+URL nor credentials from tool input.  ScrapeX remains the owner of browser
+state and CIQ reconciliation; X Omni only invokes its published loopback API
+and reports the returned state without turning "started" into "completed".
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import re
+from typing import Any
+from urllib.parse import quote, urlsplit
+
+import httpx
+
+
+DEFAULT_BASE_URL = "http://127.0.0.1:8125"
+BASE_URL_ENV = "XOMNI_SCRAPEX_BASE_URL"
+STATUS_TIMEOUT = 5.0
+READ_TIMEOUT = 20.0
+OPERATOR_TIMEOUT = 180.0
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_BATCH_ID_CHARS = 80
+MAX_RO_CHARS = 80
+MAX_NAME_CHARS = 180
+MAX_SHOP_CHARS = 180
+MAX_PHASE_CHARS = 40
+_INVOCATION_CONTEXT_KEY = "__xomni_invocation"
+_RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(password|secret|access[_-]?token|refresh[_-]?token|"
+    r"service[_-]?token|api[_-]?key)\s*[=:]\s*[^\s,&;]+"
+)
+
+READ_ACTIONS = frozenset(
+    {
+        "list_batches",
+        "batch_summary",
+        "batch_exceptions",
+        "batch_item",
+        "preview_ciq_queue",
+    }
+)
+ADAS_MAP_ACTIONS = frozenset(
+    {
+        "open_authentication",
+        "create_exact_batch",
+        "create_phase_batch",
+        "process_one",
+        "start_batch",
+        "pause_batch",
+    }
+)
+SOURCE_SCOPES = frozenset({"active", "all", "terminal"})
+
+
+SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
+    "description": (
+        "Check the local ScrapeX ADAS Map worker, Calibration IQ dependency, "
+        "and managed-browser authentication state. This reads status only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
+SCRAPEX_READ_SCHEMA: dict[str, Any] = {
+    "description": (
+        "Read ScrapeX ADAS Map batches, exact per-RO evidence, exceptions, or "
+        "a non-mutating Calibration IQ queue preview. Choose an explicit action. "
+        "Any action requiring batch_id must copy that opaque id verbatim from an "
+        "observed prior list/create result. If no exact id has been observed, call "
+        "list_batches first only for a non-mutating existing-evidence read; placeholder, "
+        "example, derived, or guessed ids are forbidden. Never use list_batches to prepare "
+        "a request to acquire/process current evidence; use create_exact_batch instead."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": sorted(READ_ACTIONS),
+                "description": (
+                    "For a non-mutating existing-evidence read, use list_batches first "
+                    "whenever no exact batch id has been observed. Never use this read action "
+                    "as preparation for new acquisition or processing."
+                ),
+            },
+            "batch_id": {
+                "type": "string",
+                "maxLength": MAX_BATCH_ID_CHARS,
+                "description": (
+                    "Copy the opaque exact id verbatim from a prior ScrapeX list/create "
+                    "result. Never use a placeholder, example, derived, or guessed value; "
+                    "for existing-evidence reads, call list_batches first when none has "
+                    "been observed."
+                ),
+            },
+            "ro_number": {"type": "string", "maxLength": MAX_RO_CHARS},
+            "phases": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": MAX_PHASE_CHARS},
+                "minItems": 1,
+                "maxItems": 10,
+            },
+            "shop": {"type": "string", "maxLength": MAX_SHOP_CHARS},
+            "source_scope": {"type": "string", "enum": sorted(SOURCE_SCOPES)},
+        },
+        "required": ["action"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"action": {"const": "batch_item"}},
+                    "required": ["action"],
+                },
+                "then": {"required": ["batch_id", "ro_number"]},
+            },
+            {
+                "if": {
+                    "properties": {
+                        "action": {"enum": ["batch_summary", "batch_exceptions"]}
+                    },
+                    "required": ["action"],
+                },
+                "then": {"required": ["batch_id"]},
+            },
+        ],
+        "additionalProperties": False,
+    },
+}
+
+SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
+    "description": (
+        "Direct ScrapeX's bounded ADAS Map work with structured identifiers. "
+        "Create an exact-RO or phase batch, process one RO, start or pause a "
+        "batch, or open the managed browser for human authentication. process_one "
+        "never creates or discovers a batch: it requires batch_id copied verbatim "
+        "from an observed prior create/list result. If none has been observed, call "
+        "create_exact_batch first, then process_one with its returned id. Check or "
+        "process the requested work first; open_authentication is a parameterless "
+        "human handoff used only after ScrapeX reports authentication_required and "
+        "the user asks to open that handoff. Starting a batch means accepted/running, "
+        "not completed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": sorted(ADAS_MAP_ACTIONS),
+                "description": (
+                    "Never call process_one without an observed exact batch_id. Create "
+                    "the exact batch first when no id is available."
+                ),
+            },
+            "name": {"type": "string", "maxLength": MAX_NAME_CHARS},
+            "batch_id": {
+                "type": "string",
+                "maxLength": MAX_BATCH_ID_CHARS,
+                "description": (
+                    "Opaque exact id copied verbatim from an observed ScrapeX create/list "
+                    "result; never omit, invent, derive, or guess it. "
+                    "Valid only for process_one, start_batch, or pause_batch, never for "
+                    "open_authentication or batch creation."
+                ),
+            },
+            "ro_number": {"type": "string", "maxLength": MAX_RO_CHARS},
+            "ro_numbers": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": MAX_RO_CHARS},
+                "minItems": 1,
+                "maxItems": 10,
+            },
+            "phases": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": MAX_PHASE_CHARS},
+                "minItems": 1,
+                "maxItems": 10,
+            },
+            "shop": {"type": "string", "maxLength": MAX_SHOP_CHARS},
+            "source_scope": {"type": "string", "enum": sorted(SOURCE_SCOPES)},
+        },
+        "required": ["action"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"action": {"const": "create_exact_batch"}},
+                    "required": ["action"],
+                },
+                "then": {"required": ["ro_numbers"]},
+            },
+            {
+                "if": {
+                    "properties": {"action": {"const": "create_phase_batch"}},
+                    "required": ["action"],
+                },
+                "then": {"required": ["phases"]},
+            },
+            {
+                "if": {
+                    "properties": {"action": {"const": "process_one"}},
+                    "required": ["action"],
+                },
+                "then": {"required": ["batch_id", "ro_number"]},
+            },
+            {
+                "if": {
+                    "properties": {
+                        "action": {"enum": ["start_batch", "pause_batch"]}
+                    },
+                    "required": ["action"],
+                },
+                "then": {"required": ["batch_id"]},
+            },
+        ],
+        "additionalProperties": False,
+    },
+}
+
+SCRAPEX_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "scrapex_status": SCRAPEX_STATUS_SCHEMA,
+    "scrapex_read": SCRAPEX_READ_SCHEMA,
+    "scrapex_adas_map": SCRAPEX_ADAS_MAP_SCHEMA,
+}
+
+
+class ScrapeXInput(ValueError):
+    """Structured tool input is invalid."""
+
+
+class ScrapeXConfiguration(ValueError):
+    """The configured service boundary is unsafe or invalid."""
+
+
+class ScrapeXTransport(RuntimeError):
+    def __init__(self, code: str, message: str, *, indeterminate: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.indeterminate = indeterminate
+
+
+class ScrapeXRemote(RuntimeError):
+    def __init__(self, status_code: int, detail: Any, *, may_mutate: bool = False):
+        super().__init__(f"ScrapeX returned HTTP {status_code}.")
+        self.status_code = status_code
+        self.detail = detail
+        self.may_mutate = may_mutate
+
+
+class ScrapeXContract(RuntimeError):
+    """A successful HTTP response did not prove the requested resource/action."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _clean_args(args: dict[str, Any] | None) -> dict[str, Any]:
+    if args is None:
+        return {}
+    if not isinstance(args, dict):
+        raise ScrapeXInput("Tool arguments must be an object.")
+    return {key: value for key, value in args.items() if key != _INVOCATION_CONTEXT_KEY}
+
+
+def _expect_keys(args: dict[str, Any], allowed: set[str]) -> None:
+    unknown = sorted(set(args) - allowed)
+    if unknown:
+        raise ScrapeXInput(f"Unsupported argument(s): {', '.join(unknown)}.")
+
+
+def _text(
+    value: Any,
+    field: str,
+    *,
+    maximum: int,
+    required: bool = True,
+) -> str | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise ScrapeXInput(f"{field} must be a string.")
+    result = value.strip()
+    if not result and required:
+        raise ScrapeXInput(f"{field} is required.")
+    if not result:
+        return None
+    if len(result) > maximum or any(ord(ch) < 32 or ord(ch) == 127 for ch in result):
+        raise ScrapeXInput(f"{field} is invalid or too long.")
+    return result
+
+
+def _batch_id(args: dict[str, Any]) -> str:
+    value = _text(args.get("batch_id"), "batch_id", maximum=MAX_BATCH_ID_CHARS)
+    assert value is not None
+    if not _RESOURCE_ID_RE.fullmatch(value):
+        raise ScrapeXInput("batch_id must be a bounded ScrapeX identifier.")
+    return value
+
+
+def _ro_number(value: Any, field: str = "ro_number") -> str:
+    result = _text(value, field, maximum=MAX_RO_CHARS)
+    assert result is not None
+    return result
+
+
+def _string_list(
+    value: Any,
+    field: str,
+    *,
+    maximum_items: int,
+    maximum_chars: int,
+) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= maximum_items:
+        raise ScrapeXInput(f"{field} must contain 1 to {maximum_items} values.")
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        item = _text(raw, field, maximum=maximum_chars)
+        assert item is not None
+        key = item.casefold()
+        if key not in seen:
+            seen.add(key)
+            output.append(item)
+    return output
+
+
+def _source_scope(args: dict[str, Any], default: str) -> str:
+    raw = args.get("source_scope", default)
+    if not isinstance(raw, str) or raw not in SOURCE_SCOPES:
+        raise ScrapeXInput("source_scope must be active, all, or terminal.")
+    return raw
+
+
+def _base_url(settings: Any) -> str:
+    configured = getattr(settings, "scrapex_base_url", None)
+    raw = str(configured or os.getenv(BASE_URL_ENV) or DEFAULT_BASE_URL).strip()
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ScrapeXConfiguration("ScrapeX base URL has an invalid port.") from exc
+    if parsed.scheme != "http" or not parsed.hostname:
+        raise ScrapeXConfiguration("ScrapeX must use a literal loopback HTTP URL.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ScrapeXConfiguration("ScrapeX base URL cannot contain credentials or URL parameters.")
+    if parsed.path not in {"", "/"}:
+        raise ScrapeXConfiguration("ScrapeX base URL cannot contain an API path.")
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError as exc:
+        raise ScrapeXConfiguration("ScrapeX host must be a literal loopback address.") from exc
+    if not address.is_loopback:
+        raise ScrapeXConfiguration("ScrapeX is restricted to the local loopback interface.")
+    if port is None:
+        raise ScrapeXConfiguration("ScrapeX base URL must include its explicit loopback port.")
+    host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    return f"http://{host}:{port}"
+
+
+def _sensitive_key(value: Any) -> bool:
+    folded = re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return folded in {
+        "password",
+        "secret",
+        "accesstoken",
+        "refreshtoken",
+        "servicetoken",
+        "authorization",
+        "cookie",
+        "setcookie",
+        "apikey",
+        "credential",
+        "credentials",
+    }
+
+
+def _safe_text(value: str) -> str:
+    value = _BEARER_RE.sub("Bearer [redacted]", value)
+    return _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=[redacted]", value)
+
+
+def _sanitize(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize(item)
+            for key, item in value.items()
+            if not _sensitive_key(key)
+        }
+    if isinstance(value, list):
+        return [_sanitize(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize(item) for item in value]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if len(stripped) <= MAX_RESPONSE_BYTES and (
+            (stripped.startswith("{") and stripped.endswith("}"))
+            or (stripped.startswith("[") and stripped.endswith("]"))
+        ):
+            try:
+                embedded = json.loads(stripped)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if isinstance(embedded, (dict, list)):
+                    return json.dumps(
+                        _sanitize(embedded),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+        return _safe_text(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _safe_text(str(value))
+
+
+def _decode_response(response: httpx.Response, *, may_mutate: bool) -> Any:
+    ambiguous_success = may_mutate and 200 <= response.status_code < 300
+    content = response.content
+    if len(content) > MAX_RESPONSE_BYTES:
+        raise ScrapeXTransport(
+            "response_too_large",
+            "ScrapeX returned too much data.",
+            indeterminate=ambiguous_success,
+        )
+    if not content:
+        return {}
+    try:
+        return _sanitize(response.json())
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ScrapeXTransport(
+            "invalid_response",
+            "ScrapeX returned invalid JSON.",
+            indeterminate=ambiguous_success,
+        ) from exc
+
+
+async def _request(
+    settings: Any,
+    method: str,
+    path: str,
+    *,
+    body: dict[str, Any] | None = None,
+    timeout: float,
+    may_mutate: bool,
+) -> Any:
+    base_url = _base_url(settings)
+    try:
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            timeout=timeout,
+            trust_env=False,
+            follow_redirects=False,
+            headers={"Accept": "application/json", "User-Agent": "X-Omni/ScrapeX-adapter"},
+        ) as client:
+            response = await client.request(method, path, json=body)
+    except httpx.TimeoutException as exc:
+        raise ScrapeXTransport(
+            "timeout",
+            "ScrapeX did not respond before the operation timeout.",
+            indeterminate=may_mutate,
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise ScrapeXTransport(
+            "unavailable",
+            "ScrapeX is unavailable on its local loopback endpoint.",
+            indeterminate=may_mutate,
+        ) from exc
+    payload = _decode_response(response, may_mutate=may_mutate)
+    if response.status_code >= 400:
+        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        raise ScrapeXRemote(
+            response.status_code,
+            detail,
+            may_mutate=may_mutate,
+        )
+    return payload
+
+
+def _failure(action: str, code: str, message: str, **extra: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "service": "ScrapeX",
+        "action": action,
+        "status": code,
+        "success": False,
+        "executed": False,
+        "verified": False,
+        "error": {"code": code, "message": _safe_text(message)},
+    }
+    result.update(_sanitize(extra))
+    return result
+
+
+def _input_failure(action: str, exc: Exception) -> dict[str, Any]:
+    return _failure(action, "invalid_request", str(exc))
+
+
+def _detail_text(detail: Any) -> str:
+    if isinstance(detail, str):
+        return detail
+    try:
+        return json.dumps(detail, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(detail)
+
+
+def _remote_failure(action: str, exc: ScrapeXRemote) -> dict[str, Any]:
+    detail = _sanitize(exc.detail)
+    lowered = _detail_text(detail).casefold()
+    if exc.status_code == 409 and "adas map" in lowered and (
+        "not authenticated" in lowered or "login" in lowered
+    ):
+        return _authentication_required(action, {"detail": detail}, executed=False)
+    # A server/proxy error can be returned after the remote side committed a
+    # POST.  The adapter has no request-id lookup that could safely disprove
+    # execution, so fail closed and forbid an automatic retry.  Validation,
+    # auth, not-found, conflict, and rate-limit responses are definitive
+    # rejections and remain ordinary failures below.
+    definitive_rejections = {400, 401, 403, 404, 409, 422, 429}
+    if exc.may_mutate and exc.status_code not in definitive_rejections:
+        return _failure(
+            action,
+            "indeterminate",
+            f"ScrapeX returned HTTP {exc.status_code} after a mutation request; "
+            "execution could not be disproved.",
+            http_status=exc.status_code,
+            detail=detail,
+            may_have_executed=True,
+            indeterminate=True,
+            retryable=False,
+        )
+    if exc.status_code == 404:
+        code = "not_found"
+    elif exc.status_code in {400, 422}:
+        code = "invalid_request"
+    elif exc.status_code == 409:
+        code = "conflict"
+    elif exc.status_code in {502, 503, 504}:
+        code = "dependency_unavailable"
+    else:
+        code = "service_error"
+    return _failure(
+        action,
+        code,
+        f"ScrapeX returned HTTP {exc.status_code}.",
+        http_status=exc.status_code,
+        detail=detail,
+    )
+
+
+def _transport_failure(action: str, exc: ScrapeXTransport) -> dict[str, Any]:
+    status = "indeterminate" if exc.indeterminate else exc.code
+    result = _failure(
+        action,
+        status,
+        exc.message,
+        may_have_executed=exc.indeterminate,
+        indeterminate=exc.indeterminate,
+        retryable=(
+            not exc.indeterminate and exc.code in {"timeout", "unavailable"}
+        ),
+    )
+    result["error"]["transport_code"] = exc.code
+    return result
+
+
+def _configuration_failure(action: str, exc: ScrapeXConfiguration) -> dict[str, Any]:
+    return _failure(action, "configuration_error", str(exc))
+
+
+def _contract_failure(
+    action: str,
+    exc: ScrapeXContract,
+    *,
+    may_mutate: bool,
+) -> dict[str, Any]:
+    if may_mutate:
+        result = _failure(
+            action,
+            "indeterminate",
+            "ScrapeX returned a 2xx response that did not prove the requested "
+            "resource and operation contract.",
+            may_have_executed=True,
+            indeterminate=True,
+            retryable=False,
+        )
+    else:
+        result = _failure(
+            action,
+            "invalid_response",
+            "ScrapeX returned data for a different or malformed resource.",
+            may_have_executed=False,
+            indeterminate=False,
+            retryable=False,
+        )
+    result["error"]["contract_code"] = exc.code
+    result["error"]["contract_message"] = _safe_text(exc.message)
+    return result
+
+
+def _success(
+    action: str,
+    data: Any,
+    *,
+    status: str = "verified",
+    executed: bool = True,
+    verified: bool = True,
+    work_complete: bool | None = None,
+    success: bool = True,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "service": "ScrapeX",
+        "action": action,
+        "status": status,
+        "success": success,
+        "executed": executed,
+        "verified": verified,
+        "data": _sanitize(data),
+    }
+    if work_complete is not None:
+        result["work_complete"] = work_complete
+    return result
+
+
+def _authentication_required(
+    action: str,
+    authentication: Any,
+    *,
+    executed: bool,
+) -> dict[str, Any]:
+    return {
+        "service": "ScrapeX",
+        "action": action,
+        "status": "authentication_required",
+        "success": False,
+        "executed": executed,
+        "verified": False,
+        "work_complete": False,
+        "authentication_required": True,
+        "requires_human": True,
+        "authentication": _sanitize(authentication),
+        "message": (
+            "ADAS Map needs interactive sign-in in ScrapeX's managed work Chrome "
+            "window. No credential is requested or returned through the model."
+        ),
+    }
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _provenance(item: dict[str, Any]) -> dict[str, Any]:
+    """Expose the canonical evidence fields without reinterpreting their truth."""
+    raw_result = _json_object(item.get("adas_map_raw_result_json"))
+    reconciliation = item.get("ciq_reconciliation")
+    if not isinstance(reconciliation, dict):
+        reconciliation = _json_object(item.get("ciq_reconciliation_json"))
+    requirements = item.get("adas_map_requirements")
+    if not isinstance(requirements, list):
+        requirements = _json_list(item.get("adas_map_requirements_json"))
+    return _sanitize(
+        {
+            "contract_version": item.get("adas_map_contract_version"),
+            "state": item.get("adas_map_state"),
+            "requirements_proven": bool(item.get("adas_map_requirements_proven")),
+            "inspection_id": item.get("adas_map_inspection_id"),
+            "source_url": item.get("adas_map_source_url"),
+            "checked_at": item.get("adas_map_checked_at"),
+            "requirements": requirements,
+            "raw_result": raw_result,
+            "ciq_reconciliation_state": item.get("ciq_reconciliation_state"),
+            "ciq_reconciliation": reconciliation,
+        }
+    )
+
+
+def _contract_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ScrapeXContract("malformed_payload", f"{label} must be an object.")
+    return value
+
+
+def _contract_identifier(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ScrapeXContract("malformed_identifier", f"{label} must be a string.")
+    result = value.strip()
+    if not _RESOURCE_ID_RE.fullmatch(result):
+        raise ScrapeXContract(
+            "malformed_identifier",
+            f"{label} is not a bounded ScrapeX identifier.",
+        )
+    return result
+
+
+def _contract_text(value: Any, label: str, *, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise ScrapeXContract("malformed_text", f"{label} must be a string.")
+    result = value.strip()
+    if (
+        not result
+        or len(result) > maximum
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in result)
+    ):
+        raise ScrapeXContract("malformed_text", f"{label} is empty or invalid.")
+    return result
+
+
+def _contract_string_list(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ScrapeXContract("malformed_list", f"{label} must be a non-empty list.")
+    output: list[str] = []
+    for item in value:
+        output.append(_contract_text(item, label, maximum=MAX_RO_CHARS))
+    return output
+
+
+def _returned_batch(payload: Any, *, expected_batch_id: str | None = None) -> tuple[dict[str, Any], str]:
+    batch = _contract_mapping(payload, "batch")
+    batch_id = _contract_identifier(batch.get("id"), "batch.id")
+    if expected_batch_id is not None and batch_id != expected_batch_id:
+        raise ScrapeXContract(
+            "batch_mismatch",
+            "ScrapeX returned a different batch than the one requested.",
+        )
+    return batch, batch_id
+
+
+def _returned_item(
+    payload: Any,
+    *,
+    expected_batch_id: str,
+    expected_ro_number: str | None = None,
+) -> dict[str, Any]:
+    item = _contract_mapping(payload, "item")
+    _contract_identifier(item.get("id"), "item.id")
+    returned_batch_id = _contract_identifier(item.get("batch_id"), "item.batch_id")
+    if returned_batch_id != expected_batch_id:
+        raise ScrapeXContract(
+            "item_batch_mismatch",
+            "ScrapeX returned an item from a different batch.",
+        )
+    if expected_ro_number is not None:
+        returned_ro = _contract_text(
+            item.get("ro_number"), "item.ro_number", maximum=MAX_RO_CHARS
+        )
+        if returned_ro != expected_ro_number:
+            raise ScrapeXContract(
+                "item_ro_mismatch",
+                "ScrapeX returned an item for a different repair order.",
+            )
+    return item
+
+
+def _returned_batch_items(batch: dict[str, Any], batch_id: str) -> list[dict[str, Any]]:
+    values = batch.get("items")
+    if not isinstance(values, list) or not values:
+        raise ScrapeXContract(
+            "batch_items_missing",
+            "ScrapeX did not return the created batch items.",
+        )
+    return [
+        _returned_item(value, expected_batch_id=batch_id)
+        for value in values
+    ]
+
+
+def _returned_readiness(payload: Any) -> dict[str, Any]:
+    readiness = _contract_mapping(payload, "readiness")
+    if type(readiness.get("ready")) is not bool:
+        raise ScrapeXContract(
+            "readiness_state_missing",
+            "ScrapeX omitted the authoritative readiness state.",
+        )
+    total = readiness.get("total")
+    if total is not None and (
+        isinstance(total, bool) or not isinstance(total, int) or total < 0
+    ):
+        raise ScrapeXContract(
+            "readiness_total_invalid",
+            "ScrapeX returned an invalid readiness total.",
+        )
+    return readiness
+
+
+def _validate_exact_batch_contract(
+    payload: Any,
+    *,
+    requested_ro_numbers: list[str],
+    source_scope: str,
+) -> dict[str, Any]:
+    batch, batch_id = _returned_batch(payload)
+    returned_requested = _contract_string_list(
+        batch.get("requested_ro_numbers"), "requested_ro_numbers"
+    )
+    if returned_requested != requested_ro_numbers:
+        raise ScrapeXContract(
+            "requested_ro_contract_mismatch",
+            "ScrapeX did not echo the exact requested RO contract.",
+        )
+    if batch.get("source_scope") != source_scope:
+        raise ScrapeXContract(
+            "source_scope_mismatch",
+            "ScrapeX returned a different source scope than requested.",
+        )
+    items = _returned_batch_items(batch, batch_id)
+    returned_ros = [
+        _contract_text(item.get("ro_number"), "item.ro_number", maximum=MAX_RO_CHARS)
+        for item in items
+    ]
+    if returned_ros != requested_ro_numbers:
+        raise ScrapeXContract(
+            "created_ro_contract_mismatch",
+            "The created batch items do not exactly match the requested ROs.",
+        )
+    readiness = _returned_readiness(batch.get("readiness"))
+    if readiness.get("total") != len(items):
+        raise ScrapeXContract(
+            "created_batch_total_mismatch",
+            "ScrapeX readiness does not match the exact created batch items.",
+        )
+    return batch
+
+
+def _validate_phase_batch_contract(
+    payload: Any,
+    *,
+    requested_phases: list[str],
+    requested_shop: str | None,
+    source_scope: str,
+) -> dict[str, Any]:
+    batch, batch_id = _returned_batch(payload)
+    returned_phases = _contract_string_list(batch.get("phases"), "phases")
+    if returned_phases != requested_phases:
+        raise ScrapeXContract(
+            "requested_phase_contract_mismatch",
+            "ScrapeX did not echo the exact requested phase contract.",
+        )
+    returned_shop = batch.get("shop")
+    if returned_shop is not None:
+        returned_shop = _contract_text(returned_shop, "shop", maximum=MAX_SHOP_CHARS)
+    if returned_shop != requested_shop:
+        raise ScrapeXContract(
+            "requested_shop_contract_mismatch",
+            "ScrapeX returned a different shop scope than requested.",
+        )
+    if batch.get("source_scope") != source_scope:
+        raise ScrapeXContract(
+            "source_scope_mismatch",
+            "ScrapeX returned a different source scope than requested.",
+        )
+    items = _returned_batch_items(batch, batch_id)
+    readiness = _returned_readiness(batch.get("readiness"))
+    if readiness.get("total") != len(items):
+        raise ScrapeXContract(
+            "created_batch_total_mismatch",
+            "ScrapeX readiness does not match the created phase batch items.",
+        )
+    return batch
+
+
+def _validate_authentication_contract(payload: Any) -> dict[str, Any]:
+    status_payload = _contract_mapping(payload, "authentication status")
+    if type(status_payload.get("active")) is not bool:  # bool, not truthy coercion
+        raise ScrapeXContract(
+            "authentication_state_missing",
+            "ScrapeX omitted the managed-browser active state.",
+        )
+    if type(status_payload.get("authenticated")) is not bool:
+        raise ScrapeXContract(
+            "authentication_state_missing",
+            "ScrapeX omitted the managed-browser authentication state.",
+        )
+    if status_payload["authenticated"] and not status_payload["active"]:
+        raise ScrapeXContract(
+            "authentication_state_conflict",
+            "ScrapeX reported authentication without an active managed browser.",
+        )
+    return status_payload
+
+
+def _validate_completed_provenance(
+    item: dict[str, Any],
+    *,
+    expected_ro_number: str,
+) -> dict[str, Any]:
+    provenance = _provenance(item)
+    if provenance.get("contract_version") != 1:
+        raise ScrapeXContract(
+            "provenance_contract_mismatch",
+            "Completed ADAS Map work did not return canonical contract version 1.",
+        )
+    if provenance.get("state") != "adas_map_complete":
+        raise ScrapeXContract(
+            "provenance_state_mismatch",
+            "Completed ADAS Map work did not return the canonical complete state.",
+        )
+    if item.get("adas_map_requirements_proven") not in (1, True):
+        raise ScrapeXContract(
+            "requirements_not_proven",
+            "Completed ADAS Map work did not prove its requirements.",
+        )
+    inspection_id = _contract_text(
+        provenance.get("inspection_id"), "inspection_id", maximum=160
+    )
+    source_url = _contract_text(
+        provenance.get("source_url"), "source_url", maximum=2048
+    )
+    if provenance.get("ciq_reconciliation_state") != "complete":
+        raise ScrapeXContract(
+            "ciq_reconciliation_incomplete",
+            "Completed ADAS Map work was not reconciled to Calibration IQ.",
+        )
+    reconciliation = _contract_mapping(
+        provenance.get("ciq_reconciliation"), "ciq_reconciliation"
+    )
+    if not (
+        reconciliation.get("verified") is True
+        and reconciliation.get("snapshot_verified") is True
+    ):
+        raise ScrapeXContract(
+            "ciq_reconciliation_unverified",
+            "Calibration IQ reconciliation was not authoritatively verified.",
+        )
+    raw_result = _contract_mapping(provenance.get("raw_result"), "raw_result")
+    if not (
+        raw_result.get("success") is True
+        and raw_result.get("status") == "complete"
+        and raw_result.get("requirements_proven") is True
+        and raw_result.get("row_binding_confirmed") is True
+        and raw_result.get("modal_inspection_confirmed") is True
+        and raw_result.get("required_region_confirmed") is True
+    ):
+        raise ScrapeXContract(
+            "raw_provenance_unverified",
+            "The raw ADAS Map evidence did not prove its selected row and modal.",
+        )
+    modal_runtime_id = _contract_text(
+        raw_result.get("modal_runtime_id"),
+        "raw_result.modal_runtime_id",
+        maximum=160,
+    )
+    explicit_none = raw_result.get("explicit_no_calibration")
+    if type(explicit_none) is not bool:
+        raise ScrapeXContract(
+            "explicit_none_state_missing",
+            "The raw ADAS Map evidence omitted its explicit-none state.",
+        )
+    requirement_records = raw_result.get("requirement_records")
+    if not isinstance(requirement_records, list):
+        raise ScrapeXContract(
+            "requirement_provenance_missing",
+            "The raw ADAS Map evidence omitted structured requirement records.",
+        )
+    if explicit_none:
+        if requirement_records:
+            raise ScrapeXContract(
+                "explicit_none_conflict",
+                "Explicit no-calibration evidence also returned requirements.",
+            )
+    elif not requirement_records:
+        raise ScrapeXContract(
+            "requirement_provenance_missing",
+            "Completed ADAS Map evidence did not include requirement provenance.",
+        )
+    else:
+        for raw_record in requirement_records:
+            record = _contract_mapping(raw_record, "requirement_record")
+            control_classes = str(record.get("source_control_class") or "").split()
+            if not (
+                record.get("source") == "adas_map_required_list_item"
+                and record.get("source_context") == "selected_required_modal"
+                and record.get("source_context_runtime_id") == modal_runtime_id
+                and "custom-link" in control_classes
+            ):
+                raise ScrapeXContract(
+                    "requirement_provenance_mismatch",
+                    "A requirement record was not bound to the selected ADAS Map modal.",
+                )
+    raw_ro = _contract_text(raw_result.get("ro_number"), "raw_result.ro_number", maximum=MAX_RO_CHARS)
+    raw_inspection = _contract_text(
+        raw_result.get("inspection_id"), "raw_result.inspection_id", maximum=160
+    )
+    raw_source = raw_result.get("source_url") or raw_result.get("details_url")
+    raw_source = _contract_text(raw_source, "raw_result.source_url", maximum=2048)
+    if raw_ro != expected_ro_number:
+        raise ScrapeXContract(
+            "raw_ro_mismatch",
+            "The raw ADAS Map evidence belongs to a different repair order.",
+        )
+    if raw_inspection != inspection_id or raw_source != source_url:
+        raise ScrapeXContract(
+            "raw_provenance_mismatch",
+            "The returned canonical item and raw ADAS Map provenance disagree.",
+        )
+    return provenance
+
+
+def _validate_process_one_contract(
+    payload: Any,
+    *,
+    expected_batch_id: str,
+    expected_ro_number: str,
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    result = _contract_mapping(payload, "process-one result")
+    if result.get("attempted") is not True:
+        raise ScrapeXContract(
+            "attempt_not_proven",
+            "ScrapeX did not prove that process-one was attempted.",
+        )
+    if type(result.get("completed")) is not bool:
+        raise ScrapeXContract(
+            "completion_state_missing",
+            "ScrapeX omitted the process-one completion state.",
+        )
+    if result.get("batch_id") != expected_batch_id:
+        raise ScrapeXContract(
+            "batch_mismatch",
+            "ScrapeX returned process-one state for a different batch.",
+        )
+    if result.get("ro_number") != expected_ro_number:
+        raise ScrapeXContract(
+            "ro_mismatch",
+            "ScrapeX returned process-one state for a different repair order.",
+        )
+    item = _returned_item(
+        result.get("item"),
+        expected_batch_id=expected_batch_id,
+        expected_ro_number=expected_ro_number,
+    )
+    _returned_readiness(result.get("readiness"))
+    completed = result["completed"]
+    if completed:
+        if result.get("status") != "completed":
+            raise ScrapeXContract(
+                "completion_status_mismatch",
+                "ScrapeX marked process-one complete without its completed status.",
+            )
+        provenance = _validate_completed_provenance(
+            item,
+            expected_ro_number=expected_ro_number,
+        )
+    else:
+        _contract_text(result.get("status"), "status", maximum=120)
+        provenance = _provenance(item)
+    return result, completed, provenance
+
+
+def _validate_start_contract(
+    payload: Any,
+    *,
+    expected_batch_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], bool, bool]:
+    result = _contract_mapping(payload, "start result")
+    if result.get("stage") != "adas_map":
+        raise ScrapeXContract(
+            "stage_mismatch",
+            "ScrapeX returned a start result for a different stage.",
+        )
+    batch, _ = _returned_batch(
+        result.get("batch"), expected_batch_id=expected_batch_id
+    )
+    _returned_readiness(batch.get("readiness"))
+    started = result.get("started")
+    already_running = result.get("already_running", False)
+    if type(started) is not bool or type(already_running) is not bool:
+        raise ScrapeXContract(
+            "start_state_missing",
+            "ScrapeX omitted its start/already-running state.",
+        )
+    if not (started or already_running) or (started and already_running):
+        raise ScrapeXContract(
+            "start_state_conflict",
+            "ScrapeX did not return one verified start outcome.",
+        )
+    return result, batch, started, already_running
+
+
+def _validate_pause_contract(payload: Any, *, expected_batch_id: str) -> dict[str, Any]:
+    result = _contract_mapping(payload, "pause result")
+    if result.get("paused") is not True or result.get("stage") != "adas_map":
+        raise ScrapeXContract(
+            "pause_state_mismatch",
+            "ScrapeX did not return a verified ADAS Map pause state.",
+        )
+    batch, _ = _returned_batch(
+        result.get("batch"), expected_batch_id=expected_batch_id
+    )
+    _returned_readiness(batch.get("readiness"))
+    return result
+
+
+async def status(settings: Any, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return service/dependency state without launching a browser or work."""
+    try:
+        clean = _clean_args(args)
+        _expect_keys(clean, set())
+        data = await _request(
+            settings,
+            "GET",
+            "/api/health",
+            timeout=STATUS_TIMEOUT,
+            may_mutate=False,
+        )
+    except ScrapeXInput as exc:
+        return _input_failure("status", exc)
+    except ScrapeXConfiguration as exc:
+        return _configuration_failure("status", exc)
+    except ScrapeXRemote as exc:
+        return _remote_failure("status", exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure("status", exc)
+
+    adas_map = data.get("adas_map") if isinstance(data, dict) else None
+    ciq = data.get("ciq") if isinstance(data, dict) else None
+    if isinstance(adas_map, dict) and adas_map.get("ok") is False:
+        result = _success(
+            "status",
+            data,
+            status="dependency_unavailable",
+            success=False,
+        )
+        result["ready"] = False
+        return result
+    authenticated = bool(isinstance(adas_map, dict) and adas_map.get("authenticated"))
+    ciq_ready = bool(isinstance(ciq, dict) and ciq.get("authorized"))
+    ready = bool(isinstance(data, dict) and data.get("ok") and authenticated and ciq_ready)
+    if not authenticated:
+        result = _authentication_required("status", adas_map or {}, executed=True)
+        result["data"] = _sanitize(data)
+        result["verified"] = True  # the read verified that authentication is absent
+        result["ready"] = False
+        return result
+    result = _success(
+        "status",
+        data,
+        status="ready" if ready else "dependency_unavailable",
+        success=ready,
+    )
+    result["ready"] = ready
+    return result
+
+
+async def read(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """Read bounded ScrapeX state selected entirely by structured arguments."""
+    action = "read"
+    try:
+        clean = _clean_args(args)
+        action_value = _text(clean.get("action"), "action", maximum=40)
+        assert action_value is not None
+        action = action_value
+        if action not in READ_ACTIONS:
+            raise ScrapeXInput(f"Unsupported ScrapeX read action: {action}.")
+
+        if action == "list_batches":
+            _expect_keys(clean, {"action"})
+            data = await _request(
+                settings, "GET", "/api/batches", timeout=READ_TIMEOUT, may_mutate=False
+            )
+            return _success(action, data)
+
+        if action == "preview_ciq_queue":
+            _expect_keys(clean, {"action", "phases", "shop", "source_scope"})
+            phases = _string_list(
+                clean.get("phases"),
+                "phases",
+                maximum_items=10,
+                maximum_chars=MAX_PHASE_CHARS,
+            )
+            shop = _text(
+                clean.get("shop"), "shop", maximum=MAX_SHOP_CHARS, required=False
+            )
+            body = {
+                "phases": phases,
+                "shop": shop,
+                "source_scope": _source_scope(clean, "active"),
+            }
+            data = await _request(
+                settings,
+                "POST",
+                "/api/ciq/preview",
+                body=body,
+                timeout=READ_TIMEOUT,
+                may_mutate=False,
+            )
+            return _success(action, data)
+
+        _expect_keys(clean, {"action", "batch_id", "ro_number"})
+        batch_id = _batch_id(clean)
+        encoded_batch = quote(batch_id, safe="")
+        if action == "batch_summary":
+            if "ro_number" in clean:
+                raise ScrapeXInput("ro_number is not used by batch_summary.")
+            path = f"/api/batches/{encoded_batch}/summary"
+            data = await _request(
+                settings, "GET", path, timeout=READ_TIMEOUT, may_mutate=False
+            )
+            return _success(action, data)
+        if action == "batch_exceptions":
+            if "ro_number" in clean:
+                raise ScrapeXInput("ro_number is not used by batch_exceptions.")
+            path = f"/api/batches/{encoded_batch}/exceptions"
+            data = await _request(
+                settings, "GET", path, timeout=READ_TIMEOUT, may_mutate=False
+            )
+            return _success(action, data)
+
+        ro_number = _ro_number(clean.get("ro_number"))
+        data = await _request(
+            settings,
+            "GET",
+            f"/api/batches/{encoded_batch}",
+            timeout=READ_TIMEOUT,
+            may_mutate=False,
+        )
+        batch, _ = _returned_batch(data, expected_batch_id=batch_id)
+        items = batch.get("items")
+        matches = [
+            item
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, dict)
+            and str(item.get("ro_number") or "").strip() == ro_number
+        ]
+        if not matches:
+            return _failure(action, "not_found", f"RO {ro_number} is not in this batch.")
+        if len(matches) != 1:
+            return _failure(action, "conflict", f"RO {ro_number} is not unique in this batch.")
+        item = matches[0]
+        return _success(
+            action,
+            {
+                "batch_id": batch_id,
+                "batch_name": batch.get("name"),
+                "batch_state": batch.get("state"),
+                "readiness": batch.get("readiness"),
+                "item": item,
+                "provenance": _provenance(item),
+            },
+        )
+    except ScrapeXInput as exc:
+        return _input_failure(action, exc)
+    except ScrapeXConfiguration as exc:
+        return _configuration_failure(action, exc)
+    except ScrapeXRemote as exc:
+        return _remote_failure(action, exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure(action, exc)
+    except ScrapeXContract as exc:
+        return _contract_failure(action, exc, may_mutate=False)
+
+
+async def _authentication_status(settings: Any, action: str) -> dict[str, Any] | None:
+    data = await _request(
+        settings,
+        "GET",
+        "/api/adas-map/status",
+        timeout=STATUS_TIMEOUT,
+        may_mutate=False,
+    )
+    try:
+        data = _validate_authentication_contract(data)
+    except ScrapeXContract as exc:
+        return _contract_failure(action, exc, may_mutate=False)
+    if not data["authenticated"]:
+        return _authentication_required(action, data, executed=False)
+    return None
+
+
+async def adas_map(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """Perform one explicitly selected ScrapeX ADAS Map control operation."""
+    action = "adas_map"
+    try:
+        clean = _clean_args(args)
+        action_value = _text(clean.get("action"), "action", maximum=40)
+        assert action_value is not None
+        action = action_value
+        if action not in ADAS_MAP_ACTIONS:
+            raise ScrapeXInput(f"Unsupported ScrapeX ADAS Map action: {action}.")
+
+        if action == "open_authentication":
+            _expect_keys(clean, {"action"})
+            data = await _request(
+                settings,
+                "POST",
+                "/api/adas-map/open",
+                body={},
+                timeout=OPERATOR_TIMEOUT,
+                may_mutate=True,
+            )
+            data = _validate_authentication_contract(data)
+            if not data["authenticated"]:
+                return _authentication_required(action, data, executed=True)
+            return _success(action, data, status="verified", work_complete=True)
+
+        if action == "create_exact_batch":
+            _expect_keys(clean, {"action", "name", "ro_numbers", "source_scope"})
+            name = _text(
+                clean.get("name", "ScrapeX staged acceptance"),
+                "name",
+                maximum=MAX_NAME_CHARS,
+            )
+            ro_numbers = _string_list(
+                clean.get("ro_numbers"),
+                "ro_numbers",
+                maximum_items=10,
+                maximum_chars=MAX_RO_CHARS,
+            )
+            body = {
+                "name": name,
+                "ro_numbers": ro_numbers,
+                "source_scope": _source_scope(clean, "all"),
+            }
+            data = await _request(
+                settings,
+                "POST",
+                "/api/batches/from-ciq/exact",
+                body=body,
+                timeout=OPERATOR_TIMEOUT,
+                may_mutate=True,
+            )
+            data = _validate_exact_batch_contract(
+                data,
+                requested_ro_numbers=ro_numbers,
+                source_scope=body["source_scope"],
+            )
+            readiness = data.get("readiness")
+            complete = bool(isinstance(readiness, dict) and readiness.get("ready"))
+            return _success(
+                action,
+                data,
+                status="completed" if complete else "queued",
+                work_complete=complete,
+            )
+
+        if action == "create_phase_batch":
+            _expect_keys(
+                clean, {"action", "name", "phases", "shop", "source_scope"}
+            )
+            name = _text(
+                clean.get("name", "Calibration IQ weekly queue"),
+                "name",
+                maximum=MAX_NAME_CHARS,
+            )
+            phases = _string_list(
+                clean.get("phases"),
+                "phases",
+                maximum_items=10,
+                maximum_chars=MAX_PHASE_CHARS,
+            )
+            shop = _text(
+                clean.get("shop"), "shop", maximum=MAX_SHOP_CHARS, required=False
+            )
+            body = {
+                "name": name,
+                "phases": phases,
+                "shop": shop,
+                "source_scope": _source_scope(clean, "active"),
+            }
+            data = await _request(
+                settings,
+                "POST",
+                "/api/batches/from-ciq",
+                body=body,
+                timeout=OPERATOR_TIMEOUT,
+                may_mutate=True,
+            )
+            data = _validate_phase_batch_contract(
+                data,
+                requested_phases=phases,
+                requested_shop=shop,
+                source_scope=body["source_scope"],
+            )
+            readiness = data.get("readiness")
+            complete = bool(isinstance(readiness, dict) and readiness.get("ready"))
+            return _success(
+                action,
+                data,
+                status="completed" if complete else "queued",
+                work_complete=complete,
+            )
+
+        if action in {"process_one", "start_batch"}:
+            allowed = {"action", "batch_id"}
+            if action == "process_one":
+                allowed.add("ro_number")
+            _expect_keys(clean, allowed)
+            batch_id = _batch_id(clean)
+            ro_number = (
+                _ro_number(clean.get("ro_number")) if action == "process_one" else None
+            )
+            authentication = await _authentication_status(settings, action)
+            if authentication is not None:
+                return authentication
+        else:
+            _expect_keys(clean, {"action", "batch_id"})
+            batch_id = _batch_id(clean)
+            ro_number = None
+
+        encoded_batch = quote(batch_id, safe="")
+        if action == "process_one":
+            assert ro_number is not None
+            path = (
+                f"/api/batches/{encoded_batch}/adas-map/process-one/"
+                f"{quote(ro_number, safe='')}"
+            )
+            data = await _request(
+                settings,
+                "POST",
+                path,
+                body={},
+                timeout=OPERATOR_TIMEOUT,
+                may_mutate=True,
+            )
+            data, completed, provenance = _validate_process_one_contract(
+                data,
+                expected_batch_id=batch_id,
+                expected_ro_number=ro_number,
+            )
+            operation_status = (
+                "completed"
+                if completed
+                else str(data["status"])
+            )
+            data = {**data, "provenance": provenance}
+            return _success(
+                action,
+                data,
+                status=operation_status,
+                verified=completed,
+                work_complete=completed,
+                success=completed,
+            )
+
+        if action == "start_batch":
+            data = await _request(
+                settings,
+                "POST",
+                f"/api/batches/{encoded_batch}/adas-map/start",
+                body={},
+                timeout=OPERATOR_TIMEOUT,
+                may_mutate=True,
+            )
+            data, batch, started, already_running = _validate_start_contract(
+                data,
+                expected_batch_id=batch_id,
+            )
+            readiness = batch.get("readiness")
+            complete = bool(isinstance(readiness, dict) and readiness.get("ready"))
+            return _success(
+                action,
+                data,
+                status="completed" if complete else "running",
+                # The bounded start request itself was executed and the service
+                # authoritatively confirmed either a new or already-running task.
+                executed=started or already_running,
+                verified=started or already_running,
+                work_complete=complete,
+                success=started or already_running,
+            )
+
+        data = await _request(
+            settings,
+            "POST",
+            f"/api/batches/{encoded_batch}/adas-map/pause",
+            body={},
+            timeout=OPERATOR_TIMEOUT,
+            may_mutate=True,
+        )
+        data = _validate_pause_contract(data, expected_batch_id=batch_id)
+        paused = True
+        return _success(
+            action,
+            data,
+            status="paused" if paused else "indeterminate",
+            executed=paused,
+            verified=paused,
+            work_complete=False,
+            success=paused,
+        )
+    except ScrapeXInput as exc:
+        return _input_failure(action, exc)
+    except ScrapeXConfiguration as exc:
+        return _configuration_failure(action, exc)
+    except ScrapeXRemote as exc:
+        return _remote_failure(action, exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure(action, exc)
+    except ScrapeXContract as exc:
+        return _contract_failure(action, exc, may_mutate=True)

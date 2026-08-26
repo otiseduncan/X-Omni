@@ -412,6 +412,84 @@ def test_approval_request_and_terminal_receipt_are_persisted_as_message_artifact
     store.close()
 
 
+def test_approval_pauses_before_later_same_round_tool_calls(tmp_path: Path) -> None:
+    store = Store(tmp_path / "approval-round-boundary.sqlite")
+    registry = Registry(_policy(tmp_path), store=store)
+    protected_calls = 0
+    later_calls = 0
+
+    def protected(_args: dict) -> dict:
+        nonlocal protected_calls
+        protected_calls += 1
+        return {"ok": True}
+
+    def later_read(_args: dict) -> dict:
+        nonlocal later_calls
+        later_calls += 1
+        return {"ok": True}
+
+    registry.register("write_file", protected)
+    registry.register("read_file", later_read)
+
+    class Router:
+        active_name = "omni"
+
+        @staticmethod
+        def active_config():
+            return SimpleNamespace(supports_vision=True, supports_audio=True)
+
+    class Client:
+        async def stream(self, _messages, tools=None):
+            assert tools
+            yield {
+                "type": "tool_call",
+                "id": "approval-first",
+                "name": "write_file",
+                "arguments": json.dumps({"path": "safe.txt", "content": "pending"}),
+            }
+            yield {
+                "type": "tool_call",
+                "id": "must-not-run",
+                "name": "read_file",
+                "arguments": json.dumps({"path": "safe.txt"}),
+            }
+
+    orchestrator = Orchestrator(
+        Router(),
+        Client(),
+        registry,
+        store,
+        SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
+    )
+    conversation_id = store.create_conversation("approval boundary")
+    message_id = store.add_message(conversation_id, "user", "write, then read")
+
+    async def collect() -> list[dict]:
+        return [
+            event
+            async for event in orchestrator.run_turn(
+                conversation_id,
+                "write, then read",
+                approval_context={
+                    "session_id": "local:owner-a",
+                    "user_id": "owner-a",
+                    "message_id": message_id,
+                    "role": "owner",
+                },
+            )
+        ]
+
+    events = asyncio.run(collect())
+
+    assert protected_calls == 0
+    assert later_calls == 0
+    assert [event["name"] for event in events if event["type"] == "tool_start"] == [
+        "write_file"
+    ]
+    assert sum(event["type"] == "approval" for event in events) == 1
+    store.close()
+
+
 def test_public_approval_summary_and_args_redact_recognized_command_secret(
     tmp_path: Path,
 ) -> None:

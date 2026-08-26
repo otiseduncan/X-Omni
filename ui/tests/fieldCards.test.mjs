@@ -9,6 +9,7 @@ import {
   calibrationSummaryScopeLabel,
   calibrationStatusTone,
 } from "../src/lib/calibrationIqPresentation.js";
+import { scrapexCardPresentation } from "../src/lib/scrapexCardPresentation.js";
 
 test("Calibration IQ status and phase presentation stays truthful", () => {
   assert.equal(calibrationStatusTone("Calibration Complete"), "done");
@@ -108,6 +109,62 @@ test("calibration_iq_work_prep is wired to a dedicated card, not silently droppe
   assert.match(cards, /si_covered_count/);
   assert.match(cards, /repair_orders_truncated/);
   assert.match(cards, /r\.ready !== true/);
+});
+
+test("ScrapeX and durable knowledge results render truthful provenance cards", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/FieldCards.jsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(cards, /scrapex:\s*ScrapeXCard/);
+  assert.match(cards, /automotive_knowledge:\s*AutomotiveKnowledgeCard/);
+  assert.match(cards, /Interactive ADAS Map sign-in is required/);
+  assert.match(cards, /Credentials never pass through chat or the model/);
+  assert.match(cards, /scrapexCardPresentation\(data\)/);
+  assert.match(cards, /readinessRows\.map/);
+  assert.doesNotMatch(cards, /ready_count|Research complete/);
+  assert.match(cards, /Requirements proven/);
+  assert.match(cards, /Source provenance/);
+  assert.match(cards, /verification_deferred/);
+  assert.match(cards, /preserved as unverified/);
+  assert.match(cards, /item\?\.verification_status === "verified"/);
+});
+
+test("ScrapeX card presents authoritative ADAS Map and CIQ readiness fields", () => {
+  const view = scrapexCardPresentation({
+    action: "start_batch",
+    status: "running",
+    executed: true,
+    success: true,
+    work_complete: false,
+    data: {
+      stage: "adas_map",
+      batch: {
+        id: "batch-7",
+        readiness: {
+          total: 4,
+          ready: false,
+          adas_map_complete: 2,
+          ciq_reconciled: 1,
+          adas_map_unresolved: 2,
+          adas_map_attention: 0,
+        },
+      },
+    },
+  });
+
+  assert.equal(view.completionLabel, "ADAS Map + CIQ complete");
+  assert.deepEqual(view.readinessRows, [
+    { key: "batch-size", label: "Batch vehicles", value: "4" },
+    { key: "scope-ready", label: "ADAS Map + CIQ ready", value: "no" },
+    { key: "adas_map_complete", label: "ADAS Map complete", value: "2 of 4" },
+    { key: "ciq_reconciled", label: "CIQ reconciled", value: "1 of 4" },
+    { key: "adas_map_unresolved", label: "ADAS Map unresolved", value: "2" },
+    { key: "adas_map_attention", label: "Operator attention", value: "0" },
+  ]);
+  assert.equal("ready_count" in view.readiness, false);
+  assert.equal(scrapexCardPresentation({ action: "open_authentication" }).completionLabel, "Authentication ready");
 });
 
 test("Calibration IQ card CSS protects 360, 390, and 430 pixel layouts", async () => {

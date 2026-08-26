@@ -843,6 +843,13 @@ async def read_repair_orders(settings, args: dict) -> dict[str, Any]:
     # Count and shown_count are deliberately distinct so a capped list can
     # never be mistaken for the whole answer.
     result["truncated"] = len(items) > len(shown)
+    # This collection shape is intentionally too thin for a one-RO technical
+    # answer.  Expose that contract in the result so a model that safely used
+    # the list as an identity-discovery detour continues with the exact RO read
+    # instead of inferring calibrations from workflow status.
+    result["result_scope"] = "board_list_only"
+    result["exact_ro_detail_included"] = False
+    result["next_capability_for_one_ro_detail"] = "calibration_iq_ro"
     return result
 
 
@@ -875,6 +882,7 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
 
     item: Optional[dict] = None
     raw_detail: Optional[dict] = None
+    resolution_conflict: Optional[str] = None
     tried: list[str] = []
 
     try:
@@ -955,22 +963,37 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
                         f for f in found
                         if str(_dig(f, "ro_number", "roNumber", "number", default="")).strip() == ident
                     ]
-                    match = (exact or found or [None])[0]
-                    resolved_id = (
-                        str(_dig(match, "id", "repair_order_id", "uuid") or "").strip()
-                        if isinstance(match, dict)
-                        else ""
-                    )
-                    if not (
-                        resolved_id
-                        and resolved_id != ident
-                        and await _try_snapshot(resolved_id)
-                    ):
-                        item = match
-                        raw_detail = match if isinstance(match, dict) else None
+                    if len(exact) > 1:
+                        resolution_conflict = (
+                            f"More than one repair order exactly matched '{ident}'."
+                        )
+                    elif len(exact) == 1:
+                        match = exact[0]
+                        resolved_id = str(
+                            _dig(match, "id", "repair_order_id", "uuid") or ""
+                        ).strip()
+                        if not resolved_id:
+                            resolution_conflict = (
+                                f"Repair order '{ident}' matched a collection row, but "
+                                "Calibration IQ did not provide its authoritative id."
+                            )
+                        elif resolved_id == ident or not await _try_snapshot(resolved_id):
+                            resolution_conflict = (
+                                f"Repair order '{ident}' matched exactly, but its "
+                                "authoritative detail snapshot could not be verified."
+                            )
     except httpx.HTTPError as exc:
         return {"status": "offline", "repair_order": None, "error": type(exc).__name__,
                 "message": f"Calibration IQ is not reachable at {base}."}
+
+    if resolution_conflict:
+        return {
+            "status": "conflict",
+            "repair_order": None,
+            "query": ident,
+            "tried": tried,
+            "message": resolution_conflict,
+        }
 
     if not item:
         return {"status": "no_result", "repair_order": None, "query": ident,
@@ -2043,7 +2066,16 @@ async def _expand_research_action(
     ).strip()
     queries = _research_queries(vehicle, specs, arguments, ro_number=ro_number)
     search_results = await asyncio.gather(*[
-        asyncio.to_thread(adas.search, {"query": item["query"]})
+        asyncio.to_thread(
+            adas.search,
+            {
+                "query": item["query"],
+                # research_ro is already an explicit structured business
+                # operation. Preserve its exhaustive OEM calibration scan
+                # without inferring depth from words inside the query.
+                "search_mode": "calibration_requirements",
+            },
+        )
         for item in queries
     ])
 

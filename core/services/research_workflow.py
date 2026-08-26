@@ -32,33 +32,13 @@ log = logging.getLogger("xomni.research_workflow")
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
 
-# Carries the live model client (already attached to the app's one running
-# ModelRouter/worker) from the orchestrator turn that triggered this research
-# request down to full_research(), without ever putting a live object into a
-# tool-args dict -- those flow through Registry.invoke's audit/log_args path,
-# which is not a safe place for anything but plain, loggable data. Only the
-# Orchestrator._run wrapper installed below sets this; a model explicitly
-# invoking collision_research(action="full_research") on its own leaves it
-# unset, and full_research() falls back to the deterministic search in that
-# case rather than trying to construct a second, unmanaged ModelRouter.
+# Optional execution context for callers that already own a live model client.
+# Ordinary conversation reaches this workflow only through a structured
+# collision_research tool call and never patches the orchestrator turn loop.
 _ACTIVE_RESEARCH_CLIENT: "contextvars.ContextVar[Optional[Any]]" = contextvars.ContextVar(
     "_xomni_active_research_client", default=None
 )
 
-_INTENT_RE = re.compile(r"\b(?:research|find|verify|check|look\s*up|investigate)\b", re.I)
-_DOMAIN_RE = re.compile(
-    r"\b(?:all\s*data|alldata|oem|manufacturer|collision|position\s+statement|"
-    r"recycled|used\s+(?:module|sensor|part)|insurance|blind\s+spot|adas\s+si|"
-    r"service\s+information|repair\s+procedure|technical\s+bulletin)\b",
-    re.I,
-)
-_RO_ONLY_RE = re.compile(r"^\s*(?:please\s+)?research\s+(?:this|that|the)\s+(?:repair\s+order|ro)\b", re.I)
-_PRESERVE_RE = re.compile(
-    r"\b(?:preserve|save|capture|store|archive|add|import|keep)\b.{0,100}"
-    r"\b(?:adas|database|library|documentation|evidence|source|pdf)\b"
-    r"|\bmissing\b.{0,80}\badas\s+si\b",
-    re.I | re.S,
-)
 _STOPWORDS = {
     "about", "after", "alldata", "and", "any", "check", "collision", "documentation",
     "evidence", "find", "first", "for", "from", "into", "look", "manufacturer",
@@ -66,15 +46,6 @@ _STOPWORDS = {
     "source", "sources", "supporting", "that", "the", "then", "this", "use", "what",
     "whether", "with",
 }
-
-
-def full_research_request(message: object) -> bool:
-    text = str(message or "").strip()
-    return bool(text and not _RO_ONLY_RE.search(text) and _INTENT_RE.search(text) and _DOMAIN_RE.search(text))
-
-
-def preserve_requested(message: object) -> bool:
-    return bool(_PRESERVE_RE.search(str(message or "")))
 
 
 def focused_query(message: object) -> str:
@@ -226,7 +197,23 @@ def _source_score(source: dict[str, Any], make: Optional[str]) -> int:
     return score
 
 
-async def search_public_oem(query: str, make: Optional[str]) -> dict[str, Any]:
+async def search_public_oem(
+    query: str,
+    make: Optional[str],
+    *,
+    source_depth: str = "standard",
+) -> dict[str, Any]:
+    if source_depth != "standard":
+        # source_depth is already a structured caller decision. Delegating to
+        # the bounded deep reader restores complete PDF/one-hop OEM evidence
+        # without classifying conversational language.
+        from . import research_policy_depth
+
+        return await research_policy_depth.deep_search_public_oem(
+            query,
+            make,
+            source_depth=source_depth,
+        )
     search = await ro.public_search({"query": query, "manufacturer": make or ""})
     sources = [s for s in (search.get("sources") or []) if isinstance(s, dict)]
     sources.sort(key=lambda s: _source_score(s, make), reverse=True)
@@ -256,13 +243,9 @@ async def search_public_oem(query: str, make: Optional[str]) -> dict[str, Any]:
 async def _search_alldata_best_available(browser: Any, query: str) -> dict[str, Any]:
     """Prefer model-driven ALLDATA navigation; fall back to the fixed sequence.
 
-    A live client is only present when this research request was triggered
-    from an active conversation turn (see the Orchestrator._run wrapper
-    installed below) -- that's the only context where reusing the app's one
-    running model worker is safe. Anything else (a model calling
-    collision_research(action="full_research") on its own, or the agent
-    failing before it can even authenticate) uses the deterministic
-    vehicle-first search, unchanged.
+    A live client may be supplied by an execution caller that already owns the
+    app's running model worker. Ordinary structured tool calls leave it unset
+    and use the bounded vehicle-first execution path.
     """
     client = _ACTIVE_RESEARCH_CLIENT.get()
     if client is not None:
@@ -289,9 +272,17 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
     if not query:
         raise ValueError("query is required")
     make = str(args.get("manufacturer") or "").strip() or requested_make(query, adas_mod)
-    preserve = bool(args.get("preserve") is True or preserve_requested(raw))
+    # Persistence is an explicit structured decision made by the model. Never
+    # infer it from words embedded in the research query.
+    preserve = args.get("preserve") is True
+    source_depth = str(args.get("source_depth") or "standard").strip().casefold()
+    if source_depth not in {"standard", "calibration_requirements", "repair_policy"}:
+        raise ValueError("source_depth must be standard, calibration_requirements, or repair_policy")
 
-    local = adas.search({"query": query})
+    local_args = {"query": query}
+    if source_depth == "calibration_requirements":
+        local_args["search_mode"] = "calibration_requirements"
+    local = adas.search(local_args)
     compact_local = _compact_adas(local, make or None)
     local_ledger = {
         "source": "ADAS SI", "attempted": True, "searched": True,
@@ -318,7 +309,11 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
     }
 
     try:
-        public = await search_public_oem(query, make or None)
+        public = await search_public_oem(
+            query,
+            make or None,
+            source_depth=source_depth,
+        )
     except Exception as exc:  # noqa: BLE001
         public = {"searched": False, "verified": False, "sources": [], "read_results": [], "result_count": 0, "error": f"{type(exc).__name__}: {exc}"}
     public_ledger = {
@@ -457,93 +452,16 @@ def _persist_research_task(conversation_id: Any, result: dict[str, Any], history
 
 
 def install() -> None:
+    """Retain import compatibility without exposing the fixed source sequence.
+
+    The base collision_research actions remain model-selectable. The legacy
+    full_research helper stays directly testable, but production registration
+    must not collapse source selection and escalation into one deterministic
+    composite action.
+    """
+
     global _INSTALLED
     with _INSTALL_LOCK:
         if _INSTALLED:
             return
-        from ..tools import registry as registry_mod
-
-        schema = registry_mod.TOOL_SCHEMAS.get("collision_research", {})
-        props = schema.get("parameters", {}).get("properties", {})
-        enum = props.get("action", {}).get("enum")
-        if isinstance(enum, list) and "full_research" not in enum:
-            enum.append("full_research")
-        props.setdefault("preserve", {"type": "boolean", "description": "Preserve relevant newly found evidence into ADAS SI."})
-
-        previous_init = registry_mod.Registry.__init__
-        if not getattr(previous_init, "_xomni_full_research", False):
-            def registry_init(self, *args, **kwargs):
-                previous_init(self, *args, **kwargs)
-                prior = self._handlers.get("collision_research")  # noqa: SLF001
-
-                async def handler(tool_args: dict[str, Any]):
-                    if str(tool_args.get("action") or "").casefold() != "full_research":
-                        if prior is None:
-                            raise ValueError("Collision research operator is unavailable.")
-                        value = prior(tool_args)
-                        return await value if hasattr(value, "__await__") else value
-                    from ..config import Settings
-                    from . import adas_si as adas_si_mod
-                    settings = Settings.load()
-                    adas = adas_si_mod.AdasSI(settings.adas_si_root, settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite")
-                    return await full_research(tool_args, adas=adas, browser=ro.get_browser(settings.root, adas=adas))
-
-                self.register("collision_research", handler)
-
-            registry_init._xomni_full_research = True  # type: ignore[attr-defined]
-            registry_mod.Registry.__init__ = registry_init
-
-        try:
-            from ..orchestrator import loop as loop_mod
-            previous_run = loop_mod.Orchestrator._run
-            if not getattr(previous_run, "_xomni_full_research", False):
-                async def run(self, conversation_id, user_message, approved_tool, approval_context):
-                    if approved_tool or not full_research_request(user_message) or self.registry.tier("collision_research") != "operator_authorized":
-                        async for event in previous_run(self, conversation_id, user_message, approved_tool, approval_context):
-                            yield event
-                        return
-
-                    history = self.store.get_messages(conversation_id)
-                    user_message_id = next((m.get("id") for m in reversed(history) if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("id"), int)), None)
-                    call_id = f"routed_collision_research_full_{conversation_id}_{len(history)}"
-                    context = approval_context if isinstance(approval_context, dict) else {}
-                    args = {"action": "full_research", "query": str(user_message or "")[:2000], "preserve": preserve_requested(user_message)}
-                    yield {"type": "tool_start", "name": "collision_research", "args": args}
-                    # Hand the live model client to full_research() for the duration of
-                    # this one invocation only, via the contextvar -- never through
-                    # `args`, which Registry.invoke logs/audits as plain data. This is
-                    # the only call site where reusing self.client is safe: it's the
-                    # app's one already-running ModelRouter/worker, owned by this
-                    # orchestrator instance, not a second one constructed on the side.
-                    client_token = _ACTIVE_RESEARCH_CLIENT.set(self.client)
-                    try:
-                        result = await self.registry.invoke(
-                            "collision_research", args, message_id=user_message_id,
-                            conversation_id=conversation_id, tool_call_id=call_id,
-                            user_id=context.get("user_id"), role=context.get("role"),
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        result = {
-                            "status": "failed", "action": "full_research", "query": focused_query(user_message),
-                            "workflow_complete": False, "external_search_verified": False,
-                            "source_ledger": [], "error": f"{type(exc).__name__}: {exc}",
-                        }
-                    finally:
-                        _ACTIVE_RESEARCH_CLIENT.reset(client_token)
-                    _persist_research_task(conversation_id, result, len(history))
-                    artifact = {"type": "research_provider", "data": result}
-                    yield {"type": "tool_result", "name": "collision_research", "result": result}
-                    yield {"type": "artifact", "artifact": artifact}
-                    summary = await synthesize(self, user_message, result)
-                    output_id = self.store.add_message(
-                        conversation_id, "assistant", summary, worker_used=self.router.active_name, artifacts=[artifact]
-                    )
-                    yield {"type": "token", "text": summary}
-                    yield {"type": "done", "message_id": output_id, "worker": self.router.active_name, "artifacts": [artifact]}
-
-                run._xomni_full_research = True  # type: ignore[attr-defined]
-                loop_mod.Orchestrator._run = run
-        except Exception:  # noqa: BLE001
-            pass
-
         _INSTALLED = True

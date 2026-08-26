@@ -67,4 +67,5 @@ test("research card exposes public OEM evidence and permanent ADAS capture resul
   assert.match(cards, /Research source saved/);
   assert.match(cards, /readable_pages/);
   assert.match(cards, /relative_path/);
+  assert.match(cards, /"alldata_vehicle_research"/);
 });
