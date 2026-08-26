@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  speechResultSlotsText,
   speechRecognitionResultsText,
+  updateSpeechResultSlots,
 } from "../src/lib/speechTranscript.js";
 
 
@@ -32,6 +34,20 @@ test("cumulative Android events rebuild one current hypothesis", () => {
 });
 
 
+test("the photographed Android cumulative slot ladder collapses once", () => {
+  const text = speechRecognitionResultsText([
+    result("how many", true),
+    result("how many", true),
+    result("how many cars", true),
+    result("how many cars and", true),
+    result("How many cars and Phase 5", true),
+    result("how many cars and Phase 5 6 7 and 8 need", true),
+  ]);
+
+  assert.equal(text, "how many cars and Phase 5 6 7 and 8 need");
+});
+
+
 test("a changing result slot is rebuilt instead of appended across events", () => {
   const first = speechRecognitionResultsText([result("do you", true)]);
   const second = speechRecognitionResultsText([
@@ -41,6 +57,28 @@ test("a changing result slot is rebuilt instead of appended across events", () =
   assert.equal(first, "do you");
   assert.equal(second, "do you show the front windshield camera calibration");
   assert.equal(second.includes("do you do you"), false);
+});
+
+
+test("resultIndex replaces changed slots and truncates a vanished interim tail", () => {
+  let slots = updateSpeechResultSlots([], {
+    resultIndex: 0,
+    results: [result("show me", true), result("the windshield", false)],
+  });
+  assert.deepEqual(slots, ["show me", "the windshield"]);
+
+  slots = updateSpeechResultSlots(slots, {
+    resultIndex: 1,
+    results: [result("show me", true), result("the windshield camera", true)],
+  });
+  assert.deepEqual(slots, ["show me", "the windshield camera"]);
+  assert.equal(speechResultSlotsText(slots), "show me the windshield camera");
+
+  slots = updateSpeechResultSlots(slots, {
+    resultIndex: 1,
+    results: [result("show me", true)],
+  });
+  assert.deepEqual(slots, ["show me"]);
 });
 
 
@@ -79,5 +117,13 @@ test("sequential Web Speech result slots preserve intentional repetition", () =>
   assert.equal(
     speechRecognitionResultsText([result("very"), result("very")]),
     "very very"
+  );
+  assert.equal(
+    speechRecognitionResultsText([
+      result("I", true),
+      result("I really", true),
+      result("meant something else", true),
+    ]),
+    "I I really meant something else"
   );
 });

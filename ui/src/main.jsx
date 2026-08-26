@@ -13,9 +13,19 @@ createRoot(document.getElementById("root")).render(
 // static assets. API, auth, WebSocket, and third-party radar traffic always
 // remain network-only so an offline shell cannot fabricate live state.
 if ("serviceWorker" in navigator) {
+  let reloadingForServiceWorker = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (reloadingForServiceWorker) return;
+    reloadingForServiceWorker = true;
+    window.location.reload();
+  });
+
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch(() => {
-      // Installation is an enhancement; Core connectivity is surfaced in-app.
-    });
+    navigator.serviceWorker
+      .register("/sw.js", { updateViaCache: "none" })
+      .then((registration) => registration.update())
+      .catch(() => {
+        // Installation is an enhancement; Core connectivity is surfaced in-app.
+      });
   });
 }

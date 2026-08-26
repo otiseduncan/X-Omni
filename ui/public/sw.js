@@ -1,4 +1,4 @@
-const CACHE_NAME = "x-omni-shell-2026-08-16-11";
+const CACHE_NAME = "x-omni-shell-2026-08-26-12";
 const SHELL_URLS = [
   "/manifest.webmanifest",
   "/icons/icon.svg",

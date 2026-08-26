@@ -5,9 +5,9 @@ import test from "node:test";
 const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
 const voice = await readFile(new URL("../src/hooks/useVoice.js", import.meta.url), "utf8");
 
-test("browser dictation uses one guarded continuous recognition session", () => {
+test("browser dictation uses one guarded single-utterance recognition session", () => {
   assert.match(voice, /const BROWSER_END_SILENCE_MS = 1800;/);
-  assert.match(voice, /recognition\.continuous = true;/);
+  assert.match(voice, /recognition\.continuous = false;/);
   assert.match(voice, /recognitionRef\.current !== recognition/);
   assert.match(voice, /recognition\.onend = \(\) => \{/);
   assert.doesNotMatch(voice, /BROWSER_RESTART_DELAY_MS/);
@@ -16,8 +16,8 @@ test("browser dictation uses one guarded continuous recognition session", () => 
 });
 
 test("browser dictation rebuilds Android hypotheses instead of appending each result event", () => {
-  assert.match(voice, /speechRecognitionResultsText\(event\.results\)/);
-  assert.match(voice, /session\.latestText = speechRecognitionResultsText/);
+  assert.match(voice, /updateSpeechResultSlots\(session\.resultSlots, event\)/);
+  assert.match(voice, /speechResultSlotsText\(session\.resultSlots\)/);
   assert.match(voice, /browserSessionRef\.current !== session/);
   assert.match(voice, /recognitionRef\.current !== recognition/);
   assert.match(voice, /browserSessionRef\.current \|\| recognitionRef\.current/);

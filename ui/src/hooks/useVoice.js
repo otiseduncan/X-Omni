@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toSpeechText } from "../lib/speechText.js";
-import { speechRecognitionResultsText } from "../lib/speechTranscript.js";
+import {
+  speechResultSlotsText,
+  updateSpeechResultSlots,
+} from "../lib/speechTranscript.js";
 
 /**
  * Voice I/O with two selectable speech-to-text engines.
@@ -145,6 +148,7 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       active: true,
       finishing: false,
       latestText: "",
+      resultSlots: [],
       idleTimer: null,
       finalize: null,
     };
@@ -165,6 +169,7 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       setRecording(false);
       const text = session.latestText.trim();
       session.latestText = "";
+      session.resultSlots = [];
       cb.current.onInterim?.("");
       if (text) cb.current.onTranscript?.(text);
     };
@@ -195,10 +200,10 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       const recognition = new SpeechRecognitionImpl();
       recognitionRef.current = recognition;
       recognition.lang = "en-US";
-      // Keep one guarded recognition instance. Android Chrome can end a
-      // continuous stream itself; restarting from onend can replay cumulative
-      // hypotheses and system tones, so onend finalizes exactly once instead.
-      recognition.continuous = true;
+      // One mic press is one utterance. Android Chrome does not implement
+      // continuous Web Speech reliably and can emit cumulative final slots;
+      // never enable it or restart automatically from onend.
+      recognition.continuous = false;
       recognition.interimResults = true;
       recognition.maxAlternatives = 3;
 
@@ -209,7 +214,8 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
         ) {
           return;
         }
-        session.latestText = speechRecognitionResultsText(event.results);
+        session.resultSlots = updateSpeechResultSlots(session.resultSlots, event);
+        session.latestText = speechResultSlotsText(session.resultSlots);
         cb.current.onInterim?.(session.latestText);
         requestFinishAfterSilence();
       };
