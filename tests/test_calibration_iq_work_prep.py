@@ -51,6 +51,39 @@ def test_adas_map_nested_payload_extracts_governing_requirements_and_source():
     assert result["sources"][0]["url"] == "https://example.invalid/adas-map/ro-1"
 
 
+@pytest.mark.asyncio
+async def test_discover_adas_map_drops_non_calibration_canonical_labels():
+    """ADAS Map's required-procedures list includes SRS/inspection items (seat
+    belt pretensioner checks, etc.) alongside real ADAS calibrations. Those
+    items have no CIQ calibration_type to reconcile against, so treating them
+    as required calibrations means the weekly-readiness queue reports the RO
+    as permanently missing coverage no matter how many times reconciliation
+    runs. The canonical (ScrapeX-sourced) requirements list must be filtered
+    the same way extract_adas_map already filters its own snapshot path."""
+
+    class FakeCatalog:
+        @staticmethod
+        def discover(**_kwargs):
+            return {
+                "status": "verified",
+                "record": {
+                    "requirements": [
+                        {"label": "Occupant Classification System"},
+                        {"label": "Passenger Seat Weight Sensor"},
+                        {"label": "Seat Belt"},
+                    ],
+                    "explicit_no_calibration": False,
+                },
+            }
+
+    result = await prep._discover_adas_map(FakeCatalog(), {})  # noqa: SLF001
+
+    assert result["status"] == "verified"
+    labels = {item["label"] for item in result["requirements"]}
+    assert labels == {"Occupant Classification System", "Passenger Seat Weight Sensor"}
+    assert "Seat Belt" not in labels
+
+
 def test_requirement_identity_collapses_common_oem_label_variants():
     assert prep._calibration_key("Blind Spot Monitor Calibration") == prep._calibration_key("BSM calibration")
     assert prep._calibration_key("Steering Angle Sensor Reset") == prep._calibration_key("steering angle calibration")
@@ -371,6 +404,20 @@ def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
     assert set(schema["parameters"]["properties"]["statuses"]["items"]["enum"]) == set(
         weekly_queue.LIFECYCLE_STATUSES
     )
+
+
+def test_work_prep_schema_owns_ciq_field_work_not_calendar_events():
+    schema = registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]
+    description = schema["description"].casefold()
+    mode_description = schema["parameters"]["properties"]["mode"][
+        "description"
+    ].casefold()
+
+    assert "authoritative calibration iq source" in description
+    assert "upcoming shop field work" in description
+    assert "weekly ro readiness" in description
+    assert "does not read google calendar appointments or events" in description
+    assert "authoritative ciq ro workload/readiness operation" in mode_description
 
 
 @pytest.mark.asyncio

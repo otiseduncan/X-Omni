@@ -62,8 +62,9 @@ SOURCE_SCOPES = frozenset({"active", "all", "terminal"})
 
 SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
     "description": (
-        "Check the local ScrapeX ADAS Map worker, Calibration IQ dependency, "
-        "and managed-browser authentication state. This reads status only."
+        "Safe, non-mutating provider preflight. Check the local ScrapeX ADAS Map "
+        "worker, Calibration IQ dependency, and managed-browser authentication "
+        "state. It may run before acquisition or provider setup and opens nothing."
     ),
     "parameters": {
         "type": "object",
@@ -74,154 +75,233 @@ SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_READ_SCHEMA: dict[str, Any] = {
     "description": (
-        "Read ScrapeX ADAS Map batches, exact per-RO evidence, exceptions, or "
-        "a non-mutating Calibration IQ queue preview. Choose an explicit action. "
-        "Any action requiring batch_id must copy that opaque id verbatim from an "
-        "observed prior list/create result. If no exact id has been observed, call "
-        "list_batches first only for a non-mutating existing-evidence read; placeholder, "
-        "example, derived, or guessed ids are forbidden. Never use list_batches to prepare "
-        "a request to acquire/process current evidence; use create_exact_batch instead."
+        "Read ScrapeX batches, exact-RO ADAS Map evidence, exceptions, or a "
+        "non-mutating CIQ queue preview. For a create result, batch_id is exactly "
+        "result.data.id, never evidence_id. Existing-evidence reads begin with "
+        "list_batches when no id is known; new acquisition uses "
+        "scrapex_adas_map.create_exact_batch instead."
     ),
     "parameters": {
         "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": sorted(READ_ACTIONS),
-                "description": (
-                    "For a non-mutating existing-evidence read, use list_batches first "
-                    "whenever no exact batch id has been observed. Never use this read action "
-                    "as preparation for new acquisition or processing."
-                ),
-            },
-            "batch_id": {
-                "type": "string",
-                "maxLength": MAX_BATCH_ID_CHARS,
-                "description": (
-                    "Copy the opaque exact id verbatim from a prior ScrapeX list/create "
-                    "result. Never use a placeholder, example, derived, or guessed value; "
-                    "for existing-evidence reads, call list_batches first when none has "
-                    "been observed."
-                ),
-            },
-            "ro_number": {"type": "string", "maxLength": MAX_RO_CHARS},
-            "phases": {
-                "type": "array",
-                "items": {"type": "string", "maxLength": MAX_PHASE_CHARS},
-                "minItems": 1,
-                "maxItems": 10,
-            },
-            "shop": {"type": "string", "maxLength": MAX_SHOP_CHARS},
-            "source_scope": {"type": "string", "enum": sorted(SOURCE_SCOPES)},
-        },
-        "required": ["action"],
-        "allOf": [
+        "oneOf": [
             {
-                "if": {
-                    "properties": {"action": {"const": "batch_item"}},
-                    "required": ["action"],
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "list_batches",
+                        "description": (
+                            "Discover stored ScrapeX batches containing existing ADAS "
+                            "Map evidence when no exact batch id is known."
+                        ),
+                    }
                 },
-                "then": {"required": ["batch_id", "ro_number"]},
+                "required": ["action"],
             },
             {
-                "if": {
-                    "properties": {
-                        "action": {"enum": ["batch_summary", "batch_exceptions"]}
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {"type": "string", "const": "batch_summary"},
+                    "batch_id": {
+                        "type": "string",
+                        "maxLength": MAX_BATCH_ID_CHARS,
+                        "description": (
+                            "Exact opaque id copied verbatim from a returned batch "
+                            "object. For create results copy result.data.id; never use "
+                            "evidence_id, a placeholder, or a derived or guessed value."
+                        ),
                     },
-                    "required": ["action"],
                 },
-                "then": {"required": ["batch_id"]},
+                "required": ["action", "batch_id"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {"type": "string", "const": "batch_exceptions"},
+                    "batch_id": {
+                        "type": "string",
+                        "maxLength": MAX_BATCH_ID_CHARS,
+                        "description": (
+                            "Exact opaque id copied verbatim from a returned batch "
+                            "object. For create results copy result.data.id; never use "
+                            "evidence_id, a placeholder, or a derived or guessed value."
+                        ),
+                    },
+                },
+                "required": ["action", "batch_id"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {"type": "string", "const": "batch_item"},
+                    "batch_id": {
+                        "type": "string",
+                        "maxLength": MAX_BATCH_ID_CHARS,
+                        "description": (
+                            "Exact opaque id copied verbatim from a returned batch "
+                            "object. For create results copy result.data.id; never use "
+                            "evidence_id, a placeholder, or a derived or guessed value."
+                        ),
+                    },
+                    "ro_number": {"type": "string", "maxLength": MAX_RO_CHARS},
+                },
+                "required": ["action", "batch_id", "ro_number"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "preview_ciq_queue",
+                        "description": (
+                            "Non-mutating view of Calibration IQ candidate work selected "
+                            "by phases, shop, and source scope. This is not stored ADAS Map "
+                            "evidence and does not provide an existing ScrapeX batch or "
+                            "batch item; list_batches discovers existing evidence."
+                        ),
+                    },
+                    "phases": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": MAX_PHASE_CHARS},
+                        "minItems": 1,
+                        "maxItems": 10,
+                    },
+                    "shop": {"type": "string", "maxLength": MAX_SHOP_CHARS},
+                    "source_scope": {
+                        "type": "string",
+                        "enum": sorted(SOURCE_SCOPES),
+                    },
+                },
+                "required": ["action", "phases"],
             },
         ],
-        "additionalProperties": False,
     },
 }
 
 SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
     "description": (
-        "Direct ScrapeX's bounded ADAS Map work with structured identifiers. "
-        "Create an exact-RO or phase batch, process one RO, start or pause a "
-        "batch, or open the managed browser for human authentication. process_one "
-        "never creates or discovers a batch: it requires batch_id copied verbatim "
-        "from an observed prior create/list result. If none has been observed, call "
-        "create_exact_batch first, then process_one with its returned id. Check or "
-        "process the requested work first; open_authentication is a parameterless "
-        "human handoff used only after ScrapeX reports authentication_required and "
-        "the user asks to open that handoff. Starting a batch means accepted/running, "
-        "not completed."
+        "Run bounded ScrapeX ADAS Map actions. process_one requires an observed exact "
+        "batch_id. After create_exact_batch or create_phase_batch, copy "
+        "result.data.id exactly; never copy evidence_id. open_authentication is a "
+        "parameterless browser-opening human/provider handoff used after status reports "
+        "authentication_required or when the user explicitly requests provider setup. "
+        "Queued or started is not completed."
     ),
     "parameters": {
         "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": sorted(ADAS_MAP_ACTIONS),
-                "description": (
-                    "Never call process_one without an observed exact batch_id. Create "
-                    "the exact batch first when no id is available."
-                ),
-            },
-            "name": {"type": "string", "maxLength": MAX_NAME_CHARS},
-            "batch_id": {
-                "type": "string",
-                "maxLength": MAX_BATCH_ID_CHARS,
-                "description": (
-                    "Opaque exact id copied verbatim from an observed ScrapeX create/list "
-                    "result; never omit, invent, derive, or guess it. "
-                    "Valid only for process_one, start_batch, or pause_batch, never for "
-                    "open_authentication or batch creation."
-                ),
-            },
-            "ro_number": {"type": "string", "maxLength": MAX_RO_CHARS},
-            "ro_numbers": {
-                "type": "array",
-                "items": {"type": "string", "maxLength": MAX_RO_CHARS},
-                "minItems": 1,
-                "maxItems": 10,
-            },
-            "phases": {
-                "type": "array",
-                "items": {"type": "string", "maxLength": MAX_PHASE_CHARS},
-                "minItems": 1,
-                "maxItems": 10,
-            },
-            "shop": {"type": "string", "maxLength": MAX_SHOP_CHARS},
-            "source_scope": {"type": "string", "enum": sorted(SOURCE_SCOPES)},
-        },
-        "required": ["action"],
-        "allOf": [
+        "oneOf": [
             {
-                "if": {
-                    "properties": {"action": {"const": "create_exact_batch"}},
-                    "required": ["action"],
-                },
-                "then": {"required": ["ro_numbers"]},
-            },
-            {
-                "if": {
-                    "properties": {"action": {"const": "create_phase_batch"}},
-                    "required": ["action"],
-                },
-                "then": {"required": ["phases"]},
-            },
-            {
-                "if": {
-                    "properties": {"action": {"const": "process_one"}},
-                    "required": ["action"],
-                },
-                "then": {"required": ["batch_id", "ro_number"]},
-            },
-            {
-                "if": {
-                    "properties": {
-                        "action": {"enum": ["start_batch", "pause_batch"]}
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "open_authentication",
+                        "description": "Open the managed provider sign-in handoff.",
                     },
-                    "required": ["action"],
                 },
-                "then": {"required": ["batch_id"]},
+                "required": ["action"],
             },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "create_exact_batch",
+                        "description": "Create one bounded batch for exact RO numbers.",
+                    },
+                    "name": {"type": "string", "maxLength": MAX_NAME_CHARS},
+                    "ro_numbers": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": MAX_RO_CHARS},
+                        "minItems": 1,
+                        "maxItems": 10,
+                    },
+                    "source_scope": {
+                        "type": "string",
+                        "enum": sorted(SOURCE_SCOPES),
+                    },
+                },
+                "required": ["action", "ro_numbers"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "create_phase_batch",
+                        "description": "Create one bounded batch for exact CIQ phases.",
+                    },
+                    "name": {"type": "string", "maxLength": MAX_NAME_CHARS},
+                    "phases": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": MAX_PHASE_CHARS},
+                        "minItems": 1,
+                        "maxItems": 10,
+                    },
+                    "shop": {"type": "string", "maxLength": MAX_SHOP_CHARS},
+                    "source_scope": {
+                        "type": "string",
+                        "enum": sorted(SOURCE_SCOPES),
+                    },
+                },
+                "required": ["action", "phases"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "process_one",
+                        "description": "Process one RO in an observed exact batch.",
+                    },
+                    "batch_id": {
+                        "type": "string",
+                        "maxLength": MAX_BATCH_ID_CHARS,
+                        "description": (
+                            "Exact id copied verbatim from a verified same-turn "
+                            "ScrapeX result; never guess or use evidence_id."
+                        ),
+                    },
+                    "ro_number": {"type": "string", "maxLength": MAX_RO_CHARS},
+                },
+                "required": ["action", "batch_id", "ro_number"],
+            },
+            *[
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "const": action,
+                            "description": f"{label} an observed exact batch.",
+                        },
+                        "batch_id": {
+                            "type": "string",
+                            "maxLength": MAX_BATCH_ID_CHARS,
+                            "description": (
+                                "Exact id copied verbatim from a verified same-turn "
+                                "ScrapeX result; never guess or use evidence_id."
+                            ),
+                        },
+                    },
+                    "required": ["action", "batch_id"],
+                }
+                for action, label in (
+                    ("start_batch", "Start"),
+                    ("pause_batch", "Pause"),
+                )
+            ],
         ],
-        "additionalProperties": False,
     },
 }
 

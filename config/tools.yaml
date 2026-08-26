@@ -12,6 +12,54 @@
 #
 # A tool with no entry here is BLOCKED (fail closed).
 
+# The active profile controls only which configured capabilities are advertised
+# to the conversational model.  It never changes a tool's policy tier or makes
+# a hidden capability executable.  `full` remains available for explicit
+# maintenance sessions without burdening the normal ADAS field catalog.
+default_profile: adas_operator
+
+profiles:
+  adas_operator:
+    # Runtime staging hides both CIQ write schemas until a verified exact-RO
+    # result is returned earlier in the same turn. create_ro and create_location
+    # share the batch operator but cannot be authorized by an unrelated existing
+    # RO, so their action branches stay available only in the explicit `full`
+    # maintenance profile. No implementation or full-profile capability is deleted.
+    description: "Daily ADAS technician, research, and staged Calibration IQ operator surface."
+    tools:
+      - get_calendar
+      - create_calendar_event
+      - list_tasks
+      - add_task
+      - update_task_status
+      - read_file
+      - list_directory
+      - search_files
+      - assistant_capabilities_read
+      - system_status
+      - adas_si_search
+      - adas_si_inventory
+      - adas_si_open
+      - automotive_knowledge_search
+      - automotive_knowledge_read
+      - automotive_knowledge_capture
+      - calibration_iq_status
+      - calibration_iq_summary
+      - calibration_iq_read
+      - calibration_iq_ro
+      - calibration_iq_operator
+      - calibration_iq_destructive
+      - calibration_iq_work_prep
+      - collision_research
+      - research_provider_setup
+      - scrapex_status
+      - scrapex_read
+      - scrapex_adas_map
+
+  full:
+    description: "Every configured and implemented capability for explicit maintenance use."
+    tools: "*"
+
 roots:
   # read_file / list_directory are confined to these. Anything outside
   # is refused even at read_only tier.

@@ -12,10 +12,12 @@ tools.yaml -- a read_only tier does not mean "read anything on the disk".
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -56,6 +58,7 @@ VALID_POLICY_TIERS = frozenset({
 
 _CALIBRATION_IQ_CONTEXT_KEY = "__xomni_invocation"
 _CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY = "__xomni_work_prep_context"
+_CALIBRATION_IQ_APPROVAL_BINDING_KEY = "__xomni_write_binding"
 _AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY = "__xomni_actor"
 
 CALIBRATION_IQ_ROUTINE_OPERATIONS = (
@@ -119,6 +122,1282 @@ CALIBRATION_IQ_DESTRUCTIVE_OPERATIONS = (
     "delete_prerequisite",
 )
 
+_CALIBRATION_IQ_DESTRUCTIVE_TARGET_KINDS = {
+    "delete_calibration": "calibration",
+    "delete_blocker": "blocker",
+    "delete_photo": "photo",
+    "delete_prerequisite": "prerequisite",
+}
+
+_CALIBRATION_IQ_TARGET_OPERATION_KINDS = {
+    "update_note": "note",
+    "update_calibration": "calibration",
+    "complete_calibration": "calibration",
+    "reopen_calibration": "calibration",
+    "update_blocker": "blocker",
+    "resolve_blocker": "blocker",
+    "reopen_blocker": "blocker",
+    "update_prerequisite": "prerequisite",
+    "complete_prerequisite": "prerequisite",
+    "verify_prerequisite": "prerequisite",
+    "reject_prerequisite": "prerequisite",
+    "reopen_prerequisite": "prerequisite",
+    "update_document": "document",
+    "link_document": "document",
+    "unlink_document": "document",
+    "replace_document": "document",
+    "archive_document": "document",
+    "restore_document": "document",
+    "update_photo": "photo",
+    "update_location": "location",
+    "annotate_domo": "domo_comparison",
+    "update_assessment": "assessment",
+    "publish_assessment": "assessment",
+}
+
+# These requirement groups mirror Calibration IQ's production
+# OperatorAction.target_requirements and VERSION_REQUIRED_OPERATIONS contracts.
+# ``research_ro`` is X's composite operation: it is RO-scoped, while its adapter
+# obtains any required research-case version from the authoritative pre-snapshot.
+CALIBRATION_IQ_RO_REQUIRED_OPERATIONS = (
+    "update_ro",
+    "change_status",
+    "hold_ro",
+    "resume_ro",
+    "close_ro",
+    "reopen_ro",
+    "undo_status",
+    "add_note",
+    "add_calibration",
+    "mark_no_calibration_required",
+    "reopen_calibration_review",
+    "add_blocker",
+    "add_prerequisite",
+    "update_research",
+    "research_ro",
+    "ensure_case_workspace",
+    "create_folder",
+    "rename_entry",
+    "move_entry",
+    "copy_entry",
+    "create_file",
+    "archive_entry",
+    "restore_entry",
+    "import_document",
+    "import_photo",
+    "create_assessment",
+)
+
+CALIBRATION_IQ_TARGET_REQUIRED_OPERATIONS = (
+    "update_note",
+    "update_calibration",
+    "complete_calibration",
+    "reopen_calibration",
+    "update_blocker",
+    "resolve_blocker",
+    "reopen_blocker",
+    "update_prerequisite",
+    "complete_prerequisite",
+    "verify_prerequisite",
+    "reject_prerequisite",
+    "reopen_prerequisite",
+    "update_document",
+    "link_document",
+    "unlink_document",
+    "replace_document",
+    "archive_document",
+    "restore_document",
+    "update_photo",
+    "update_location",
+    "annotate_domo",
+    "update_assessment",
+    "publish_assessment",
+)
+
+CALIBRATION_IQ_VERSION_REQUIRED_OPERATIONS = (
+    "update_ro",
+    "change_status",
+    "hold_ro",
+    "resume_ro",
+    "close_ro",
+    "reopen_ro",
+    "undo_status",
+    "mark_no_calibration_required",
+    "reopen_calibration_review",
+    "update_note",
+    "update_calibration",
+    "complete_calibration",
+    "reopen_calibration",
+    "update_blocker",
+    "resolve_blocker",
+    "reopen_blocker",
+    "update_prerequisite",
+    "complete_prerequisite",
+    "verify_prerequisite",
+    "reject_prerequisite",
+    "reopen_prerequisite",
+    "update_research",
+    "update_document",
+    "link_document",
+    "unlink_document",
+    "replace_document",
+    "archive_document",
+    "restore_document",
+    "update_photo",
+    "update_location",
+    "annotate_domo",
+    "update_assessment",
+    "publish_assessment",
+)
+
+CALIBRATION_IQ_RO_VERSIONED_OPERATIONS = tuple(
+    operation
+    for operation in CALIBRATION_IQ_RO_REQUIRED_OPERATIONS
+    if operation in CALIBRATION_IQ_VERSION_REQUIRED_OPERATIONS
+)
+CALIBRATION_IQ_GENERAL_RO_VERSIONED_OPERATIONS = tuple(
+    operation
+    for operation in CALIBRATION_IQ_RO_VERSIONED_OPERATIONS
+    if operation not in {"change_status", "close_ro"}
+)
+CALIBRATION_IQ_RO_UNVERSIONED_OPERATIONS = tuple(
+    operation
+    for operation in CALIBRATION_IQ_RO_REQUIRED_OPERATIONS
+    if operation not in CALIBRATION_IQ_VERSION_REQUIRED_OPERATIONS
+)
+CALIBRATION_IQ_RESEARCH_RO_OPERATIONS = ("research_ro",)
+CALIBRATION_IQ_ADD_CALIBRATION_OPERATIONS = ("add_calibration",)
+CALIBRATION_IQ_WORKSPACE_DOCUMENT_RO_OPERATIONS = (
+    "ensure_case_workspace",
+    "create_folder",
+    "rename_entry",
+    "move_entry",
+    "copy_entry",
+    "create_file",
+    "archive_entry",
+    "restore_entry",
+    "import_document",
+    "import_photo",
+)
+CALIBRATION_IQ_OTHER_RO_UNVERSIONED_OPERATIONS = tuple(
+    operation
+    for operation in CALIBRATION_IQ_RO_UNVERSIONED_OPERATIONS
+    if operation not in {
+        *CALIBRATION_IQ_RESEARCH_RO_OPERATIONS,
+        *CALIBRATION_IQ_ADD_CALIBRATION_OPERATIONS,
+        *CALIBRATION_IQ_WORKSPACE_DOCUMENT_RO_OPERATIONS,
+    }
+)
+CALIBRATION_IQ_TARGET_VERSIONED_OPERATIONS = tuple(
+    operation
+    for operation in CALIBRATION_IQ_TARGET_REQUIRED_OPERATIONS
+    if operation in CALIBRATION_IQ_VERSION_REQUIRED_OPERATIONS
+)
+CALIBRATION_IQ_UNSCOPED_CREATE_OPERATIONS = tuple(
+    operation
+    for operation in CALIBRATION_IQ_ROUTINE_OPERATIONS
+    if operation not in CALIBRATION_IQ_RO_REQUIRED_OPERATIONS
+    and operation not in CALIBRATION_IQ_TARGET_REQUIRED_OPERATIONS
+)
+
+CALIBRATION_IQ_STATUS_VALUES = (
+    "NEW_ARRIVAL",
+    "NEEDS_TECHNICIAN_REVIEW",
+    "INITIAL_ASSESSMENT_COMPLETE",
+    "REPAIR_IN_PROGRESS",
+    "WAITING_ON_PREREQUISITES",
+    "READY_FOR_TECHNICIAN_VERIFICATION",
+    "CALIBRATION_READY",
+    "CALIBRATION_IN_PROGRESS",
+    "RETURNED_TO_SHOP",
+    "CALIBRATION_COMPLETE",
+    "ARCHIVED",
+)
+
+CALIBRATION_IQ_STAGED_WRITE_TOOLS = frozenset({
+    "calibration_iq_operator",
+    "calibration_iq_destructive",
+})
+
+SCRAPEX_ID_FREE_READ_ACTIONS = frozenset({
+    "list_batches",
+    "preview_ciq_queue",
+})
+SCRAPEX_ID_BOUND_READ_ACTIONS = frozenset({
+    "batch_summary",
+    "batch_exceptions",
+    "batch_item",
+})
+SCRAPEX_ID_FREE_ADAS_MAP_ACTIONS = frozenset({
+    "open_authentication",
+    "create_exact_batch",
+    "create_phase_batch",
+})
+SCRAPEX_ID_BOUND_ADAS_MAP_ACTIONS = frozenset({
+    "process_one",
+    "start_batch",
+    "pause_batch",
+})
+SCRAPEX_STAGED_TOOLS = frozenset({"scrapex_read", "scrapex_adas_map"})
+_SCRAPEX_BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+_CALIBRATION_IQ_CURRENT_RESOURCE_KINDS = {
+    "assessments": "assessment",
+    "blockers": "blocker",
+    "calibration_items": "calibration",
+    "calibrations": "calibration",
+    "domo_comparison": "domo_comparison",
+    "documents": "document",
+    "locations": "location",
+    "notes": "note",
+    "photos": "photo",
+    "prerequisites": "prerequisite",
+    "requirements": "prerequisite",
+    "shop": "location",
+}
+_CALIBRATION_IQ_NONCURRENT_COLLECTIONS = frozenset({
+    "activity",
+    "audit",
+    "events",
+    "history",
+    "receipts",
+})
+
+
+@dataclass(frozen=True)
+class CalibrationIQExactROBinding:
+    """Identifiers and concurrency tokens proved by one exact same-turn read."""
+
+    repair_order_id: str
+    identifiers: frozenset[str]
+    expected_version: int
+    research_expected_version: Optional[int] = None
+    target_versions: tuple[tuple[str, int], ...] = ()
+    target_kinds: tuple[tuple[str, str], ...] = ()
+
+    def target_version(self, target_id: str) -> Optional[int]:
+        return dict(self.target_versions).get(target_id)
+
+    def target_kind(self, target_id: str) -> Optional[str]:
+        return dict(self.target_kinds).get(target_id)
+
+
+@dataclass(frozen=True)
+class CalibrationIQTurnEvidence:
+    """Registry-owned structured state; never constructed from user text."""
+
+    conversation_id: int
+    message_id: int
+    source_tool_call_ids: tuple[str, ...]
+    repair_orders: tuple[CalibrationIQExactROBinding, ...] = ()
+
+    @property
+    def verified(self) -> bool:
+        return bool(self.repair_orders)
+
+
+@dataclass(frozen=True)
+class ScrapeXTurnEvidence:
+    """Opaque batch identities proved by prior results in one user turn."""
+
+    conversation_id: int
+    message_id: int
+    source_tool_call_ids: tuple[str, ...]
+    batch_ids: tuple[str, ...] = ()
+    quarantined_batch_ids: tuple[str, ...] = ()
+
+    @property
+    def verified(self) -> bool:
+        return bool(set(self.batch_ids).difference(self.quarantined_batch_ids))
+
+
+def _scrapex_batch_identifier(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or value != value.strip():
+        return None
+    return value if _SCRAPEX_BATCH_ID_RE.fullmatch(value) else None
+
+
+def _scrapex_action(args: Any) -> str:
+    if not isinstance(args, dict) or not isinstance(args.get("action"), str):
+        return ""
+    return args["action"].strip()
+
+
+def _scrapex_same_turn_previous(
+    previous: Optional[ScrapeXTurnEvidence],
+    *,
+    conversation_id: int,
+    message_id: int,
+) -> Optional[ScrapeXTurnEvidence]:
+    if (
+        previous is not None
+        and previous.conversation_id == conversation_id
+        and previous.message_id == message_id
+    ):
+        return previous
+    return None
+
+
+def scrapex_evidence_from_result(
+    tool_name: str,
+    tool_args: Any,
+    result: Any,
+    *,
+    conversation_id: int,
+    message_id: int,
+    source_tool_call_id: str,
+    previous: Optional[ScrapeXTurnEvidence] = None,
+) -> Optional[ScrapeXTurnEvidence]:
+    """Merge only structurally verified ScrapeX batch ids from this turn."""
+
+    same_turn_previous = _scrapex_same_turn_previous(
+        previous,
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
+    if (
+        tool_name not in SCRAPEX_STAGED_TOOLS
+        or not isinstance(result, dict)
+        or result.get("service") != "ScrapeX"
+    ):
+        return same_turn_previous
+    action = _scrapex_action(tool_args)
+    if not action or result.get("action") != action:
+        return same_turn_previous
+    if (
+        isinstance(conversation_id, bool)
+        or not isinstance(conversation_id, int)
+        or conversation_id <= 0
+        or isinstance(message_id, bool)
+        or not isinstance(message_id, int)
+        or message_id <= 0
+        or not isinstance(source_tool_call_id, str)
+        or not source_tool_call_id.strip()
+    ):
+        return same_turn_previous
+
+    ambiguous_id_mutation = (
+        tool_name == "scrapex_adas_map"
+        and action in SCRAPEX_ID_BOUND_ADAS_MAP_ACTIONS
+        and (
+            result.get("may_have_executed") is True
+            or result.get("indeterminate") is True
+            or result.get("status") == "indeterminate"
+        )
+    )
+    if ambiguous_id_mutation:
+        batch_id = _scrapex_batch_identifier(
+            tool_args.get("batch_id") if isinstance(tool_args, dict) else None
+        )
+        if (
+            batch_id is None
+            or same_turn_previous is None
+            or batch_id not in same_turn_previous.batch_ids
+        ):
+            return same_turn_previous
+        remaining = set(same_turn_previous.batch_ids)
+        remaining.discard(batch_id)
+        quarantined = set(same_turn_previous.quarantined_batch_ids)
+        quarantined.add(batch_id)
+        source_ids = set(same_turn_previous.source_tool_call_ids)
+        source_ids.add(source_tool_call_id.strip())
+        return ScrapeXTurnEvidence(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            source_tool_call_ids=tuple(sorted(source_ids)),
+            batch_ids=tuple(sorted(remaining)),
+            quarantined_batch_ids=tuple(sorted(quarantined)),
+        )
+
+    if (
+        result.get("success") is not True
+        or result.get("executed") is not True
+        or result.get("verified") is not True
+        or result.get("authentication_required") is True
+        or result.get("may_have_executed") is True
+        or result.get("indeterminate") is True
+        or result.get("status") == "indeterminate"
+    ):
+        return same_turn_previous
+
+    observed: set[str] = set()
+    data = result.get("data")
+    if tool_name == "scrapex_read" and action == "list_batches":
+        if not isinstance(data, dict) or not isinstance(data.get("batches"), list):
+            return same_turn_previous
+        for batch in data["batches"]:
+            if not isinstance(batch, dict):
+                return same_turn_previous
+            batch_id = _scrapex_batch_identifier(batch.get("id"))
+            if batch_id is None:
+                return same_turn_previous
+            observed.add(batch_id)
+    elif tool_name == "scrapex_adas_map" and action in {
+        "create_exact_batch",
+        "create_phase_batch",
+    }:
+        if not isinstance(data, dict):
+            return same_turn_previous
+        batch_id = _scrapex_batch_identifier(data.get("id"))
+        if batch_id is None:
+            return same_turn_previous
+        observed.add(batch_id)
+    elif (
+        tool_name == "scrapex_read"
+        and action in SCRAPEX_ID_BOUND_READ_ACTIONS
+    ) or (
+        tool_name == "scrapex_adas_map"
+        and action in SCRAPEX_ID_BOUND_ADAS_MAP_ACTIONS
+    ):
+        # Bound reads and controls preserve an already-proved opaque id. They
+        # can never mint a new identity from their own arguments.
+        batch_id = _scrapex_batch_identifier(
+            tool_args.get("batch_id") if isinstance(tool_args, dict) else None
+        )
+        if (
+            batch_id is None
+            or same_turn_previous is None
+            or batch_id not in same_turn_previous.batch_ids
+        ):
+            return same_turn_previous
+        observed.add(batch_id)
+    else:
+        return same_turn_previous
+
+    if not observed:
+        return same_turn_previous
+    quarantined = set(
+        same_turn_previous.quarantined_batch_ids if same_turn_previous else ()
+    )
+    observed.difference_update(quarantined)
+    if not observed:
+        return same_turn_previous
+    batch_ids = set(same_turn_previous.batch_ids if same_turn_previous else ())
+    batch_ids.update(observed)
+    source_ids = set(
+        same_turn_previous.source_tool_call_ids if same_turn_previous else ()
+    )
+    source_ids.add(source_tool_call_id.strip())
+    return ScrapeXTurnEvidence(
+        conversation_id=conversation_id,
+        message_id=message_id,
+        source_tool_call_ids=tuple(sorted(source_ids)),
+        batch_ids=tuple(sorted(batch_ids)),
+        quarantined_batch_ids=tuple(sorted(quarantined)),
+    )
+
+
+def scrapex_apply_new_quarantine(
+    round_evidence: Optional[ScrapeXTurnEvidence],
+    observed_evidence: Optional[ScrapeXTurnEvidence],
+) -> Optional[ScrapeXTurnEvidence]:
+    """Revoke ambiguous batch ids for later calls in one authored batch.
+
+    The model selected every sibling call before seeing any sibling result, so
+    newly listed or created ids remain unavailable until the next model round.
+    An indeterminate mutation is different: its no-retry quarantine must take
+    effect immediately to prevent a later sibling from repeating that action.
+    """
+
+    if not isinstance(round_evidence, ScrapeXTurnEvidence):
+        return round_evidence
+    if (
+        not isinstance(observed_evidence, ScrapeXTurnEvidence)
+        or observed_evidence.conversation_id != round_evidence.conversation_id
+        or observed_evidence.message_id != round_evidence.message_id
+    ):
+        return round_evidence
+    newly_quarantined = set(observed_evidence.quarantined_batch_ids).difference(
+        round_evidence.quarantined_batch_ids
+    )
+    if not newly_quarantined:
+        return round_evidence
+    remaining_ids = set(round_evidence.batch_ids).difference(newly_quarantined)
+    quarantined_ids = set(round_evidence.quarantined_batch_ids)
+    quarantined_ids.update(newly_quarantined)
+    source_ids = set(round_evidence.source_tool_call_ids)
+    source_ids.update(observed_evidence.source_tool_call_ids)
+    return ScrapeXTurnEvidence(
+        conversation_id=round_evidence.conversation_id,
+        message_id=round_evidence.message_id,
+        source_tool_call_ids=tuple(sorted(source_ids)),
+        batch_ids=tuple(sorted(remaining_ids)),
+        quarantined_batch_ids=tuple(sorted(quarantined_ids)),
+    )
+
+
+def _calibration_iq_nonempty(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _calibration_iq_positive_version(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _calibration_iq_current_target_bindings(
+    raw: dict[str, Any],
+) -> dict[str, tuple[str, int]]:
+    bindings: dict[str, tuple[str, int]] = {}
+    conflicts: set[str] = set()
+
+    def walk(value: Any, *, resource_kind: Optional[str] = None) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item, resource_kind=resource_kind)
+            return
+        if not isinstance(value, dict):
+            return
+
+        if resource_kind:
+            target_id = _calibration_iq_nonempty(
+                value.get("id")
+                or value.get("target_id")
+                or value.get("resource_id")
+                or value.get("uuid")
+            )
+            version = _calibration_iq_positive_version(
+                value.get("version")
+                if value.get("version") is not None
+                else value.get("revision")
+            )
+            if target_id and version is not None:
+                candidate = (resource_kind, version)
+                previous = bindings.get(target_id)
+                if previous is not None and previous != candidate:
+                    conflicts.add(target_id)
+                else:
+                    bindings[target_id] = candidate
+
+        for key, child in value.items():
+            normalized = str(key).strip().casefold()
+            if normalized in _CALIBRATION_IQ_NONCURRENT_COLLECTIONS:
+                continue
+            walk(
+                child,
+                resource_kind=(
+                    _CALIBRATION_IQ_CURRENT_RESOURCE_KINDS.get(normalized)
+                    or resource_kind
+                ),
+            )
+
+    walk(raw)
+    for target_id in conflicts:
+        bindings.pop(target_id, None)
+    return bindings
+
+
+def _calibration_iq_exact_binding(result: Any) -> Optional[CalibrationIQExactROBinding]:
+    if not isinstance(result, dict) or result.get("status") != "verified":
+        return None
+    repair_order = result.get("repair_order")
+    raw = result.get("raw")
+    if not isinstance(repair_order, dict) or not isinstance(raw, dict):
+        return None
+    raw_repair_order = raw.get("repair_order")
+    if not isinstance(raw_repair_order, dict):
+        raw_repair_order = raw
+
+    id_candidates = {
+        value
+        for value in (
+            _calibration_iq_nonempty(repair_order.get("id")),
+            _calibration_iq_nonempty(repair_order.get("repair_order_id")),
+            _calibration_iq_nonempty(raw_repair_order.get("id")),
+            _calibration_iq_nonempty(raw_repair_order.get("repair_order_id")),
+        )
+        if value
+    }
+    if len(id_candidates) != 1:
+        return None
+    repair_order_id = next(iter(id_candidates))
+
+    versions = {
+        version
+        for version in (
+            _calibration_iq_positive_version(repair_order.get("version")),
+            _calibration_iq_positive_version(raw_repair_order.get("version")),
+        )
+        if version is not None
+    }
+    if len(versions) != 1:
+        return None
+    expected_version = next(iter(versions))
+
+    identifiers = {
+        repair_order_id,
+        *(
+            value
+            for value in (
+                _calibration_iq_nonempty(repair_order.get("RO")),
+                _calibration_iq_nonempty(repair_order.get("ro_number")),
+                _calibration_iq_nonempty(repair_order.get("number")),
+                _calibration_iq_nonempty(raw_repair_order.get("ro_number")),
+                _calibration_iq_nonempty(raw_repair_order.get("number")),
+            )
+            if value
+        ),
+    }
+    target_bindings = _calibration_iq_current_target_bindings(raw)
+    target_bindings.pop(repair_order_id, None)
+    research = raw.get("research")
+    if not isinstance(research, dict):
+        research = raw.get("research_case")
+    research_expected_version = (
+        _calibration_iq_positive_version(research.get("version"))
+        if isinstance(research, dict)
+        else None
+    )
+    return CalibrationIQExactROBinding(
+        repair_order_id=repair_order_id,
+        identifiers=frozenset(identifiers),
+        expected_version=expected_version,
+        research_expected_version=research_expected_version,
+        target_versions=tuple(sorted(
+            (target_id, binding[1])
+            for target_id, binding in target_bindings.items()
+        )),
+        target_kinds=tuple(sorted(
+            (target_id, binding[0])
+            for target_id, binding in target_bindings.items()
+        )),
+    )
+
+
+def calibration_iq_evidence_from_result(
+    tool_name: str,
+    result: Any,
+    *,
+    conversation_id: int,
+    message_id: int,
+    source_tool_call_id: str,
+    previous: Optional[CalibrationIQTurnEvidence] = None,
+) -> Optional[CalibrationIQTurnEvidence]:
+    """Merge only a verified exact-RO result into same-turn write evidence."""
+
+    if tool_name != "calibration_iq_ro":
+        return previous
+    binding = _calibration_iq_exact_binding(result)
+    if binding is None:
+        return previous
+    if (
+        isinstance(conversation_id, bool)
+        or not isinstance(conversation_id, int)
+        or conversation_id <= 0
+        or isinstance(message_id, bool)
+        or not isinstance(message_id, int)
+        or message_id <= 0
+        or not _calibration_iq_nonempty(source_tool_call_id)
+    ):
+        return previous
+    same_turn_previous = previous if (
+        previous is not None
+        and previous.conversation_id == conversation_id
+        and previous.message_id == message_id
+    ) else None
+    existing = list(same_turn_previous.repair_orders if same_turn_previous else ())
+    existing = [
+        item
+        for item in existing
+        if not (item.identifiers & binding.identifiers)
+    ]
+    existing.append(binding)
+    source_ids = set(same_turn_previous.source_tool_call_ids if same_turn_previous else ())
+    source_ids.add(_calibration_iq_nonempty(source_tool_call_id))
+    return CalibrationIQTurnEvidence(
+        conversation_id=conversation_id,
+        message_id=message_id,
+        source_tool_call_ids=tuple(sorted(source_ids)),
+        repair_orders=tuple(existing),
+    )
+
+
+def calibration_iq_normal_profile_catalog(catalog: list[dict]) -> list[dict]:
+    """Return the configured normal surface with unscoped creates pruned."""
+
+    # The normal profile cannot bind a top-level create to an existing exact
+    # resource, so its staged operator grammar omits those action branches.
+    # The configured/full catalog is left untouched for explicit maintenance.
+    staged_catalog = copy.deepcopy(catalog)
+    for item in staged_catalog:
+        function = item.get("function") or {}
+        if function.get("name") != "calibration_iq_operator":
+            continue
+        actions = (
+            (function.get("parameters") or {}).get("properties", {})
+            .get("actions", {})
+        )
+        branches = (actions.get("items") or {}).get("oneOf")
+        if not isinstance(branches, list):
+            continue
+        filtered_branches = []
+        for branch in branches:
+            operation_schema = (branch.get("properties") or {}).get("operation") or {}
+            operations = operation_schema.get("enum")
+            if not isinstance(operations, list):
+                filtered_branches.append(branch)
+                continue
+            allowed = [
+                operation
+                for operation in operations
+                if operation not in CALIBRATION_IQ_UNSCOPED_CREATE_OPERATIONS
+            ]
+            if not allowed:
+                continue
+            operation_schema["enum"] = allowed
+            filtered_branches.append(branch)
+        actions["items"]["oneOf"] = filtered_branches
+        function["description"] = (
+            str(function.get("description") or "").rstrip()
+            + " Normal ADAS staging does not expose unscoped top-level creates; "
+            "use the explicit full maintenance profile for those operations."
+        )
+    return staged_catalog
+
+
+def calibration_iq_catalog_for_turn(
+    catalog: list[dict],
+    evidence: Optional[CalibrationIQTurnEvidence] = None,
+) -> list[dict]:
+    """Hide staged writes until structured exact-RO evidence exists."""
+
+    if not isinstance(evidence, CalibrationIQTurnEvidence) or not evidence.verified:
+        return [
+            item
+            for item in catalog
+            if (item.get("function") or {}).get("name")
+            not in CALIBRATION_IQ_STAGED_WRITE_TOOLS
+        ]
+    return calibration_iq_normal_profile_catalog(catalog)
+
+
+def scrapex_catalog_for_turn(
+    catalog: list[dict],
+    evidence: Optional[ScrapeXTurnEvidence] = None,
+) -> list[dict]:
+    """Expose opaque-id ScrapeX branches only after a verified prior result."""
+
+    if isinstance(evidence, ScrapeXTurnEvidence) and evidence.verified:
+        return copy.deepcopy(catalog)
+    allowed_by_tool = {
+        "scrapex_read": SCRAPEX_ID_FREE_READ_ACTIONS,
+        "scrapex_adas_map": SCRAPEX_ID_FREE_ADAS_MAP_ACTIONS,
+    }
+    staged: list[dict] = []
+    for raw_item in copy.deepcopy(catalog):
+        function = raw_item.get("function") or {}
+        name = function.get("name")
+        allowed = allowed_by_tool.get(name)
+        if allowed is None:
+            staged.append(raw_item)
+            continue
+        parameters = function.get("parameters") or {}
+        branches = parameters.get("oneOf")
+        if not isinstance(branches, list):
+            # An unrecognized schema cannot safely prove that batch-id fields
+            # were removed, so omit this tool instead of exposing a flat leak.
+            continue
+        filtered = []
+        for branch in branches:
+            action = (
+                ((branch.get("properties") or {}).get("action") or {}).get("const")
+                if isinstance(branch, dict)
+                else None
+            )
+            if action in allowed:
+                filtered.append(branch)
+        if not filtered:
+            continue
+        parameters["oneOf"] = filtered
+        staged.append(raw_item)
+    return staged
+
+
+def validate_scrapex_batch_binding(
+    name: str,
+    args: Any,
+    evidence: Optional[ScrapeXTurnEvidence],
+    *,
+    conversation_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+) -> None:
+    """Reject an opaque ScrapeX batch id not proved earlier in this turn."""
+
+    action = _scrapex_action(args)
+    id_bound = (
+        name == "scrapex_read" and action in SCRAPEX_ID_BOUND_READ_ACTIONS
+    ) or (
+        name == "scrapex_adas_map"
+        and action in SCRAPEX_ID_BOUND_ADAS_MAP_ACTIONS
+    )
+    if not id_bound:
+        return
+    if not isinstance(evidence, ScrapeXTurnEvidence) or not evidence.verified:
+        raise ToolBlocked(
+            "ScrapeX batch-id actions require a verified same-turn list, create, or "
+            "bound read result before the opaque id can be used. Nothing was run."
+        )
+    if (
+        conversation_id is None
+        or message_id is None
+        or evidence.conversation_id != conversation_id
+        or evidence.message_id != message_id
+    ):
+        raise ToolBlocked(
+            "ScrapeX batch-id evidence belongs to a different conversation turn. "
+            "Nothing was run."
+        )
+    batch_id = _scrapex_batch_identifier(
+        args.get("batch_id") if isinstance(args, dict) else None
+    )
+    if batch_id in evidence.quarantined_batch_ids:
+        raise ToolBlocked(
+            "ScrapeX reported an indeterminate prior attempt for this batch in the "
+            "current turn, so an automatic retry is forbidden. Nothing was run."
+        )
+    if batch_id is None or batch_id not in evidence.batch_ids:
+        raise ToolBlocked(
+            "ScrapeX batch_id was not copied verbatim from a verified same-turn "
+            "ScrapeX result. Nothing was run."
+        )
+
+
+def _calibration_iq_ro_binding(
+    evidence: CalibrationIQTurnEvidence,
+    identifier: Any,
+) -> Optional[CalibrationIQExactROBinding]:
+    value = _calibration_iq_nonempty(identifier)
+    matches = [item for item in evidence.repair_orders if value in item.identifiers]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _calibration_iq_target_binding(
+    evidence: CalibrationIQTurnEvidence,
+    target_id: Any,
+    expected_version: Any,
+    *,
+    required_kind: Optional[str] = None,
+) -> Optional[CalibrationIQExactROBinding]:
+    target = _calibration_iq_nonempty(target_id)
+    version = _calibration_iq_positive_version(expected_version)
+    matches = [
+        item
+        for item in evidence.repair_orders
+        if (
+            target
+            and version is not None
+            and item.target_version(target) == version
+            and (
+                required_kind is None
+                or item.target_kind(target) == required_kind
+            )
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def validate_calibration_iq_write_binding(
+    name: str,
+    args: Any,
+    evidence: Optional[CalibrationIQTurnEvidence],
+    *,
+    conversation_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    allow_unscoped_creates: bool = False,
+) -> None:
+    """Fail closed unless every write target is bound to prior-round exact detail."""
+
+    if name not in CALIBRATION_IQ_STAGED_WRITE_TOOLS:
+        return
+    actions = args.get("actions") if isinstance(args, dict) else None
+    if not isinstance(actions, list) or not actions:
+        raise ToolBlocked("Calibration IQ write actions are missing. Nothing was run.")
+    if (
+        name == "calibration_iq_operator"
+        and allow_unscoped_creates
+        and all(
+            isinstance(action, dict)
+            and _calibration_iq_nonempty(action.get("operation"))
+            in CALIBRATION_IQ_UNSCOPED_CREATE_OPERATIONS
+            for action in actions
+        )
+    ):
+        for index, action in enumerate(actions):
+            if any(
+                action.get(key) is not None
+                for key in ("repair_order_id", "target_id", "expected_version")
+            ):
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] create operation supplied an existing "
+                    "resource binding. Nothing was run."
+                )
+        return
+    if not isinstance(evidence, CalibrationIQTurnEvidence) or not evidence.verified:
+        raise ToolBlocked(
+            "Calibration IQ writes require a verified same-turn exact calibration_iq_ro "
+            "result before the write tool is available. Nothing was run."
+        )
+    if (
+        conversation_id is not None
+        and evidence.conversation_id != conversation_id
+    ) or (
+        message_id is not None
+        and evidence.message_id != message_id
+    ):
+        raise ToolBlocked(
+            "Calibration IQ write evidence belongs to a different conversation turn. "
+            "Nothing was run."
+        )
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            raise ToolBlocked(
+                f"Calibration IQ actions[{index}] is not structured. Nothing was run."
+            )
+        operation = _calibration_iq_nonempty(action.get("operation"))
+        if name == "calibration_iq_destructive":
+            if operation not in CALIBRATION_IQ_DESTRUCTIVE_OPERATIONS:
+                raise ToolBlocked(
+                    f"{operation or 'This action'} is not a staged destructive operation."
+                )
+            binding = _calibration_iq_target_binding(
+                evidence,
+                action.get("target_id"),
+                action.get("expected_version"),
+                required_kind=_CALIBRATION_IQ_DESTRUCTIVE_TARGET_KINDS[operation],
+            )
+            if binding is None:
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] target/version was not copied from "
+                    "the verified same-turn exact RO result. Nothing was run."
+                )
+            supplied_ro = action.get("repair_order_id")
+            if supplied_ro is not None and _calibration_iq_ro_binding(
+                evidence, supplied_ro
+            ) != binding:
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] RO context does not own that target. "
+                    "Nothing was run."
+                )
+            continue
+
+        if operation in CALIBRATION_IQ_UNSCOPED_CREATE_OPERATIONS:
+            if not allow_unscoped_creates:
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] is an unscoped top-level create. "
+                    "Normal ADAS staging cannot authorize it from an unrelated exact RO; "
+                    "use the explicit maintenance profile. Nothing was run."
+                )
+            if any(
+                action.get(key) is not None
+                for key in ("repair_order_id", "target_id", "expected_version")
+            ):
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] create operation supplied an existing "
+                    "resource binding. Nothing was run."
+                )
+            continue
+        if operation in CALIBRATION_IQ_RO_REQUIRED_OPERATIONS:
+            binding = _calibration_iq_ro_binding(evidence, action.get("repair_order_id"))
+            if binding is None:
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] RO id was not copied from the verified "
+                    "same-turn exact RO result. Nothing was run."
+                )
+            supplied_version = action.get("expected_version")
+            if operation in CALIBRATION_IQ_VERSION_REQUIRED_OPERATIONS:
+                authoritative_version = (
+                    binding.research_expected_version
+                    if operation == "update_research"
+                    else binding.expected_version
+                )
+                if (
+                    authoritative_version is None
+                    or _calibration_iq_positive_version(supplied_version)
+                    != authoritative_version
+                ):
+                    raise ToolBlocked(
+                        f"Calibration IQ actions[{index}] expected_version is stale or does "
+                        "not belong to that exact RO result. Nothing was run."
+                    )
+            elif supplied_version is not None and (
+                _calibration_iq_positive_version(supplied_version)
+                != binding.expected_version
+            ):
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] optional version does not match that "
+                    "exact RO result. Nothing was run."
+                )
+            continue
+        if operation in CALIBRATION_IQ_TARGET_REQUIRED_OPERATIONS:
+            required_kind = _CALIBRATION_IQ_TARGET_OPERATION_KINDS.get(operation)
+            if required_kind is None:
+                raise ToolBlocked(
+                    f"{operation} has no authoritative target-kind binding. Nothing was run."
+                )
+            binding = _calibration_iq_target_binding(
+                evidence,
+                action.get("target_id"),
+                action.get("expected_version"),
+                required_kind=required_kind,
+            )
+            if binding is None:
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] target/version was not copied from "
+                    "the verified same-turn exact RO result. Nothing was run."
+                )
+            supplied_ro = action.get("repair_order_id")
+            if supplied_ro is not None and _calibration_iq_ro_binding(
+                evidence, supplied_ro
+            ) != binding:
+                raise ToolBlocked(
+                    f"Calibration IQ actions[{index}] RO context does not own that target. "
+                    "Nothing was run."
+                )
+            continue
+        raise ToolBlocked(
+            f"{operation or 'Calibration IQ action'} has no staged write contract. "
+            "Nothing was run."
+        )
+
+
+def _calibration_iq_binding_proof(
+    evidence: CalibrationIQTurnEvidence,
+) -> dict[str, Any]:
+    return {
+        "conversation_id": evidence.conversation_id,
+        "message_id": evidence.message_id,
+        "source_tool_call_ids": list(evidence.source_tool_call_ids),
+        "repair_orders": [
+            {
+                "repair_order_id": item.repair_order_id,
+                "identifiers": sorted(item.identifiers),
+                "expected_version": item.expected_version,
+                "research_expected_version": item.research_expected_version,
+                "target_versions": [list(pair) for pair in item.target_versions],
+                "target_kinds": [list(pair) for pair in item.target_kinds],
+            }
+            for item in evidence.repair_orders
+        ],
+    }
+
+
+def _calibration_iq_evidence_from_proof(
+    proof: Any,
+) -> Optional[CalibrationIQTurnEvidence]:
+    if not isinstance(proof, dict):
+        return None
+    conversation_id = proof.get("conversation_id")
+    message_id = proof.get("message_id")
+    source_ids = proof.get("source_tool_call_ids")
+    raw_bindings = proof.get("repair_orders")
+    if (
+        isinstance(conversation_id, bool)
+        or not isinstance(conversation_id, int)
+        or conversation_id <= 0
+        or isinstance(message_id, bool)
+        or not isinstance(message_id, int)
+        or message_id <= 0
+        or not isinstance(source_ids, list)
+        or not source_ids
+        or not isinstance(raw_bindings, list)
+        or not raw_bindings
+    ):
+        return None
+    bindings: list[CalibrationIQExactROBinding] = []
+    seen_identifiers: set[str] = set()
+    seen_targets: set[str] = set()
+    for raw in raw_bindings:
+        if not isinstance(raw, dict):
+            return None
+        repair_order_id = _calibration_iq_nonempty(raw.get("repair_order_id"))
+        identifiers = raw.get("identifiers")
+        expected_version = _calibration_iq_positive_version(raw.get("expected_version"))
+        research_version = _calibration_iq_positive_version(
+            raw.get("research_expected_version")
+        )
+        target_pairs = raw.get("target_versions")
+        target_kind_pairs = raw.get("target_kinds")
+        if (
+            not repair_order_id
+            or not isinstance(identifiers, list)
+            or repair_order_id not in identifiers
+            or expected_version is None
+            or not isinstance(target_pairs, list)
+            or not isinstance(target_kind_pairs, list)
+        ):
+            return None
+        normalized_identifiers = frozenset(
+            value for value in map(_calibration_iq_nonempty, identifiers) if value
+        )
+        if (
+            repair_order_id not in normalized_identifiers
+            or normalized_identifiers & seen_identifiers
+        ):
+            return None
+        parsed_targets: list[tuple[str, int]] = []
+        for pair in target_pairs:
+            if not isinstance(pair, list) or len(pair) != 2:
+                return None
+            target_id = _calibration_iq_nonempty(pair[0])
+            target_version = _calibration_iq_positive_version(pair[1])
+            if (
+                not target_id
+                or target_version is None
+                or target_id in seen_targets
+                or target_id in seen_identifiers
+            ):
+                return None
+            parsed_targets.append((target_id, target_version))
+            seen_targets.add(target_id)
+        parsed_kinds: list[tuple[str, str]] = []
+        for pair in target_kind_pairs:
+            if not isinstance(pair, list) or len(pair) != 2:
+                return None
+            target_id = _calibration_iq_nonempty(pair[0])
+            target_kind = _calibration_iq_nonempty(pair[1])
+            if (
+                not target_id
+                or target_kind not in set(_CALIBRATION_IQ_CURRENT_RESOURCE_KINDS.values())
+            ):
+                return None
+            parsed_kinds.append((target_id, target_kind))
+        if (
+            len(parsed_kinds) != len(parsed_targets)
+            or {pair[0] for pair in parsed_kinds}
+            != {pair[0] for pair in parsed_targets}
+        ):
+            return None
+        if normalized_identifiers & seen_targets:
+            return None
+        seen_identifiers.update(normalized_identifiers)
+        bindings.append(CalibrationIQExactROBinding(
+            repair_order_id=repair_order_id,
+            identifiers=normalized_identifiers,
+            expected_version=expected_version,
+            research_expected_version=research_version,
+            target_versions=tuple(sorted(parsed_targets)),
+            target_kinds=tuple(sorted(parsed_kinds)),
+        ))
+    normalized_source_ids = tuple(sorted({
+        value for value in map(_calibration_iq_nonempty, source_ids) if value
+    }))
+    if not normalized_source_ids:
+        return None
+    return CalibrationIQTurnEvidence(
+        conversation_id=conversation_id,
+        message_id=message_id,
+        source_tool_call_ids=normalized_source_ids,
+        repair_orders=tuple(bindings),
+    )
+
+
+def _calibration_iq_action_branch(
+    operations: tuple[str, ...],
+    required_fields: tuple[str, ...],
+    description: str,
+    *,
+    operation_description: str,
+    arguments_schema: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return one self-contained action object for llama.cpp's tool grammar.
+
+    The local b9906 grammar does not reliably merge an object's shared
+    properties with partial ``oneOf`` requirements.  Complete, disjoint object
+    branches make every required id/version visible to the generated grammar
+    while retaining heterogeneous batches (each array item selects its branch).
+    """
+
+    properties: dict[str, Any] = {
+        "operation": {
+            "type": "string",
+            "enum": list(operations),
+            "description": operation_description,
+        },
+        "arguments": arguments_schema
+        or {"type": "object"},
+    }
+    if "repair_order_id" in required_fields:
+        properties["repair_order_id"] = {
+            "type": "string",
+            "minLength": 1,
+            "description": "Exact id/number from same-turn RO detail.",
+        }
+    if "target_id" in required_fields:
+        properties["target_id"] = {
+            "type": "string",
+            "minLength": 1,
+            "description": "Exact child id from same-turn RO detail.",
+        }
+    if "expected_version" in required_fields:
+        properties["expected_version"] = {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Current affected resource version from that detail.",
+        }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "description": description,
+        "properties": properties,
+        "required": ["operation", *required_fields],
+    }
+
+
+def _calibration_iq_arguments_schema(
+    properties: Optional[dict[str, Any]] = None,
+    *,
+    required: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Return a strict operation-specific ``arguments`` object."""
+
+    schema: dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties or {},
+    }
+    if required:
+        schema["required"] = list(required)
+    return schema
+
+_AUTOMOTIVE_KNOWLEDGE_REPOSITORY_SEARCH_PROPERTIES = {
+    "query": {
+        "type": "string",
+        "description": "Semantic retrieval terms across the repository.",
+    },
+    "system": {"type": "string"},
+    "component": {"type": "string"},
+    "lifecycles": {
+        "type": "array",
+        "items": {
+            "type": "string",
+            "enum": ["discovered", "evidence_backed", "verified", "superseded"],
+        },
+        "description": "Defaults to verified only.",
+    },
+    "include_superseded": {"type": "boolean"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+}
+
+_AUTOMOTIVE_KNOWLEDGE_APPLICATION_SEARCH_PROPERTIES = {
+    **_AUTOMOTIVE_KNOWLEDGE_REPOSITORY_SEARCH_PROPERTIES,
+    "year": {"type": "integer", "minimum": 1900, "maximum": 2200},
+    "manufacturer": {"type": "string"},
+    "model": {"type": "string"},
+    "platform": {"type": "string"},
+    "trim": {"type": "string"},
+    "event_type": {
+        "type": "string",
+        "description": "Structured repair-event category when known.",
+    },
+    "event": {
+        "type": "string",
+        "description": "Structured repair event from the RO or user request.",
+    },
+    "requirement_type": {"type": "string"},
+    "calibration_type": {"type": "string"},
+}
+
 _SENSITIVE_PATH_EXACT = {
     ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".git", ".hg", ".svn",
     "credentials", "credential",
@@ -145,7 +1424,7 @@ class ToolBlocked(ToolError):
 class NeedsApproval(Exception):
     def __init__(self, tool_name: str, args: dict, summary: str):
         self.tool_name = tool_name
-        self.args = args
+        self.tool_args = args
         self.summary = summary
         super().__init__(summary)
 
@@ -158,7 +1437,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     "get_calendar": {
-        "description": "Read upcoming events from Google Calendar.",
+        "description": (
+            "Read appointments and events from Google Calendar only, not Calibration IQ "
+            "repair-order field workload or readiness. calibration_iq_work_prep is "
+            "authoritative for upcoming CIQ field work and weekly RO readiness."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -403,11 +1686,20 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     },
     "assistant_capabilities_read": {
-        "description": "Read the truthful live capability catalog, policies, worker modes, and known unavailable features.",
+        "description": (
+            "Primary read for whether X is configured and permitted to read or change "
+            "records: return model capabilities, policy tiers, worker modes, and known "
+            "unavailable features. Call this even when connectivity also needs a separate "
+            "service-status read. It performs no business action. Catalog presence is not "
+            "health, authentication, readiness, or execution proof."
+        ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     "system_status": {
-        "description": "Report the active model worker, GPU VRAM, and health.",
+        "description": (
+            "Report active model-worker and GPU health only. This does not test "
+            "Calibration IQ, ADAS SI, ScrapeX, or other connected services."
+        ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     "write_file": {
@@ -444,14 +1736,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
     # ---------------- ADAS SI ----------------
     "adas_si_search": {
         "description": (
-            "Search the local authoritative ADAS SI source library using structured "
-            "vehicle, system, component, and repair-event facts. Returns source-backed "
-            "page excerpts and document provenance. Use calibration_requirements mode "
-            "when buried trigger, prerequisite, inspection, or calibration rules must "
-            "be scanned across the complete relevant OEM documents. A no_result means "
-            "only that this source did not establish the answer. This library establishes "
-            "source requirements, not which calibrations are currently saved on a CIQ "
-            "repair order; read that exact RO first for a current one-RO question."
+            "Search the authoritative local ADAS SI OEM/service-information library "
+            "with structured vehicle and technical scope. Returns document/page "
+            "provenance and source excerpts. calibration_requirements mode scans the "
+            "complete relevant documents for buried trigger, prerequisite, inspection, "
+            "or calibration rules. It does not report current CIQ assignments; no_result "
+            "is only a miss in this source."
         ),
         "parameters": {
             "type": "object",
@@ -498,21 +1788,16 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "adas_si_inventory": {
         "description": (
-            "List what the ADAS SI library actually contains -- documents and the "
-            "vehicle applications they cover. Use this for coverage questions instead "
-            "of guessing whether a vehicle is supported. Its artifact_kind_summary "
-            "field classifies each document as an ADAS Map report or OE service "
-            "information -- use that for document-type counts, never "
-            "summary.parsed_document_count, which only means filename identity was "
-            "readable and says nothing about document type."
+            "Inventory ADAS SI documents and covered vehicle applications. Returns "
+            "artifact_kind_summary for authoritative document-type counts; "
+            "summary.parsed_document_count measures readable identity only, not type."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     "adas_si_open": {
         "description": (
-            "Pull up an ADAS SI document and display the actual PDF inline in chat. "
-            "Use this when Otis asks to see, open, show, or pull up a document, rather "
-            "than only describing what it contains. Optionally jump to a page."
+            "Display an actual ADAS SI PDF inline, optionally at a known page. Supply "
+            "an exact returned relative_path or a document-identity query."
         ),
         "parameters": {
             "type": "object",
@@ -590,51 +1875,35 @@ TOOL_SCHEMAS: dict[str, dict] = {
     # ---------------- Durable automotive knowledge ----------------
     "automotive_knowledge_search": {
         "description": (
-            "Search durable source-backed automotive knowledge using model-supplied "
-            "vehicle, system, component, repair-event, and requirement filters. "
-            "Verified non-superseded records are returned by default. A no_result is "
-            "a miss in this source, not proof that the information does not exist. For "
-            "an application-specific requirement, copy all known active-RO year, make, "
-            "and model facts into year, manufacturer, and model, and put a known repair "
-            "event in event or event_type; query text alone is not structured scope."
+            "Search provenance-backed structured automotive knowledge. Verified, "
+            "non-superseded records are the default. Repository-wide semantic searches "
+            "may use query/system/component. Any structured vehicle, repair-event, "
+            "requirement, or calibration filter is application-specific and requires the "
+            "complete year/manufacturer/model triple. no_result is only a repository miss."
         ),
         "parameters": {
             "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Optional semantic retrieval terms within the structured scope.",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "description": (
+                        "Repository-wide semantic/browse scope without application, event, "
+                        "requirement, or calibration filters."
+                    ),
+                    "additionalProperties": False,
+                    "properties": _AUTOMOTIVE_KNOWLEDGE_REPOSITORY_SEARCH_PROPERTIES,
+                    "required": [],
                 },
-                "year": {"type": "integer", "minimum": 1900, "maximum": 2200},
-                "manufacturer": {"type": "string"},
-                "model": {"type": "string"},
-                "platform": {"type": "string"},
-                "trim": {"type": "string"},
-                "system": {"type": "string"},
-                "component": {"type": "string"},
-                "event_type": {
-                    "type": "string",
-                    "description": "Structured repair-event category when known.",
+                {
+                    "type": "object",
+                    "description": (
+                        "Application-specific scope with a complete vehicle identity."
+                    ),
+                    "additionalProperties": False,
+                    "properties": _AUTOMOTIVE_KNOWLEDGE_APPLICATION_SEARCH_PROPERTIES,
+                    "required": ["year", "manufacturer", "model"],
                 },
-                "event": {
-                    "type": "string",
-                    "description": "Structured repair event from the RO or user request.",
-                },
-                "requirement_type": {"type": "string"},
-                "calibration_type": {"type": "string"},
-                "lifecycles": {
-                    "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": ["discovered", "evidence_backed", "verified", "superseded"],
-                    },
-                    "description": "Defaults to verified only.",
-                },
-                "include_superseded": {"type": "boolean"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-            },
-            "required": [],
+            ],
         },
     },
     "automotive_knowledge_read": {
@@ -854,18 +2123,22 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_read": {
         "description": (
-            "Return a bounded visible list from the complete verified Calibration IQ "
-            "repair-order collection matching structured filters. Finished work is "
-            "excluded unless include_completed is true. Use the active subject context "
-            "for follow-ups; do not invent filters from wording. This board-list result "
-            "does not include exact-RO calibration detail. If it is used as a safe identity "
-            "discovery detour for a one-RO question, continue with calibration_iq_ro using "
-            "the exact returned id; never answer current calibrations from a list row."
+            "Collection/list read for bounded Calibration IQ board questions and identity "
+            "discovery; finished work is excluded by default. Even an exact RO-number q "
+            "returns only a thin board row, never exact-resource detail. Continue with "
+            "calibration_iq_ro for any request about one identified RO."
         ),
         "parameters": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
-                "q": {"type": "string", "description": "Free-text search, e.g. an RO number or VIN"},
+                "q": {
+                    "type": "string",
+                    "description": (
+                        "Board-list search, including RO number or VIN discovery. A match "
+                        "does not contain exact-RO detail."
+                    ),
+                },
                 "shop": {"type": "string"},
                 "insurance": {"type": "string"},
                 "status": {"type": "string"},
@@ -888,21 +2161,21 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_ro": {
         "description": (
-            "Retrieve one repair order by the exact model-supplied RO number or internal "
-            "identifier, including vehicle, workflow, blockers, calibration requirements, "
-            "research, documents, and provenance. A verified result becomes the active "
-            "conversation subject for later model reasoning. This is the only CIQ read for "
-            "the current saved calibration set on one active RO; use it first for that "
-            "question. When active-subject metadata says current calibration detail is not "
-            "included, call this tool now for any one-RO calibration activity/requirements "
-            "question; do not answer from status/phase or merely offer a read. A board list "
-            "or ADAS SI source search cannot substitute for it."
+            "Exact-resource read for one identified Calibration IQ RO. Retrieve current "
+            "vehicle, workflow, blockers, saved calibrations, research, documents, and "
+            "provenance. Use this instead of the board-list read whenever one RO number "
+            "or id is known. It proves current CIQ state, not OEM trigger, requirement, "
+            "or procedure claims, which need authoritative technical evidence."
         ),
         "parameters": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
-                "repair_order_id": {"type": "string",
-                                    "description": "The RO number or id, e.g. 2400911724"},
+                "repair_order_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact displayed RO number or authoritative internal id.",
+                },
             },
             "required": ["repair_order_id"],
         },
@@ -937,25 +2210,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_operator": {
         "description": (
-            "The only model capability that performs routine Calibration IQ writes; a request "
-            "to change/close an RO or put evidence in its case requires this tool and cannot "
-            "be completed by prose. Perform one or more authorized business actions in a "
-            "single verified batch. Existing query tools remain preferable for ordinary reads. "
-            "Completing or removing a whole repair order from the active board is routine "
-            "close_ro work here, never deletion of an inferred child prerequisite. "
-            "research_ro writes source evidence into the case; use it for an explicit research, "
-            "import, or persistence request, not merely to show or read an OEM procedure. "
-            "Use operation research_ro to search ADAS SI, import matched OEM PDFs with page/source "
-            "provenance, link evidence to supplied or discovered calibration ids, and report missing "
-            "documentation. Set arguments.complete_research=true only when the user explicitly asks "
-            "to finish research; completion is withheld unless every required calibration has "
-            "source-backed persisted evidence. If research depends on a calibration mutation, call "
-            "this tool sequentially in the same user turn: verify the mutation receipt, then call "
-            "research_ro with the generated calibration id. Do not combine them in one actions array. "
-            "It also manages photos, general workspace entries, status undo, no-calibration decisions, "
-            "locations, document links/replacement/archive/restore, and verified download URLs. "
-            "delete_calibration, delete_blocker, delete_photo, and delete_prerequisite are not accepted "
-            "here; they use the confirmation-gated destructive tool."
+            "WRITE only for a direct current-turn command to change a specific Calibration "
+            "IQ record; non-change requests use reads. close_ro changes only "
+            "RO workflow; change_status is only for an explicitly named target status. Child "
+            "completion needs an explicit request and fresh id/version; deletion uses "
+            "the destructive tool. Copy ids/versions from same-turn detail. "
+            "research_ro persists source/page docs and never adds calibration children."
         ),
         "parameters": {
             "type": "object",
@@ -965,42 +2225,412 @@ TOOL_SCHEMAS: dict[str, dict] = {
                     "minItems": 1,
                     "maxItems": 50,
                     "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "operation": {
-                                "type": "string",
-                                "enum": list(CALIBRATION_IQ_ROUTINE_OPERATIONS),
-                                "description": (
-                                    "Exact routine Calibration IQ operator operation. Photo and workspace "
-                                    "actions manage product-owned files; document actions support metadata, "
-                                    "link/unlink, replacement, archive, and restore. undo_status uses the "
-                                    "product's history-aware correction, while no-calibration decisions use "
-                                    "their dedicated business actions. close_ro completes the whole repair "
-                                    "order and removes it from the active board. Verified file URLs are "
-                                    "returned through authenticated X proxies."
+                        "oneOf": [
+                            _calibration_iq_action_branch(
+                                ("close_ro",),
+                                ("repair_order_id", "expected_version"),
+                                "Normal whole-RO finished/Complete transition; child state is unchanged.",
+                                operation_description=(
+                                    "Close the whole RO/workflow. Never complete a child calibration."
                                 ),
-                            },
-                            "repair_order_id": {
-                                "type": "string",
-                                "description": (
-                                    "Authoritative repair-order UUID from a prior snapshot, or the "
-                                    "exact displayed RO number. X resolves a number to one UUID and "
-                                    "fails closed when it is missing or ambiguous."
+                                arguments_schema={
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "disposition": {"type": "string"},
+                                        "reason": {"type": "string"},
+                                    },
+                                },
+                            ),
+                            _calibration_iq_action_branch(
+                                ("change_status",),
+                                ("repair_order_id", "expected_version", "arguments"),
+                                "Set one explicitly named non-closure workflow status.",
+                                operation_description=(
+                                    "Use only for an explicit target status; not as a closure synonym."
                                 ),
-                            },
-                            "target_id": {"type": "string"},
-                            "expected_version": {"type": "integer", "minimum": 1},
-                            "arguments": {
-                                "type": "object",
-                                "description": (
-                                    "Operation-specific business fields. For add_note use body; for "
-                                    "create_folder use path. Do not send alternate names for the "
-                                    "same field or conflicting duplicate values."
+                                arguments_schema={
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "status": {
+                                            "type": "string",
+                                            "enum": list(CALIBRATION_IQ_STATUS_VALUES),
+                                        },
+                                        "reason": {"type": "string"},
+                                        "corrective_action": {"type": "string"},
+                                        "override_reason": {"type": "string"},
+                                    },
+                                    "required": ["status"],
+                                },
+                            ),
+                            _calibration_iq_action_branch(
+                                CALIBRATION_IQ_GENERAL_RO_VERSIONED_OPERATIONS,
+                                ("repair_order_id", "expected_version"),
+                                "Other versioned whole-RO actions.",
+                                operation_description="Exact named whole-RO operation.",
+                            ),
+                            _calibration_iq_action_branch(
+                                CALIBRATION_IQ_RESEARCH_RO_OPERATIONS,
+                                ("repair_order_id",),
+                                "Persist OEM source/page docs for existing children; never add one.",
+                                operation_description=(
+                                    "Research existing children and attach evidence."
                                 ),
-                            },
-                        },
-                        "required": ["operation"],
+                                arguments_schema={
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "query": {"type": "string"},
+                                        "queries": {"type": "array"},
+                                        "calibrations": {"type": "array"},
+                                        "calibration_ids": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "calibration_item_ids": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "destination_path": {"type": "string"},
+                                        "destination_folder": {"type": "string"},
+                                        "document_type": {"type": "string"},
+                                        "complete_research": {"type": "boolean"},
+                                        "summary": {"type": "string"},
+                                        "reason": {"type": "string"},
+                                    },
+                                },
+                            ),
+                            _calibration_iq_action_branch(
+                                CALIBRATION_IQ_ADD_CALIBRATION_OPERATIONS,
+                                ("repair_order_id", "arguments"),
+                                "Add a missing CIQ calibration child; never attach evidence.",
+                                operation_description=(
+                                    "Add a missing child; not research or documents."
+                                ),
+                                arguments_schema={
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "calibration_type": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 160,
+                                        },
+                                        "determination": {
+                                            "type": "string",
+                                            "enum": [
+                                                "REQUIRED",
+                                                "LIKELY_REQUIRED",
+                                                "NEEDS_RESEARCH",
+                                                "NOT_REQUIRED",
+                                                "REMOVED_AFTER_REVIEW",
+                                            ],
+                                        },
+                                        "method": {
+                                            "type": "string",
+                                            "enum": [
+                                                "STATIC",
+                                                "DYNAMIC",
+                                                "BOTH",
+                                                "INSPECTION_ONLY",
+                                                "UNKNOWN",
+                                            ],
+                                        },
+                                        "notes": {"type": "string"},
+                                        "research_status": {
+                                            "type": "string",
+                                            "maxLength": 120,
+                                        },
+                                    },
+                                    "required": ["calibration_type", "determination"],
+                                },
+                            ),
+                            _calibration_iq_action_branch(
+                                ("ensure_case_workspace",),
+                                ("repair_order_id",),
+                                "Ensure the RO research workspace exists.",
+                                operation_description="Ensure the case workspace.",
+                                arguments_schema=_calibration_iq_arguments_schema(),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("create_folder", "archive_entry"),
+                                ("repair_order_id", "arguments"),
+                                "Create a folder or archive a workspace entry by path.",
+                                operation_description="Workspace path action.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {"path": {"type": "string", "minLength": 1}},
+                                    required=("path",),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("rename_entry",),
+                                ("repair_order_id", "arguments"),
+                                "Rename one workspace entry.",
+                                operation_description="Rename a workspace entry.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "source_path": {"type": "string", "minLength": 1},
+                                        "new_name": {"type": "string", "minLength": 1},
+                                    },
+                                    required=("source_path", "new_name"),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("move_entry", "copy_entry"),
+                                ("repair_order_id", "arguments"),
+                                "Move or copy one workspace entry.",
+                                operation_description="Move or copy a workspace entry.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "source_path": {"type": "string", "minLength": 1},
+                                        "destination_path": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                    },
+                                    required=("source_path", "destination_path"),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("create_file",),
+                                ("repair_order_id", "arguments"),
+                                "Create one text file in the workspace.",
+                                operation_description="Create a workspace text file.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "path": {"type": "string", "minLength": 1},
+                                        "content": {"type": "string"},
+                                    },
+                                    required=("path", "content"),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("restore_entry",),
+                                ("repair_order_id", "arguments"),
+                                "Restore one archived workspace entry.",
+                                operation_description="Restore an archived entry.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "archive_path": {"type": "string", "minLength": 1},
+                                        "destination_path": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                    },
+                                    required=("archive_path",),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("import_document",),
+                                ("repair_order_id", "arguments"),
+                                "Import an authoritative local document into the RO case.",
+                                operation_description="Import a document from an allowed path.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "source_path": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "description": "Exact allowed absolute path; never invent.",
+                                        },
+                                        "destination_path": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                        "document_type": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 80,
+                                        },
+                                        "title": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 255,
+                                        },
+                                        "status": {
+                                            "type": "string",
+                                            "enum": ["candidate", "validated"],
+                                        },
+                                        "source_uri": {
+                                            "type": ["string", "null"],
+                                            "maxLength": 1000,
+                                        },
+                                        "source_name": {
+                                            "type": ["string", "null"],
+                                            "maxLength": 255,
+                                        },
+                                        "page_references": {
+                                            "type": "array",
+                                            "maxItems": 100,
+                                            "items": {"type": "string"},
+                                        },
+                                        "citation": {"type": ["string", "null"]},
+                                        "notes": {"type": ["string", "null"]},
+                                        "calibration_item_ids": {
+                                            "type": "array",
+                                            "items": {"type": "string", "minLength": 1},
+                                        },
+                                    },
+                                    required=("source_path",),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("import_photo",),
+                                ("repair_order_id", "arguments"),
+                                "Import one authoritative local photo into the RO.",
+                                operation_description="Import a photo from an allowed path.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "source_path": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "description": "Exact allowed absolute path; never invent.",
+                                        },
+                                        "category": {
+                                            "type": ["string", "null"],
+                                            "minLength": 1,
+                                            "maxLength": 120,
+                                        },
+                                        "caption": {
+                                            "type": ["string", "null"],
+                                            "maxLength": 500,
+                                        },
+                                    },
+                                    required=("source_path",),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("add_note",),
+                                ("repair_order_id", "arguments"),
+                                "Add a note to the RO.",
+                                operation_description="Add an RO note.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "body": {"type": "string", "minLength": 1},
+                                        "visibility": {
+                                            "type": "string",
+                                            "enum": ["SHARED", "TECHNICIAN_ONLY"],
+                                        },
+                                        "context_type": {
+                                            "type": ["string", "null"],
+                                            "maxLength": 80,
+                                        },
+                                        "context_id": {
+                                            "type": ["string", "null"],
+                                            "maxLength": 36,
+                                        },
+                                    },
+                                    required=("body",),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("add_blocker",),
+                                ("repair_order_id", "arguments"),
+                                "Add a blocking RO prerequisite.",
+                                operation_description="Add an RO blocker.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "title": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 180,
+                                        },
+                                        "category": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 120,
+                                        },
+                                        "calibration_item_id": {
+                                            "type": ["string", "null"]
+                                        },
+                                        "description": {"type": ["string", "null"]},
+                                        "is_required": {"type": "boolean"},
+                                        "due_date": {
+                                            "type": ["string", "null"],
+                                            "format": "date",
+                                        },
+                                    },
+                                    required=("title", "category"),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("add_prerequisite",),
+                                ("repair_order_id", "arguments"),
+                                "Add a nonblocking vehicle need or diagnostic scan.",
+                                operation_description="Add an RO prerequisite.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "kind": {
+                                            "type": "string",
+                                            "enum": ["VEHICLE_NEED", "DIAGNOSTIC_SCAN"],
+                                        },
+                                        "title": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 180,
+                                        },
+                                        "category": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 120,
+                                        },
+                                        "calibration_item_id": {
+                                            "type": ["string", "null"]
+                                        },
+                                        "description": {"type": ["string", "null"]},
+                                        "is_required": {"type": "boolean"},
+                                        "due_date": {
+                                            "type": ["string", "null"],
+                                            "format": "date",
+                                        },
+                                    },
+                                    required=("title", "category"),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                ("create_assessment",),
+                                ("repair_order_id",),
+                                "Create an RO assessment draft.",
+                                operation_description="Create an RO assessment.",
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "damage_areas": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "likely_calibrations": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "confirmed_calibrations": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "research_required": {"type": "boolean"},
+                                        "instructions_to_shop": {
+                                            "type": ["string", "null"]
+                                        },
+                                        "concerns": {"type": "object"},
+                                        "draft_content": {"type": "object"},
+                                    }
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                CALIBRATION_IQ_TARGET_VERSIONED_OPERATIONS,
+                                ("target_id", "expected_version"),
+                                "Versioned child/resource action using fresh exact detail.",
+                                operation_description=(
+                                    "Exact child/resource operation; complete_calibration requires "
+                                    "an explicit child-state command."
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
+                                CALIBRATION_IQ_UNSCOPED_CREATE_OPERATIONS,
+                                ("arguments",),
+                                "Create a new top-level record from complete operation fields.",
+                                operation_description="Exact top-level create operation.",
+                            ),
+                        ],
                     },
                 },
                 "continue_on_error": {
@@ -1014,12 +2644,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_destructive": {
         "description": (
-            "Delete one explicitly identified child calibration requirement, blocker, photo, "
-            "or general prerequisite through Calibration IQ's destructive operations. Each "
-            "action requires that child's authoritative target_id and Owner confirmation; "
-            "never invent a target or use this capability to complete, close, or remove a whole "
-            "repair order from the active board. Archive, restore, and whole-RO close remain "
-            "routine operator work."
+            "Delete an explicitly identified child calibration, blocker, photo, or "
+            "prerequisite. Every action requires the exact authoritative target_id and "
+            "current expected_version from a fresh exact-RO snapshot, plus Owner approval. "
+            "It cannot close a whole RO; close, archive, and restore are routine actions."
         ),
         "parameters": {
             "type": "object",
@@ -1042,22 +2670,31 @@ TOOL_SCHEMAS: dict[str, dict] = {
                             },
                             "repair_order_id": {
                                 "type": "string",
+                                "minLength": 1,
                                 "description": (
-                                    "Authoritative repair-order UUID from a prior snapshot, or the "
-                                    "exact displayed RO number for unique fail-closed resolution."
+                                    "Optional RO context; when supplied, copy the authoritative "
+                                    "UUID or exact displayed RO number from the same fresh snapshot."
                                 ),
                             },
                             "target_id": {
                                 "type": "string",
+                                "minLength": 1,
                                 "description": (
                                     "Authoritative id of the exact child calibration, blocker, "
                                     "photo, or prerequisite from a current snapshot. Never invent it."
                                 ),
                             },
-                            "expected_version": {"type": "integer", "minimum": 1},
+                            "expected_version": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": (
+                                    "Current version of the exact child resource from the fresh "
+                                    "snapshot; never use a board-row or stale-context version."
+                                ),
+                            },
                             "arguments": {"type": "object"},
                         },
-                        "required": ["operation", "target_id"],
+                        "required": ["operation", "target_id", "expected_version"],
                     },
                 },
                 "continue_on_error": {"type": "boolean"},
@@ -1081,9 +2718,49 @@ TEST_USER_TOOLS = {
 
 
 class Registry:
-    def __init__(self, policy_path: str | Path, store=None):
+    def __init__(
+        self,
+        policy_path: str | Path,
+        store=None,
+        *,
+        profile: str | None = None,
+    ):
         raw = yaml.safe_load(Path(policy_path).read_text(encoding="utf-8")) or {}
         self.policy: dict[str, dict] = raw.get("tools", {}) or {}
+        configured_profile = profile if profile is not None else raw.get("default_profile")
+        self.active_profile = str(configured_profile or "").strip() or None
+        self.profile_description = ""
+        self._profile_tools: frozenset[str] | None = None
+        if self.active_profile is not None:
+            profiles = raw.get("profiles") or {}
+            entry = profiles.get(self.active_profile)
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"Unknown or invalid tool profile: {self.active_profile!r}"
+                )
+            self.profile_description = str(entry.get("description") or "").strip()
+            configured_tools = entry.get("tools")
+            if configured_tools == "*":
+                self._profile_tools = None
+            elif isinstance(configured_tools, list) and all(
+                isinstance(name, str) and name.strip() for name in configured_tools
+            ):
+                names = [name.strip() for name in configured_tools]
+                if len(names) != len(set(names)):
+                    raise ValueError(
+                        f"Tool profile {self.active_profile!r} contains duplicate names"
+                    )
+                unknown = sorted(set(names) - set(self.policy))
+                if unknown:
+                    raise ValueError(
+                        f"Tool profile {self.active_profile!r} references unconfigured "
+                        f"tools: {', '.join(unknown)}"
+                    )
+                self._profile_tools = frozenset(names)
+            else:
+                raise ValueError(
+                    f"Tool profile {self.active_profile!r} must declare a tool list or '*'"
+                )
         self.roots: list[Path] = [Path(r).resolve() for r in (raw.get("roots") or [])]
         self.write_roots: list[Path] = [
             Path(r).resolve() for r in (raw.get("write_roots") or [])
@@ -1103,15 +2780,28 @@ class Registry:
     def role_allows_tool(role: str, name: str) -> bool:
         return role == "owner" or (role == "test_user" and name in TEST_USER_TOOLS)
 
-    def model_tools(self, role: str = "owner") -> list[dict]:
-        """OpenAI-format tool list for whatever is actually allowed and
-        implemented right now. Blocked tools are never advertised -- the
-        model shouldn't waste turns asking for something it can't have."""
+    def profile_allows_tool(self, name: str) -> bool:
+        """Whether the active model-surface profile advertises ``name``.
+
+        Profiles never authorize execution. Policy tiers, registered handlers,
+        role checks, approvals, and the invocation gateway remain independent.
+        """
+
+        return self._profile_tools is None or name in self._profile_tools
+
+    def profile_catalog(self, role: str = "owner") -> list[dict]:
+        """Configured profile schemas without requiring live service handlers.
+
+        This read-only catalog is suitable for model-level fixture harnesses and
+        budget inspection. Runtime model calls use :meth:`model_tools`, which
+        additionally requires an implemented handler.
+        """
+
         out = []
         for name, schema in TOOL_SCHEMAS.items():
             if not self.role_allows_tool(role, name):
                 continue
-            if self.tier(name) == "blocked" or name not in self._handlers:
+            if not self.profile_allows_tool(name) or self.tier(name) == "blocked":
                 continue
             out.append({
                 "type": "function",
@@ -1122,6 +2812,55 @@ class Registry:
                 },
             })
         return out
+
+    def model_tools(
+        self,
+        role: str = "owner",
+        *,
+        calibration_iq_evidence: Optional[CalibrationIQTurnEvidence] = None,
+        scrapex_evidence: Optional[ScrapeXTurnEvidence] = None,
+        gate_calibration_iq_writes: bool = True,
+        gate_scrapex_batch_ids: bool = True,
+    ) -> list[dict]:
+        """OpenAI-format tool list for whatever is actually allowed and
+        implemented right now. Blocked tools are never advertised -- the
+        model shouldn't waste turns asking for something it can't have.
+
+        The normal ADAS profile stages both Calibration IQ write tools behind
+        prior-round exact-RO evidence. Opaque ScrapeX batch-id branches likewise
+        require a verified prior-round list/create result. Gate overrides are
+        reserved for capability reporting and context-budget calculation; they
+        never bypass invocation validation.
+        """
+        catalog = [
+            item
+            for item in self.profile_catalog(role)
+            if item["function"]["name"] in self._handlers
+        ]
+        if gate_calibration_iq_writes and self.active_profile == "adas_operator":
+            catalog = calibration_iq_catalog_for_turn(
+                catalog, calibration_iq_evidence
+            )
+        if gate_scrapex_batch_ids:
+            catalog = scrapex_catalog_for_turn(catalog, scrapex_evidence)
+        return catalog
+
+    def capability_catalog(self, role: str = "owner") -> list[dict]:
+        """Configured/implemented capabilities, including staged write tools.
+
+        This is for truthful capability reporting, not model execution. The
+        normal profile keeps staged tools visible as capabilities while using
+        the same pruned action grammar that will be exposed after an exact read.
+        """
+
+        catalog = self.model_tools(
+            role,
+            gate_calibration_iq_writes=False,
+            gate_scrapex_batch_ids=False,
+        )
+        if self.active_profile == "adas_operator":
+            return calibration_iq_normal_profile_catalog(catalog)
+        return catalog
 
     def check_path(self, raw: str, *, write: bool = False) -> Path:
         """Resolve and confine to an allowed root. Resolution happens before
@@ -1207,7 +2946,12 @@ class Registry:
     @classmethod
     def log_args(cls, name: str, args: dict) -> dict:
         """Audit arguments without copying file bodies or likely secrets."""
-        safe = cls.redact_sensitive(args)
+        visible_args = {
+            key: value
+            for key, value in args.items()
+            if key != _CALIBRATION_IQ_APPROVAL_BINDING_KEY
+        }
+        safe = cls.redact_sensitive(visible_args)
         if name == "write_file" and "content" in args:
             content = str(args.get("content") or "")
             safe["content"] = {
@@ -1847,6 +3591,8 @@ class Registry:
         tool_call_id: Optional[str] = None,
         user_id: Optional[str] = None,
         role: Optional[str] = None,
+        calibration_iq_evidence: Optional[CalibrationIQTurnEvidence] = None,
+        scrapex_evidence: Optional[ScrapeXTurnEvidence] = None,
     ) -> Any:
         if name in {
             "calibration_iq_operator",
@@ -1861,6 +3607,7 @@ class Registry:
                 args.pop(_CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY, None)
             else:
                 args.pop(_CALIBRATION_IQ_CONTEXT_KEY, None)
+                args.pop(_CALIBRATION_IQ_APPROVAL_BINDING_KEY, None)
         if name in {
             "automotive_knowledge_capture",
             "automotive_knowledge_lifecycle",
@@ -1898,6 +3645,53 @@ class Registry:
                 )
             raise ToolBlocked(f"'{name}' is blocked by policy and cannot run.")
 
+        # This structured provenance check is independent of model advertising,
+        # policy tier, approval, and backend validation. It must run before an
+        # approval can be created or a handler can observe the request.
+        try:
+            validate_calibration_iq_write_binding(
+                name,
+                args,
+                calibration_iq_evidence,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                allow_unscoped_creates=self.active_profile != "adas_operator",
+            )
+        except ToolBlocked:
+            if self.store and name in CALIBRATION_IQ_STAGED_WRITE_TOOLS:
+                self.store.audit(
+                    "tool_write_binding_blocked",
+                    {
+                        "tool": name,
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "tool_call_id": tool_call_id,
+                    },
+                )
+            raise
+
+        try:
+            validate_scrapex_batch_binding(
+                name,
+                args,
+                scrapex_evidence,
+                conversation_id=conversation_id,
+                message_id=message_id,
+            )
+        except ToolBlocked:
+            if self.store and name in SCRAPEX_STAGED_TOOLS:
+                self.store.audit(
+                    "tool_batch_binding_blocked",
+                    {
+                        "tool": name,
+                        "action": _scrapex_action(args),
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "tool_call_id": tool_call_id,
+                    },
+                )
+            raise
+
         if name not in self._handlers:
             raise ToolError(f"'{name}' has no handler registered.")
 
@@ -1906,7 +3700,17 @@ class Registry:
                 raise ToolBlocked(
                     "Direct approved=True execution is disabled; resolve the bound approval instead."
                 )
-            raise NeedsApproval(name, args, self.approval_summary(name, args))
+            approval_args = args
+            if name == "calibration_iq_destructive":
+                approval_args = dict(args)
+                approval_args[_CALIBRATION_IQ_APPROVAL_BINDING_KEY] = (
+                    _calibration_iq_binding_proof(calibration_iq_evidence)
+                )
+            raise NeedsApproval(
+                name,
+                approval_args,
+                self.approval_summary(name, args),
+            )
 
         handler_args = args
         if name in {"get_weather", "list_tasks", "add_task", "update_task_status"}:
@@ -2026,6 +3830,53 @@ class Registry:
             )
             self.store.audit("approval_role_blocked", {"id": approval_id, "role": role})
             return completed
+
+        # A Calibration IQ destructive approval persists the exact-read proof
+        # inside its action digest. Reconstruct and revalidate it after the
+        # pending -> executing claim, before status delivery or handler entry.
+        # The private proof is never forwarded to the handler or projected to
+        # public approval data.
+        approval_handler_args = args
+        if name == "calibration_iq_destructive":
+            approval_handler_args = dict(args)
+            binding_proof = approval_handler_args.pop(
+                _CALIBRATION_IQ_APPROVAL_BINDING_KEY, None
+            )
+            approval_evidence = _calibration_iq_evidence_from_proof(binding_proof)
+            try:
+                validate_calibration_iq_write_binding(
+                    name,
+                    approval_handler_args,
+                    approval_evidence,
+                    conversation_id=conversation_id,
+                    message_id=approval.get("message_id"),
+                )
+            except ToolBlocked as exc:
+                safe_error = self.redact_sensitive(str(exc))
+                payload = {
+                    "status": "blocked",
+                    "executed": False,
+                    "success": False,
+                    "message": safe_error,
+                }
+                completed = self.store.complete_approval(
+                    approval_id,
+                    success=False,
+                    result=payload,
+                    error=safe_error,
+                    executed=False,
+                )
+                self.store.audit(
+                    "approval_write_binding_blocked",
+                    {
+                        "id": approval_id,
+                        "tool": name,
+                        "conversation_id": conversation_id,
+                        "message_id": approval.get("message_id"),
+                        "tool_call_id": approval.get("tool_call_id"),
+                    },
+                )
+                return completed
         if on_status:
             try:
                 notified = on_status("executing")
@@ -2059,7 +3910,7 @@ class Registry:
         try:
             if self.tier(name) != "confirm_required" or name not in self._handlers:
                 raise ToolBlocked(f"'{name}' is no longer an executable approval-gated tool.")
-            handler_args = args
+            handler_args = approval_handler_args
             if name in {"add_task", "update_task_status"}:
                 handler_args = dict(args)
                 handler_args["__xomni_user_id"] = user_id
@@ -2067,7 +3918,7 @@ class Registry:
                 handler_args = dict(args)
                 handler_args[_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY] = user_id
             if name == "calibration_iq_destructive":
-                handler_args = dict(args)
+                handler_args = dict(approval_handler_args)
                 handler_args[_CALIBRATION_IQ_CONTEXT_KEY] = (
                     self._calibration_iq_invocation_context(
                         conversation_id=conversation_id,

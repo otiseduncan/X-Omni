@@ -1,13 +1,31 @@
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from jsonschema import Draft202012Validator
 
+from core.config import ROOT
+from core.orchestrator.loop import (
+    Orchestrator,
+    tool_result_json_for_model,
+    tool_result_visible_to_model,
+)
 from core.services import scrapex
+from core.state.db import Store
+from core.tools.registry import (
+    Registry,
+    TOOL_SCHEMAS,
+    ToolBlocked,
+    scrapex_apply_new_quarantine,
+    scrapex_evidence_from_result,
+    validate_scrapex_batch_binding,
+)
 
 
 @dataclass
@@ -276,6 +294,182 @@ async def test_read_preview_is_structured_and_non_mutating(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_read_preview_rejects_ro_number_before_network(monkeypatch):
+    def fail_if_called(**_kwargs):
+        raise AssertionError("irrelevant preview fields must not reach ScrapeX")
+
+    monkeypatch.setattr(scrapex.httpx, "AsyncClient", fail_if_called)
+    result = await scrapex.read(
+        FakeSettings(),
+        {
+            "action": "preview_ciq_queue",
+            "phases": ["5"],
+            "ro_number": "9000000009",
+        },
+    )
+
+    assert result["status"] == "invalid_request"
+    assert result["executed"] is False
+    assert "ro_number" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_path"),
+    [
+        ({"action": "list_batches"}, "/api/batches"),
+        (
+            {"action": "batch_summary", "batch_id": "batch-9"},
+            "/api/batches/batch-9/summary",
+        ),
+        (
+            {"action": "batch_exceptions", "batch_id": "batch-9"},
+            "/api/batches/batch-9/exceptions",
+        ),
+    ],
+)
+async def test_read_list_and_batch_views_follow_production_paths(
+    monkeypatch, arguments, expected_path
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == expected_path
+        return httpx.Response(200, json={"ok": True})
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.read(FakeSettings(), arguments)
+
+    assert result["status"] == "verified"
+    assert result["success"] is True
+
+
+def test_read_schema_uses_complete_action_specific_branches() -> None:
+    parameters = scrapex.SCRAPEX_READ_SCHEMA["parameters"]
+    Draft202012Validator.check_schema(parameters)
+    validator = Draft202012Validator(parameters)
+
+    valid_arguments = [
+        {"action": "list_batches"},
+        {"action": "batch_summary", "batch_id": "batch-9"},
+        {"action": "batch_exceptions", "batch_id": "batch-9"},
+        {
+            "action": "batch_item",
+            "batch_id": "batch-9",
+            "ro_number": "9000000009",
+        },
+        {
+            "action": "preview_ciq_queue",
+            "phases": ["5", "6"],
+            "shop": "Macon",
+            "source_scope": "active",
+        },
+    ]
+    for arguments in valid_arguments:
+        assert validator.is_valid(arguments), arguments
+
+    invalid_arguments = [
+        {
+            "action": "preview_ciq_queue",
+            "phases": ["5"],
+            "ro_number": "9000000009",
+        },
+        {"action": "preview_ciq_queue"},
+        {
+            "action": "batch_summary",
+            "batch_id": "batch-9",
+            "ro_number": "9000000009",
+        },
+        {"action": "batch_item", "batch_id": "batch-9"},
+        {"action": "list_batches", "batch_id": "batch-9"},
+    ]
+    for arguments in invalid_arguments:
+        assert not validator.is_valid(arguments), arguments
+
+    branches = parameters["oneOf"]
+    assert len(branches) == len(scrapex.READ_ACTIONS)
+    assert all(branch["additionalProperties"] is False for branch in branches)
+    assert {branch["properties"]["action"]["const"] for branch in branches} == (
+        scrapex.READ_ACTIONS
+    )
+    exposed_fields = {
+        branch["properties"]["action"]["const"]: set(branch["properties"])
+        for branch in branches
+    }
+    assert exposed_fields == {
+        "list_batches": {"action"},
+        "batch_summary": {"action", "batch_id"},
+        "batch_exceptions": {"action", "batch_id"},
+        "batch_item": {"action", "batch_id", "ro_number"},
+        "preview_ciq_queue": {"action", "phases", "shop", "source_scope"},
+    }
+    action_descriptions = {
+        branch["properties"]["action"]["const"]: branch["properties"]["action"].get(
+            "description", ""
+        )
+        for branch in branches
+    }
+    assert "stored ScrapeX batches" in action_descriptions["list_batches"]
+    assert "existing ADAS Map evidence" in action_descriptions["list_batches"]
+    preview_description = action_descriptions["preview_ciq_queue"]
+    assert "Calibration IQ candidate work" in preview_description
+    assert "not stored ADAS Map evidence" in preview_description
+    assert "does not provide an existing ScrapeX batch or batch item" in (
+        preview_description
+    )
+    assert "list_batches discovers existing evidence" in preview_description
+
+
+def test_adas_map_schema_uses_complete_action_specific_branches() -> None:
+    parameters = scrapex.SCRAPEX_ADAS_MAP_SCHEMA["parameters"]
+    Draft202012Validator.check_schema(parameters)
+    validator = Draft202012Validator(parameters)
+
+    valid_arguments = [
+        {"action": "open_authentication"},
+        {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+        {"action": "create_phase_batch", "phases": ["5", "6"]},
+        {
+            "action": "process_one",
+            "batch_id": "batch-9",
+            "ro_number": "9000000009",
+        },
+        {"action": "start_batch", "batch_id": "batch-9"},
+        {"action": "pause_batch", "batch_id": "batch-9"},
+    ]
+    for arguments in valid_arguments:
+        assert validator.is_valid(arguments), arguments
+
+    invalid_arguments = [
+        {"action": "open_authentication", "batch_id": "batch-9"},
+        {
+            "action": "create_exact_batch",
+            "ro_numbers": ["9000000009"],
+            "batch_id": "batch-9",
+        },
+        {"action": "create_phase_batch", "phases": ["5"], "ro_numbers": ["9"]},
+        {"action": "process_one", "batch_id": "batch-9"},
+        {
+            "action": "process_one",
+            "batch_id": "batch-9",
+            "ro_number": "9000000009",
+            "phases": ["5"],
+        },
+        {"action": "start_batch"},
+        {"action": "pause_batch", "batch_id": "batch-9", "ro_number": "9"},
+    ]
+    for arguments in invalid_arguments:
+        assert not validator.is_valid(arguments), arguments
+
+    branches = parameters["oneOf"]
+    assert len(branches) == len(scrapex.ADAS_MAP_ACTIONS)
+    assert all(branch["additionalProperties"] is False for branch in branches)
+    assert {branch["properties"]["action"]["const"] for branch in branches} == (
+        scrapex.ADAS_MAP_ACTIONS
+    )
+    assert "allOf" not in parameters
+
+
+@pytest.mark.asyncio
 async def test_start_batch_stops_truthfully_when_authentication_is_required(monkeypatch):
     requests: list[tuple[str, str]] = []
 
@@ -297,6 +491,29 @@ async def test_start_batch_stops_truthfully_when_authentication_is_required(monk
     assert result["status"] == "authentication_required"
     assert result["executed"] is False
     assert result["work_complete"] is False
+    assert result["requires_human"] is True
+
+
+@pytest.mark.asyncio
+async def test_open_authentication_is_a_parameterless_provider_setup_handoff(
+    monkeypatch,
+):
+    requests: list[tuple[str, str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"active": True, "authenticated": False, "title": "ADAS Map"},
+        )
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.adas_map(FakeSettings(), {"action": "open_authentication"})
+
+    assert requests == [("POST", "/api/adas-map/open", {})]
+    assert result["status"] == "authentication_required"
+    assert result["executed"] is True
+    assert result["verified"] is False
     assert result["requires_human"] is True
 
 
@@ -341,6 +558,79 @@ async def test_create_exact_batch_uses_only_bounded_structured_fields(monkeypatc
     assert result["executed"] is True
     assert result["verified"] is True
     assert result["work_complete"] is False
+    assert result["data"]["id"] == "batch-2"
+    assert "evidence_id" not in result
+
+
+@pytest.mark.asyncio
+async def test_process_one_copies_the_exact_created_batch_data_id(monkeypatch):
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/api/batches/from-ciq/exact":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "batch-resource-42",
+                    "state": "pending",
+                    "requested_ro_numbers": ["9601"],
+                    "source_scope": "all",
+                    "items": [
+                        {
+                            "id": "item-9601",
+                            "batch_id": "batch-resource-42",
+                            "ro_number": "9601",
+                        }
+                    ],
+                    "readiness": {
+                        "ready": False,
+                        "total": 1,
+                        "adas_map_unresolved": 1,
+                    },
+                },
+            )
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": True, "authenticated": True})
+        assert request.url.path == (
+            "/api/batches/batch-resource-42/adas-map/process-one/9601"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "attempted": True,
+                "completed": True,
+                "status": "completed",
+                "batch_id": "batch-resource-42",
+                "ro_number": "9601",
+                "item": _completed_item("batch-resource-42", "9601"),
+                "readiness": {"ready": True},
+            },
+        )
+
+    _install_transport(monkeypatch, handler)
+    created = await scrapex.adas_map(
+        FakeSettings(),
+        {"action": "create_exact_batch", "ro_numbers": ["9601"]},
+    )
+    authoritative_batch_id = created["data"]["id"]
+    processed = await scrapex.adas_map(
+        FakeSettings(),
+        {
+            "action": "process_one",
+            "batch_id": authoritative_batch_id,
+            "ro_number": "9601",
+        },
+    )
+
+    assert authoritative_batch_id == "batch-resource-42"
+    assert processed["status"] == "completed"
+    assert processed["data"]["batch_id"] == authoritative_batch_id
+    assert requests == [
+        ("POST", "/api/batches/from-ciq/exact"),
+        ("GET", "/api/adas-map/status"),
+        ("POST", "/api/batches/batch-resource-42/adas-map/process-one/9601"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -799,3 +1089,595 @@ async def test_structured_actions_reject_irrelevant_or_secret_arguments_before_n
     assert "password" not in schema_text
     assert "credential" not in schema_text
     assert "base_url" not in schema_text
+
+
+def test_schemas_name_authoritative_batch_id_and_safe_provider_preflights() -> None:
+    status_text = json.dumps(scrapex.SCRAPEX_STATUS_SCHEMA).casefold()
+    adas_map_text = json.dumps(scrapex.SCRAPEX_ADAS_MAP_SCHEMA).casefold()
+    read_text = json.dumps(scrapex.SCRAPEX_READ_SCHEMA).casefold()
+
+    assert "safe, non-mutating provider preflight" in status_text
+    assert "before acquisition or provider setup" in status_text
+    assert "result.data.id" in adas_map_text
+    assert "never copy evidence_id" in adas_map_text
+    assert "parameterless browser-opening human/provider handoff" in adas_map_text
+    assert "user explicitly requests provider setup" in adas_map_text
+    assert "result.data.id, never evidence_id" in read_text
+
+
+def _verified_scrapex_result(action: str, data: Any) -> dict[str, Any]:
+    return {
+        "service": "ScrapeX",
+        "action": action,
+        "status": "verified",
+        "success": True,
+        "executed": True,
+        "verified": True,
+        "data": data,
+    }
+
+
+def test_scrapex_evidence_is_minted_only_from_verified_structured_results() -> None:
+    listed = scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "list_batches"},
+        _verified_scrapex_result(
+            "list_batches",
+            {"batches": [{"id": "batch-list-1"}, {"id": "batch-list-2"}]},
+        ),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="list-call",
+    )
+    assert listed is not None
+    assert listed.batch_ids == ("batch-list-1", "batch-list-2")
+    assert listed.source_tool_call_ids == ("list-call",)
+
+    created = scrapex_evidence_from_result(
+        "scrapex_adas_map",
+        {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+        _verified_scrapex_result(
+            "create_exact_batch", {"id": "batch-created-3"}
+        ),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="create-call",
+        previous=listed,
+    )
+    assert created is not None
+    assert created.batch_ids == (
+        "batch-created-3",
+        "batch-list-1",
+        "batch-list-2",
+    )
+    assert created.source_tool_call_ids == ("create-call", "list-call")
+
+    malformed = _verified_scrapex_result(
+        "list_batches", {"batches": [{"id": "batch-ok"}, {"name": "missing-id"}]}
+    )
+    assert scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "list_batches"},
+        malformed,
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="bad-list",
+    ) is None
+
+    for unsafe_result in (
+        {
+            **_verified_scrapex_result(
+                "create_exact_batch", {"id": "batch-untrusted"}
+            ),
+            "action": "create_phase_batch",
+        },
+        {
+            **_verified_scrapex_result(
+                "create_exact_batch", {"id": "batch-untrusted"}
+            ),
+            "verified": False,
+        },
+        {
+            **_verified_scrapex_result(
+                "create_exact_batch", {"id": "batch-untrusted"}
+            ),
+            "authentication_required": True,
+        },
+        {
+            **_verified_scrapex_result(
+                "create_exact_batch", {"id": "batch-untrusted"}
+            ),
+            "status": "indeterminate",
+            "may_have_executed": True,
+        },
+    ):
+        assert scrapex_evidence_from_result(
+            "scrapex_adas_map",
+            {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+            unsafe_result,
+            conversation_id=11,
+            message_id=22,
+            source_tool_call_id="unsafe-call",
+        ) is None
+
+
+def test_bound_scrapex_results_can_preserve_but_never_mint_an_opaque_id() -> None:
+    created = scrapex_evidence_from_result(
+        "scrapex_adas_map",
+        {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+        _verified_scrapex_result("create_exact_batch", {"id": "batch-created-3"}),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="create-call",
+    )
+    assert created is not None
+
+    preserved = scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "batch_summary", "batch_id": "batch-created-3"},
+        _verified_scrapex_result(
+            "batch_summary", {"batch_id": "batch-created-3", "items": []}
+        ),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="summary-call",
+        previous=created,
+    )
+    assert preserved is not None
+    assert preserved.batch_ids == ("batch-created-3",)
+    assert preserved.source_tool_call_ids == ("create-call", "summary-call")
+
+    invented = scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "batch_summary", "batch_id": "batch-invented"},
+        _verified_scrapex_result(
+            "batch_summary", {"batch_id": "batch-invented", "items": []}
+        ),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="invented-call",
+        previous=created,
+    )
+    assert invented == created
+
+    stale = scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "batch_summary", "batch_id": "batch-created-3"},
+        _verified_scrapex_result(
+            "batch_summary", {"batch_id": "batch-created-3", "items": []}
+        ),
+        conversation_id=11,
+        message_id=23,
+        source_tool_call_id="stale-call",
+        previous=created,
+    )
+    assert stale is None
+
+
+def test_indeterminate_id_bound_mutation_quarantines_only_that_batch_for_turn() -> None:
+    evidence = scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "list_batches"},
+        _verified_scrapex_result(
+            "list_batches",
+            {"batches": [{"id": "batch-risk"}, {"id": "batch-safe"}]},
+        ),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="list-call",
+    )
+    assert evidence is not None
+
+    quarantined = scrapex_evidence_from_result(
+        "scrapex_adas_map",
+        {
+            "action": "process_one",
+            "batch_id": "batch-risk",
+            "ro_number": "9000000009",
+        },
+        {
+            "service": "ScrapeX",
+            "action": "process_one",
+            "status": "indeterminate",
+            "success": False,
+            "executed": False,
+            "verified": False,
+            "may_have_executed": True,
+            "indeterminate": True,
+            "retryable": False,
+        },
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="ambiguous-process",
+        previous=evidence,
+    )
+    assert quarantined is not None
+    assert quarantined.batch_ids == ("batch-safe",)
+    assert quarantined.quarantined_batch_ids == ("batch-risk",)
+
+    with pytest.raises(ToolBlocked, match="automatic retry is forbidden"):
+        validate_scrapex_batch_binding(
+            "scrapex_adas_map",
+            {"action": "start_batch", "batch_id": "batch-risk"},
+            quarantined,
+            conversation_id=11,
+            message_id=22,
+        )
+    validate_scrapex_batch_binding(
+        "scrapex_adas_map",
+        {"action": "start_batch", "batch_id": "batch-safe"},
+        quarantined,
+        conversation_id=11,
+        message_id=22,
+    )
+
+    relisted = scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "list_batches"},
+        _verified_scrapex_result(
+            "list_batches", {"batches": [{"id": "batch-risk"}]}
+        ),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="relist-call",
+        previous=quarantined,
+    )
+    assert relisted == quarantined
+
+
+def test_sibling_overlay_applies_only_quarantine_and_never_new_batch_ids() -> None:
+    round_evidence = scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "list_batches"},
+        _verified_scrapex_result(
+            "list_batches", {"batches": [{"id": "batch-risk"}, {"id": "batch-safe"}]}
+        ),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="prior-list",
+    )
+    assert round_evidence is not None
+
+    newly_created = scrapex_evidence_from_result(
+        "scrapex_adas_map",
+        {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+        _verified_scrapex_result("create_exact_batch", {"id": "batch-new"}),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="create-call",
+        previous=round_evidence,
+    )
+    assert newly_created is not None
+    assert scrapex_apply_new_quarantine(round_evidence, newly_created) == round_evidence
+
+    quarantined = scrapex_evidence_from_result(
+        "scrapex_adas_map",
+        {"action": "start_batch", "batch_id": "batch-risk"},
+        {
+            "service": "ScrapeX",
+            "action": "start_batch",
+            "status": "indeterminate",
+            "success": False,
+            "executed": False,
+            "verified": False,
+            "may_have_executed": True,
+            "retryable": False,
+        },
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="ambiguous-start",
+        previous=newly_created,
+    )
+    sibling_evidence = scrapex_apply_new_quarantine(round_evidence, quarantined)
+    assert sibling_evidence is not None
+    assert sibling_evidence.batch_ids == ("batch-safe",)
+    assert sibling_evidence.quarantined_batch_ids == ("batch-risk",)
+    assert "batch-new" not in sibling_evidence.batch_ids
+
+
+def test_scrapex_evidence_never_exceeds_the_exact_model_visible_result() -> None:
+    oversized = _verified_scrapex_result(
+        "list_batches",
+        {"batches": [{"id": f"batch-{index:04d}"} for index in range(800)]},
+    )
+    encoded = tool_result_json_for_model("scrapex_read", oversized)
+
+    assert len(encoded) == 12_000
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(encoded)
+    assert tool_result_visible_to_model("scrapex_read", oversized) is None
+    assert scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "list_batches"},
+        tool_result_visible_to_model("scrapex_read", oversized),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="oversized-list",
+    ) is None
+
+
+def test_scrapex_batch_binding_defers_new_evidence_until_the_next_model_round() -> None:
+    round_evidence = None
+    next_round_evidence = scrapex_evidence_from_result(
+        "scrapex_adas_map",
+        {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+        _verified_scrapex_result("create_exact_batch", {"id": "batch-created-3"}),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="create-call",
+        previous=round_evidence,
+    )
+    arguments = {
+        "action": "process_one",
+        "batch_id": "batch-created-3",
+        "ro_number": "9000000009",
+    }
+
+    with pytest.raises(ToolBlocked, match="verified same-turn"):
+        validate_scrapex_batch_binding(
+            "scrapex_adas_map",
+            arguments,
+            round_evidence,
+            conversation_id=11,
+            message_id=22,
+        )
+    validate_scrapex_batch_binding(
+        "scrapex_adas_map",
+        arguments,
+        next_round_evidence,
+        conversation_id=11,
+        message_id=22,
+    )
+
+
+@pytest.mark.asyncio
+async def test_registry_blocks_unbound_or_stale_batch_ids_before_handler() -> None:
+    registry = Registry(ROOT / "config" / "tools.yaml", profile="adas_operator")
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def read_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        calls.append(("scrapex_read", arguments))
+        return {"status": "sentinel"}
+
+    async def map_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        calls.append(("scrapex_adas_map", arguments))
+        return {"status": "sentinel"}
+
+    registry.register("scrapex_read", read_handler)
+    registry.register("scrapex_adas_map", map_handler)
+    evidence = scrapex_evidence_from_result(
+        "scrapex_read",
+        {"action": "list_batches"},
+        _verified_scrapex_result(
+            "list_batches", {"batches": [{"id": "batch-observed-7"}]}
+        ),
+        conversation_id=11,
+        message_id=22,
+        source_tool_call_id="list-call",
+    )
+    assert evidence is not None
+
+    for name, arguments, bound_evidence, conversation_id, message_id in (
+        (
+            "scrapex_read",
+            {"action": "batch_summary", "batch_id": "batch-invented"},
+            evidence,
+            11,
+            22,
+        ),
+        (
+            "scrapex_adas_map",
+            {"action": "start_batch", "batch_id": "batch-observed-7"},
+            None,
+            11,
+            22,
+        ),
+        (
+            "scrapex_adas_map",
+            {"action": "pause_batch", "batch_id": "batch-observed-7"},
+            evidence,
+            11,
+            23,
+        ),
+        (
+            "scrapex_read",
+            {"action": "batch_exceptions", "batch_id": "batch-observed-7"},
+            evidence,
+            12,
+            22,
+        ),
+    ):
+        with pytest.raises(ToolBlocked):
+            await registry.invoke(
+                name,
+                arguments,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                scrapex_evidence=bound_evidence,
+            )
+    assert calls == []
+
+    await registry.invoke(
+        "scrapex_read",
+        {"action": "batch_summary", "batch_id": "batch-observed-7"},
+        conversation_id=11,
+        message_id=22,
+        scrapex_evidence=evidence,
+    )
+    await registry.invoke(
+        "scrapex_adas_map",
+        {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+        conversation_id=11,
+        message_id=22,
+    )
+    assert calls == [
+        (
+            "scrapex_read",
+            {"action": "batch_summary", "batch_id": "batch-observed-7"},
+        ),
+        (
+            "scrapex_adas_map",
+            {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_loop_revokes_indeterminate_batch_before_later_sibling_call(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    for name, schema in scrapex.SCRAPEX_TOOL_SCHEMAS.items():
+        monkeypatch.setitem(TOOL_SCHEMAS, name, schema)
+
+    store = Store(tmp_path / "scrapex-sibling-quarantine.sqlite")
+    conversation_id = store.create_conversation("ScrapeX staging")
+    message_id = store.add_message(
+        conversation_id,
+        "user",
+        "Continue the already selected ScrapeX batches.",
+    )
+    registry = Registry(
+        ROOT / "config" / "tools.yaml",
+        store=store,
+        profile="adas_operator",
+    )
+    read_calls: list[dict[str, Any]] = []
+    map_calls: list[dict[str, Any]] = []
+
+    async def read_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        read_calls.append(dict(arguments))
+        return _verified_scrapex_result(
+            "list_batches",
+            {"batches": [{"id": "batch-risk"}, {"id": "batch-safe"}]},
+        )
+
+    async def map_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        map_calls.append(dict(arguments))
+        if arguments["batch_id"] == "batch-risk":
+            return {
+                "service": "ScrapeX",
+                "action": "start_batch",
+                "status": "indeterminate",
+                "success": False,
+                "executed": False,
+                "verified": False,
+                "may_have_executed": True,
+                "indeterminate": True,
+                "retryable": False,
+                "message": "The remote outcome could not be verified.",
+                "error": {
+                    "detail": {
+                        "records": [
+                            f"ambiguous remote diagnostic {index:04d}"
+                            for index in range(800)
+                        ]
+                    }
+                },
+            }
+        return _verified_scrapex_result(
+            "start_batch", {"batch_id": arguments["batch_id"], "started": True}
+        )
+
+    registry.register("scrapex_read", read_handler)
+    registry.register("scrapex_adas_map", map_handler)
+
+    class Router:
+        active_name = "omni"
+
+        @staticmethod
+        def active_config():
+            return SimpleNamespace(supports_vision=True, supports_audio=True)
+
+    class Client:
+        def __init__(self) -> None:
+            self.round = 0
+
+        async def stream(self, _messages, tools=None):
+            self.round += 1
+            catalog = {
+                item["function"]["name"]: item["function"] for item in tools or []
+            }
+            map_actions = {
+                branch["properties"]["action"]["const"]
+                for branch in catalog["scrapex_adas_map"]["parameters"]["oneOf"]
+            }
+            if self.round == 1:
+                assert "start_batch" not in map_actions
+                yield {
+                    "type": "tool_call",
+                    "id": "list-call",
+                    "name": "scrapex_read",
+                    "arguments": json.dumps({"action": "list_batches"}),
+                }
+                return
+            if self.round == 2:
+                assert "start_batch" in map_actions
+                for call_id, batch_id in (
+                    ("risk-first", "batch-risk"),
+                    ("risk-sibling", "batch-risk"),
+                    ("safe-sibling", "batch-safe"),
+                ):
+                    yield {
+                        "type": "tool_call",
+                        "id": call_id,
+                        "name": "scrapex_adas_map",
+                        "arguments": json.dumps(
+                            {"action": "start_batch", "batch_id": batch_id}
+                        ),
+                    }
+                return
+            yield {"type": "content", "text": "The verified outcomes are shown."}
+
+    client = Client()
+    orchestrator = Orchestrator(
+        Router(),
+        client,
+        registry,
+        store,
+        SimpleNamespace(context_tokens=32_768, max_response_tokens=1_024),
+    )
+    events = [
+        event
+        async for event in orchestrator.run_turn(
+            conversation_id,
+            "Continue the already selected ScrapeX batches.",
+            approval_context={
+                "session_id": "local:local-dev",
+                "user_id": "local-dev",
+                "role": "owner",
+                "message_id": message_id,
+            },
+        )
+    ]
+
+    assert client.round == 3
+    assert read_calls == [{"action": "list_batches"}]
+    assert map_calls == [
+        {"action": "start_batch", "batch_id": "batch-risk"},
+        {"action": "start_batch", "batch_id": "batch-safe"},
+    ]
+    map_results = [
+        event["result"]
+        for event in events
+        if event.get("type") == "tool_result"
+        and event.get("name") == "scrapex_adas_map"
+    ]
+    assert [result["status"] for result in map_results] == [
+        "indeterminate",
+        "blocked",
+        "verified",
+    ]
+    assert "automatic retry is forbidden" in map_results[1]["message"]
+    store.close()
+
+
+def test_scrapex_staging_contract_has_no_conversational_text_input() -> None:
+    for helper in (
+        scrapex_evidence_from_result,
+        validate_scrapex_batch_binding,
+    ):
+        parameter_names = set(inspect.signature(helper).parameters)
+        assert parameter_names.isdisjoint(
+            {"message", "request_text", "user_message", "user_text", "utterance"}
+        )

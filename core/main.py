@@ -51,6 +51,27 @@ logging.basicConfig(
 log = logging.getLogger("xomni")
 
 
+def configured_profile_catalog(
+    settings: Settings,
+    *,
+    role: str = "owner",
+    profile: str | None = None,
+) -> list[dict]:
+    """Return production schemas for a profile without starting services.
+
+    Import-time capability installers have already registered their schemas;
+    ScrapeX publishes a static schema mapping that is merged here explicitly.
+    No handler is invoked and no external service or model worker is started.
+    """
+
+    TOOL_SCHEMAS.update(scrapex_svc.SCRAPEX_TOOL_SCHEMAS)
+    registry = Registry(
+        settings.tools_config,
+        profile=profile or getattr(settings, "tool_profile", None),
+    )
+    return registry.profile_catalog(role)
+
+
 def build_app(settings: Settings) -> FastAPI:
     settings.audio_tmp.mkdir(parents=True, exist_ok=True)
 
@@ -69,7 +90,11 @@ def build_app(settings: Settings) -> FastAPI:
     # catalog.  Keeping their implementation modules independent avoids
     # importing external-service clients into the security gateway itself.
     TOOL_SCHEMAS.update(scrapex_svc.SCRAPEX_TOOL_SCHEMAS)
-    registry = Registry(settings.tools_config, store=store)
+    registry = Registry(
+        settings.tools_config,
+        store=store,
+        profile=getattr(settings, "tool_profile", None),
+    )
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
     image_config = None
     image_generation = None

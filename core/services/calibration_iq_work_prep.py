@@ -592,7 +592,8 @@ async def _discover_adas_map(
     requirements = [
         dict(item)
         for item in (record.get("requirements") or [])
-        if isinstance(item, dict) and str(item.get("label") or "").strip()
+        if isinstance(item, dict)
+        and _looks_like_calibration_label(item.get("label"))
     ]
     explicit_none = record.get("explicit_no_calibration") is True
     discovery_status = str(discovery.get("status") or "unverified")
@@ -2995,13 +2996,37 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Calibration IQ work-prep bridge. Use CIQ as the work queue, ADAS Map on each RO as the governing calibration-requirement source, and ADAS SI as procedure coverage. It can list a phase, run a full ADAS Map/SI coverage audit for one phase, report one RO's saved requirements, or audit/reconcile the active queue for weekly SI readiness. Missing CIQ calibrations proved by ADAS Map are added/reactivated through CIQ's verified routine operator contract. mode: queue_list reads the durable conversation-scoped queue without a live re-audit. Supply statuses to select exact lifecycle rows, including authentication_required, retryable, or blocked work that could not finish."
+                    "Authoritative Calibration IQ source for upcoming shop field work "
+                    "and weekly RO readiness. It does not read Google Calendar "
+                    "appointments or events. Use it for active CIQ RO phase or queue "
+                    "lists, saved one-RO requirements, and live ADAS Map requirement or "
+                    "ADAS SI procedure audits. CIQ is the work queue; ADAS Map governs "
+                    "calibration requirements; ADAS SI supplies procedure coverage. "
+                    "Verified gaps may add or reactivate CIQ calibrations. queue_list "
+                    "reads the saved conversation queue; statuses filters exact "
+                    "lifecycle rows."
                 ),
                 "parameters": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "mode": {"type": "string", "enum": ["phase_list", "phase_coverage", "ro_requirements", "week_readiness", "queue_list", "queue_next"]},
+                        "mode": {
+                            "type": "string",
+                            "enum": [
+                                "phase_list",
+                                "phase_coverage",
+                                "ro_requirements",
+                                "week_readiness",
+                                "queue_list",
+                                "queue_next",
+                            ],
+                            "description": (
+                                "Choose an authoritative CIQ RO workload/readiness "
+                                "operation: phase_list and queue_list read lists; "
+                                "phase_coverage and week_readiness audit; ro_requirements "
+                                "reads one RO; queue_next advances one saved weekly row."
+                            ),
+                        },
                         "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
                         "repair_order_id": {"type": "string"},
                         "phase": {"type": "string"},

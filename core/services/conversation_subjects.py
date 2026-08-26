@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from . import conversation_working_context as working_context
+
 
 _DIRECT_RO_TOOLS = frozenset({"calibration_iq_ro"})
 _OPERATOR_TOOLS = frozenset(
@@ -118,7 +120,7 @@ def _subject_from_snapshot(snapshot: dict[str, Any]) -> Optional[dict[str, Any]]
         subject["vehicle"] = vehicle
     if shop:
         subject["shop"] = shop
-    return subject
+    return working_context.attach_snapshot(subject, snapshot)
 
 
 def subject_from_tool_result(
@@ -174,7 +176,7 @@ def subject_from_tool_result(
             return None
         return _subject_from_snapshot(verified_snapshots[0])
 
-    return None
+    return working_context.non_ciq_subject(name, result)
 
 
 def track_active_subject_from_tool_result(
@@ -192,14 +194,16 @@ def track_active_subject_from_tool_result(
     This is the single post-tool hook for the orchestrator. Returning ``None``
     means the result was not an authoritative, unambiguous subject update.
     """
-    subject = subject_from_tool_result(tool_name, result)
-    if subject is None:
+    if not isinstance(result, dict):
         return None
-    return store.set_conversation_subject(
-        conversation_id,
-        subject,
-        source_tool_name=tool_name,
-        source_tool_call_id=tool_call_id,
-        source_message_id=message_id,
+    name = str(tool_name or "").strip()
+    return working_context.persist_update(
+        store,
+        conversation_id=conversation_id,
+        tool_name=name,
+        result=result,
+        incoming=subject_from_tool_result(name, result),
+        tool_call_id=tool_call_id,
+        message_id=message_id,
         user_id=user_id,
     )

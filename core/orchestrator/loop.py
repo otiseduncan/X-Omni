@@ -21,16 +21,107 @@ import json
 import logging
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from ..state.db import WebsiteRevisionConflict
-from ..tools.registry import NeedsApproval, ToolBlocked, ToolError
+from ..tools.registry import (
+    CalibrationIQTurnEvidence,
+    NeedsApproval,
+    ScrapeXTurnEvidence,
+    ToolBlocked,
+    ToolError,
+    calibration_iq_evidence_from_result,
+    scrapex_apply_new_quarantine,
+    scrapex_evidence_from_result,
+)
 from . import prompt as prompt_mod
 
 log = logging.getLogger("xomni.loop")
 
 MAX_TOOL_ROUNDS = 6
 MAX_TOOL_CALLS_PER_ROUND = 8
+
+FINAL_SYNTHESIS_MESSAGE = (
+    "Internal final-synthesis boundary; this is not a new user request. The six "
+    "tool-capable rounds for this turn are complete. Using only the original "
+    "request and tool results already returned, provide one concise, truthful "
+    "final answer now. No more tools are available: do not request another tool "
+    "or imply that an unexecuted action ran. Preserve source, approval, receipt, "
+    "and indeterminate-result boundaries."
+)
+TOOL_ROUND_CAP_FALLBACK = (
+    "The six-round tool limit was reached. No additional tool was run, and I’m "
+    "not making a claim beyond the tool results already returned."
+)
+
+NO_TOOL_SELF_CHECK_ACCEPT = "NO_TOOL_NEEDED"
+NO_TOOL_SELF_CHECK_MESSAGE = """Internal final-answer evidence check; this is not a new user request. Review the withheld draft against the original request, current structured context, advertised tool contracts, and returned evidence. If a safe answer requires current or live business state, execution proof, capability state, or vehicle-specific OEM technical evidence, do not answer in prose: call the best justified advertised tool or tools now. If the draft is a casual or general answer, or already states a truthful unresolved boundary and no tool is needed, output exactly NO_TOOL_NEEDED. Never run a mutation to test or demonstrate capability. Reason from meaning and evidence contracts, not keyword rules."""
+NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE = """Internal active-context evidence check; this is not a new user request. A trusted active working subject exists, so do not accept or repeat the withheld draft and do not output NO_TOOL_NEEDED. Select the best justified advertised tool now to refresh or establish the authoritative evidence needed for the original request. The model owns which advertised capability fits; never mutate merely to test or demonstrate capability. Reason from the structured subject, full request, evidence contracts, and tool schemas, not keyword rules."""
+NO_TOOL_SELF_CHECK_FALLBACK = (
+    "I can’t verify the withheld draft from the available evidence, so I’m not "
+    "presenting it as established."
+)
+
+
+@dataclass(frozen=True)
+class NoToolSelfCheckResult:
+    accept_draft: bool
+    tool_calls: tuple[dict[str, Any], ...]
+    checker_text: str
+
+
+def no_tool_self_check_reserve_tokens(max_draft_tokens: int) -> int:
+    """Worst-case extra input for the one bounded review request."""
+
+    return (
+        max(0, int(max_draft_tokens))
+        + max(
+            prompt_mod.estimate_tokens(NO_TOOL_SELF_CHECK_MESSAGE),
+            prompt_mod.estimate_tokens(NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE),
+        )
+        + 24
+    )
+
+
+async def model_owned_no_tool_self_check(
+    client,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    draft: str,
+    *,
+    require_tool: bool = False,
+) -> NoToolSelfCheckResult:
+    """Let the same model accept its draft or select evidence tools once."""
+
+    review_instruction = (
+        NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE
+        if require_tool
+        else NO_TOOL_SELF_CHECK_MESSAGE
+    )
+    review_messages = [
+        *messages,
+        {"role": "assistant", "content": draft},
+        {"role": "user", "content": review_instruction},
+    ]
+    checker_text = ""
+    tool_calls: list[dict[str, Any]] = []
+    stream_kwargs: dict[str, Any] = {"tools": tools}
+    if require_tool:
+        stream_kwargs["tool_choice"] = "required"
+    async for event in client.stream(review_messages, **stream_kwargs):
+        if event.get("type") == "content":
+            checker_text += str(event.get("text") or "")
+        elif event.get("type") == "tool_call":
+            tool_calls.append(event)
+    return NoToolSelfCheckResult(
+        accept_draft=(
+            not require_tool and bool(draft.strip()) and not tool_calls
+            and checker_text.strip() == NO_TOOL_SELF_CHECK_ACCEPT
+        ),
+        tool_calls=tuple(tool_calls),
+        checker_text=checker_text,
+    )
 
 _WEB_ACCESS_DENIAL_RE = re.compile(
     r"\b(?:don't|do\s+not|doesn't|does\s+not|can't|cannot|unable\s+to)\b"
@@ -1033,6 +1124,27 @@ def _bounded_tool_result_json(
     return encoded[:max_chars]
 
 
+def tool_result_json_for_model(name: str, result: Any) -> str:
+    """Serialize exactly the projected result delivered to the model."""
+
+    return _bounded_tool_result_json(tool_result_for_model(name, result))
+
+
+def tool_result_visible_to_model(name: str, result: Any) -> Any:
+    """Return the structurally intact value the model can actually observe.
+
+    A pathological oversized nested result can still hit the serializer's
+    legacy raw-cut fallback. Such a fragment is not authoritative evidence:
+    fail closed instead of binding opaque identifiers that were present only
+    in the full handler/UI payload.
+    """
+
+    try:
+        return json.loads(tool_result_json_for_model(name, result))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
     """Choose media success cards only when result truth is self-consistent."""
     if name not in {"image_generate", "video_generate"}:
@@ -1389,20 +1501,49 @@ class Orchestrator:
                     "Could not load active subject for conversation %s",
                     conversation_id,
                 )
+        role = str(effective_context["role"])
+        calibration_iq_evidence: Optional[CalibrationIQTurnEvidence] = None
+        scrapex_evidence: Optional[ScrapeXTurnEvidence] = None
+        no_tool_self_check_enabled = bool(
+            not approved_tool
+            and getattr(self.client, "supports_no_tool_self_check", False)
+        )
+        no_tool_self_check_requires_tool = active_subject is not None
+        no_tool_self_check_reserve = (
+            no_tool_self_check_reserve_tokens(self.settings.max_response_tokens)
+            if no_tool_self_check_enabled
+            else 0
+        )
+        # An approval continuation reports the already executed protected call;
+        # it cannot mint a fresh staged-write unlock and chain another mutation.
+        calibration_iq_staging_enabled = not bool(approved_tool)
+        try:
+            # Reserve the largest catalog this turn may expose. The first model
+            # round receives the staged catalog, while a verified exact-RO read
+            # can unlock CIQ writes for a later round without overrunning context.
+            reserve_tools = self.registry.model_tools(
+                role,
+                gate_calibration_iq_writes=False,
+                gate_scrapex_batch_ids=False,
+            )
+            tools = self.registry.model_tools(
+                role,
+                calibration_iq_evidence=calibration_iq_evidence,
+                scrapex_evidence=scrapex_evidence,
+            )
+        except TypeError:
+            # Lightweight test registries expose the original zero-argument
+            # shape; the production Registry always accepts the role.
+            reserve_tools = tools = self.registry.model_tools()
         messages = prompt_mod.build_messages(
             self.router,
             history,
             self.settings.context_tokens,
             self.settings.max_response_tokens,
             active_subject=active_subject,
+            tools=reserve_tools,
+            extra_input_reserve_tokens=no_tool_self_check_reserve,
         )
-        role = str(effective_context["role"])
-        try:
-            tools = self.registry.model_tools(role)
-        except TypeError:
-            # Lightweight test registries expose the original zero-argument
-            # shape; the production Registry always accepts the role.
-            tools = self.registry.model_tools()
         artifacts: list[dict] = []
         full_text = ""
         last_calibration_iq_operator_result: Optional[dict[str, Any]] = None
@@ -1420,7 +1561,12 @@ class Orchestrator:
         # handler again, then let the model report the verified result.
         if approved_tool:
             name = approved_tool["name"]
-            args = approved_tool.get("args") or {}
+            raw_approved_args = approved_tool.get("args") or {}
+            args = (
+                self.registry.log_args(name, raw_approved_args)
+                if hasattr(self.registry, "log_args")
+                else raw_approved_args
+            )
             result = approved_tool.get("result")
             receipt = approved_tool.get("receipt") or {}
             if name in _CALIBRATION_IQ_OPERATOR_TOOLS:
@@ -1647,12 +1793,46 @@ class Orchestrator:
         # invocation touches the handler; later identical requests reuse that
         # result instead of re-running it and re-rendering its card.
         read_only_call_cache: dict[tuple[str, str], Any] = {}
-        for round_index in range(MAX_TOOL_ROUNDS):
+        for round_index in range(MAX_TOOL_ROUNDS + 1):
+            synthesis_only = round_index == MAX_TOOL_ROUNDS
+            if synthesis_only:
+                # Six tool-bearing model rounds are allowed. The extra model
+                # call exists only so the sixth result can become a truthful
+                # user-facing answer; no schema is advertised and no seventh
+                # tool request can reach the gateway.
+                log.warning("Tool loop hit the %d-round cap", MAX_TOOL_ROUNDS)
+                round_tools: list[dict] = []
+                round_messages = [
+                    *messages,
+                    {"role": "user", "content": FINAL_SYNTHESIS_MESSAGE},
+                ]
+            else:
+                try:
+                    tools = self.registry.model_tools(
+                        role,
+                        calibration_iq_evidence=calibration_iq_evidence,
+                        scrapex_evidence=scrapex_evidence,
+                    )
+                except TypeError:
+                    # Backward-compatible lightweight registries retain their
+                    # original fixed catalog.
+                    pass
+                round_tools = tools
+                round_messages = messages
+            # Evidence returned during this round cannot authorize another
+            # call authored in the same model batch. It becomes usable only on
+            # the next model round, after the result is visible to the model.
+            round_calibration_iq_evidence = calibration_iq_evidence
+            call_calibration_iq_evidence = round_calibration_iq_evidence
+            next_calibration_iq_evidence = calibration_iq_evidence
+            round_scrapex_evidence = scrapex_evidence
+            call_scrapex_evidence = round_scrapex_evidence
+            next_scrapex_evidence = scrapex_evidence
             tool_calls: list[dict] = []
             round_text = ""
             sealed_round_tokens: list[dict] = []
 
-            async for event in self.client.stream(messages, tools=tools):
+            async for event in self.client.stream(round_messages, tools=round_tools):
                 if event["type"] == "content":
                     round_text += event["text"]
                     # A model can emit optimistic prose before a tool call in
@@ -1670,6 +1850,53 @@ class Orchestrator:
                     MAX_TOOL_CALLS_PER_ROUND,
                 )
                 tool_calls = tool_calls[:MAX_TOOL_CALLS_PER_ROUND]
+
+            synthesis_boundary_failed = bool(
+                synthesis_only and (tool_calls or not round_text.strip())
+            )
+            if synthesis_boundary_failed:
+                if tool_calls:
+                    log.warning(
+                        "Model requested %d tool call(s) during synthesis-only round; "
+                        "none were executed",
+                        len(tool_calls),
+                    )
+                # Drop both the impossible call and any provisional narration
+                # emitted beside it. Protected result guards below still get
+                # first refusal; ordinary turns receive the bounded boundary.
+                tool_calls = []
+                round_text = ""
+                sealed_round_tokens = []
+
+            if (
+                no_tool_self_check_enabled
+                and round_index == 0
+                and not tool_calls
+            ):
+                self_check = await model_owned_no_tool_self_check(
+                    self.client,
+                    messages,
+                    tools,
+                    round_text,
+                    require_tool=no_tool_self_check_requires_tool,
+                )
+                if self_check.tool_calls:
+                    # The first draft and internal review prompt are temporary
+                    # review context. Keep only the model-owned tool decision in
+                    # the normal protocol history; neither checker prose nor the
+                    # unsupported draft reaches the user or persisted chat.
+                    tool_calls = list(self_check.tool_calls)[:MAX_TOOL_CALLS_PER_ROUND]
+                    round_text = ""
+                    sealed_round_tokens = []
+                elif self_check.accept_draft:
+                    for token_event in sealed_round_tokens:
+                        yield token_event
+                    full_text += round_text
+                    break
+                else:
+                    yield {"type": "token", "text": NO_TOOL_SELF_CHECK_FALLBACK}
+                    full_text += NO_TOOL_SELF_CHECK_FALLBACK
+                    break
 
             operator_turn_active = bool(calibration_iq_operator_results)
             work_prep_turn_active = bool(calibration_iq_work_prep_results)
@@ -1708,8 +1935,11 @@ class Orchestrator:
                 and not calibration_iq_protected_turn_active
                 and not guarded_web_response
             ):
-                for token_event in sealed_round_tokens:
-                    yield token_event
+                if synthesis_boundary_failed:
+                    yield {"type": "token", "text": TOOL_ROUND_CAP_FALLBACK}
+                else:
+                    for token_event in sealed_round_tokens:
+                        yield token_event
 
             if guarded_calibration_iq_response:
                 guarded_text = _calibration_iq_protected_terminal_summary(
@@ -1724,7 +1954,11 @@ class Orchestrator:
                 yield {"type": "token", "text": guarded_text}
                 full_text += guarded_text
             elif not tool_calls and not calibration_iq_protected_turn_active:
-                full_text += round_text
+                full_text += (
+                    TOOL_ROUND_CAP_FALLBACK
+                    if synthesis_boundary_failed
+                    else round_text
+                )
 
             if not tool_calls:
                 break
@@ -1760,6 +1994,13 @@ class Orchestrator:
 
                 call_id = call.get("id") or f"call_{round_index}_{i}"
                 is_website_call = call.get("name") == "website_preview_generate"
+                calibration_iq_evidence_for_call = call_calibration_iq_evidence
+                if call.get("name") in _CALIBRATION_IQ_OPERATOR_TOOLS:
+                    # One staged write attempt consumes the unlock. A later
+                    # mutation must refresh exact state again, while backend
+                    # optimistic-concurrency checks remain authoritative.
+                    call_calibration_iq_evidence = None
+                    next_calibration_iq_evidence = None
                 sealed_events: list[dict] = []
                 website_result = None
                 async for ev in self._execute(
@@ -1771,9 +2012,63 @@ class Orchestrator:
                     approval_context=effective_context,
                     call_id=call_id,
                     call_cache=read_only_call_cache,
+                    calibration_iq_evidence=calibration_iq_evidence_for_call,
+                    scrapex_evidence=call_scrapex_evidence,
                 ):
                     if ev["type"] == "approval":
                         paused = True
+                    if (
+                        calibration_iq_staging_enabled
+                        and call.get("name") == "calibration_iq_ro"
+                        and ev.get("type") == "tool_result"
+                    ):
+                        next_calibration_iq_evidence = calibration_iq_evidence_from_result(
+                            "calibration_iq_ro",
+                            ev.get("result"),
+                            conversation_id=conversation_id,
+                            message_id=int(effective_context.get("message_id") or 0),
+                            source_tool_call_id=call_id,
+                            previous=next_calibration_iq_evidence,
+                        )
+                    if (
+                        call.get("name") in {"scrapex_read", "scrapex_adas_map"}
+                        and ev.get("type") == "tool_result"
+                    ):
+                        visible_result = tool_result_visible_to_model(
+                            call["name"], ev.get("result")
+                        )
+                        previous_next_scrapex_evidence = next_scrapex_evidence
+                        visible_scrapex_evidence = scrapex_evidence_from_result(
+                            call["name"],
+                            args,
+                            visible_result,
+                            conversation_id=conversation_id,
+                            message_id=int(effective_context.get("message_id") or 0),
+                            source_tool_call_id=call_id,
+                            previous=previous_next_scrapex_evidence,
+                        )
+                        # Opaque identities can be minted only from the exact
+                        # structurally intact result shown to the model. A
+                        # no-retry quarantine is a safety revocation, so apply
+                        # it from the trusted full handler result even when a
+                        # pathological oversized detail could not be projected.
+                        trusted_scrapex_evidence = scrapex_evidence_from_result(
+                            call["name"],
+                            args,
+                            ev.get("result"),
+                            conversation_id=conversation_id,
+                            message_id=int(effective_context.get("message_id") or 0),
+                            source_tool_call_id=call_id,
+                            previous=previous_next_scrapex_evidence,
+                        )
+                        next_scrapex_evidence = scrapex_apply_new_quarantine(
+                            visible_scrapex_evidence,
+                            trusted_scrapex_evidence,
+                        )
+                        call_scrapex_evidence = scrapex_apply_new_quarantine(
+                            call_scrapex_evidence,
+                            next_scrapex_evidence,
+                        )
                     if (
                         call.get("name") in _CALIBRATION_IQ_OPERATOR_TOOLS
                         and ev.get("type") == "tool_result"
@@ -1860,13 +2155,12 @@ class Orchestrator:
                     # and may themselves mutate state.
                     break
 
+            calibration_iq_evidence = next_calibration_iq_evidence
+            scrapex_evidence = next_scrapex_evidence
             if paused:
                 # Stop here. The UI shows the approval card; approving it
                 # starts a new turn carrying approved_tool.
                 break
-        else:
-            log.warning("Tool loop hit the %d-round cap", MAX_TOOL_ROUNDS)
-
         if (
             paused
             and not calibration_iq_truth_emitted
@@ -1930,17 +2224,18 @@ class Orchestrator:
         approval_context: Optional[dict],
         call_id: str = "call_0",
         call_cache: Optional[dict[tuple[str, str], Any]] = None,
+        calibration_iq_evidence: Optional[CalibrationIQTurnEvidence] = None,
+        scrapex_evidence: Optional[ScrapeXTurnEvidence] = None,
     ) -> AsyncIterator[dict]:
         yield {"type": "tool_start", "name": name, "args": args}
 
         def feed(payload: Any) -> None:
-            projected = tool_result_for_model(name, payload)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": name,
-                    "content": _bounded_tool_result_json(projected),
+                    "content": tool_result_json_for_model(name, payload),
                 }
             )
 
@@ -2001,6 +2296,8 @@ class Orchestrator:
                 tool_call_id=call_id,
                 user_id=(approval_context or {}).get("user_id"),
                 role=(approval_context or {}).get("role"),
+                calibration_iq_evidence=calibration_iq_evidence,
+                scrapex_evidence=scrapex_evidence,
             )
         except NeedsApproval as pending:
             context = approval_context or {}
@@ -2017,7 +2314,7 @@ class Orchestrator:
             approval_id = self.store.create_approval(
                 name,
                 pending.summary,
-                {"name": name, "args": args},
+                {"name": name, "args": pending.tool_args},
                 conversation_id=conversation_id,
                 session_id=str(context["session_id"]),
                 user_id=str(context["user_id"]),

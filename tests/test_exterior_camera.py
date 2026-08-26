@@ -24,7 +24,7 @@ from core.orchestrator.loop import (
 )
 from core.services import camera
 from core.services import exterior_camera
-from core.tools.registry import Registry
+from core.tools.registry import Registry, TOOL_SCHEMAS
 
 
 class _Reader:
@@ -1409,7 +1409,13 @@ def test_exterior_camera_api_requires_owner_exact_origin_and_safe_stream_status(
 def test_exterior_camera_tool_is_read_only_inline_and_starts_nothing():
     service = _ApiExteriorCamera()
     handler = exterior_camera.make_exterior_camera_request(service)
-    registry = Registry("config/tools.yaml")
+    normal_registry = Registry("config/tools.yaml")
+    normal_registry.register("exterior_camera_request", handler)
+    assert "exterior_camera_request" not in {
+        item["function"]["name"] for item in normal_registry.model_tools()
+    }
+
+    registry = Registry("config/tools.yaml", profile="full")
     registry.register("exterior_camera_request", handler)
     advertised = {
         item["function"]["name"]: item["function"]
@@ -1436,10 +1442,10 @@ def test_exterior_camera_tool_is_read_only_inline_and_starts_nothing():
             return SimpleNamespace(supports_vision=True, supports_audio=True)
 
     system = prompt_module.system_prompt(OmniRouter())
-    assert "call `exterior_camera_request`" in system
-    assert "does not expose credentials, start a stream, or prove a frame exists" in system
-    assert "Never ask for the device password in chat" in system
-    assert "only a separately submitted exterior-camera observation artifact" in system
+    assert "exterior_camera_request" not in system
+    schema_description = TOOL_SCHEMAS["exterior_camera_request"]["description"]
+    assert "does not start a stream" in schema_description
+    assert "does not" in schema_description
 
 
 def test_exterior_camera_observation_is_model_selected_inline():
@@ -1455,7 +1461,7 @@ def test_exterior_camera_observation_is_model_selected_inline():
         invocations.append(dict(args))
         return real_handler(args)
 
-    registry = Registry("config/tools.yaml")
+    registry = Registry("config/tools.yaml", profile="full")
     registry.register("exterior_camera_request", handler)
 
     class Store:

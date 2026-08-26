@@ -13,7 +13,7 @@ from core.api.routes import create_router
 from core.orchestrator import prompt as prompt_module
 from core.orchestrator.loop import ARTIFACT_FOR_TOOL
 from core.services import camera
-from core.tools.registry import Registry
+from core.tools.registry import Registry, TOOL_SCHEMAS
 
 
 def _jpeg(width=32, height=24, color=(12, 34, 56)) -> bytes:
@@ -48,8 +48,14 @@ def test_camera_request_is_truthful_and_does_not_claim_capture():
     }
 
 
-def test_camera_request_is_advertised_read_only_and_prompt_routes_to_it():
-    registry = Registry("config/tools.yaml")
+def test_camera_request_remains_available_in_full_profile_without_prompt_routing():
+    normal_registry = Registry("config/tools.yaml")
+    normal_registry.register("camera_request", camera.make_camera_request())
+    assert "camera_request" not in {
+        item["function"]["name"] for item in normal_registry.model_tools()
+    }
+
+    registry = Registry("config/tools.yaml", profile="full")
     registry.register("camera_request", camera.make_camera_request())
     advertised = {
         item["function"]["name"]: item["function"]
@@ -65,10 +71,10 @@ def test_camera_request_is_advertised_read_only_and_prompt_routes_to_it():
             return SimpleNamespace(supports_vision=True, supports_audio=True)
 
     system = prompt_module.system_prompt(OmniRouter())
-    assert "call `camera_request`" in system
-    assert "does not itself open the camera" in system
-    assert "preview is live" in system
-    assert "only the submitted frame" in system
+    assert "camera_request" not in system
+    schema_description = TOOL_SCHEMAS["camera_request"]["description"]
+    assert "operator" in schema_description
+    assert "does not itself open the camera" in schema_description
 
 
 def test_camera_frame_is_fully_decoded_and_metadata_only_artifact_is_built():

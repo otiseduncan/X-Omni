@@ -5,6 +5,7 @@ from datetime import datetime
 import pytest
 
 from core.services import calendar
+from core.tools.registry import TOOL_SCHEMAS
 
 
 class AuditStore:
@@ -13,6 +14,22 @@ class AuditStore:
 
     def audit(self, action: str, details: dict) -> None:
         self.entries.append((action, details))
+
+
+def test_calendar_and_ciq_work_prep_schemas_have_distinct_source_ownership():
+    calendar_description = TOOL_SCHEMAS["get_calendar"]["description"].casefold()
+    work_prep_description = TOOL_SCHEMAS["calibration_iq_work_prep"][
+        "description"
+    ].casefold()
+
+    assert "appointments and events from google calendar only" in calendar_description
+    assert "not calibration iq repair-order field workload or readiness" in (
+        calendar_description
+    )
+    assert "calibration_iq_work_prep is authoritative" in calendar_description
+    assert "upcoming shop field work" in work_prep_description
+    assert "weekly ro readiness" in work_prep_description
+    assert "does not read google calendar appointments or events" in work_prep_description
 
 
 @pytest.mark.asyncio

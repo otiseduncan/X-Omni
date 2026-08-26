@@ -526,12 +526,19 @@ class LicensedBrowser:
         if action == "alldata_vehicle_research":
             from . import research_alldata_navigation as navigation
 
+            vehicle_label = " ".join(str(args.get("vehicle") or "").split()).strip()
+            parsed_vehicle = (
+                navigation.vehicle_from_query(vehicle_label) if vehicle_label else {}
+            )
             result = await navigation.search_alldata_vehicle_first(
                 self,
                 vehicle={
-                    "year": args.get("vehicle_year"),
-                    "make": args.get("vehicle_make"),
-                    "model": args.get("vehicle_model"),
+                    "year": args.get("vehicle_year") or parsed_vehicle.get("year"),
+                    "make": args.get("vehicle_make") or parsed_vehicle.get("make"),
+                    "model": (
+                        args.get("vehicle_model")
+                        or parsed_vehicle.get("model_trim")
+                    ),
                     "trim": args.get("vehicle_trim"),
                 },
                 topic=str(args.get("topic") or ""),
@@ -912,21 +919,13 @@ def install() -> None:
             "collision_research",
             {
                 "description": (
-                    "Post-collision research operator. Use setup/status/start for ALLDATA access; "
-                    "use alldata_vehicle_research with explicit year/make/model/topic for one "
-                    "bounded vehicle-first licensed-source search; "
-                    "snapshot/extract/goto/click_text/fill/press to operate the licensed ALLDATA "
-                    "session without exposing credentials; capture_to_adas to preserve a targeted "
-                    "licensed source in ADAS SI; public_search/public_read for official OEM collision "
-                    "sites, position statements, technical articles, and manufacturer publications "
-                    "when local ADAS SI or ALLDATA does not answer the question. ALLDATA is "
-                    "vehicle-first: snapshot to see the current page, select the exact requested "
-                    "vehicle (Year/Make/Model or VIN, then click the matching result) before any "
-                    "search result can be considered relevant, then search Vehicle Information for "
-                    "the topic, open the best result, and extract. A vehicle must actually be "
-                    "selected -- confirmed by what a tool result shows, not assumed -- before "
-                    "treating any found text as belonging to that vehicle. Never bypass access "
-                    "controls or CAPTCHA."
+                    "Acquire post-collision evidence from the authorized licensed ALLDATA "
+                    "session or bounded public OEM sources. Vehicle-specific ALLDATA work "
+                    "requires an exact vehicle label or structured year/make/model, plus a "
+                    "topic and result-proven selection "
+                    "before evidence is attributed to that vehicle. Browser actions never "
+                    "carry credentials; capture_to_adas preserves a targeted source with "
+                    "provenance. Never bypass access controls or CAPTCHA."
                 ),
                 "parameters": {
                     "type": "object",

@@ -76,6 +76,7 @@ class Settings:
     calibration_iq_project_path: Path = Path(r"X:\calibration iq")
     scrapex_base_url: str = "http://127.0.0.1:8125"
     automotive_knowledge_db: Path | None = None
+    tool_profile: str = "adas_operator"
 
     @property
     def local_origin(self) -> str:
@@ -139,6 +140,10 @@ class Settings:
                         / "knowledge.sqlite"
                     ),
                 )
+            ),
+            tool_profile=(
+                os.getenv("XOMNI_TOOL_PROFILE", "adas_operator").strip()
+                or "adas_operator"
             ),
             vram_free_threshold_mib=_int("XOMNI_VRAM_FREE_THRESHOLD_MIB", 15000),
             gpu_index=_int("XOMNI_GPU_INDEX", 0),

@@ -159,6 +159,49 @@ async def test_alldata_vehicle_research_executes_model_supplied_structured_field
     }
 
 
+@pytest.mark.asyncio
+async def test_alldata_vehicle_research_normalizes_advertised_vehicle_label(
+    tmp_path, monkeypatch
+):
+    browser = research_operator.LicensedBrowser(tmp_path)
+    received: dict = {}
+
+    async def structured_search(browser_arg, query="", *, vehicle=None, topic=None):
+        assert browser_arg is browser
+        assert query == ""
+        received.update({"vehicle": vehicle, "topic": topic})
+        return {
+            "status": "success",
+            "searched": True,
+            "verified": True,
+            "vehicle": vehicle,
+            "topic": topic,
+        }
+
+    monkeypatch.setattr(
+        research_alldata_navigation,
+        "search_alldata_vehicle_first",
+        structured_search,
+    )
+    result = await browser.operator_action(
+        {
+            "action": "alldata_vehicle_research",
+            "vehicle": "2023 Chevrolet Tahoe",
+            "topic": "forward camera calibration after windshield replacement",
+        }
+    )
+    assert result["verified"] is True
+    assert received == {
+        "vehicle": {
+            "year": "2023",
+            "make": "Chevrolet",
+            "model": "Tahoe",
+            "trim": None,
+        },
+        "topic": "forward camera calibration after windshield replacement",
+    }
+
+
 def test_windows_vault_validation_does_not_require_windows_api():
     with pytest.raises(ValueError, match="username"):
         research_operator.WindowsCredentialVault._validate("", "password")

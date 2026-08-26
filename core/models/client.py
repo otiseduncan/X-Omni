@@ -25,6 +25,11 @@ class ModelError(RuntimeError):
 
 
 class ModelClient:
+    # Production turns support one bounded same-model evidence review before
+    # Core accepts an initial prose-only draft. Lightweight test clients opt in
+    # explicitly so their scripted call counts remain deterministic.
+    supports_no_tool_self_check = True
+
     def __init__(self, router: ModelRouter, temperature: float = 0.4,
                  max_tokens: int = 1536):
         self.router = router
@@ -42,6 +47,8 @@ class ModelClient:
         messages: list[dict[str, Any]],
         tools: Optional[list[dict]] = None,
         max_tokens: Optional[int] = None,
+        *,
+        tool_choice: Optional[str | dict[str, Any]] = None,
     ) -> AsyncIterator[dict]:
         """Stream a turn, recovering once if the worker has died.
 
@@ -54,7 +61,12 @@ class ModelClient:
         emitted = False
         try:
             async with self.router.inference_session():
-                async for event in self._stream_once(messages, tools, max_tokens):
+                async for event in self._stream_once(
+                    messages,
+                    tools,
+                    max_tokens,
+                    tool_choice=tool_choice,
+                ):
                     emitted = True
                     yield event
             return
@@ -80,7 +92,12 @@ class ModelClient:
 
         try:
             async with self.router.inference_session():
-                async for event in self._stream_once(messages, tools, max_tokens):
+                async for event in self._stream_once(
+                    messages,
+                    tools,
+                    max_tokens,
+                    tool_choice=tool_choice,
+                ):
                     yield event
         except (httpx.ConnectError, WorkerSwapError) as exc:
             raise ModelError(
@@ -96,6 +113,8 @@ class ModelClient:
         messages: list[dict[str, Any]],
         tools: Optional[list[dict]] = None,
         max_tokens: Optional[int] = None,
+        *,
+        tool_choice: Optional[str | dict[str, Any]] = None,
     ) -> AsyncIterator[dict]:
         """Yields {"type": "content", "text": ...} as tokens arrive, then
         {"type": "tool_call", ...} for any accumulated calls once the
@@ -111,7 +130,9 @@ class ModelClient:
         }
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice or "auto"
+        elif tool_choice is not None:
+            raise ValueError("tool_choice requires at least one advertised tool")
 
         pending: dict[int, dict] = {}
         timeout = httpx.Timeout(15.0, read=600.0, write=60.0, pool=15.0)

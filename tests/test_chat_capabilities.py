@@ -226,6 +226,45 @@ def test_capability_catalog_reports_real_tools_and_known_limits(tmp_path):
     assert any(item["name"] == "image attachments" for item in result["not_wired"])
 
 
+def test_capability_catalog_reports_staged_pruned_ciq_write_surface() -> None:
+    registry = Registry("config/tools.yaml", profile="adas_operator")
+    for name in (
+        "assistant_capabilities_read",
+        "calibration_iq_operator",
+        "calibration_iq_destructive",
+    ):
+        registry.register(name, lambda _args: {})
+    router = SimpleNamespace(
+        active_name="omni",
+        configs={
+            "omni": SimpleNamespace(supports_vision=True, supports_audio=True),
+        },
+    )
+
+    initially_advertised = {
+        item["function"]["name"] for item in registry.model_tools()
+    }
+    assert "calibration_iq_operator" not in initially_advertised
+    assert "calibration_iq_destructive" not in initially_advertised
+
+    result = builtin.make_assistant_capabilities(router, registry)({})
+    tools = {item["name"]: item for item in result["tools"]}
+    assert tools["calibration_iq_operator"]["turn_availability"] == (
+        "after_verified_same_turn_exact_ro"
+    )
+    assert tools["calibration_iq_operator"]["unavailable_operations"] == [
+        "create_ro",
+        "create_location",
+    ]
+    assert "does not expose unscoped top-level creates" in tools[
+        "calibration_iq_operator"
+    ]["description"]
+    assert tools["calibration_iq_destructive"]["requires_approval"] is True
+    assert "explicit full maintenance profile" in result[
+        "normal_profile_create_tradeoff"
+    ]
+
+
 def test_task_mutations_are_approval_gated_and_status_update_is_real(tmp_path):
     registry = Registry("config/tools.yaml")
     assert registry.tier("list_tasks") == "read_only"

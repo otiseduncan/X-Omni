@@ -21,9 +21,8 @@ def install() -> None:
             "research_provider_setup",
             {
                 "description": (
-                    "Open the secure ALLDATA credential and mobile authentication card in chat. "
-                    "Use when the owner asks to set up, save, enter, update, or log in to ALLDATA. "
-                    "The credential itself is collected by the UI and never enters model context."
+                    "Open the secure ALLDATA authentication card. The credential is collected "
+                    "by the UI and never enters model context or tool arguments."
                 ),
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },

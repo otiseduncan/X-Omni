@@ -383,7 +383,7 @@ def create_router(settings, store, router_, client, registry) -> APIRouter:
             "",
             approved_tool={
                 "name": current["tool_name"],
-                "args": current["args"],
+                "args": registry.log_args(current["tool_name"], current["args"]),
                 "result": receipt["result"],
                 "receipt": receipt,
                 "call_id": current["tool_call_id"],

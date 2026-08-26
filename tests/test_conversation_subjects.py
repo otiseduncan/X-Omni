@@ -274,13 +274,27 @@ def test_active_subject_survives_history_truncation_and_total_budget_is_bounded(
     history = [
         {"role": "user", "content": "x" * 100_000, "artifacts": []},
     ]
+    tools = Registry("config/tools.yaml", profile="adas_operator").profile_catalog()
     messages = prompt.build_messages(
-        _Router(), history, 32_768, 1_024, active_subject=active
+        _Router(),
+        history,
+        32_768,
+        1_024,
+        active_subject=active,
+        tools=tools,
     )
     assert len(messages) == 1
     assert "ro-persisted" in messages[0]["content"]
-    total = sum(prompt.estimate_tokens(message["content"]) + 8 for message in messages)
-    assert total <= 32_768 - 1_024 + 8
+    packed_tokens = prompt.estimate_tokens(messages[0]["content"]) + sum(
+        prompt.estimate_tokens(message["content"]) + 8
+        for message in messages[1:]
+    )
+    total = (
+        packed_tokens
+        + prompt.estimate_tool_catalog_tokens(tools)
+        + 1_024
+    )
+    assert total <= 32_768
 
 
 @pytest.mark.asyncio

@@ -244,14 +244,43 @@ def make_system_status(router):
 def make_assistant_capabilities(router, registry):
     def assistant_capabilities_read(_args: dict) -> dict:
         tools = []
-        for item in registry.model_tools():
+        try:
+            configured_tools = registry.capability_catalog()
+        except AttributeError:
+            try:
+                configured_tools = registry.model_tools(
+                    gate_calibration_iq_writes=False,
+                )
+            except TypeError:
+                configured_tools = registry.model_tools()
+        staged_names = {
+            "calibration_iq_operator",
+            "calibration_iq_destructive",
+        }
+        for item in configured_tools:
             function = item["function"]
             name = function["name"]
-            tools.append({
+            requires_approval = registry.tier(name) == "confirm_required"
+            capability = {
                 "name": name,
-                "status": "approval_required" if registry.tier(name) == "confirm_required" else "available",
+                "status": "approval_required" if requires_approval else "available",
+                "turn_availability": (
+                    "after_verified_same_turn_exact_ro"
+                    if name in staged_names
+                    else "advertised_normally"
+                ),
+                "requires_approval": requires_approval,
                 "description": function["description"],
-            })
+            }
+            if (
+                name == "calibration_iq_operator"
+                and getattr(registry, "active_profile", None) == "adas_operator"
+            ):
+                capability["unavailable_operations"] = [
+                    "create_ro",
+                    "create_location",
+                ]
+            tools.append(capability)
         workers = []
         for name, cfg in router.configs.items():
             workers.append({
@@ -263,6 +292,20 @@ def make_assistant_capabilities(router, registry):
         return {
             "delivery": "existing_chat_stream",
             "catalog_is_execution_proof": False,
+            "tool_profile": getattr(registry, "active_profile", None),
+            "tool_profile_description": getattr(
+                registry, "profile_description", ""
+            ),
+            "staged_write_requirement": (
+                "Calibration IQ operator and destructive tools are advertised only after "
+                "a verified same-turn exact calibration_iq_ro result; the gateway binds "
+                "their ids and versions to that result."
+            ),
+            "normal_profile_create_tradeoff": (
+                "Top-level creates share calibration_iq_operator but cannot be bound to "
+                "an existing exact RO, so the normal ADAS staged grammar omits them; "
+                "they remain implemented in the explicit full maintenance profile."
+            ),
             "active_worker": router.active_name,
             "workers": workers,
             "tools": tools,

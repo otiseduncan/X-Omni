@@ -73,6 +73,43 @@ async def test_stream_releases_lease_before_recovery_and_retries_once(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_stream_forwards_required_tool_choice_without_changing_default(monkeypatch):
+    router = LeaseRouter()
+    client = ModelClient(router)
+    observed: list[object] = []
+
+    async def fake_stream_once(
+        _messages,
+        _tools=None,
+        _max_tokens=None,
+        *,
+        tool_choice=None,
+    ):
+        observed.append(tool_choice)
+        yield {"type": "tool_call", "name": "read", "arguments": "{}"}
+
+    monkeypatch.setattr(client, "_stream_once", fake_stream_once)
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    _ = [
+        event
+        async for event in client.stream(
+            [{"role": "user", "content": "check"}],
+            tools,
+            tool_choice="required",
+        )
+    ]
+    _ = [
+        event
+        async for event in client.stream(
+            [{"role": "user", "content": "check"}],
+            tools,
+        )
+    ]
+
+    assert observed == ["required", None]
+
+
+@pytest.mark.asyncio
 async def test_non_stream_completion_uses_same_lifecycle_guard(monkeypatch):
     router = LeaseRouter()
     client = ModelClient(router)

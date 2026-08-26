@@ -48,7 +48,7 @@ def test_rehydrates_prior_cards_as_concise_structured_context_across_worker_swap
     messages = prompt.build_messages(FakeRouter(omni=False), history, 32_768, 1_024)
     payload = stored_payload(messages)
 
-    assert "You are currently running as **Coder**" in messages[0]["content"]
+    assert "running as Coder (Qwen3-Coder 30B)" in messages[0]["content"]
     assert payload["newest_first"] is True
     assert [item["type"] for item in payload["items"]] == [
         "web_research", "file", "calendar", "weather"

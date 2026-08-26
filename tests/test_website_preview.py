@@ -19,7 +19,7 @@ from core.services.website import (
     make_website_preview,
 )
 from core.state.db import Store, WebsiteRevisionConflict
-from core.tools.registry import Registry, ToolBlocked
+from core.tools.registry import Registry, TOOL_SCHEMAS, ToolBlocked
 
 
 class FakeClient:
@@ -78,7 +78,13 @@ async def test_website_preview_rejects_missing_oversized_or_non_html_output():
 
 
 def test_website_tool_is_exposed_and_chat_native():
-    registry = Registry("config/tools.yaml")
+    normal_registry = Registry("config/tools.yaml")
+    normal_registry.register("website_preview_generate", lambda _args: {})
+    assert "website_preview_generate" not in {
+        item["function"]["name"] for item in normal_registry.model_tools()
+    }
+
+    registry = Registry("config/tools.yaml", profile="full")
     registry.register("website_preview_generate", lambda _args: {})
     names = [item["function"]["name"] for item in registry.model_tools()]
     assert "website_preview_generate" in names
@@ -86,7 +92,7 @@ def test_website_tool_is_exposed_and_chat_native():
     assert ARTIFACT_FOR_TOOL["website_preview_generate"] == "website_preview"
 
 
-def test_prompt_routes_website_requests_to_the_real_tool():
+def test_website_semantics_live_in_full_profile_schema_not_normal_prompt():
     class Config:
         supports_vision = True
         supports_audio = True
@@ -96,14 +102,10 @@ def test_prompt_routes_website_requests_to_the_real_tool():
             return Config()
 
     prompt = system_prompt(Router())
-    assert "call `website_preview_generate`" in prompt
-    assert "Do not say you lack website-generation ability" in prompt
-    assert "does not remove your write authority" in prompt
-    assert "do not repeat or regenerate its HTML" in prompt
-    assert "inline card already contains the complete preview and code" in prompt
-    assert "never say the preview was updated" in prompt
-    assert "do not substitute a preview" in prompt
-    assert "approval-gated `write_file` or `run_powershell`" in prompt
+    assert "website_preview_generate" not in prompt
+    schema_description = TOOL_SCHEMAS["website_preview_generate"]["description"]
+    assert "sandboxed inline chat preview" in schema_description
+    assert "does not write files or deploy" in schema_description
 
 
 def test_website_html_stays_in_artifact_not_model_feed_or_tool_audit():

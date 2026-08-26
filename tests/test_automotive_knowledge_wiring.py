@@ -67,6 +67,51 @@ def _candidate_record() -> dict:
     }
 
 
+def _one_of_object_schema_accepts(schema: dict, payload: dict) -> bool:
+    matches = 0
+    for branch in schema["oneOf"]:
+        properties = set(branch.get("properties") or {})
+        required = set(branch.get("required") or [])
+        if required <= set(payload) and (
+            branch.get("additionalProperties") is not False
+            or set(payload) <= properties
+        ):
+            matches += 1
+    return matches == 1
+
+
+def test_knowledge_search_schema_requires_complete_application_scope() -> None:
+    schema = TOOL_SCHEMAS["automotive_knowledge_search"]["parameters"]
+
+    assert _one_of_object_schema_accepts(schema, {})
+    assert _one_of_object_schema_accepts(
+        schema,
+        {"query": "camera calibration procedures", "system": "ADAS"},
+    )
+    assert _one_of_object_schema_accepts(
+        schema,
+        {
+            "year": 2024,
+            "manufacturer": "Toyota",
+            "model": "Camry",
+            "event": "windshield replacement",
+            "calibration_type": "dynamic",
+        },
+    )
+    assert not _one_of_object_schema_accepts(
+        schema,
+        {"query": "Camry", "event": "windshield replacement"},
+    )
+    assert not _one_of_object_schema_accepts(
+        schema,
+        {"requirement_type": "calibration"},
+    )
+    assert not _one_of_object_schema_accepts(
+        schema,
+        {"year": 2024, "manufacturer": "Toyota", "event_type": "repair"},
+    )
+
+
 @pytest.mark.asyncio
 async def test_knowledge_tools_are_statically_advertised_and_safely_tiered(tmp_path):
     app = build_app(_settings(tmp_path))
@@ -79,15 +124,18 @@ async def test_knowledge_tools_are_statically_advertised_and_safely_tiered(tmp_p
             "automotive_knowledge_search",
             "automotive_knowledge_read",
             "automotive_knowledge_capture",
-            "automotive_knowledge_lifecycle",
         } <= advertised
+        assert "automotive_knowledge_lifecycle" not in advertised
+        assert registry.profile_allows_tool("automotive_knowledge_lifecycle") is False
         assert "automotive_knowledge_review" not in advertised
         assert registry.tier("automotive_knowledge_search") == "read_only"
         assert registry.tier("automotive_knowledge_capture") == "operator_authorized"
         assert registry.tier("automotive_knowledge_lifecycle") == "confirm_required"
-        assert TOOL_SCHEMAS["automotive_knowledge_search"]["parameters"][
-            "additionalProperties"
-        ] is False
+        search_branches = TOOL_SCHEMAS["automotive_knowledge_search"][
+            "parameters"
+        ]["oneOf"]
+        assert all(branch["additionalProperties"] is False for branch in search_branches)
+        assert search_branches[1]["required"] == ["year", "manufacturer", "model"]
         capture_conditions = TOOL_SCHEMAS["automotive_knowledge_capture"][
             "parameters"
         ]["allOf"]

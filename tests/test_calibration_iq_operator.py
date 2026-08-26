@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,12 +13,33 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from jsonschema import Draft202012Validator
 
 from core.api.routes import create_router
 from core.orchestrator.loop import Orchestrator
 from core.services import calibration_iq as ciq
 from core.state.db import Store
-from core.tools.registry import NeedsApproval, Registry, TOOL_SCHEMAS, ToolBlocked
+from core.tools.registry import (
+    CALIBRATION_IQ_ADD_CALIBRATION_OPERATIONS,
+    CALIBRATION_IQ_GENERAL_RO_VERSIONED_OPERATIONS,
+    CALIBRATION_IQ_OTHER_RO_UNVERSIONED_OPERATIONS,
+    CALIBRATION_IQ_RESEARCH_RO_OPERATIONS,
+    CALIBRATION_IQ_ROUTINE_OPERATIONS,
+    CALIBRATION_IQ_RO_REQUIRED_OPERATIONS,
+    CALIBRATION_IQ_RO_UNVERSIONED_OPERATIONS,
+    CALIBRATION_IQ_RO_VERSIONED_OPERATIONS,
+    CALIBRATION_IQ_STATUS_VALUES,
+    CALIBRATION_IQ_TARGET_REQUIRED_OPERATIONS,
+    CALIBRATION_IQ_TARGET_VERSIONED_OPERATIONS,
+    CALIBRATION_IQ_VERSION_REQUIRED_OPERATIONS,
+    CALIBRATION_IQ_WORKSPACE_DOCUMENT_RO_OPERATIONS,
+    NeedsApproval,
+    Registry,
+    TOOL_SCHEMAS,
+    ToolBlocked,
+    calibration_iq_evidence_from_result,
+    validate_calibration_iq_write_binding,
+)
 
 
 @dataclass
@@ -47,6 +69,52 @@ def _context(
         "user_id": "local-dev",
         "role": "owner",
     }
+
+
+def _exact_ro_result(
+    *,
+    repair_order_id: str = "ro-1",
+    ro_number: str = "2400911667",
+    version: int = 7,
+    research_version: int = 3,
+    calibration_version: int = 4,
+) -> dict[str, Any]:
+    return {
+        "status": "verified",
+        "repair_order": {
+            "id": repair_order_id,
+            "RO": ro_number,
+            "version": version,
+        },
+        "raw": {
+            "repair_order": {
+                "id": repair_order_id,
+                "ro_number": ro_number,
+                "version": version,
+            },
+            "research": {"id": "research-1", "version": research_version},
+            "calibrations": [{"id": "cal-1", "version": calibration_version}],
+            "blockers": [{"id": "blocker-1", "version": 2}],
+        },
+    }
+
+
+def _write_evidence(
+    *,
+    conversation_id: int = 41,
+    message_id: int = 99,
+    source_tool_call_id: str = "exact-ro-call",
+    result: dict[str, Any] | None = None,
+):
+    evidence = calibration_iq_evidence_from_result(
+        "calibration_iq_ro",
+        result or _exact_ro_result(),
+        conversation_id=conversation_id,
+        message_id=message_id,
+        source_tool_call_id=source_tool_call_id,
+    )
+    assert evidence is not None
+    return evidence
 
 
 def _verified_receipt(action: dict[str, Any], index: int) -> dict[str, Any]:
@@ -1879,6 +1947,7 @@ def _policy(tmp_path: Path, *, operator_tier: str = "operator_authorized") -> Pa
     policy = tmp_path / "tools.yaml"
     policy.write_text(
         "roots: []\nwrite_roots: []\ntools:\n"
+        "  calibration_iq_ro:\n    tier: read_only\n"
         f"  calibration_iq_operator:\n    tier: {operator_tier}\n"
         "  calibration_iq_update:\n    tier: confirm_required\n"
         "  calibration_iq_destructive:\n    tier: confirm_required\n",
@@ -1896,10 +1965,11 @@ def test_policy_tiers_are_explicit_and_invalid_values_fail_closed(tmp_path: Path
 
 
 def test_parity_operations_are_explicitly_split_between_routine_and_destructive_tools():
-    routine = set(
-        TOOL_SCHEMAS["calibration_iq_operator"]["parameters"]["properties"]
-        ["actions"]["items"]["properties"]["operation"]["enum"]
-    )
+    routine = set().union(*(
+        set(branch["properties"]["operation"]["enum"])
+        for branch in TOOL_SCHEMAS["calibration_iq_operator"]["parameters"]
+        ["properties"]["actions"]["items"]["oneOf"]
+    ))
     destructive = set(
         TOOL_SCHEMAS["calibration_iq_destructive"]["parameters"]["properties"]
         ["actions"]["items"]["properties"]["operation"]["enum"]
@@ -1932,7 +2002,463 @@ def test_parity_operations_are_explicitly_split_between_routine_and_destructive_
         TOOL_SCHEMAS["calibration_iq_destructive"]["parameters"]["properties"]
         ["actions"]["items"]["required"]
     )
-    assert destructive_required == {"operation", "target_id"}
+    assert destructive_required == {"operation", "target_id", "expected_version"}
+
+
+def test_operator_schema_matches_production_target_and_version_preflight():
+    item_schema = (
+        TOOL_SCHEMAS["calibration_iq_operator"]["parameters"]["properties"]
+        ["actions"]["items"]
+    )
+    branches = item_schema["oneOf"]
+    branch_operation_sets = [
+        set(branch["properties"]["operation"]["enum"])
+        for branch in branches
+    ]
+
+    def branch_for(operation: str) -> dict[str, Any]:
+        matches = [
+            branch
+            for branch in branches
+            if operation in branch["properties"]["operation"]["enum"]
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    assert set(item_schema) == {"oneOf"}
+    assert all(branch["type"] == "object" for branch in branches)
+    assert all(branch["additionalProperties"] is False for branch in branches)
+    assert all(set(branch["required"]) <= set(branch["properties"]) for branch in branches)
+    assert set().union(*branch_operation_sets) == set(
+        CALIBRATION_IQ_ROUTINE_OPERATIONS
+    )
+    assert sum(len(group) for group in branch_operation_sets) == len(
+        CALIBRATION_IQ_ROUTINE_OPERATIONS
+    )
+    assert set(branch_for("close_ro")["required"]) == {
+        "operation", "repair_order_id", "expected_version",
+    }
+    assert set(branch_for("change_status")["required"]) == {
+        "operation", "repair_order_id", "expected_version", "arguments",
+    }
+    assert set(branch_for("add_note")["required"]) == {
+        "operation", "repair_order_id", "arguments",
+    }
+    assert set(branch_for("research_ro")["properties"]["operation"]["enum"]) == {
+        "research_ro"
+    }
+    assert set(branch_for("add_calibration")["required"]) == {
+        "operation", "repair_order_id", "arguments",
+    }
+    assert set(branch_for("update_note")["required"]) == {
+        "operation", "target_id", "expected_version",
+    }
+    assert set(branch_for("create_ro")["required"]) == {"operation", "arguments"}
+    assert set(branch_for("update_ro")["properties"]["operation"]["enum"]) == set(
+        CALIBRATION_IQ_GENERAL_RO_VERSIONED_OPERATIONS
+    )
+
+    assert set(CALIBRATION_IQ_RO_VERSIONED_OPERATIONS) == (
+        set(CALIBRATION_IQ_RO_REQUIRED_OPERATIONS)
+        & set(CALIBRATION_IQ_VERSION_REQUIRED_OPERATIONS)
+    )
+    assert set(CALIBRATION_IQ_RO_VERSIONED_OPERATIONS) == (
+        set(CALIBRATION_IQ_GENERAL_RO_VERSIONED_OPERATIONS)
+        | {"change_status", "close_ro"}
+    )
+    assert set(CALIBRATION_IQ_TARGET_VERSIONED_OPERATIONS) == set(
+        CALIBRATION_IQ_TARGET_REQUIRED_OPERATIONS
+    )
+    unversioned_groups = (
+        set(CALIBRATION_IQ_RESEARCH_RO_OPERATIONS),
+        set(CALIBRATION_IQ_ADD_CALIBRATION_OPERATIONS),
+        set(CALIBRATION_IQ_WORKSPACE_DOCUMENT_RO_OPERATIONS),
+        set(CALIBRATION_IQ_OTHER_RO_UNVERSIONED_OPERATIONS),
+    )
+    assert set().union(*unversioned_groups) == set(
+        CALIBRATION_IQ_RO_UNVERSIONED_OPERATIONS
+    )
+    assert sum(len(group) for group in unversioned_groups) == len(
+        CALIBRATION_IQ_RO_UNVERSIONED_OPERATIONS
+    )
+
+    def schema_accepts(action: dict[str, Any]) -> bool:
+        branch = branch_for(str(action.get("operation") or ""))
+        if not set(branch["required"]) <= set(action):
+            return False
+        if not set(action) <= set(branch["properties"]):
+            return False
+        arguments_schema = branch["properties"].get("arguments", {})
+        arguments = action.get("arguments")
+        if arguments is not None and not isinstance(arguments, dict):
+            return False
+        if isinstance(arguments, dict):
+            if not set(arguments_schema.get("required", ())) <= set(arguments):
+                return False
+            status_schema = arguments_schema.get("properties", {}).get("status", {})
+            if "status" in arguments and arguments["status"] not in status_schema.get("enum", ()):
+                return False
+        return True
+
+    assert not schema_accepts({"operation": "close_ro"})
+    assert not schema_accepts({"operation": "close_ro", "repair_order_id": "ro-1"})
+    assert schema_accepts(
+        {
+            "operation": "close_ro",
+            "repair_order_id": "ro-1",
+            "expected_version": 7,
+        }
+    )
+    assert not schema_accepts(
+        {
+            "operation": "change_status",
+            "repair_order_id": "ro-1",
+            "expected_version": 7,
+        }
+    )
+    assert not schema_accepts(
+        {
+            "operation": "change_status",
+            "repair_order_id": "ro-1",
+            "expected_version": 7,
+            "arguments": {},
+        }
+    )
+    assert schema_accepts(
+        {
+            "operation": "change_status",
+            "repair_order_id": "ro-1",
+            "expected_version": 7,
+            "arguments": {"status": CALIBRATION_IQ_STATUS_VALUES[0]},
+        }
+    )
+    assert not schema_accepts({"operation": "add_note"})
+    assert not schema_accepts({"operation": "add_note", "repair_order_id": "ro-1"})
+    assert schema_accepts({
+        "operation": "add_note",
+        "repair_order_id": "ro-1",
+        "arguments": {"body": "Windshield was replaced."},
+    })
+    assert not schema_accepts({"operation": "update_note", "target_id": "note-1"})
+    assert schema_accepts(
+        {
+            "operation": "update_note",
+            "target_id": "note-1",
+            "expected_version": 2,
+        }
+    )
+    assert not schema_accepts({"operation": "create_ro"})
+    assert schema_accepts({"operation": "create_ro", "arguments": {"ro_number": "1"}})
+    assert not schema_accepts({"operation": "create_location"})
+    assert schema_accepts({"operation": "create_location", "arguments": {"name": "Perry"}})
+
+
+def test_operator_unversioned_action_families_are_schema_disjoint_and_truthful() -> None:
+    action_schema = (
+        TOOL_SCHEMAS["calibration_iq_operator"]["parameters"]["properties"]
+        ["actions"]["items"]
+    )
+    validator = Draft202012Validator(action_schema)
+    branches = action_schema["oneOf"]
+
+    def branch_for(operation: str) -> dict[str, Any]:
+        matches = [
+            branch
+            for branch in branches
+            if operation in branch["properties"]["operation"]["enum"]
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    research = branch_for("research_ro")
+    add = branch_for("add_calibration")
+    assert research["properties"]["operation"]["enum"] == ["research_ro"]
+    assert add["properties"]["operation"]["enum"] == ["add_calibration"]
+    assert "never add" in research["description"]
+    assert "never attach evidence" in add["description"]
+
+    assert validator.is_valid({
+        "operation": "research_ro",
+        "repair_order_id": "ro-1",
+        "arguments": {
+            "calibration_ids": ["cal-1"],
+            "destination_folder": "OEM",
+            "complete_research": True,
+        },
+    })
+    assert not validator.is_valid({
+        "operation": "research_ro",
+        "repair_order_id": "ro-1",
+        "arguments": {"documents": [{"page": 7}]},
+    })
+    assert validator.is_valid({
+        "operation": "add_calibration",
+        "repair_order_id": "ro-1",
+        "arguments": {
+            "calibration_type": "Forward camera aiming",
+            "determination": "REQUIRED",
+            "method": "STATIC",
+        },
+    })
+    assert not validator.is_valid({
+        "operation": "add_calibration",
+        "repair_order_id": "ro-1",
+        "arguments": {"documents": [{"page": 7}]},
+    })
+    assert not validator.is_valid({
+        "operation": "add_calibration",
+        "repair_order_id": "ro-1",
+        "arguments": {"calibration_type": "Forward camera aiming"},
+    })
+
+    exact_groups = {
+        "ensure_case_workspace": {"ensure_case_workspace"},
+        "create_folder": {"create_folder", "archive_entry"},
+        "rename_entry": {"rename_entry"},
+        "move_entry": {"move_entry", "copy_entry"},
+        "create_file": {"create_file"},
+        "restore_entry": {"restore_entry"},
+        "import_document": {"import_document"},
+        "import_photo": {"import_photo"},
+        "add_note": {"add_note"},
+        "add_blocker": {"add_blocker"},
+        "add_prerequisite": {"add_prerequisite"},
+        "create_assessment": {"create_assessment"},
+    }
+    for operation, expected_group in exact_groups.items():
+        branch = branch_for(operation)
+        assert set(branch["properties"]["operation"]["enum"]) == expected_group
+        assert "expected_version" not in branch["properties"]
+
+    valid_actions = [
+        {"operation": "ensure_case_workspace", "repair_order_id": "ro-1"},
+        {
+            "operation": "create_folder",
+            "repair_order_id": "ro-1",
+            "arguments": {"path": "OEM"},
+        },
+        {
+            "operation": "archive_entry",
+            "repair_order_id": "ro-1",
+            "arguments": {"path": "OEM/old.txt"},
+        },
+        {
+            "operation": "rename_entry",
+            "repair_order_id": "ro-1",
+            "arguments": {"source_path": "OEM/a.txt", "new_name": "b.txt"},
+        },
+        {
+            "operation": "move_entry",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "source_path": "OEM/a.txt",
+                "destination_path": "Evidence/a.txt",
+            },
+        },
+        {
+            "operation": "copy_entry",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "source_path": "OEM/a.txt",
+                "destination_path": "Evidence/a.txt",
+            },
+        },
+        {
+            "operation": "create_file",
+            "repair_order_id": "ro-1",
+            "arguments": {"path": "notes.txt", "content": ""},
+        },
+        {
+            "operation": "restore_entry",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "archive_path": ".archive/a.txt",
+                "destination_path": "OEM/a.txt",
+            },
+        },
+        {
+            "operation": "import_document",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "source_path": r"X:\ADAS SI\Toyota\procedure.pdf",
+                "destination_path": "OEM/procedure.pdf",
+                "document_type": "OEM_DOCUMENT",
+                "title": "Camera procedure",
+                "status": "validated",
+                "source_uri": None,
+                "source_name": "procedure.pdf",
+                "page_references": ["7"],
+                "citation": "p. 7",
+                "notes": None,
+                "calibration_item_ids": ["cal-1"],
+            },
+        },
+        {
+            "operation": "import_photo",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "source_path": r"X:\ADAS SI\Toyota\target.jpg",
+                "category": "Calibration target",
+                "caption": None,
+            },
+        },
+        {
+            "operation": "add_note",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "body": "Windshield was replaced.",
+                "visibility": "SHARED",
+                "context_type": None,
+                "context_id": None,
+            },
+        },
+        {
+            "operation": "add_blocker",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "title": "Alignment required",
+                "category": "alignment",
+                "description": None,
+                "is_required": True,
+                "due_date": None,
+            },
+        },
+        {
+            "operation": "add_prerequisite",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "kind": "DIAGNOSTIC_SCAN",
+                "title": "Pre-scan",
+                "category": "scan",
+            },
+        },
+        {"operation": "create_assessment", "repair_order_id": "ro-1"},
+        {
+            "operation": "create_assessment",
+            "repair_order_id": "ro-1",
+            "arguments": {
+                "damage_areas": ["windshield"],
+                "likely_calibrations": ["forward camera"],
+                "confirmed_calibrations": [],
+                "research_required": True,
+                "instructions_to_shop": None,
+                "concerns": {"glass": "aftermarket"},
+                "draft_content": {},
+            },
+        },
+    ]
+    assert all(validator.is_valid(action) for action in valid_actions)
+
+    arguments_required = {
+        "create_folder",
+        "archive_entry",
+        "rename_entry",
+        "move_entry",
+        "copy_entry",
+        "create_file",
+        "restore_entry",
+        "import_document",
+        "import_photo",
+        "add_note",
+        "add_blocker",
+        "add_prerequisite",
+    }
+    for operation in arguments_required:
+        assert not validator.is_valid({
+            "operation": operation,
+            "repair_order_id": "ro-1",
+        })
+
+    invalid_cross_action_arguments = [
+        {
+            "operation": "ensure_case_workspace",
+            "repair_order_id": "ro-1",
+            "arguments": {"path": "OEM"},
+        },
+        {
+            "operation": "create_folder",
+            "repair_order_id": "ro-1",
+            "arguments": {"source_path": "a", "destination_path": "b"},
+        },
+        {
+            "operation": "rename_entry",
+            "repair_order_id": "ro-1",
+            "arguments": {"source_path": "a", "destination_path": "b"},
+        },
+        {
+            "operation": "move_entry",
+            "repair_order_id": "ro-1",
+            "arguments": {"path": "a"},
+        },
+        {
+            "operation": "create_file",
+            "repair_order_id": "ro-1",
+            "arguments": {"path": "a.txt"},
+        },
+        {
+            "operation": "restore_entry",
+            "repair_order_id": "ro-1",
+            "arguments": {"path": "a.txt"},
+        },
+        {
+            "operation": "import_document",
+            "repair_order_id": "ro-1",
+            "arguments": {"source_path": "a.pdf", "caption": "wrong family"},
+        },
+        {
+            "operation": "import_photo",
+            "repair_order_id": "ro-1",
+            "arguments": {"source_path": "a.jpg", "document_type": "OEM_DOCUMENT"},
+        },
+        {
+            "operation": "add_note",
+            "repair_order_id": "ro-1",
+            "arguments": {"title": "wrong", "category": "wrong"},
+        },
+        {
+            "operation": "add_blocker",
+            "repair_order_id": "ro-1",
+            "arguments": {"body": "wrong"},
+        },
+        {
+            "operation": "add_prerequisite",
+            "repair_order_id": "ro-1",
+            "arguments": {"title": "Need", "category": "shop", "kind": "BLOCKER"},
+        },
+        {
+            "operation": "create_assessment",
+            "repair_order_id": "ro-1",
+            "arguments": {"path": "wrong"},
+        },
+    ]
+    assert all(
+        not validator.is_valid(action)
+        for action in invalid_cross_action_arguments
+    )
+
+
+def test_close_ro_schema_never_implies_child_calibration_completion():
+    schema = TOOL_SCHEMAS["calibration_iq_operator"]
+    description = schema["description"]
+    branches = schema["parameters"]["properties"]["actions"]["items"]["oneOf"]
+    close_branch = next(
+        branch
+        for branch in branches
+        if branch["properties"]["operation"]["enum"] == ["close_ro"]
+    )
+    child_branch = next(
+        branch
+        for branch in branches
+        if "complete_calibration" in branch["properties"]["operation"]["enum"]
+    )
+    operation_description = close_branch["properties"]["operation"]["description"]
+
+    assert "close_ro changes only RO workflow" in description
+    assert "Never complete a child calibration" in operation_description
+    assert "child state is unchanged" in close_branch["description"]
+    assert "explicit child-state command" in (
+        child_branch["properties"]["operation"]["description"]
+    )
 
 
 def test_operator_context_fails_closed_without_positive_persisted_message_id():
@@ -1945,6 +2471,173 @@ def test_operator_context_fails_closed_without_positive_persisted_message_id():
                 user_id="local-dev",
                 role="owner",
             )
+
+
+def test_structured_write_binding_uses_exact_state_not_user_text() -> None:
+    evidence = _write_evidence()
+    close_args = {"actions": [{
+        "operation": "close_ro",
+        "repair_order_id": "ro-1",
+        "expected_version": 7,
+    }]}
+
+    assert "user_message" not in inspect.signature(
+        validate_calibration_iq_write_binding
+    ).parameters
+    assert "user_text" not in inspect.signature(
+        calibration_iq_evidence_from_result
+    ).parameters
+    with pytest.raises(ToolBlocked, match="exact calibration_iq_ro"):
+        validate_calibration_iq_write_binding(
+            "calibration_iq_operator", close_args, None,
+        )
+    with pytest.raises(ToolBlocked, match="different conversation turn"):
+        validate_calibration_iq_write_binding(
+            "calibration_iq_operator",
+            close_args,
+            evidence,
+            conversation_id=42,
+            message_id=99,
+        )
+    validate_calibration_iq_write_binding(
+        "calibration_iq_operator",
+        close_args,
+        evidence,
+        conversation_id=41,
+        message_id=99,
+    )
+    with pytest.raises(ToolBlocked, match="stale"):
+        validate_calibration_iq_write_binding(
+            "calibration_iq_operator",
+            {"actions": [{
+                "operation": "close_ro",
+                "repair_order_id": "ro-1",
+                "expected_version": 6,
+            }]},
+            evidence,
+        )
+
+    validate_calibration_iq_write_binding(
+        "calibration_iq_operator",
+        {"actions": [{
+            "operation": "update_research",
+            "repair_order_id": "ro-1",
+            "expected_version": 3,
+        }]},
+        evidence,
+    )
+    with pytest.raises(ToolBlocked, match="stale"):
+        validate_calibration_iq_write_binding(
+            "calibration_iq_operator",
+            {"actions": [{
+                "operation": "update_research",
+                "repair_order_id": "ro-1",
+                "expected_version": 7,
+            }]},
+            evidence,
+        )
+
+
+def test_typed_target_binding_rejects_cross_resource_and_ambiguous_ids() -> None:
+    evidence = _write_evidence()
+    with pytest.raises(ToolBlocked, match="target/version"):
+        validate_calibration_iq_write_binding(
+            "calibration_iq_destructive",
+            {"actions": [{
+                "operation": "delete_photo",
+                "target_id": "cal-1",
+                "expected_version": 4,
+            }]},
+            evidence,
+        )
+
+    collision = _exact_ro_result()
+    collision["raw"]["photos"] = [{"id": "cal-1", "version": 4}]
+    ambiguous = _write_evidence(result=collision)
+    with pytest.raises(ToolBlocked, match="target/version"):
+        validate_calibration_iq_write_binding(
+            "calibration_iq_destructive",
+            {"actions": [{
+                "operation": "delete_photo",
+                "target_id": "cal-1",
+                "expected_version": 4,
+            }]},
+            ambiguous,
+        )
+
+
+def test_normal_profile_blocks_unbound_and_unscoped_writes_before_handler(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state.sqlite")
+    registry = Registry("config/tools.yaml", store=store, profile="adas_operator")
+    invoked: list[dict[str, Any]] = []
+    registry.register("calibration_iq_operator", lambda args: invoked.append(args) or {})
+    conversation_id = store.create_conversation("structured gate")
+    message_id = store.add_message(conversation_id, "user", "current request")
+    exact = _write_evidence(
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
+
+    with pytest.raises(ToolBlocked, match="exact calibration_iq_ro"):
+        asyncio.run(registry.invoke(
+            "calibration_iq_operator",
+            {"actions": [{
+                "operation": "close_ro",
+                "repair_order_id": "ro-fabricated",
+                "expected_version": 1,
+            }]},
+            message_id=message_id,
+            conversation_id=conversation_id,
+            tool_call_id="fabricated-capability-write",
+            user_id="local-dev",
+            role="owner",
+        ))
+    with pytest.raises(ToolBlocked, match="unscoped top-level create"):
+        asyncio.run(registry.invoke(
+            "calibration_iq_operator",
+            {"actions": [{
+                "operation": "create_ro",
+                "arguments": {"ro_number": "2400999999"},
+            }]},
+            message_id=message_id,
+            conversation_id=conversation_id,
+            tool_call_id="unscoped-create",
+            user_id="local-dev",
+            role="owner",
+            calibration_iq_evidence=exact,
+        ))
+
+    assert invoked == []
+    assert store.conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 0
+    assert store.conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0] == 0
+    audit_rows = store.conn.execute(
+        "SELECT detail_json FROM audit_log "
+        "WHERE event_type = 'tool_write_binding_blocked' ORDER BY id"
+    ).fetchall()
+    assert len(audit_rows) == 2
+    assert all("actions" not in row["detail_json"] for row in audit_rows)
+    assert all("2400999999" not in row["detail_json"] for row in audit_rows)
+    store.close()
+
+
+def test_full_profile_preserves_explicit_unscoped_create_contract() -> None:
+    evidence = _write_evidence()
+    create_args = {"actions": [{
+        "operation": "create_ro",
+        "arguments": {"ro_number": "2400999999"},
+    }]}
+    with pytest.raises(ToolBlocked, match="unscoped top-level create"):
+        validate_calibration_iq_write_binding(
+            "calibration_iq_operator", create_args, evidence,
+        )
+    validate_calibration_iq_write_binding(
+        "calibration_iq_operator",
+        create_args,
+        None,
+        allow_unscoped_creates=True,
+    )
 
 
 def test_operator_failure_is_logged_failed_with_authoritative_invocation_context(tmp_path: Path):
@@ -1962,15 +2655,24 @@ def test_operator_failure_is_logged_failed_with_authoritative_invocation_context
     registry.register("calibration_iq_operator", handler)
     conversation_id = store.create_conversation("operator receipt truth")
     message_id = store.add_message(conversation_id, "user", "update the RO")
+    evidence = _write_evidence(
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
     result = asyncio.run(registry.invoke(
         "calibration_iq_operator",
-        {"actions": [{"operation": "update_ro", "repair_order_id": "ro-1"}],
+        {"actions": [{
+            "operation": "update_ro",
+            "repair_order_id": "ro-1",
+            "expected_version": 7,
+        }],
          ciq._INVOCATION_CONTEXT_KEY: {"conversation_id": 999, "tool_call_id": "spoof"}},
         message_id=message_id,
         conversation_id=conversation_id,
         tool_call_id="real-call-id",
         user_id="local-dev",
         role="owner",
+        calibration_iq_evidence=evidence,
     ))
     assert result["success"] is False
     assert captured[ciq._INVOCATION_CONTEXT_KEY]["conversation_id"] == conversation_id
@@ -2044,8 +2746,16 @@ def test_destructive_delete_requires_bound_approval_and_receipt_truth(tmp_path: 
     registry.register("calibration_iq_destructive", destructive_handler)
     conversation_id = store.create_conversation("destructive operator")
     message_id = store.add_message(conversation_id, "user", "remove the bad calibration")
-    args = {"actions": [{"operation": "delete_calibration", "target_id": "cal-1"}]}
-    with pytest.raises(NeedsApproval):
+    args = {"actions": [{
+        "operation": "delete_calibration",
+        "target_id": "cal-1",
+        "expected_version": 4,
+    }]}
+    evidence = _write_evidence(
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
+    with pytest.raises(NeedsApproval) as pending:
         asyncio.run(registry.invoke(
             "calibration_iq_destructive",
             args,
@@ -2054,11 +2764,13 @@ def test_destructive_delete_requires_bound_approval_and_receipt_truth(tmp_path: 
             tool_call_id="delete-call",
             user_id="local-dev",
             role="owner",
+            calibration_iq_evidence=evidence,
         ))
+    approval_args = pending.value.tool_args
     approval_id = store.create_approval(
         "calibration_iq_destructive",
         registry.approval_summary("calibration_iq_destructive", args),
-        {"name": "calibration_iq_destructive", "args": args},
+        {"name": "calibration_iq_destructive", "args": approval_args},
         conversation_id=conversation_id,
         session_id="session-owner",
         user_id="local-dev",
@@ -2076,6 +2788,156 @@ def test_destructive_delete_requires_bound_approval_and_receipt_truth(tmp_path: 
     assert outcome["receipt"]["success"] is True
     assert captured[ciq._INVOCATION_CONTEXT_KEY]["conversation_id"] == conversation_id
     assert captured[ciq._INVOCATION_CONTEXT_KEY]["tool_call_id"] == "delete-call"
+    assert "__xomni_write_binding" not in captured
+    assert "__xomni_write_binding" not in registry.public_approval(
+        store.get_approval(approval_id) or {}
+    )["args"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_approval_continuation_never_exposes_private_binding_proof_to_model(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "approval-model-context.sqlite")
+    conversation_id = store.create_conversation("approved destructive action")
+    message_id = store.add_message(conversation_id, "user", "remove the exact item")
+    registry = Registry("config/tools.yaml", store=store, profile="adas_operator")
+    observed = {"called": False}
+
+    class Router:
+        active_name = "omni"
+
+        @staticmethod
+        def active_config():
+            return SimpleNamespace(supports_vision=True, supports_audio=True)
+
+    class Client:
+        async def stream(self, messages, tools=None):
+            observed["called"] = True
+            encoded = json.dumps(messages)
+            assert "__xomni_write_binding" not in encoded
+            assert "private-proof-marker" not in encoded
+            yield {"type": "content", "text": "The protected action did not execute."}
+
+    failed_result = {
+        "status": "failed",
+        "executed": False,
+        "success": False,
+        "verified": False,
+        "partial": False,
+        "requested_count": 1,
+        "processed_count": 0,
+        "receipts": [],
+        "final_snapshots": {},
+        "error": {"code": "blocked", "message": "Nothing was run."},
+    }
+    receipt = {
+        "tool_name": "calibration_iq_destructive",
+        "status": "failed",
+        "executed": False,
+        "success": False,
+        "result": failed_result,
+    }
+    orchestrator = Orchestrator(
+        Router(),
+        Client(),
+        registry,
+        store,
+        SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
+    )
+    events = [event async for event in orchestrator.run_turn(
+        conversation_id,
+        "",
+        approved_tool={
+            "name": "calibration_iq_destructive",
+            "args": {
+                "actions": [{
+                    "operation": "delete_calibration",
+                    "target_id": "cal-1",
+                    "expected_version": 4,
+                }],
+                "__xomni_write_binding": {"marker": "private-proof-marker"},
+            },
+            "result": failed_result,
+            "receipt": receipt,
+            "call_id": "approved-delete-call",
+        },
+        approval_context={
+            "session_id": "session-owner",
+            "user_id": "local-dev",
+            "role": "owner",
+            "message_id": message_id,
+        },
+    )]
+
+    assert observed["called"] is True
+    assert not any(event["type"] == "error" for event in events)
+    store.close()
+
+
+def test_destructive_approval_revalidates_persisted_typed_binding_before_handler(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "tampered-approval.sqlite")
+    registry = Registry(_policy(tmp_path / "policy"), store=store)
+    invoked: list[dict[str, Any]] = []
+    registry.register(
+        "calibration_iq_destructive", lambda args: invoked.append(args) or {},
+    )
+    conversation_id = store.create_conversation("tampered destructive proof")
+    message_id = store.add_message(conversation_id, "user", "remove the exact item")
+    args = {"actions": [{
+        "operation": "delete_calibration",
+        "target_id": "cal-1",
+        "expected_version": 4,
+    }]}
+    evidence = _write_evidence(
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
+    with pytest.raises(NeedsApproval) as pending:
+        asyncio.run(registry.invoke(
+            "calibration_iq_destructive",
+            args,
+            message_id=message_id,
+            conversation_id=conversation_id,
+            tool_call_id="tampered-delete-call",
+            user_id="local-dev",
+            role="owner",
+            calibration_iq_evidence=evidence,
+        ))
+
+    approval_args = pending.value.tool_args
+    proof = approval_args["__xomni_write_binding"]
+    target_kinds = proof["repair_orders"][0]["target_kinds"]
+    calibration_kind = next(pair for pair in target_kinds if pair[0] == "cal-1")
+    calibration_kind[1] = "photo"
+    approval_id = store.create_approval(
+        "calibration_iq_destructive",
+        registry.approval_summary("calibration_iq_destructive", args),
+        {"name": "calibration_iq_destructive", "args": approval_args},
+        conversation_id=conversation_id,
+        session_id="session-owner",
+        user_id="local-dev",
+        message_id=message_id,
+        tool_call_id="tampered-delete-call",
+    )
+    outcome = asyncio.run(registry.resolve_approval(
+        approval_id,
+        True,
+        conversation_id=conversation_id,
+        session_id="session-owner",
+        user_id="local-dev",
+    ))
+
+    assert outcome["approval"]["status"] == "failed"
+    assert outcome["receipt"]["executed"] is False
+    assert invoked == []
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM audit_log "
+        "WHERE event_type = 'approval_write_binding_blocked'"
+    ).fetchone()[0] == 1
     store.close()
 
 
@@ -2159,6 +3021,7 @@ async def test_natural_language_multi_action_request_executes_one_operator_batch
         }
 
     registry.register("calibration_iq_operator", operator_handler)
+    registry.register("calibration_iq_ro", lambda _args: _exact_ro_result())
 
     class Router:
         active_name = "omni"
@@ -2173,6 +3036,13 @@ async def test_natural_language_multi_action_request_executes_one_operator_batch
         async def stream(self, messages, tools=None):
             self.calls += 1
             if self.calls == 1:
+                yield {
+                    "type": "tool_call",
+                    "id": "multi-action-exact-ro",
+                    "name": "calibration_iq_ro",
+                    "arguments": json.dumps({"repair_order_id": "ro-1"}),
+                }
+            elif self.calls == 2:
                 yield {
                     "type": "tool_call",
                     "id": "multi-action-call",
@@ -2209,10 +3079,19 @@ async def test_natural_language_multi_action_request_executes_one_operator_batch
     assert captured[0][ciq._INVOCATION_CONTEXT_KEY]["tool_call_id"] == "multi-action-call"
     assert not any(event["type"] == "approval" for event in events)
     artifacts = [event["artifact"] for event in events if event["type"] == "artifact"]
-    assert artifacts == [{
+    operator_result = next(
+        event["result"] for event in events
+        if event["type"] == "tool_result"
+        and event.get("name") == "calibration_iq_operator"
+    )
+    assert [
+        artifact for artifact in artifacts
+        if artifact["type"] == "calibration_iq_receipt"
+    ] == [{
         "type": "calibration_iq_receipt",
-        "data": next(event["result"] for event in events if event["type"] == "tool_result"),
+        "data": operator_result,
     }]
+    assert any(artifact["type"] == "calibration_iq_ro" for artifact in artifacts)
     row = store.conn.execute(
         "SELECT status, approved_by FROM tool_calls WHERE tool_call_id = 'multi-action-call'"
     ).fetchone()
@@ -2269,6 +3148,7 @@ async def test_output_dependent_operator_calls_share_turn_and_consume_generated_
         }
 
     registry.register("calibration_iq_operator", operator_handler)
+    registry.register("calibration_iq_ro", lambda _args: _exact_ro_result())
 
     class Router:
         active_name = "omni"
@@ -2285,6 +3165,13 @@ async def test_output_dependent_operator_calls_share_turn_and_consume_generated_
             if self.calls == 1:
                 yield {
                     "type": "tool_call",
+                    "id": "initial-exact-ro-call",
+                    "name": "calibration_iq_ro",
+                    "arguments": json.dumps({"repair_order_id": "ro-1"}),
+                }
+            elif self.calls == 2:
+                yield {
+                    "type": "tool_call",
                     "id": "add-calibration-call",
                     "name": "calibration_iq_operator",
                     "arguments": json.dumps({"actions": [{
@@ -2293,7 +3180,20 @@ async def test_output_dependent_operator_calls_share_turn_and_consume_generated_
                         "arguments": {"name": "front camera"},
                     }]}),
                 }
-            elif self.calls == 2:
+            elif self.calls == 3:
+                first_result = next(
+                    json.loads(message["content"])
+                    for message in reversed(messages)
+                    if message.get("role") == "tool"
+                    and message.get("tool_call_id") == "add-calibration-call"
+                )
+                yield {
+                    "type": "tool_call",
+                    "id": "post-create-exact-ro-call",
+                    "name": "calibration_iq_ro",
+                    "arguments": json.dumps({"repair_order_id": "ro-1"}),
+                }
+            elif self.calls == 4:
                 first_result = next(
                     json.loads(message["content"])
                     for message in reversed(messages)

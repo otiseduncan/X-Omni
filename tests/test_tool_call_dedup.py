@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 from core.orchestrator.loop import Orchestrator
 from core.state.db import Store
-from core.tools.registry import Registry
+from core.tools.registry import Registry, calibration_iq_evidence_from_result
 
 
 class _Router:
@@ -56,6 +56,7 @@ def _orchestrator(store: Store, calls: list, *, handler_name: str = "adas_si_inv
 async def _drain(
     orchestrator, name, args, messages, artifacts, *,
     conversation_id, call_id, call_cache, approval_context=None,
+    calibration_iq_evidence=None,
 ):
     return [
         event async for event in orchestrator._execute(  # noqa: SLF001
@@ -64,8 +65,27 @@ async def _drain(
             approval_context=approval_context,
             call_id=call_id,
             call_cache=call_cache,
+            calibration_iq_evidence=calibration_iq_evidence,
         )
     ]
+
+
+def _exact_ro_evidence(conversation_id: int, message_id: int):
+    return calibration_iq_evidence_from_result(
+        "calibration_iq_ro",
+        {
+            "status": "verified",
+            "repair_order": {"id": "ro-1", "RO": "2400911667", "version": 7},
+            "raw": {
+                "repair_order": {
+                    "id": "ro-1", "ro_number": "2400911667", "version": 7,
+                },
+            },
+        },
+        conversation_id=conversation_id,
+        message_id=message_id,
+        source_tool_call_id="exact-ro-call",
+    )
 
 
 def test_identical_read_only_calls_share_one_execution_and_one_card(tmp_path):
@@ -145,17 +165,20 @@ def test_operator_authorized_tool_is_never_deduplicated(tmp_path):
     call_cache: dict = {}
     args = {"actions": [{"operation": "add_note", "repair_order_id": "ro-1", "arguments": {"body": "hi"}}]}
     approval_context = {"message_id": message_id, "user_id": "local-dev", "role": "owner"}
+    evidence = _exact_ro_evidence(conversation_id, message_id)
 
     async def run():
         await _drain(
             orchestrator, "calibration_iq_operator", args, messages, artifacts,
             conversation_id=conversation_id, call_id="call_0", call_cache=call_cache,
             approval_context=approval_context,
+            calibration_iq_evidence=evidence,
         )
         await _drain(
             orchestrator, "calibration_iq_operator", args, messages, artifacts,
             conversation_id=conversation_id, call_id="call_1", call_cache=call_cache,
             approval_context=approval_context,
+            calibration_iq_evidence=evidence,
         )
 
     asyncio.run(run())
@@ -180,17 +203,20 @@ def test_research_ro_composite_is_deduplicated_like_a_read(tmp_path):
     call_cache: dict = {}
     args = {"actions": [{"operation": "research_ro", "repair_order_id": "ro-1", "arguments": {}}]}
     approval_context = {"message_id": message_id, "user_id": "local-dev", "role": "owner"}
+    evidence = _exact_ro_evidence(conversation_id, message_id)
 
     async def run():
         await _drain(
             orchestrator, "calibration_iq_operator", args, messages, artifacts,
             conversation_id=conversation_id, call_id="call_0", call_cache=call_cache,
             approval_context=approval_context,
+            calibration_iq_evidence=evidence,
         )
         return await _drain(
             orchestrator, "calibration_iq_operator", args, messages, artifacts,
             conversation_id=conversation_id, call_id="call_1", call_cache=call_cache,
             approval_context=approval_context,
+            calibration_iq_evidence=evidence,
         )
 
     second_events = asyncio.run(run())
@@ -218,17 +244,20 @@ def test_research_ro_mixed_with_another_operation_is_not_deduplicated(tmp_path):
         ]
     }
     approval_context = {"message_id": message_id, "user_id": "local-dev", "role": "owner"}
+    evidence = _exact_ro_evidence(conversation_id, message_id)
 
     async def run():
         await _drain(
             orchestrator, "calibration_iq_operator", args, messages, artifacts,
             conversation_id=conversation_id, call_id="call_0", call_cache=call_cache,
             approval_context=approval_context,
+            calibration_iq_evidence=evidence,
         )
         await _drain(
             orchestrator, "calibration_iq_operator", args, messages, artifacts,
             conversation_id=conversation_id, call_id="call_1", call_cache=call_cache,
             approval_context=approval_context,
+            calibration_iq_evidence=evidence,
         )
 
     asyncio.run(run())

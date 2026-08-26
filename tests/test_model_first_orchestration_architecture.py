@@ -262,6 +262,30 @@ def test_production_orchestration_has_no_casual_semantic_tool_router() -> None:
     )
 
 
+def test_required_no_tool_review_is_gated_only_by_trusted_active_subject() -> None:
+    tree = ast.parse(LOOP.read_text(encoding="utf-8"), filename=str(LOOP))
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "no_tool_self_check_requires_tool"
+            for target in node.targets
+        )
+    ]
+
+    assert len(assignments) == 1
+    assert ast.dump(assignments[0].value, include_attributes=False) == ast.dump(
+        ast.Compare(
+            left=ast.Name(id="active_subject", ctx=ast.Load()),
+            ops=[ast.IsNot()],
+            comparators=[ast.Constant(value=None)],
+        ),
+        include_attributes=False,
+    )
+
+
 def test_semantic_router_guard_rejects_count_membership_choose_tool() -> None:
     source = '''
 def choose_tool(message):
