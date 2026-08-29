@@ -17,6 +17,8 @@ from typing import Any, Optional
 
 from . import camera as camera_svc
 from . import camera_monitoring as legacy
+from . import camera_dvr as camera_dvr_svc
+from . import exterior_camera as exterior_camera_svc
 from . import push_notifications
 from ..models.router import WorkerSwapError
 
@@ -49,6 +51,115 @@ SECURITY_TOOL_SCHEMAS["camera_motion_clip"]["parameters"]["properties"].update(
         },
     }
 )
+
+_DEVICE_NS = "http://www.onvif.org/ver10/device/wsdl"
+_EVENT_TOPIC_MARKERS = ("motion", "move", "human", "people", "person", "vehicle", "car")
+
+
+class XiongmaiDVR(camera_dvr_svc.CameraDVR):
+    """DVR with Xiongmai-tolerant ONVIF event discovery and topic parsing."""
+
+    async def _discover_event_url(self, client, credentials) -> Optional[str]:
+        def body_builder(operation):
+            import xml.etree.ElementTree as ET
+            ET.SubElement(operation, f"{{{_DEVICE_NS}}}Category").text = "Events"
+
+        payload = exterior_camera_svc._soap_envelope(
+            namespace=_DEVICE_NS, operation="GetCapabilities",
+            credentials=credentials, body_builder=body_builder,
+        )
+        url = f"http://{credentials.host}:{exterior_camera_svc._ONVIF_PORT}/onvif/device_service"
+        action = f"{_DEVICE_NS}/GetCapabilities"
+        try:
+            async with client.stream(
+                "POST", url,
+                headers={
+                    "Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"',
+                    "Accept": "application/soap+xml, text/xml",
+                },
+                content=payload,
+            ) as response:
+                if response.status_code < 200 or response.status_code >= 300:
+                    return None
+                raw = bytearray()
+                async for chunk in response.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > exterior_camera_svc.MAX_ONVIF_RESPONSE_BYTES:
+                        return None
+            body = exterior_camera_svc._parse_onvif_xml(bytes(raw))
+            for node in body.iter():
+                if exterior_camera_svc._xml_name(node) != "Events":
+                    continue
+                for child in node.iter():
+                    if exterior_camera_svc._xml_name(child) == "XAddr" and str(child.text or "").strip():
+                        return self._pinned_subscription_url(str(child.text).strip(), host=credentials.host)
+        except Exception:
+            return None
+        finally:
+            payload = b""
+        return None
+
+    async def _create_subscription(self, client, credentials) -> str:
+        discovered = await self._discover_event_url(client, credentials)
+        candidates = [
+            discovered,
+            f"http://{credentials.host}:{exterior_camera_svc._ONVIF_PORT}/onvif/event_service",
+            f"http://{credentials.host}:{exterior_camera_svc._ONVIF_PORT}/onvif/events_service",
+        ]
+        seen = set()
+        last_error = None
+        for event_url in candidates:
+            if not event_url or event_url in seen:
+                continue
+            seen.add(event_url)
+            try:
+                def body_builder(operation):
+                    import xml.etree.ElementTree as ET
+                    ET.SubElement(operation, f"{{{camera_dvr_svc._WSN_NS}}}InitialTerminationTime").text = "PT10M"
+
+                body = await self._post_event(
+                    client, credentials=credentials, url=event_url,
+                    operation="CreatePullPointSubscription", body_builder=body_builder,
+                )
+                addresses = [
+                    str(node.text or "").strip()
+                    for node in body.iter()
+                    if exterior_camera_svc._xml_name(node) == "Address" and str(node.text or "").strip()
+                ]
+                return (
+                    self._pinned_subscription_url(addresses[0], host=credentials.host)
+                    if addresses else event_url
+                )
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise exterior_camera_svc.ExteriorCameraUnavailable("Exterior camera event service was not found.")
+
+    @classmethod
+    def motion_states_from_body(cls, body):
+        states = super().motion_states_from_body(body)
+        if states:
+            return states
+        for notification in [
+            node for node in body.iter()
+            if exterior_camera_svc._xml_name(node) == "NotificationMessage"
+        ]:
+            topic = " ".join(
+                str(node.text or "") for node in notification.iter()
+                if exterior_camera_svc._xml_name(node) == "Topic"
+            ).casefold()
+            if not any(marker in topic for marker in _EVENT_TOPIC_MARKERS):
+                continue
+            for node in notification.iter():
+                if exterior_camera_svc._xml_name(node) != "SimpleItem":
+                    continue
+                value = cls._parse_bool(node.attrib.get("Value"))
+                if value is not None:
+                    states.append(value)
+                    break
+        return states
+
 
 _SECURITY_ANALYSIS_PROMPT = (
     "Reply in exactly this three-line format:\n"
