@@ -7,6 +7,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from core.services import camera_dvr
+from core.services import camera_security
 
 
 def test_recording_profile_prefers_highest_resolution_h264():
@@ -75,3 +76,14 @@ async def test_segment_index_marks_only_newest_active_segment_open(tmp_path: Pat
 
 def test_dvr_default_root_is_dedicated_e_drive_folder():
     assert str(camera_dvr.DEFAULT_DVR_ROOT).replace("\\", "/") == "E:/XOmni-DVR"
+
+
+def test_xiongmai_security_parser_accepts_vehicle_and_trigger_topics():
+    assert camera_security.XiongmaiDVR.motion_states_from_body(
+        _notification("tns1:VideoAnalytics/Vehicle", "State", "true")
+    ) == [True]
+    assert camera_security.XiongmaiDVR.motion_states_from_body(
+        _notification("tns1:VideoAnalytics/Motion", "Level", "Trigger")
+    ) == [True]
+    assert "VEHICLE: yes or no" in camera_security._SECURITY_ANALYSIS_PROMPT
+    assert "truck" in camera_security._SECURITY_ANALYSIS_PROMPT
