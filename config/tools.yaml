@@ -37,6 +37,8 @@ profiles:
       - search_files
       - assistant_capabilities_read
       - system_status
+      - camera_request
+      - exterior_camera_request
       - adas_si_search
       - adas_si_inventory
       - adas_si_open
