@@ -73,7 +73,8 @@ def _settings(tmp_path: Path, **overrides) -> SimpleNamespace:
         camera_baseline_interval_seconds=600,
         camera_snapshot_retention_days=30,
         camera_motion_threshold=18.0,
-        camera_motion_cooldown_seconds=120,
+        camera_motion_burst_seconds=90,
+        camera_motion_burst_interval_seconds=5,
         vapid_public_key="pub",
         vapid_private_key="priv",
         vapid_subject="mailto:otiseduncan@gmail.com",
@@ -168,14 +169,55 @@ async def test_identical_frames_never_fire_motion_or_captioning(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
-async def test_motion_cooldown_suppresses_a_second_immediate_event(tmp_path: Path, monkeypatch):
-    store = Store(tmp_path / "cooldown.sqlite")
+async def test_sustained_motion_extends_the_burst_and_captions_only_once(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "burst.sqlite")
     clock = FakeClock()
     monkeypatch.setattr(camera_monitoring.time, "monotonic", clock)
-    settings = _settings(tmp_path, camera_motion_cooldown_seconds=120)
+    settings = _settings(tmp_path, camera_motion_burst_seconds=90, camera_motion_burst_interval_seconds=5)
+    # Alternating extreme colors keep the frame-to-frame diff above
+    # threshold on every tick, simulating continued activity.
+    frames = [_jpeg_frame((0, 0, 0))] + [
+        _jpeg_frame((255, 255, 255) if i % 2 == 0 else (0, 0, 0)) for i in range(6)
+    ]
+    monitor, _camera, _router = _monitor(tmp_path, store, frames, settings=settings)
+
+    caption_calls = []
+
+    async def fake_caption(*args):
+        caption_calls.append(args)
+        return "PERSON: yes\nVEHICLE: no\nDESCRIPTION: someone is moving around"
+
+    monkeypatch.setattr(camera_svc, "caption_frame", fake_caption)
+
+    await monitor._tick()  # baseline, no previous frame to diff against
+    for _ in range(6):
+        clock.advance(5)  # the burst-interval cadence
+        await monitor._tick()
+
+    motion_events = [e for e in store.list_camera_events(limit=20) if e["trigger"] == "motion"]
+    assert len(motion_events) == 6
+    assert len(caption_calls) == 1
+    assert sum(e["notified"] for e in motion_events) == 1
+    # Insertion order (by id) is authoritative -- captured_at has only
+    # one-second SQLite resolution, so these rows can share a timestamp.
+    first_by_id = min(motion_events, key=lambda e: e["id"])
+    assert first_by_id["notified"] == 1
+
+
+@pytest.mark.asyncio
+async def test_burst_ends_once_activity_stops_and_the_window_elapses(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "burst-end.sqlite")
+    clock = FakeClock()
+    monkeypatch.setattr(camera_monitoring.time, "monotonic", clock)
+    settings = _settings(tmp_path, camera_motion_burst_seconds=90, camera_motion_burst_interval_seconds=5)
+    still_frame = _jpeg_frame((10, 10, 10))
+    bright_frame = _jpeg_frame((250, 250, 250))
+    # A single transition into "bright", then it stays bright (no further
+    # frame-to-frame change) -- so once the 90s window elapses with nothing
+    # new happening, the burst should actually close.
     monitor, _camera, _router = _monitor(
         tmp_path, store,
-        [_jpeg_frame((0, 0, 0)), _jpeg_frame((255, 255, 255)), _jpeg_frame((0, 0, 0))],
+        [still_frame, bright_frame, bright_frame],
         settings=settings,
     )
 
@@ -186,12 +228,41 @@ async def test_motion_cooldown_suppresses_a_second_immediate_event(tmp_path: Pat
 
     await monitor._tick()  # baseline
     clock.advance(1)
-    await monitor._tick()  # motion #1 fires
-    clock.advance(1)  # well within the 120s cooldown
-    await monitor._tick()  # would be motion again, but cooldown suppresses it
+    await monitor._tick()  # still -> bright: motion fires, burst opens (burst_until = 1 + 90 = 91)
+    assert monitor._burst_until is not None
 
-    motion_events = [e for e in store.list_camera_events(limit=10) if e["trigger"] == "motion"]
-    assert len(motion_events) == 1
+    clock.advance(95)  # now = 96, well past 91, and bright -> bright shows no further motion
+    await monitor._tick()
+    assert monitor._burst_until is None
+
+    motion_events = [e for e in store.list_camera_events(limit=20) if e["trigger"] == "motion"]
+    assert len(motion_events) == 1  # only the frame that opened the burst
+
+
+@pytest.mark.asyncio
+async def test_run_forever_uses_the_fast_interval_only_while_a_burst_is_open(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "burst-interval.sqlite")
+    settings = _settings(tmp_path, camera_motion_burst_seconds=90, camera_motion_burst_interval_seconds=5,
+                          camera_monitor_interval_seconds=60)
+    monitor, _camera, _router = _monitor(tmp_path, store, [], settings=settings)
+
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            monitor.stop()
+
+    tick_states = [False, True]  # not in burst, then in burst
+
+    async def fake_tick():
+        monitor._burst_until = 123.0 if tick_states.pop(0) else None
+
+    monkeypatch.setattr(monitor, "_tick", fake_tick)
+    monkeypatch.setattr(camera_monitoring.asyncio, "sleep", fake_sleep)
+    await monitor.run_forever()
+
+    assert sleeps == [60, 5]
 
 
 @pytest.mark.asyncio

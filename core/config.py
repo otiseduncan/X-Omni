@@ -129,7 +129,13 @@ class Settings:
     camera_baseline_interval_seconds: int = 600
     camera_snapshot_retention_days: int = 30
     camera_motion_threshold: float = 18.0
-    camera_motion_cooldown_seconds: int = 120
+    # A motion trigger opens a rolling documentation window: frames are
+    # captured every camera_motion_burst_interval_seconds instead of the
+    # normal baseline cadence, and continued motion re-arms the window so
+    # sustained activity (e.g. floodlights staying on) keeps being
+    # documented for as long as it continues.
+    camera_motion_burst_seconds: int = 90
+    camera_motion_burst_interval_seconds: int = 5
 
     @property
     def local_origin(self) -> str:
@@ -219,5 +225,8 @@ class Settings:
             camera_baseline_interval_seconds=_int("XOMNI_CAMERA_BASELINE_INTERVAL_SECONDS", 600),
             camera_snapshot_retention_days=_int("XOMNI_CAMERA_SNAPSHOT_RETENTION_DAYS", 30),
             camera_motion_threshold=float(os.getenv("XOMNI_CAMERA_MOTION_THRESHOLD", "18.0")),
-            camera_motion_cooldown_seconds=_int("XOMNI_CAMERA_MOTION_COOLDOWN_SECONDS", 120),
+            camera_motion_burst_seconds=_int("XOMNI_CAMERA_MOTION_BURST_SECONDS", 90),
+            camera_motion_burst_interval_seconds=_int(
+                "XOMNI_CAMERA_MOTION_BURST_INTERVAL_SECONDS", 5
+            ),
         )
