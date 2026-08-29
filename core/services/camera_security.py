@@ -59,6 +59,15 @@ _EVENT_TOPIC_MARKERS = ("motion", "move", "human", "people", "person", "vehicle"
 class XiongmaiDVR(camera_dvr_svc.CameraDVR):
     """DVR with Xiongmai-tolerant ONVIF event discovery and topic parsing."""
 
+    @staticmethod
+    def _parse_bool(value: object) -> Optional[bool]:
+        text = str(value or "").strip().casefold()
+        if text in {"trigger", "triggered", "start", "started", "detected"}:
+            return True
+        if text in {"clear", "cleared", "stop", "stopped", "ended"}:
+            return False
+        return camera_dvr_svc.CameraDVR._parse_bool(value)
+
     async def _discover_event_url(self, client, credentials) -> Optional[str]:
         def body_builder(operation):
             import xml.etree.ElementTree as ET
