@@ -338,7 +338,9 @@ class Store:
 
     def _migrate_camera_events(self) -> None:
         """Add burst_id to installations that created camera_events before
-        motion clips existed."""
+        motion clips existed, and retroactively group any 'motion' rows
+        captured before this migration ran so their real burst can still be
+        assembled into a clip -- not just bursts recorded afterward."""
         exists = self.conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'camera_events'"
         ).fetchone()
@@ -352,6 +354,43 @@ class Store:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_camera_events_burst_id ON camera_events(burst_id)"
         )
+        self._backfill_camera_event_burst_ids()
+
+    def _backfill_camera_event_burst_ids(self) -> None:
+        rows = self.conn.execute(
+            "SELECT id, captured_at FROM camera_events "
+            "WHERE trigger = 'motion' AND burst_id IS NULL ORDER BY id ASC"
+        ).fetchall()
+        if not rows:
+            return
+        # A gap this large could not be one continuous documentation window
+        # (the burst interval was always seconds, never minutes) -- so it
+        # reliably separates one real motion event from the next even though
+        # these older rows predate burst_id existing at all.
+        max_gap_seconds = 120
+        next_id = (self.conn.execute(
+            "SELECT MAX(burst_id) AS n FROM camera_events"
+        ).fetchone()["n"] or 0) + 1
+        previous_dt = None
+        current_burst_id = None
+        for row in rows:
+            try:
+                captured_dt = datetime.strptime(row["captured_at"], "%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                captured_dt = None
+            if (
+                previous_dt is None
+                or captured_dt is None
+                or (captured_dt - previous_dt).total_seconds() > max_gap_seconds
+            ):
+                current_burst_id = next_id
+                next_id += 1
+            self.conn.execute(
+                "UPDATE camera_events SET burst_id = ? WHERE id = ?",
+                (current_burst_id, row["id"]),
+            )
+            if captured_dt is not None:
+                previous_dt = captured_dt
 
     def _migrate_tool_calls(self) -> None:
         """Add correlation columns to installations created by the prototype."""
