@@ -1,4 +1,4 @@
-const CACHE_NAME = "x-omni-shell-2026-08-29-14";
+const CACHE_NAME = "x-omni-shell-2026-08-29-15";
 const SHELL_URLS = [
   "/manifest.webmanifest",
   "/icons/icon.svg",
@@ -58,6 +58,12 @@ self.addEventListener("fetch", (event) => {
   const { request } = event;
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin) return;
+  // The DVR is authenticated surveillance data and has its own network
+  // freshness requirements. Leave every DVR document, asset, API request,
+  // and media request on the browser's native network path. In particular,
+  // never allow an Owner response to be replayed from Cache Storage after a
+  // logout or role change.
+  if (url.pathname === "/dvr" || url.pathname.startsWith("/dvr/")) return;
   // Browsers stream media with Range requests. Their 206 responses cannot be
   // stored by Cache.put(), so leave all range/audio/video traffic on the
   // browser's native network and HTTP-cache path.

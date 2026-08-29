@@ -59,7 +59,12 @@ def test_motion_parser_ignores_unrelated_boolean_events():
 @pytest.mark.asyncio
 async def test_segment_index_marks_only_newest_active_segment_open(tmp_path: Path):
     fake_camera = SimpleNamespace()
-    dvr = camera_dvr.CameraDVR(fake_camera, root=tmp_path, reserve_bytes=256 * 1024 * 1024)
+    dvr = camera_dvr.CameraDVR(
+        fake_camera,
+        root=tmp_path,
+        reserve_bytes=256 * 1024 * 1024,
+        required_drive=None,
+    )
     dvr.recordings_dir.mkdir(parents=True)
     (dvr.recordings_dir / "20260829-120000.mkv").write_bytes(b"a" * 100)
     (dvr.recordings_dir / "20260829-120500.mkv").write_bytes(b"b" * 200)

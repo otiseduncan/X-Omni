@@ -20,7 +20,7 @@
     <section class="overview card">
       <div class="overview-row">
         <div>
-          <span class="label">Storage</span>
+          <span class="label">E: storage</span>
           <strong id="storageText">—</strong>
         </div>
         <div>
@@ -74,9 +74,9 @@
     </section>
   </main>
 
-  <dialog id="viewer" class="viewer">
+  <dialog id="viewer" class="viewer" aria-labelledby="viewerTitle" aria-describedby="viewerMeta">
     <div class="viewer-head">
-      <div><strong id="viewerTitle">Playback</strong><span id="viewerMeta"></span></div>
+      <div><strong id="viewerTitle">Playback</strong><span id="viewerMeta" role="status"></span></div>
       <button id="closeViewer" class="icon-button" type="button" aria-label="Close">×</button>
     </div>
     <video id="videoPlayer" controls playsinline preload="metadata"></video>
