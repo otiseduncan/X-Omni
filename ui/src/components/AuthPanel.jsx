@@ -343,11 +343,11 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
             {pushState !== "unsupported" && (
               <div className="auth-notifications">
                 {pushState === "subscribed" ? (
-                  <p className="auth-private-note">
+                  <p className="auth-notifications-status">
                     <Bell size={14} /> Notifications are enabled on this device.
                   </p>
                 ) : pushState === "denied" ? (
-                  <p className="auth-private-note">
+                  <p className="auth-notifications-status">
                     <BellOff size={14} /> Notifications are blocked in the browser's site settings.
                   </p>
                 ) : (
