@@ -214,7 +214,6 @@ class OnvifCameraMonitor(legacy.CameraMonitor):
                     if self.dvr.events_healthy:
                         await self._onvif_tick()
                     else:
-                        # Proven fallback for camera firmware/network event failures.
                         await super()._tick()
                 except asyncio.CancelledError:
                     raise
@@ -255,8 +254,6 @@ class OnvifCameraMonitor(legacy.CameraMonitor):
                 self._burst_until = now + self.settings.camera_motion_burst_seconds
             else:
                 self._onvif_motion_active = False
-                # Keep a short tail after the camera says motion cleared so a
-                # departing person/vehicle is still documented.
                 if self._burst_until is not None:
                     self._burst_until = min(self._burst_until, now + 20)
 
@@ -272,9 +269,6 @@ class OnvifCameraMonitor(legacy.CameraMonitor):
             burst_id=self._current_burst_id,
         )
         person, vehicle = await self._analyze_security_frame(event_id, frame)
-        # One quick second look protects against the camera firing just before
-        # a fast vehicle/person fully enters the frame. It is bounded to one
-        # extra vision call and only when the opening image contained neither.
         if person is False and vehicle is False:
             await asyncio.sleep(2)
             follow = await self.exterior_camera.capture_snapshot()
@@ -361,7 +355,12 @@ class OnvifCameraMonitor(legacy.CameraMonitor):
 
 
 async def camera_event_history(store, args: dict, *, dvr) -> dict[str, Any]:
-    result = await legacy.camera_event_history(store, args)
+    history_args = dict(args)
+    for key in ("since", "until"):
+        parsed = _parse_iso(history_args.get(key))
+        if parsed is not None:
+            history_args[key] = parsed.strftime("%Y-%m-%d %H:%M:%S")
+    result = await legacy.camera_event_history(store, history_args)
     try:
         result["dvr_status"] = await dvr.status()
         if args.get("include_recordings"):
@@ -423,8 +422,6 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
                 "cached": True,
             }
         except Exception:
-            # Preserve the existing chat behavior even if E: was unplugged or
-            # the requested event predates continuous recording.
             pass
 
     return await legacy.camera_motion_clip(store, settings, ffmpeg_path, args)
