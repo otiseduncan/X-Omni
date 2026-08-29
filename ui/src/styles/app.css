@@ -728,6 +728,12 @@
   color: #ffd893;
 }
 
+.camera-dvr-link {
+  width: fit-content;
+  margin-top: 10px;
+  text-decoration: none;
+}
+
 .camera-snapshot-card {
   display: grid;
   gap: 10px;

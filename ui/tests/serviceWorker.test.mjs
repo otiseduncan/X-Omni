@@ -31,7 +31,7 @@ async function serviceWorkerFetchListener() {
 
 test("service worker bypasses range and media requests before static caching", async () => {
   const source = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
-  assert.match(source, /x-omni-shell-2026-08-29-16/);
+  assert.match(source, /x-omni-shell-2026-08-29-17/);
   assert.match(source, /request\.headers\.has\("range"\)/);
   assert.match(source, /request\.destination === "audio"/);
   assert.match(source, /request\.destination === "video"/);

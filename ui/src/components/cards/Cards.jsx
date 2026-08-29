@@ -1329,10 +1329,16 @@ function cameraEventTime(capturedAt) {
 
 function CameraEventHistoryCard({ data }) {
   const items = Array.isArray(data?.items) ? data.items : [];
+  const dvrUrl = data?.dvr_url === "/dvr" ? "/dvr" : null;
   if (!data?.ok || !items.length) {
     return (
       <Card icon={Camera} title="Camera history">
         <p className="card-note">No stored camera snapshots in that range.</p>
+        {dvrUrl && (
+          <a className="camera-action camera-dvr-link" href={dvrUrl} target="_blank" rel="noopener noreferrer">
+            Open standalone DVR
+          </a>
+        )}
       </Card>
     );
   }
@@ -1362,6 +1368,11 @@ function CameraEventHistoryCard({ data }) {
         <p className="card-note">
           Showing the {data.shown_count} most recent of {data.total_count} total.
         </p>
+      )}
+      {dvrUrl && (
+        <a className="camera-action camera-dvr-link" href={dvrUrl} target="_blank" rel="noopener noreferrer">
+          Open standalone DVR
+        </a>
       )}
     </Card>
   );

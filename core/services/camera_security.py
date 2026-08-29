@@ -39,9 +39,8 @@ SECURITY_TOOL_SCHEMAS = {
     ),
 }
 SECURITY_TOOL_SCHEMAS["camera_event_history"]["description"] = (
-    "List/count event metadata and thumbnails; optionally list DVR segment metadata. "
-    "Never use for playable footage/video/recordings/clips/time ranges; use "
-    "camera_footage."
+    "Lists event metadata/thumbnails and returns /dvr. For 'show me the DVR', "
+    "present that link. For playable footage/video/time ranges use camera_footage."
 )
 SECURITY_TOOL_SCHEMAS["camera_event_history"]["parameters"]["properties"][
     "include_recordings"
@@ -642,6 +641,7 @@ async def camera_event_history(store, args: dict, *, dvr) -> dict[str, Any]:
         elif args.get(key):
             dvr_bounds[key] = str(args[key])
     result = await legacy.camera_event_history(store, history_args)
+    result["dvr_url"] = "/dvr"
     try:
         result["dvr_status"] = await dvr.status()
         if args.get("include_recordings"):

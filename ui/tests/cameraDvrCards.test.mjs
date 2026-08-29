@@ -57,3 +57,14 @@ test("stored motion clips retain their frame count while partial metadata stays 
   );
   assert.equal(present({ started_at_local: "5:30 PM" }).details, "5:30 PM");
 });
+
+test("camera history exposes only the server-declared standalone DVR handoff", async () => {
+  const [cards, styles] = await Promise.all([
+    readFile(new URL("../src/components/cards/Cards.jsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/styles/app.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(cards, /const dvrUrl = data\?\.dvr_url === "\/dvr" \? "\/dvr" : null/);
+  assert.match(cards, /href=\{dvrUrl\}[\s\S]*target="_blank"[\s\S]*Open standalone DVR/);
+  assert.equal(cards.match(/Open standalone DVR/g)?.length, 2);
+  assert.match(styles, /\.camera-dvr-link \{[^}]*text-decoration: none/);
+});

@@ -975,8 +975,15 @@ def _router_app(tmp_path: Path, session: dict):
 @pytest.mark.parametrize("session", [{}, {"role": "test_user"}])
 def test_dvr_router_fails_closed_for_non_owner_roles(tmp_path: Path, session: dict):
     app, _dvr_instance = _router_app(tmp_path, session)
-    response = TestClient(app).get("/dvr")
-    assert response.status_code == 403
+    client = TestClient(app)
+    assert client.get("/dvr").status_code == 403
+    assert client.post("/dvr/api/live/sessions").status_code == 403
+    assert client.get(
+        "/dvr/api/live/sessions/watch_session_12345678/stream.mjpg"
+    ).status_code == 403
+    assert client.delete(
+        "/dvr/api/live/sessions/watch_session_12345678"
+    ).status_code == 403
 
 
 def test_dvr_trailing_slash_is_the_owner_dvr_not_chat_spa(tmp_path: Path):
@@ -984,6 +991,220 @@ def test_dvr_trailing_slash_is_the_owner_dvr_not_chat_spa(tmp_path: Path):
     response = TestClient(app).get("/dvr/")
     assert response.status_code == 200
     assert "X Omni DVR" in response.text
+
+
+def test_dvr_live_watch_is_owner_bound_exact_origin_and_conversation_free(
+    tmp_path: Path,
+):
+    calls = []
+
+    class WatchCamera:
+        ffmpeg_path = None
+
+        async def create_watch_session(self, *, owner_id):
+            calls.append(("create", owner_id))
+            return {
+                "ok": True,
+                "status": "ready",
+                "session_id": "watch_session_12345678",
+                "stream_url": "/api/unused",
+                "label": "Driveway",
+                "expires_at": "2026-08-30T00:00:00Z",
+            }
+
+        async def stream(self, *, session_id, owner_id):
+            calls.append(("stream", session_id, owner_id))
+
+            async def chunks():
+                yield b"--xomni\r\nContent-Type: image/jpeg\r\n\r\nframe\r\n"
+
+            return chunks()
+
+        async def delete_session(self, *, session_id, owner_id):
+            calls.append(("delete", session_id, owner_id))
+            return {"ok": True, "status": "stopped", "session_id": session_id}
+
+    class Store:
+        def __init__(self):
+            self.audits = []
+
+        def audit(self, event, payload):
+            self.audits.append((event, payload))
+
+    async def require_session():
+        return {"role": "owner", "token_hash": "owner-token"}
+
+    camera = WatchCamera()
+    dvr = camera_dvr.CameraDVR(camera, root=tmp_path / "dvr", required_drive=None)
+    store = Store()
+    settings = SimpleNamespace(
+        root=Path(__file__).resolve().parents[1],
+        camera_snapshot_dir=tmp_path / "snapshots",
+        local_origin="http://omega.test",
+        public_origin="",
+    )
+    app = FastAPI()
+    app.include_router(camera_dvr.create_router(settings, store, require_session, dvr))
+    client = TestClient(app)
+
+    assert client.post("/dvr/api/live/sessions").status_code == 403
+    assert client.post(
+        "/dvr/api/live/sessions", headers={"Origin": "https://attacker.test"}
+    ).status_code == 403
+
+    created = client.post(
+        "/dvr/api/live/sessions", headers={"Origin": "http://omega.test"}
+    )
+    assert created.status_code == 200
+    assert created.json() == {
+        "ok": True,
+        "status": "ready",
+        "session_id": "watch_session_12345678",
+        "stream_url": "/dvr/api/live/sessions/watch_session_12345678/stream.mjpg",
+        "label": "Driveway",
+        "expires_at": "2026-08-30T00:00:00Z",
+        "streaming": False,
+    }
+    assert "conversation_id" not in created.json()
+    assert not {
+        "host", "username", "password", "rtsp_uri", "stream_uri"
+    }.intersection(created.json())
+
+    streamed = client.get(created.json()["stream_url"])
+    assert streamed.status_code == 200
+    assert streamed.headers["content-type"].startswith("multipart/x-mixed-replace")
+    assert "no-store" in streamed.headers["cache-control"]
+    assert streamed.headers["x-content-type-options"] == "nosniff"
+    stopped = client.delete(
+        "/dvr/api/live/sessions/watch_session_12345678",
+        headers={"Origin": "http://omega.test"},
+    )
+    assert stopped.status_code == 200
+    assert calls == [
+        ("create", "session:owner-token"),
+        ("stream", "watch_session_12345678", "session:owner-token"),
+        ("delete", "watch_session_12345678", "session:owner-token"),
+    ]
+    assert [event for event, _payload in store.audits] == [
+        "standalone_dvr_live_session_started",
+        "standalone_dvr_live_session_stopped",
+    ]
+
+
+def test_dvr_camera_auth_failure_does_not_log_out_the_owner(tmp_path: Path):
+    class RejectedCamera:
+        ffmpeg_path = None
+
+        async def create_watch_session(self, *, owner_id):
+            raise camera_dvr.exterior_camera_svc.ExteriorCameraAuthError(
+                "camera rejected credentials"
+            )
+
+    async def require_session():
+        return {"role": "owner", "token_hash": "owner-token"}
+
+    settings = SimpleNamespace(
+        root=Path(__file__).resolve().parents[1],
+        camera_snapshot_dir=tmp_path / "snapshots",
+        local_origin="http://omega.test",
+        public_origin="",
+    )
+    dvr = camera_dvr.CameraDVR(
+        RejectedCamera(), root=tmp_path / "dvr", required_drive=None
+    )
+    app = FastAPI()
+    app.include_router(
+        camera_dvr.create_router(settings, SimpleNamespace(), require_session, dvr)
+    )
+
+    response = TestClient(app).post(
+        "/dvr/api/live/sessions", headers={"Origin": "http://omega.test"}
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Exterior camera credentials were rejected."
+
+
+def test_dvr_live_start_disconnect_releases_pending_session_without_audit(
+    tmp_path: Path,
+):
+    calls = []
+
+    class WatchCamera:
+        ffmpeg_path = None
+
+        async def create_watch_session(self, *, owner_id):
+            calls.append(("create", owner_id))
+            return {
+                "session_id": "watch_session_12345678",
+                "status": "ready",
+                "label": "Driveway",
+            }
+
+        async def delete_session(self, *, session_id, owner_id):
+            calls.append(("delete", session_id, owner_id))
+            return {"ok": True, "status": "stopped"}
+
+    class Store:
+        def __init__(self):
+            self.audits = []
+
+        def audit(self, event, payload):
+            self.audits.append((event, payload))
+
+    async def require_session():
+        return {"role": "owner", "token_hash": "owner-token"}
+
+    store = Store()
+    settings = SimpleNamespace(
+        root=Path(__file__).resolve().parents[1],
+        camera_snapshot_dir=tmp_path / "snapshots",
+        local_origin="http://omega.test",
+        public_origin="",
+    )
+    dvr = camera_dvr.CameraDVR(
+        WatchCamera(), root=tmp_path / "dvr", required_drive=None
+    )
+    app = FastAPI()
+    app.include_router(camera_dvr.create_router(settings, store, require_session, dvr))
+    inbound = iter(
+        [
+            {"type": "http.request", "body": b"", "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+    outbound = []
+
+    async def receive():
+        return next(inbound)
+
+    async def send(message):
+        outbound.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/dvr/api/live/sessions",
+        "raw_path": b"/dvr/api/live/sessions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"origin", b"http://omega.test"), (b"content-length", b"0")],
+        "client": ("127.0.0.1", 41000),
+        "server": ("omega.test", 80),
+    }
+
+    asyncio.run(app(scope, receive, send))
+
+    start = next(message for message in outbound if message["type"] == "http.response.start")
+    assert start["status"] == 499
+    assert calls == [
+        ("create", "session:owner-token"),
+        ("delete", "watch_session_12345678", "session:owner-token"),
+    ]
+    assert store.audits == []
 
 
 def test_dvr_rejects_untracked_cache_and_out_of_range_ids(tmp_path: Path):

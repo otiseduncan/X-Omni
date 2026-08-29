@@ -8,6 +8,7 @@ import pytest
 
 from core.services import camera_dvr
 from core.services import camera_security
+from core.tools import registry as tool_registry
 
 
 def test_recording_profile_prefers_highest_resolution_h264():
@@ -103,3 +104,10 @@ def test_camera_media_tools_precede_broad_history_in_model_catalog():
         "camera_snapshot_analyze",
         "camera_event_history",
     ]
+    history_description = camera_security.SECURITY_TOOL_SCHEMAS[
+        "camera_event_history"
+    ]["description"]
+    assert "show me the DVR" in history_description
+    assert "present that link" in history_description
+    assert "camera_event_history" not in tool_registry.TEST_USER_TOOLS
+    assert "camera_footage" not in tool_registry.TEST_USER_TOOLS

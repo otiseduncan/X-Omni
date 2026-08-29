@@ -43,10 +43,30 @@
       </label>
       <button id="refreshButton" class="button secondary" type="button">Refresh</button>
       <nav class="tabs" aria-label="DVR views">
+        <button class="tab" data-view="live" type="button">Live watch</button>
         <button class="tab active" data-view="recordings" type="button">Recordings</button>
         <button class="tab" data-view="events" type="button">Motion</button>
         <button class="tab" data-view="screenshots" type="button">Screenshots</button>
       </nav>
+    </section>
+
+    <section id="liveView" class="view">
+      <div class="section-head">
+        <div><h2>Live exterior camera</h2><p>The feed connects only when you start it. Continuous DVR recording stays independent.</p></div>
+        <span id="liveWatchBadge" class="badge muted">Offline</span>
+      </div>
+      <div class="live-watch card">
+        <div class="live-surface">
+          <img id="liveFeed" alt="Exterior camera live feed" referrerpolicy="no-referrer" hidden />
+          <div id="livePlaceholder" class="live-placeholder">Live view is off</div>
+          <span id="liveFeedBadge" class="live-feed-badge" hidden>Live</span>
+        </div>
+        <div class="live-actions">
+          <button id="startLiveButton" class="button" type="button">Start live view</button>
+          <button id="stopLiveButton" class="button secondary" type="button" hidden>Disconnect / log out</button>
+          <span id="liveWatchStatus" class="live-status" role="status" aria-live="polite">Start the feed when you want to watch outside.</span>
+        </div>
+      </div>
     </section>
 
     <section id="recordingsView" class="view active">

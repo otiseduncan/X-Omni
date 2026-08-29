@@ -163,7 +163,7 @@ class _OwnedProcess:
 @dataclass
 class _Session:
     session_id: str
-    conversation_id: int
+    conversation_id: int | None
     owner_id: str
     label: str
     created_at: str
@@ -1416,11 +1416,9 @@ class ExteriorCameraService:
         except asyncio.CancelledError:
             return
 
-    async def create_session(
-        self, *, conversation_id: int, owner_id: str
+    async def _create_session(
+        self, *, conversation_id: int | None, owner_id: str
     ) -> dict[str, Any]:
-        if int(conversation_id) <= 0:
-            raise ValueError("conversation_id must be a positive integer.")
         owner = str(owner_id or "").strip()
         if not owner:
             raise ValueError("Camera session owner is required.")
@@ -1435,7 +1433,7 @@ class ExteriorCameraService:
             now = _utc_now()
             session = _Session(
                 session_id=secrets.token_urlsafe(24),
-                conversation_id=int(conversation_id),
+                conversation_id=conversation_id,
                 owner_id=owner,
                 label=credentials.label,
                 created_at=now.isoformat(),
@@ -1444,7 +1442,7 @@ class ExteriorCameraService:
             )
             self._session = session
             session.watchdog_task = asyncio.create_task(self._watch_session(session))
-        return {
+        result = {
             "ok": True,
             "status": "ready",
             "session_id": session.session_id,
@@ -1452,10 +1450,26 @@ class ExteriorCameraService:
                 f"/api/cameras/exterior/sessions/{session.session_id}/stream.mjpg"
             ),
             "label": session.label,
-            "conversation_id": session.conversation_id,
             "expires_at": session.expires_at,
             "streaming": False,
         }
+        if session.conversation_id is not None:
+            result["conversation_id"] = session.conversation_id
+        return result
+
+    async def create_session(
+        self, *, conversation_id: int, owner_id: str
+    ) -> dict[str, Any]:
+        if int(conversation_id) <= 0:
+            raise ValueError("conversation_id must be a positive integer.")
+        return await self._create_session(
+            conversation_id=int(conversation_id), owner_id=owner_id
+        )
+
+    async def create_watch_session(self, *, owner_id: str) -> dict[str, Any]:
+        """Create an Owner-bound live preview without attaching it to chat."""
+
+        return await self._create_session(conversation_id=None, owner_id=owner_id)
 
     async def stream(
         self, *, session_id: str, owner_id: str

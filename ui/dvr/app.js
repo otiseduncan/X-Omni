@@ -1,13 +1,23 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
-const state = { segments: [], bursts: [], snapshots: [] };
+const state = {
+  segments: [],
+  bursts: [],
+  snapshots: [],
+  liveSession: null,
+  liveStartController: null,
+  liveOperation: 0,
+  leaving: false,
+};
 const datePicker = $("#datePicker");
 const viewer = $("#viewer");
 const videoPlayer = $("#videoPlayer");
 const imageViewer = $("#imageViewer");
+const liveFeed = $("#liveFeed");
 const SNAPSHOT_MEDIA_PREFIXES = ["/api/camera-snapshots/"];
 const DVR_MEDIA_PREFIXES = ["/dvr/api/", "/api/camera-clips/"];
+const LIVE_MEDIA_PREFIXES = ["/dvr/api/live/sessions/"];
 
 function makeElement(tagName, className, text) {
   const element = document.createElement(tagName);
@@ -37,6 +47,21 @@ function sameOriginMediaUrl(value, allowedPrefixes) {
   } catch {
     return null;
   }
+}
+
+function safeLiveSession(payload) {
+  const sessionId = String(payload?.session_id || "").trim();
+  if (!/^[A-Za-z0-9_-]{8,160}$/.test(sessionId)) return null;
+  const streamUrl = sameOriginMediaUrl(payload?.stream_url, LIVE_MEDIA_PREFIXES);
+  if (!streamUrl) return null;
+  const resolved = new URL(streamUrl);
+  const expectedPath = `/dvr/api/live/sessions/${encodeURIComponent(sessionId)}/stream.mjpg`;
+  if (resolved.pathname !== expectedPath || resolved.search) return null;
+  return {
+    session_id: sessionId,
+    stream_url: streamUrl,
+    label: String(payload?.label || "Exterior camera").slice(0, 80),
+  };
 }
 
 function showEmpty(container, baseClass, message) {
@@ -78,14 +103,114 @@ function formatTime(value) {
   return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
 }
 
-async function request(url) {
-  const response = await fetch(url, { credentials: "same-origin", cache: "no-store" });
+async function request(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    credentials: "same-origin",
+    cache: "no-store",
+  });
   if (response.status === 401) {
     window.location.href = "/";
     throw new Error("Sign in required");
   }
-  if (!response.ok) throw new Error(`Request failed (${response.status})`);
-  return response.json();
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = typeof payload?.detail === "string" ? payload.detail.slice(0, 300) : "";
+    throw new Error(detail || `Request failed (${response.status})`);
+  }
+  return payload;
+}
+
+function renderLiveWatch(stage, message = "") {
+  const badge = $("#liveWatchBadge");
+  const start = $("#startLiveButton");
+  const stop = $("#stopLiveButton");
+  const placeholder = $("#livePlaceholder");
+  const feedBadge = $("#liveFeedBadge");
+  const hasSession = Boolean(state.liveSession);
+  const visible = hasSession && ["connecting", "live", "error"].includes(stage);
+
+  liveFeed.hidden = !visible;
+  placeholder.hidden = visible;
+  feedBadge.hidden = stage !== "live";
+  start.hidden = hasSession;
+  start.disabled = stage === "starting" || stage === "stopping";
+  start.textContent = stage === "starting" ? "Starting…" : "Start live view";
+  stop.hidden = !hasSession;
+  stop.disabled = stage === "stopping";
+  badge.textContent = stage === "live" ? "● Live" : stage === "error" ? "Feed unavailable" : hasSession ? "Connecting…" : "Offline";
+  badge.className = `badge ${stage === "live" ? "live" : stage === "error" ? "error" : "muted"}`;
+  $("#liveWatchStatus").textContent = message || (
+    stage === "live"
+      ? "Live exterior feed is visible. DVR recording continues in the background."
+      : "Start the feed when you want to watch outside."
+  );
+}
+
+async function startLiveWatch() {
+  if (state.liveSession) return;
+  const operation = state.liveOperation + 1;
+  state.liveOperation = operation;
+  const controller = new AbortController();
+  state.liveStartController = controller;
+  renderLiveWatch("starting", "Opening an Owner-only camera session…");
+  try {
+    const payload = await request("/dvr/api/live/sessions", {
+      method: "POST",
+      signal: controller.signal,
+    });
+    const session = safeLiveSession(payload);
+    if (!session) throw new Error("Core returned an invalid live camera session.");
+    if (state.leaving || state.liveOperation !== operation) {
+      await deleteLiveSession(session, { keepalive: true });
+      return;
+    }
+    state.liveSession = session;
+    renderLiveWatch("connecting", `Connecting to ${session.label}…`);
+    liveFeed.src = session.stream_url;
+  } catch (error) {
+    if (state.leaving || state.liveOperation !== operation) return;
+    state.liveSession = null;
+    liveFeed.removeAttribute("src");
+    renderLiveWatch("error", error.message || "The live exterior feed could not be started.");
+  } finally {
+    if (state.liveOperation === operation) state.liveStartController = null;
+  }
+}
+
+async function deleteLiveSession(session, { keepalive = false } = {}) {
+  return fetch(
+    `/dvr/api/live/sessions/${encodeURIComponent(session.session_id)}`,
+    {
+      method: "DELETE",
+      credentials: "same-origin",
+      cache: "no-store",
+      keepalive,
+    },
+  );
+}
+
+async function stopLiveWatch({ keepalive = false, quiet = false } = {}) {
+  state.liveOperation += 1;
+  state.liveStartController?.abort();
+  state.liveStartController = null;
+  const session = state.liveSession;
+  state.liveSession = null;
+  liveFeed.removeAttribute("src");
+  renderLiveWatch("stopping", quiet ? "" : "Closing the live camera session…");
+  if (!session) {
+    renderLiveWatch("idle");
+    return;
+  }
+  try {
+    const response = await deleteLiveSession(session, { keepalive });
+    if (!response.ok && response.status !== 404 && !keepalive) {
+      throw new Error(`Disconnect could not be confirmed (${response.status}).`);
+    }
+    if (!quiet) renderLiveWatch("idle", "Live view is off. Continuous DVR recording is still active.");
+  } catch (error) {
+    if (!quiet) renderLiveWatch("error", error.message || "Core could not confirm camera logout.");
+  }
 }
 
 function renderStatus(status) {
@@ -322,6 +447,18 @@ async function refresh() {
 datePicker.value = localDateString();
 $("#refreshButton").addEventListener("click", refresh);
 datePicker.addEventListener("change", refresh);
+$("#startLiveButton").addEventListener("click", startLiveWatch);
+$("#stopLiveButton").addEventListener("click", () => stopLiveWatch());
+liveFeed.addEventListener("load", () => {
+  if (state.liveSession) renderLiveWatch("live");
+});
+liveFeed.addEventListener("error", () => {
+  if (state.liveSession) {
+    stopLiveWatch({ quiet: true }).finally(() => {
+      renderLiveWatch("error", "The live feed ended. You can start a new watch session.");
+    });
+  }
+});
 $("#closeViewer").addEventListener("click", closeViewer);
 viewer.addEventListener("click", (event) => { if (event.target === viewer) closeViewer(); });
 viewer.addEventListener("cancel", cleanupViewerMedia);
@@ -329,9 +466,19 @@ viewer.addEventListener("close", cleanupViewerMedia);
 videoPlayer.addEventListener("error", () => {
   if (videoPlayer.getAttribute("src")) $("#viewerMeta").textContent = "Playback could not be loaded.";
 });
-window.addEventListener("pagehide", cleanupViewerMedia);
+window.addEventListener("pagehide", () => {
+  state.leaving = true;
+  state.liveStartController?.abort();
+  cleanupViewerMedia();
+  stopLiveWatch({ keepalive: true, quiet: true });
+});
+window.addEventListener("pageshow", () => {
+  state.leaving = false;
+  if (!state.liveSession) renderLiveWatch("idle");
+});
 $$('.tab').forEach((tab) => tab.addEventListener("click", () => {
   $$('.tab').forEach((item) => item.classList.toggle("active", item === tab));
   $$('.view').forEach((view) => view.classList.toggle("active", view.id === `${tab.dataset.view}View`));
 }));
+renderLiveWatch("idle");
 refresh();

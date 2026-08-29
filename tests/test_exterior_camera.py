@@ -600,6 +600,42 @@ def test_one_owner_bound_session_expires_and_stops_only_its_exact_process(
     assert service.status()["streaming"] is False
 
 
+def test_standalone_watch_session_has_no_chat_conversation_binding(
+    tmp_path, monkeypatch
+):
+    service = exterior_camera.ExteriorCameraService(
+        tmp_path,
+        ffmpeg_path=_ffmpeg(tmp_path),
+        protect=lambda raw: b"ciphertext",
+        unprotect=lambda raw: b"password",
+    )
+    _install_successful_probe(monkeypatch, service)
+
+    async def scenario():
+        await service.configure(
+            label="Driveway",
+            host="192.168.1.73",
+            username="camera-admin",
+            password="password",
+        )
+        session = await service.create_watch_session(owner_id="session:owner")
+        assert "conversation_id" not in session
+        with pytest.raises(exterior_camera.ExteriorCameraSessionNotFound):
+            await service.current_frame(
+                session_id=session["session_id"],
+                owner_id="session:owner",
+                conversation_id=9,
+            )
+        stopped = await service.delete_session(
+            session_id=session["session_id"], owner_id="session:owner"
+        )
+        return session, stopped
+
+    session, stopped = asyncio.run(scenario())
+    assert session["stream_url"].endswith(f"/{session['session_id']}/stream.mjpg")
+    assert stopped["status"] == "stopped"
+
+
 def test_stream_disconnect_cleans_exact_child_and_releases_single_session(
     tmp_path, monkeypatch
 ):

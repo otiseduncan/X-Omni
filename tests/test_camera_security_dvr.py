@@ -316,7 +316,7 @@ async def test_camera_history_normalizes_offset_bounds_for_dvr_sql(
         list_segments=AsyncMock(return_value=[]),
     )
 
-    await camera_security.camera_event_history(
+    result = await camera_security.camera_event_history(
         store,
         {
             "since": "2026-08-29T18:00:00-04:00",
@@ -332,6 +332,7 @@ async def test_camera_history_normalizes_offset_bounds_for_dvr_sql(
         "until": "2026-08-29T22:05:00Z",
         "limit": 40,
     }
+    assert result["dvr_url"] == "/dvr"
 
 
 @pytest.mark.asyncio

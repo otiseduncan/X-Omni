@@ -32,8 +32,9 @@ from urllib.parse import urlsplit, urlunsplit
 from xml.etree import ElementTree as ET
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from . import exterior_camera as exterior_camera_svc
 from . import camera_monitoring as camera_monitoring_svc
@@ -1890,6 +1891,44 @@ def create_router(settings, store, require_session, dvr: CameraDVR) -> APIRouter
             raise HTTPException(403, "Owner authorization is required.")
         return session
 
+    def owner_session_id(session: dict) -> str:
+        token_hash = str(session.get("token_hash") or "").strip()
+        if token_hash:
+            return f"session:{token_hash}"
+        return f"local:{session.get('google_sub') or 'local-dev'}"
+
+    def require_exact_origin(request: Request, message: str) -> None:
+        origin = str(request.headers.get("origin") or "").strip().rstrip("/")
+        allowed_origins = {
+            str(getattr(settings, "local_origin", "") or "").rstrip("/"),
+            str(getattr(settings, "public_origin", "") or "").rstrip("/"),
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+        }
+        allowed_origins.discard("")
+        if not origin or origin not in allowed_origins:
+            raise HTTPException(403, message)
+
+    def exterior_camera_http_error(exc: BaseException) -> HTTPException:
+        if isinstance(exc, exterior_camera_svc.ExteriorCameraAuthError):
+            # A camera-side authentication failure is not an X Omni Owner
+            # session failure. Keep the operator signed in and show the camera
+            # error in the DVR instead of triggering the UI's 401 redirect.
+            return HTTPException(502, "Exterior camera credentials were rejected.")
+        if isinstance(exc, exterior_camera_svc.ExteriorCameraSessionNotFound):
+            return HTTPException(404, str(exc))
+        if isinstance(
+            exc,
+            (
+                exterior_camera_svc.ExteriorCameraNotConfigured,
+                exterior_camera_svc.ExteriorCameraConflict,
+            ),
+        ):
+            return HTTPException(409, str(exc))
+        if isinstance(exc, ValueError):
+            return HTTPException(400, str(exc))
+        return HTTPException(503, "Exterior camera is temporarily unavailable.")
+
     def bounded_id(value: int, label: str) -> int:
         if value < 1 or value > _SQLITE_MAX_ID:
             raise HTTPException(404, f"{label} not found.")
@@ -1948,6 +1987,106 @@ def create_router(settings, store, require_session, dvr: CameraDVR) -> APIRouter
     @router.get("/api/status")
     async def dvr_status(_session: dict = Depends(require_owner)):
         return await dvr.status()
+
+    @router.post("/api/live/sessions")
+    async def create_dvr_live_session(
+        request: Request,
+        session: dict = Depends(require_owner),
+    ):
+        require_exact_origin(
+            request, "Starting a DVR live watch requires the exact X Omni origin."
+        )
+        content_length = str(request.headers.get("content-length") or "").strip()
+        if content_length:
+            try:
+                if int(content_length) != 0:
+                    raise HTTPException(400, "DVR live-session start accepts no body.")
+            except ValueError:
+                raise HTTPException(400, "Invalid live-session Content-Length.") from None
+        try:
+            async for chunk in request.stream():
+                if chunk:
+                    raise HTTPException(400, "DVR live-session start accepts no body.")
+        except ClientDisconnect:
+            raise HTTPException(499, "DVR live-session request was cancelled.") from None
+        try:
+            result = await dvr.camera.create_watch_session(
+                owner_id=owner_session_id(session)
+            )
+        except exterior_camera_svc.ExteriorCameraError as exc:
+            raise exterior_camera_http_error(exc) from exc
+        except ValueError as exc:
+            raise exterior_camera_http_error(exc) from exc
+        session_id = str(result.get("session_id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,160}", session_id):
+            raise HTTPException(503, "Exterior camera returned an invalid live session.")
+        if await request.is_disconnected():
+            try:
+                await dvr.camera.delete_session(
+                    session_id=session_id,
+                    owner_id=owner_session_id(session),
+                )
+            except exterior_camera_svc.ExteriorCameraError:
+                log.info("Disconnected DVR live-session request was already released")
+            raise HTTPException(499, "DVR live-session request was cancelled.")
+        audit = getattr(store, "audit", None)
+        if callable(audit):
+            audit(
+                "standalone_dvr_live_session_started",
+                {"label": result.get("label"), "streaming": False},
+            )
+        return {
+            "ok": True,
+            "status": result.get("status") or "ready",
+            "session_id": session_id,
+            "stream_url": f"/dvr/api/live/sessions/{session_id}/stream.mjpg",
+            "label": result.get("label") or "Exterior camera",
+            "expires_at": result.get("expires_at"),
+            "streaming": False,
+        }
+
+    @router.get("/api/live/sessions/{camera_session_id}/stream.mjpg")
+    async def dvr_live_stream(
+        camera_session_id: str,
+        session: dict = Depends(require_owner),
+    ):
+        try:
+            iterator = await dvr.camera.stream(
+                session_id=camera_session_id,
+                owner_id=owner_session_id(session),
+            )
+        except exterior_camera_svc.ExteriorCameraError as exc:
+            raise exterior_camera_http_error(exc) from exc
+        return StreamingResponse(
+            iterator,
+            media_type="multipart/x-mixed-replace; boundary=xomni",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @router.delete("/api/live/sessions/{camera_session_id}")
+    async def delete_dvr_live_session(
+        camera_session_id: str,
+        request: Request,
+        session: dict = Depends(require_owner),
+    ):
+        require_exact_origin(
+            request, "Stopping a DVR live watch requires the exact X Omni origin."
+        )
+        try:
+            result = await dvr.camera.delete_session(
+                session_id=camera_session_id,
+                owner_id=owner_session_id(session),
+            )
+        except exterior_camera_svc.ExteriorCameraError as exc:
+            raise exterior_camera_http_error(exc) from exc
+        audit = getattr(store, "audit", None)
+        if callable(audit):
+            audit("standalone_dvr_live_session_stopped", {"streaming": False})
+        return result
 
     @router.get("/api/segments")
     async def dvr_segments(
