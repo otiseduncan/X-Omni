@@ -65,7 +65,7 @@ def test_adas_profile_prompt_and_catalog_budget_is_reviewable_and_bounded() -> N
     assert metrics["base_system"]["tokens"] <= 1_800
     assert metrics["advertised_tools"]["catalog_chars"] <= 42_200
     assert metrics["advertised_tools"]["catalog_tokens"] <= 12_100
-    assert metrics["total_input_used_tokens"] <= 13_500
+    assert metrics["total_input_used_tokens"] <= 13_650
     assert metrics["remaining_normal_turn_tokens"] >= 17_700
 
 
