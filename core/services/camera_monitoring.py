@@ -256,6 +256,10 @@ class CameraMonitor:
 # read-only tools
 # --------------------------------------------------------------------------
 
+def _snapshot_url(filename: str) -> str:
+    return f"/api/camera-snapshots/{filename}"
+
+
 async def camera_event_history(store, args: dict) -> dict:
     since = args.get("since")
     until = args.get("until")
@@ -274,6 +278,7 @@ async def camera_event_history(store, args: dict) -> dict:
             "vehicle_detected": (
                 bool(row["vehicle_detected"]) if row["vehicle_detected"] is not None else None
             ),
+            "snapshot_url": _snapshot_url(row["snapshot_filename"]),
         }
         for row in rows
     ]
@@ -307,6 +312,7 @@ async def camera_snapshot_analyze(store, router, settings, args: dict) -> dict:
             "vehicle_detected": (
                 bool(event["vehicle_detected"]) if event["vehicle_detected"] is not None else None
             ),
+            "snapshot_url": _snapshot_url(event["snapshot_filename"]),
             "cached": True,
         }
 
@@ -349,5 +355,6 @@ async def camera_snapshot_analyze(store, router, settings, args: dict) -> dict:
         "caption": description,
         "person_detected": person,
         "vehicle_detected": vehicle,
+        "snapshot_url": _snapshot_url(event["snapshot_filename"]),
         "cached": False,
     }

@@ -214,6 +214,8 @@ ARTIFACT_FOR_TOOL = {
     "website_preview_generate": "website_preview",
     "camera_request": "camera_request",
     "exterior_camera_request": "exterior_camera_request",
+    "camera_event_history": "camera_event_history",
+    "camera_snapshot_analyze": "camera_snapshot",
     "image_generation_status": "image_generation_status",
     "image_generate": "generated_image",
     "video_generation_status": "video_generation_status",

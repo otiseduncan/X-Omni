@@ -1321,6 +1321,95 @@ function GeneratedImageCard({ data, receipt }) {
   );
 }
 
+function cameraEventTime(capturedAt) {
+  if (!capturedAt) return "";
+  // SQLite datetime('now') is UTC with a space separator; force UTC parsing.
+  return fmtTime(`${String(capturedAt).replace(" ", "T")}Z`);
+}
+
+function CameraEventHistoryCard({ data }) {
+  const items = Array.isArray(data?.items) ? data.items : [];
+  if (!data?.ok || !items.length) {
+    return (
+      <Card icon={Camera} title="Camera history">
+        <p className="card-note">No stored camera snapshots in that range.</p>
+      </Card>
+    );
+  }
+  return (
+    <Card icon={Camera} title={`Camera history — ${data.shown_count} of ${data.total_count}`}>
+      <div className="camera-history-grid">
+        {items.map((item) => (
+          <figure className="camera-history-item" key={item.id}>
+            {item.snapshot_url && (
+              <img
+                className="camera-history-thumb"
+                src={item.snapshot_url}
+                alt={displayText(item.caption, `${item.trigger} snapshot`)}
+                loading="lazy"
+                referrerPolicy="no-referrer"
+              />
+            )}
+            <figcaption>
+              <span className="camera-history-time">{cameraEventTime(item.captured_at)}</span>
+              <span className={`camera-history-trigger is-${item.trigger}`}>{item.trigger}</span>
+              {item.caption && <p className="card-note">{item.caption}</p>}
+            </figcaption>
+          </figure>
+        ))}
+      </div>
+      {data.truncated && (
+        <p className="card-note">
+          Showing the {data.shown_count} most recent of {data.total_count} total.
+        </p>
+      )}
+    </Card>
+  );
+}
+
+function CameraSnapshotCard({ data }) {
+  if (!data?.ok) {
+    return (
+      <Card icon={Camera} title="Camera snapshot" className="image-generation-warning">
+        <p className="card-note" role="alert">
+          {displayText(data?.error, "This snapshot could not be analyzed.")}
+        </p>
+      </Card>
+    );
+  }
+  const badges = [
+    data.person_detected ? "person" : null,
+    data.vehicle_detected ? "vehicle" : null,
+    data.cached ? "cached" : null,
+  ].filter(Boolean);
+  return (
+    <figure className="card camera-snapshot-card">
+      <div className="card-head">
+        <Camera size={14} aria-hidden="true" />
+        <span>{data.trigger === "motion" ? "Motion event" : "Camera snapshot"}</span>
+      </div>
+      {data.snapshot_url && (
+        <img
+          className="camera-snapshot-image"
+          src={data.snapshot_url}
+          alt={displayText(data.caption, "Camera snapshot")}
+          loading="eager"
+          referrerPolicy="no-referrer"
+        />
+      )}
+      <figcaption>
+        <p className="camera-snapshot-caption">
+          {displayText(data.caption, "No description available.")}
+        </p>
+        <p className="card-note">
+          {cameraEventTime(data.captured_at)}
+          {badges.length ? ` · ${badges.join(" · ")}` : ""}
+        </p>
+      </figcaption>
+    </figure>
+  );
+}
+
 function ImageGenerationStatusCard({ data }) {
   const successful = data?.status === "completed" && data?.verified === true;
   const configured = data?.generation_available === true;
@@ -1626,6 +1715,8 @@ const REGISTRY = {
   camera_request: CameraRequestCard,
   exterior_camera_request: ExteriorCameraRequestCard,
   camera_observation: CameraObservationCard,
+  camera_event_history: CameraEventHistoryCard,
+  camera_snapshot: CameraSnapshotCard,
   generated_image: GeneratedImageCard,
   image_generation_status: ImageGenerationStatusCard,
   generated_video: GeneratedVideoCard,

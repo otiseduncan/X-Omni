@@ -1817,6 +1817,13 @@ class Store:
         row = self._one("SELECT * FROM camera_events WHERE id = ?", (event_id,))
         return dict(row) if row else None
 
+    def camera_snapshot_is_tracked(self, filename: str) -> bool:
+        """Only ever serve a file this app actually wrote and logged --
+        belt-and-suspenders alongside the filename's own safe-pattern check."""
+        return self._one(
+            "SELECT 1 FROM camera_events WHERE snapshot_filename = ? LIMIT 1", (filename,)
+        ) is not None
+
     def get_last_camera_event(self, *, trigger: Optional[str] = None) -> Optional[dict]:
         if trigger:
             row = self._one(
