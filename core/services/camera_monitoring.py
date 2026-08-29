@@ -279,6 +279,21 @@ def _snapshot_url(filename: str) -> str:
     return f"/api/camera-snapshots/{filename}"
 
 
+def _local_time_str(captured_at_utc: str) -> str:
+    """captured_at is SQLite's naive datetime('now') -- UTC with no offset
+    marker. Give the model an unambiguous local string to quote directly
+    instead of a bare "10:31:35" that reads as if it were already local
+    time (this machine's local timezone, same convention as the "Right
+    now" prompt section)."""
+    try:
+        parsed = datetime.strptime(captured_at_utc, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except (TypeError, ValueError):
+        return captured_at_utc
+    return parsed.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+
 async def camera_event_history(store, args: dict) -> dict:
     since = args.get("since")
     until = args.get("until")
@@ -289,6 +304,7 @@ async def camera_event_history(store, args: dict) -> dict:
         {
             "id": row["id"],
             "captured_at": row["captured_at"],
+            "captured_at_local": _local_time_str(row["captured_at"]),
             "trigger": row["trigger"],
             "caption": row["caption"],
             "person_detected": (
@@ -323,6 +339,7 @@ async def camera_snapshot_analyze(store, router, settings, args: dict) -> dict:
             "ok": True,
             "id": event["id"],
             "captured_at": event["captured_at"],
+            "captured_at_local": _local_time_str(event["captured_at"]),
             "trigger": event["trigger"],
             "caption": event["caption"],
             "person_detected": (
@@ -370,6 +387,7 @@ async def camera_snapshot_analyze(store, router, settings, args: dict) -> dict:
         "ok": True,
         "id": event["id"],
         "captured_at": event["captured_at"],
+        "captured_at_local": _local_time_str(event["captured_at"]),
         "trigger": event["trigger"],
         "caption": description,
         "person_detected": person,
