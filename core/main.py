@@ -102,7 +102,7 @@ def build_app(settings: Settings) -> FastAPI:
         profile=getattr(settings, "tool_profile", None),
     )
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
-    camera_dvr = camera_dvr_svc.CameraDVR(exterior_camera)
+    camera_dvr = camera_security_svc.XiongmaiDVR(exterior_camera)
     camera_monitor = camera_security_svc.OnvifCameraMonitor(
         settings, exterior_camera, router, store, dvr=camera_dvr
     )
