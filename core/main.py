@@ -132,6 +132,7 @@ def build_app(settings: Settings) -> FastAPI:
     )
     registry.register("web_research_current", research_svc.search_current)
     registry.register("scrapex_status", lambda a: scrapex_svc.status(settings, a))
+    registry.register("scrapex_start_native", lambda a: scrapex_svc.start_native(settings))
     registry.register("scrapex_read", lambda a: scrapex_svc.read(settings, a))
     registry.register("scrapex_adas_map", lambda a: scrapex_svc.adas_map(settings, a))
     registry.register(
@@ -240,6 +241,9 @@ def build_app(settings: Settings) -> FastAPI:
     async def calibration_iq_status(_args: dict) -> dict:
         return await ciq_svc.status(settings)
 
+    async def calibration_iq_start_native(_args: dict) -> dict:
+        return await ciq_svc.start_native(settings)
+
     async def calibration_iq_summary(args: dict) -> dict:
         return await ciq_svc.summarize_repair_orders(settings, args)
 
@@ -259,6 +263,7 @@ def build_app(settings: Settings) -> FastAPI:
         return await ciq_svc.operator_execute(settings, adas, args, destructive=True)
 
     registry.register("calibration_iq_status", calibration_iq_status)
+    registry.register("calibration_iq_start_native", calibration_iq_start_native)
     registry.register("calibration_iq_summary", calibration_iq_summary)
     registry.register("calibration_iq_read", calibration_iq_read)
     registry.register("calibration_iq_ro", calibration_iq_ro)

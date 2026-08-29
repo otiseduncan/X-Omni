@@ -9,10 +9,14 @@ and reports the returned state without turning "started" into "completed".
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import os
 import re
+import subprocess
+import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -21,9 +25,13 @@ import httpx
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8125"
 BASE_URL_ENV = "XOMNI_SCRAPEX_BASE_URL"
+DEFAULT_PROJECT_PATH = Path(r"X:\ScrapeX")
 STATUS_TIMEOUT = 5.0
 READ_TIMEOUT = 20.0
 OPERATOR_TIMEOUT = 180.0
+NATIVE_START_TIMEOUT_S = 90.0
+NATIVE_START_POLL_INTERVAL_S = 1.0
+MAX_NATIVE_START_LOG_CHARS = 4000
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_BATCH_ID_CHARS = 80
 MAX_RO_CHARS = 80
@@ -305,10 +313,23 @@ SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
     },
 }
 
+SCRAPEX_START_NATIVE_SCHEMA: dict[str, Any] = {
+    "description": (
+        "Start ScrapeX's local server if unreachable, then verify it "
+        "answers. Safe even if already running."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
 SCRAPEX_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "scrapex_status": SCRAPEX_STATUS_SCHEMA,
     "scrapex_read": SCRAPEX_READ_SCHEMA,
     "scrapex_adas_map": SCRAPEX_ADAS_MAP_SCHEMA,
+    "scrapex_start_native": SCRAPEX_START_NATIVE_SCHEMA,
 }
 
 
@@ -1249,6 +1270,87 @@ async def status(settings: Any, args: dict[str, Any] | None = None) -> dict[str,
     )
     result["ready"] = ready
     return result
+
+
+def _tail_native_start_log(log_path: Path) -> str:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-MAX_NATIVE_START_LOG_CHARS:]
+
+
+async def start_native(settings: Any) -> dict[str, Any]:
+    """Start ScrapeX's local server if it is not already answering
+    /api/health, then verify with a fresh probe -- the spawned process
+    merely existing is never treated as proof it is actually serving."""
+    try:
+        await _request(
+            settings, "GET", "/api/health", timeout=STATUS_TIMEOUT, may_mutate=False
+        )
+    except ScrapeXConfiguration as exc:
+        return _configuration_failure("start_native", exc)
+    except ScrapeXTransport:
+        pass  # not reachable yet -- fall through to actually starting it
+    else:
+        return _success("start_native", None, status="already_healthy", verified=True)
+
+    try:
+        project_path = getattr(settings, "scrapex_project_path", None) or DEFAULT_PROJECT_PATH
+        script = Path(project_path) / "scripts" / "start.ps1"
+        if not script.is_file():
+            return _failure(
+                "start_native", "configuration_error",
+                f"Native launcher not found at {script}.",
+            )
+        log_dir = Path(settings.root) / "data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "scrapex_native_start.log"
+        with log_path.open("w", encoding="utf-8") as log_file:
+            process = subprocess.Popen(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", str(script),
+                ],
+                cwd=str(project_path),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+    except OSError as exc:
+        return _failure("start_native", "spawn_failed", f"Could not launch ScrapeX: {exc}")
+
+    deadline = time.monotonic() + NATIVE_START_TIMEOUT_S
+    healthy = False
+    exited_early = False
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            exited_early = True
+            break
+        try:
+            await _request(
+                settings, "GET", "/api/health", timeout=STATUS_TIMEOUT, may_mutate=False
+            )
+        except ScrapeXTransport:
+            await asyncio.sleep(NATIVE_START_POLL_INTERVAL_S)
+            continue
+        healthy = True
+        break
+
+    if not healthy:
+        detail = _tail_native_start_log(log_path)
+        message = (
+            f"ScrapeX exited before becoming healthy (code {process.returncode})."
+            if exited_early
+            else "ScrapeX did not become healthy before the startup timeout."
+        )
+        return _failure(
+            "start_native", "failed", message,
+            detail=detail,
+            exit_code=process.returncode if exited_early else None,
+        )
+
+    return _success("start_native", None, status="healthy", executed=True, verified=True)
 
 
 async def read(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
