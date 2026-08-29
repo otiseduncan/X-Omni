@@ -286,6 +286,12 @@ def build_app(settings: Settings) -> FastAPI:
         "camera_snapshot_analyze",
         lambda a: camera_monitoring_svc.camera_snapshot_analyze(store, router, settings, a),
     )
+    registry.register(
+        "camera_motion_clip",
+        lambda a: camera_monitoring_svc.camera_motion_clip(
+            store, settings, exterior_camera.ffmpeg_path, a
+        ),
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

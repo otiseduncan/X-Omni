@@ -216,6 +216,7 @@ ARTIFACT_FOR_TOOL = {
     "exterior_camera_request": "exterior_camera_request",
     "camera_event_history": "camera_event_history",
     "camera_snapshot_analyze": "camera_snapshot",
+    "camera_motion_clip": "camera_motion_clip",
     "image_generation_status": "image_generation_status",
     "image_generate": "generated_image",
     "video_generation_status": "video_generation_status",

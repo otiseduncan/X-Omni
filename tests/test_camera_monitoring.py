@@ -430,3 +430,201 @@ async def test_camera_snapshot_analyze_rejects_an_unknown_event_id(tmp_path: Pat
         store, FakeRouter(), _settings(tmp_path), {"event_id": 999}
     )
     assert result["ok"] is False
+
+
+# --------------------------------------------------------------------------
+# motion clips
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_tick_assigns_one_shared_burst_id_across_a_sustained_burst(tmp_path: Path, monkeypatch):
+    store = Store(tmp_path / "burst-id.sqlite")
+    clock = FakeClock()
+    monkeypatch.setattr(camera_monitoring.time, "monotonic", clock)
+    settings = _settings(tmp_path, camera_motion_burst_seconds=90, camera_motion_burst_interval_seconds=5)
+    frames = [_jpeg_frame((0, 0, 0))] + [
+        _jpeg_frame((255, 255, 255) if i % 2 == 0 else (0, 0, 0)) for i in range(4)
+    ]
+    monitor, _camera, _router = _monitor(tmp_path, store, frames, settings=settings)
+
+    async def fake_caption(*args):
+        return "PERSON: no\nVEHICLE: no\nDESCRIPTION: nothing"
+
+    monkeypatch.setattr(camera_svc, "caption_frame", fake_caption)
+
+    await monitor._tick()  # baseline
+    for _ in range(4):
+        clock.advance(5)
+        await monitor._tick()
+
+    events = store.list_camera_events(limit=20)
+    baseline = [e for e in events if e["trigger"] == "interval"]
+    motion = [e for e in events if e["trigger"] == "motion"]
+    assert all(e["burst_id"] is None for e in baseline)
+    assert len(motion) == 4
+    burst_ids = {e["burst_id"] for e in motion}
+    assert len(burst_ids) == 1
+    assert next(iter(burst_ids)) is not None
+
+
+def _fake_ffmpeg(tmp_path: Path) -> Path:
+    path = tmp_path / "ffmpeg.exe"
+    path.write_bytes(b"")
+    return path
+
+
+class _FakeFfmpegProcess:
+    def __init__(self, returncode=0, stderr=b""):
+        self.returncode = returncode
+        self._stderr = stderr
+
+    async def communicate(self):
+        return (b"", self._stderr)
+
+
+def _writing_process_factory(*, calls: list, returncode: int = 0):
+    async def process_factory(*args, **_kwargs):
+        calls.append(args)
+        output_path = Path(args[-1])
+        if returncode == 0:
+            output_path.write_bytes(b"fake-mp4-bytes")
+        return _FakeFfmpegProcess(returncode=returncode)
+
+    return process_factory
+
+
+async def _run_burst(tmp_path, store, settings, *, n_frames=3):
+    """Drive a real sustained-motion burst through _tick so its stored
+    frames/burst_id match what the background loop would actually produce."""
+    clock = FakeClock()
+    frames = [_jpeg_frame((0, 0, 0))] + [
+        _jpeg_frame((255, 255, 255) if i % 2 == 0 else (0, 0, 0)) for i in range(n_frames)
+    ]
+    monitor, _camera, _router = _monitor(tmp_path, store, frames, settings=settings)
+
+    original_monotonic = camera_monitoring.time.monotonic
+    original_caption = camera_svc.caption_frame
+    camera_monitoring.time.monotonic = clock
+
+    async def fake_caption(*args):
+        return "PERSON: no\nVEHICLE: no\nDESCRIPTION: nothing"
+
+    camera_svc.caption_frame = fake_caption
+    try:
+        await monitor._tick()
+        for _ in range(n_frames):
+            clock.advance(5)
+            await monitor._tick()
+    finally:
+        camera_monitoring.time.monotonic = original_monotonic
+        camera_svc.caption_frame = original_caption
+    return monitor
+
+
+@pytest.mark.asyncio
+async def test_camera_motion_clip_builds_and_caches_the_latest_burst(tmp_path: Path):
+    store = Store(tmp_path / "clip-latest.sqlite")
+    settings = _settings(tmp_path, camera_motion_burst_seconds=90, camera_motion_burst_interval_seconds=5)
+    await _run_burst(tmp_path, store, settings, n_frames=3)
+
+    ffmpeg_path = _fake_ffmpeg(tmp_path)
+    calls: list = []
+    process_factory = _writing_process_factory(calls=calls)
+
+    result = await camera_monitoring.camera_motion_clip(
+        store, settings, ffmpeg_path, {}, process_factory=process_factory,
+    )
+    assert result["ok"] is True
+    assert result["cached"] is False
+    assert result["frame_count"] == 3
+    assert result["clip_url"].startswith("/api/camera-clips/")
+    assert len(calls) == 1
+
+    # Asking again must hit the DB-backed cache, not re-invoke ffmpeg.
+    result2 = await camera_monitoring.camera_motion_clip(
+        store, settings, ffmpeg_path, {}, process_factory=process_factory,
+    )
+    assert result2["ok"] is True
+    assert result2["cached"] is True
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_camera_motion_clip_resolves_an_event_id_to_its_burst(tmp_path: Path):
+    store = Store(tmp_path / "clip-event.sqlite")
+    settings = _settings(tmp_path, camera_motion_burst_seconds=90, camera_motion_burst_interval_seconds=5)
+    await _run_burst(tmp_path, store, settings, n_frames=2)
+    motion_events = [e for e in store.list_camera_events(limit=20) if e["trigger"] == "motion"]
+    some_event_id = motion_events[-1]["id"]
+
+    ffmpeg_path = _fake_ffmpeg(tmp_path)
+    result = await camera_monitoring.camera_motion_clip(
+        store, settings, ffmpeg_path, {"event_id": some_event_id},
+        process_factory=_writing_process_factory(calls=[]),
+    )
+    assert result["ok"] is True
+    assert result["frame_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_camera_motion_clip_rejects_a_baseline_event(tmp_path: Path):
+    store = Store(tmp_path / "clip-baseline.sqlite")
+    event_id = store.add_camera_event(trigger="interval", snapshot_filename="baseline.jpg")
+    result = await camera_monitoring.camera_motion_clip(
+        store, _settings(tmp_path), _fake_ffmpeg(tmp_path), {"event_id": event_id},
+    )
+    assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_camera_motion_clip_reports_no_motion_yet(tmp_path: Path):
+    store = Store(tmp_path / "clip-none.sqlite")
+    result = await camera_monitoring.camera_motion_clip(
+        store, _settings(tmp_path), _fake_ffmpeg(tmp_path), {},
+    )
+    assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_camera_motion_clip_reports_missing_ffmpeg(tmp_path: Path):
+    store = Store(tmp_path / "clip-noffmpeg.sqlite")
+    settings = _settings(tmp_path, camera_motion_burst_seconds=90, camera_motion_burst_interval_seconds=5)
+    await _run_burst(tmp_path, store, settings, n_frames=1)
+
+    result = await camera_monitoring.camera_motion_clip(
+        store, settings, tmp_path / "does-not-exist.exe", {},
+    )
+    assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_camera_motion_clip_reports_an_ffmpeg_encode_failure(tmp_path: Path):
+    store = Store(tmp_path / "clip-fail.sqlite")
+    settings = _settings(tmp_path, camera_motion_burst_seconds=90, camera_motion_burst_interval_seconds=5)
+    await _run_burst(tmp_path, store, settings, n_frames=1)
+
+    result = await camera_monitoring.camera_motion_clip(
+        store, settings, _fake_ffmpeg(tmp_path), {},
+        process_factory=_writing_process_factory(calls=[], returncode=1),
+    )
+    assert result["ok"] is False
+
+
+def test_retention_sweep_also_removes_orphaned_clips(tmp_path: Path):
+    store = Store(tmp_path / "clip-retention.sqlite")
+    settings = _settings(tmp_path, camera_snapshot_retention_days=30)
+    clip_dir = settings.camera_snapshot_dir / camera_monitoring.CLIP_SUBDIR
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    (clip_dir / "motion-1.mp4").write_bytes(b"fake")
+
+    store.add_camera_motion_clip(
+        burst_id=1, filename="motion-1.mp4", frame_count=1, first_event_id=1, last_event_id=1,
+    )
+    # No camera_events row references burst_id 1 -- it has already fully
+    # aged out, so the clip is orphaned and the sweep should remove it.
+
+    monitor, _camera, _router = _monitor(tmp_path, store, [], settings=settings)
+    monitor._sweep_retention()
+
+    assert store.get_camera_motion_clip(1) is None
+    assert not (clip_dir / "motion-1.mp4").exists()

@@ -41,6 +41,7 @@ profiles:
       - exterior_camera_request
       - camera_event_history
       - camera_snapshot_analyze
+      - camera_motion_clip
       - adas_si_search
       - adas_si_inventory
       - adas_si_open
@@ -147,6 +148,10 @@ tools:
   camera_snapshot_analyze:
     tier: read_only
     description: "Analyze one stored camera snapshot by event id."
+
+  camera_motion_clip:
+    tier: read_only
+    description: "Assemble a motion event's stored frames into one playable timelapse clip."
 
   image_generation_status:
     tier: read_only

@@ -746,6 +746,16 @@
   object-fit: contain;
 }
 
+.camera-motion-clip-video {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: min(68vh, 720px);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #080b12;
+}
+
 .camera-snapshot-card figcaption {
   display: grid;
   gap: 6px;
