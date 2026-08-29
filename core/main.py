@@ -292,7 +292,7 @@ def build_app(settings: Settings) -> FastAPI:
         lambda a: camera_monitoring_svc.camera_snapshot_analyze(store, router, settings, a),
     )
     registry.register(
-        "camera_motion_clip",
+        "camera_footage",
         lambda a: camera_security_svc.camera_motion_clip(
             store, settings, exterior_camera.ffmpeg_path, a, dvr=camera_dvr
         ),

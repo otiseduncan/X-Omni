@@ -66,9 +66,11 @@ async def test_segment_index_marks_only_newest_active_segment_open(tmp_path: Pat
         required_drive=None,
     )
     dvr.recordings_dir.mkdir(parents=True)
-    (dvr.recordings_dir / "20260829-120000.mkv").write_bytes(b"a" * 100)
-    (dvr.recordings_dir / "20260829-120500.mkv").write_bytes(b"b" * 200)
+    session = "20260829T120000000000Z"
+    (dvr.recordings_dir / f"{session}-000000.mkv").write_bytes(b"a" * 100)
+    (dvr.recordings_dir / f"{session}-000001.mkv").write_bytes(b"b" * 200)
     dvr._process = SimpleNamespace(returncode=None)
+    dvr._current_session_prefix = session
     dvr._profile = camera_dvr.RecordingProfile("x", "Main", "H264", 1920, 1080)
 
     await dvr._index_segments()
@@ -76,7 +78,8 @@ async def test_segment_index_marks_only_newest_active_segment_open(tmp_path: Pat
     assert len(rows) == 2
     assert rows[0]["complete"] == 1
     assert rows[1]["complete"] == 0
-    assert rows[0]["codec"] == "H264"
+    assert rows[0]["codec"] is None
+    assert rows[0]["probed"] == 0
 
 
 def test_dvr_default_root_is_dedicated_e_drive_folder():
@@ -92,3 +95,11 @@ def test_xiongmai_security_parser_accepts_vehicle_and_trigger_topics():
     ) == [True]
     assert "VEHICLE: yes or no" in camera_security._SECURITY_ANALYSIS_PROMPT
     assert "truck" in camera_security._SECURITY_ANALYSIS_PROMPT
+
+
+def test_camera_media_tools_precede_broad_history_in_model_catalog():
+    assert list(camera_security.SECURITY_TOOL_SCHEMAS) == [
+        "camera_footage",
+        "camera_snapshot_analyze",
+        "camera_event_history",
+    ]

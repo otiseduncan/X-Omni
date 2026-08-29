@@ -41,7 +41,7 @@ profiles:
       - exterior_camera_request
       - camera_event_history
       - camera_snapshot_analyze
-      - camera_motion_clip
+      - camera_footage
       - adas_si_search
       - adas_si_inventory
       - adas_si_open
@@ -152,6 +152,10 @@ tools:
   camera_motion_clip:
     tier: read_only
     description: "Assemble a motion event's stored frames into one playable timelapse clip."
+
+  camera_footage:
+    tier: read_only
+    description: "Render playable continuous or historical exterior-camera footage."
 
   image_generation_status:
     tier: read_only

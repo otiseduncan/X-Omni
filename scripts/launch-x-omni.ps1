@@ -243,11 +243,20 @@ function Stop-VerifiedDvrRecorders {
             }
             continue
         }
-        try {
-            Wait-Process -Id $processId -Timeout 15 -ErrorAction SilentlyContinue
-        } catch {}
-        $remaining = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
-        if ($remaining) {
+        # Windows PowerShell 5.1 lacks a bounded process-wait parameter. Poll CIM so the
+        # normal desktop shortcut waits for the verified recorder to disappear
+        # instead of treating an unsupported parameter as an immediate timeout.
+        $exited = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        do {
+            $remaining = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
+            if (-not $remaining -or -not (Test-XOmniDvrRecorderProcess -Process $remaining)) {
+                $exited = $true
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (-not $exited) {
             throw "Verified X Omni DVR recorder PID $processId did not exit."
         }
     }

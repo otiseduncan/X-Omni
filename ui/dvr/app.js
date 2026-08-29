@@ -104,6 +104,16 @@ function renderStatus(status) {
       ? `${profile.width}×${profile.height}` : null;
     $("#profileText").textContent = [profile.name, dimensions, profile.codec]
       .filter(Boolean).join(" · ") || "Waiting for camera";
+  } else if (status.advertised_profile) {
+    const advertised = status.advertised_profile;
+    const dimensions = Number.isFinite(advertised.width) && Number.isFinite(advertised.height)
+      ? `${advertised.width}×${advertised.height}` : null;
+    const claim = [dimensions, advertised.codec].filter(Boolean).join(" · ");
+    $("#profileText").textContent = [
+      advertised.name,
+      "bitstream metadata pending",
+      claim ? `advertised ${claim}` : null,
+    ].filter(Boolean).join(" · ");
   } else {
     $("#profileText").textContent = "Waiting for camera";
   }
@@ -133,7 +143,8 @@ function renderRecordings(items) {
     const dimensions = Number.isFinite(item.width) && Number.isFinite(item.height)
       ? `${item.width}×${item.height}` : "—×—";
     const profile = makeElement(
-      "div", "recording-meta recording-profile", `${dimensions} · ${item.codec || "video"}`,
+      "div", "recording-meta recording-profile",
+      item.probed ? `${dimensions} · ${item.codec}` : "bitstream metadata pending",
     );
     const size = makeElement("div", "recording-meta recording-size", formatBytes(item.bytes));
     const button = makeElement("button", "play-button", "Play");

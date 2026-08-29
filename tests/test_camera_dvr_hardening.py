@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from xml.etree import ElementTree as ET
@@ -285,6 +286,11 @@ def test_pull_response_requires_valid_camera_lease_times(tmp_path: Path):
     assert dvr.events_healthy is False
 
 
+def test_onvif_fast_pull_cycle_is_paced_but_long_poll_is_not():
+    assert camera_dvr.CameraDVR._pull_cycle_delay(10.0, now=10.1) == pytest.approx(0.9)
+    assert camera_dvr.CameraDVR._pull_cycle_delay(10.0, now=11.2) == 0.0
+
+
 def test_profile_uses_hevc_main_instead_of_low_quality_h264_substream():
     profiles = [
         SimpleNamespace(
@@ -304,8 +310,354 @@ def test_profile_uses_hevc_main_instead_of_low_quality_h264_substream():
 def test_hevc_playback_is_cpu_transcoded_but_h264_is_remuxed():
     assert camera_dvr.CameraDVR._playback_codec_args("H264") == ["-c:v", "copy"]
     hevc = camera_dvr.CameraDVR._playback_codec_args("HEVC")
+    unknown = camera_dvr.CameraDVR._playback_codec_args(None)
     assert "libx264" in hevc
+    assert "libx264" in unknown
     assert not any("cuda" in value.casefold() or "nvenc" in value.casefold() for value in hevc)
+
+
+def test_segment_probe_reads_actual_bitstream_metadata_without_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffprobe = tmp_path / "ffprobe.exe"
+    ffmpeg.write_bytes(b"")
+    ffprobe.write_bytes(b"")
+    segment = tmp_path / "recording.mkv"
+    segment.write_bytes(b"video")
+    camera = SimpleNamespace(_require_ffmpeg=lambda: ffmpeg)
+    dvr = camera_dvr.CameraDVR(camera, root=tmp_path / "dvr", required_drive=None)
+    observed = {}
+
+    def run(command, **kwargs):
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b'{"streams":[{"codec_name":"hevc","width":2304,"height":1296}]}',
+        )
+
+    monkeypatch.setattr(camera_dvr.subprocess, "run", run)
+
+    assert dvr._probe_segment_sync(segment) == ("HEVC", 2304, 1296)
+    assert observed["command"][-1] == str(segment)
+    assert "-select_streams" in observed["command"]
+    assert not any(
+        token in " ".join(observed["command"]).casefold()
+        for token in ("cuda", "nvenc", "libx264")
+    )
+    assert observed["kwargs"]["timeout"] == camera_dvr.SEGMENT_PROBE_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_completed_segment_probe_corrects_advertised_codec_and_rebuilds_stale_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dvr = _dvr(tmp_path)
+    dvr._ensure_storage_sync()
+    session = "20260829T120000000000Z"
+    dvr._current_session_prefix = session
+    first = dvr.recordings_dir / f"{session}-000000.mkv"
+    first.write_bytes(b"first")
+    dvr._process = SimpleNamespace(returncode=None)
+    dvr._profile = camera_dvr.RecordingProfile(
+        "main", "mainStream", "H264", 2304, 1296
+    )
+
+    await dvr._index_segments(force=True)
+    initial = (await dvr.list_segments(limit=10))[0]
+    stale = dvr.playback_dir / f"segment-{initial['id']}.mp4"
+    stale.write_bytes(b"stale-remux")
+    (dvr.recordings_dir / f"{session}-000001.mkv").write_bytes(b"second")
+    monkeypatch.setattr(
+        dvr, "_probe_segment_sync", lambda _path: ("HEVC", 2304, 1296)
+    )
+
+    await dvr._index_segments(force=True)
+    rows = sorted(await dvr.list_segments(limit=10), key=lambda row: row["started_at"])
+
+    assert rows[0]["complete"] == 1
+    assert rows[0]["probed"] == 1
+    assert rows[0]["codec"] == "HEVC"
+    assert rows[1]["complete"] == 0
+    assert rows[1]["probed"] == 0
+    assert rows[1]["codec"] is None
+    assert dvr._profile is not None and dvr._profile.encoding == "H264"
+    assert dvr._actual_profile is not None and dvr._actual_profile.encoding == "HEVC"
+    assert stale.read_bytes() == b"stale-remux"
+
+    observed = {}
+
+    async def write_playback(target, args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        target.write_bytes(b"fresh-h264")
+        return target
+
+    monkeypatch.setattr(dvr, "_write_playback_target", write_playback)
+    result = await dvr.segment_playback(rows[0]["id"])
+
+    assert result.read_bytes() == b"fresh-h264"
+    assert "libx264" in observed["args"]
+    assert observed["kwargs"]["artifact_kind"] == "segment"
+    assert observed["kwargs"]["source_key"] == dvr._segment_source_key(rows[0])
+
+
+@pytest.mark.asyncio
+async def test_segment_playback_reindexes_changed_source_before_cache_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    source = dvr.recordings_dir / "20260829-120000.mkv"
+    source.write_bytes(b"original-h264")
+    probe_codec = {"value": "H264"}
+    monkeypatch.setattr(
+        dvr,
+        "_probe_segment_sync",
+        lambda _path: (probe_codec["value"], 1920, 1080),
+    )
+    await dvr._index_segments(force=True)
+    original = (await dvr.list_segments(limit=1))[0]
+    target = dvr.playback_dir / f"segment-{original['id']}.mp4"
+    target.write_bytes(b"cached-old")
+    dvr._register_artifact_sync(
+        target.name, "segment", dvr._segment_source_key(original)
+    )
+    probe_codec["value"] = "HEVC"
+    source.write_bytes(b"replacement-hevc-with-new-size")
+    observed = {}
+
+    async def rebuild(target_path, args, **kwargs):
+        observed["args"] = args
+        target_path.write_bytes(b"rebuilt-h264")
+        return target_path
+
+    monkeypatch.setattr(dvr, "_write_playback_target", rebuild)
+    result = await dvr.segment_playback(original["id"])
+
+    refreshed = await dvr.get_segment(original["id"])
+    assert refreshed is not None and refreshed["codec"] == "HEVC"
+    assert result.read_bytes() == b"rebuilt-h264"
+    assert "libx264" in observed["args"]
+
+
+@pytest.mark.asyncio
+async def test_range_playback_reindexes_changed_source_before_cache_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    source = dvr.recordings_dir / "20260829-120000.mkv"
+    source.write_bytes(b"original-h264")
+    probe_codec = {"value": "H264"}
+    monkeypatch.setattr(
+        dvr,
+        "_probe_segment_sync",
+        lambda _path: (probe_codec["value"], 1920, 1080),
+    )
+    await dvr._index_segments(force=True)
+    original = (await dvr.list_segments(limit=1))[0]
+    since = datetime.fromisoformat(original["started_at"].replace("Z", "+00:00"))
+    until = since + timedelta(seconds=10)
+    target = dvr.playback_dir / "range-test.mp4"
+    target.write_bytes(b"cached-old")
+    old_source_key = dvr._validate_range_coverage([original], since, until)
+    dvr._register_artifact_sync(target.name, "range", old_source_key)
+
+    probe_codec["value"] = "HEVC"
+    source.write_bytes(b"replacement-hevc-with-new-size")
+    observed = {}
+
+    async def rebuild(target_path, args, **kwargs):
+        observed["args"] = args
+        target_path.write_bytes(b"rebuilt-h264")
+        return target_path
+
+    monkeypatch.setattr(dvr, "_write_playback_target", rebuild)
+    result = await dvr.range_clip(since, until, cache_name="range-test")
+
+    refreshed = (await dvr.list_segments(limit=1))[0]
+    assert refreshed["codec"] == "HEVC"
+    assert dvr._validate_range_coverage([refreshed], since, until) != old_source_key
+    assert result.read_bytes() == b"rebuilt-h264"
+    assert "libx264" in observed["args"]
+
+
+def test_legacy_index_migration_preserves_rows_but_clears_guessed_metadata(tmp_path: Path):
+    root = tmp_path / "dvr"
+    root.mkdir()
+    db = root / "dvr.sqlite"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL UNIQUE,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                codec TEXT,
+                width INTEGER,
+                height INTEGER,
+                complete INTEGER NOT NULL DEFAULT 0,
+                indexed_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO segments
+                (id, filename, started_at, ended_at, bytes, codec, width, height,
+                 complete, indexed_at)
+            VALUES (7, '20260829-120000.mkv', '2026-08-29T12:00:00Z',
+                    '2026-08-29T12:05:00Z', 10, 'H264', 1920, 1080, 1,
+                    '2026-08-29T12:05:00Z')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    dvr = camera_dvr.CameraDVR(SimpleNamespace(), root=root, required_drive=None)
+    dvr._ensure_storage_sync()
+    migrated = dvr._conn()
+    try:
+        row = dict(migrated.execute("SELECT * FROM segments WHERE id=7").fetchone())
+    finally:
+        migrated.close()
+
+    assert row["filename"] == "20260829-120000.mkv"
+    assert row["probed"] == 0
+    assert row["codec"] is None
+    assert row["width"] is None
+    assert row["height"] is None
+    assert row["source_mtime_ns"] == 0
+
+
+@pytest.mark.asyncio
+async def test_new_recorder_without_a_current_file_does_not_reopen_old_footage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    old = dvr.recordings_dir / "20260829T110000000000Z-000000.mkv"
+    old.write_bytes(b"old")
+    dvr._process = SimpleNamespace(returncode=None)
+    dvr._current_session_prefix = "20260829T120000000000Z"
+    dvr._profile = camera_dvr.RecordingProfile(
+        "main", "mainStream", "H264", 2304, 1296
+    )
+    monkeypatch.setattr(
+        dvr, "_probe_segment_sync", lambda _path: ("HEVC", 2304, 1296)
+    )
+
+    await dvr._index_segments(force=True)
+    row = (await dvr.list_segments(limit=1))[0]
+
+    assert row["complete"] == 1
+    assert row["probed"] == 1
+    assert dvr._actual_profile is None
+
+
+@pytest.mark.asyncio
+async def test_future_dated_archive_never_hides_current_session_active_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    current_session = "20260829T120000000000Z"
+    current = dvr.recordings_dir / f"{current_session}-000000.mkv"
+    future_archive = dvr.recordings_dir / "20260829T130000000000Z-000000.mkv"
+    current.write_bytes(b"active")
+    future_archive.write_bytes(b"restored-future")
+    dvr._process = SimpleNamespace(returncode=None)
+    dvr._current_session_prefix = current_session
+    monkeypatch.setattr(
+        dvr, "_probe_segment_sync", lambda _path: ("HEVC", 2304, 1296)
+    )
+
+    await dvr._index_segments(force=True)
+    rows = {row["filename"]: row for row in await dvr.list_segments(limit=10)}
+
+    assert rows[current.name]["complete"] == 0
+    assert rows[current.name]["probed"] == 0
+    assert rows[future_archive.name]["complete"] == 1
+    assert rows[future_archive.name]["probed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_segment_probe_backfill_is_bounded_newest_first(tmp_path: Path, monkeypatch):
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    for minute in range(6):
+        (dvr.recordings_dir / f"20260829-{120000 + minute * 100:06d}.mkv").write_bytes(
+            f"segment-{minute}".encode()
+        )
+    calls = []
+
+    def probe(path):
+        calls.append(path.name)
+        return ("H264", 1920, 1080)
+
+    monkeypatch.setattr(dvr, "_probe_segment_sync", probe)
+
+    await dvr._index_segments(force=True)
+    assert len(calls) == camera_dvr.MAX_SEGMENT_PROBES_PER_INDEX
+    assert set(calls) == {
+        "20260829-120500.mkv",
+        "20260829-120400.mkv",
+        "20260829-120300.mkv",
+        "20260829-120200.mkv",
+    }
+
+    await dvr._index_segments(force=True)
+    assert len(calls) == 6
+
+
+@pytest.mark.asyncio
+async def test_changed_segment_discards_probe_result_and_retries_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    segment = dvr.recordings_dir / "20260829-120000.mkv"
+    segment.write_bytes(b"before")
+
+    def racing_probe(path):
+        path.write_bytes(b"changed-after-probe-start")
+        return ("HEVC", 2304, 1296)
+
+    monkeypatch.setattr(dvr, "_probe_segment_sync", racing_probe)
+    await dvr._index_segments(force=True)
+    row = (await dvr.list_segments(limit=1))[0]
+
+    assert row["complete"] == 1
+    assert row["probed"] == 0
+    assert row["codec"] is None
+
+
+@pytest.mark.asyncio
+async def test_ffprobe_never_holds_database_lock(tmp_path: Path, monkeypatch):
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    (dvr.recordings_dir / "20260829-120000.mkv").write_bytes(b"complete")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_probe(_path):
+        started.set()
+        release.wait(timeout=2)
+        return ("H264", 1920, 1080)
+
+    monkeypatch.setattr(dvr, "_probe_segment_sync", blocked_probe)
+    task = asyncio.create_task(dvr._index_segments(force=True))
+    assert await asyncio.to_thread(started.wait, 1)
+    await asyncio.wait_for(dvr._db_lock.acquire(), timeout=0.2)
+    dvr._db_lock.release()
+    release.set()
+    await task
 
 
 def test_recorder_error_classification_never_projects_rtsp_uri():
@@ -337,8 +689,10 @@ def test_new_segment_names_are_utc_unique_sessions_and_use_stream_copy(tmp_path:
 async def test_active_segment_is_not_available_for_cached_playback(tmp_path: Path):
     dvr = _dvr(tmp_path)
     dvr.recordings_dir.mkdir(parents=True)
-    (dvr.recordings_dir / "20260829-120000.mkv").write_bytes(b"open")
+    session = "20260829T120000000000Z"
+    (dvr.recordings_dir / f"{session}-000000.mkv").write_bytes(b"open")
     dvr._process = SimpleNamespace(returncode=None)
+    dvr._current_session_prefix = session
     await dvr._index_segments(force=True)
     segment = (await dvr.list_segments(limit=1))[0]
 
@@ -347,17 +701,50 @@ async def test_active_segment_is_not_available_for_cached_playback(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_event_clip_retries_exact_burst_when_only_padding_crosses_a_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dvr = _dvr(tmp_path)
+    events = [
+        {"captured_at": "2026-08-29 22:04:53"},
+        {"captured_at": "2026-08-29 22:05:12"},
+    ]
+    store = SimpleNamespace(list_camera_events_by_burst=lambda _burst_id: events)
+    calls = []
+
+    async def range_clip(since, until, *, cache_name):
+        calls.append((since, until, cache_name))
+        if len(calls) == 1:
+            raise FileNotFoundError("padding crossed a recorder restart")
+        return tmp_path / "motion-23.mp4"
+
+    monkeypatch.setattr(dvr, "range_clip", range_clip)
+
+    result = await dvr.event_clip(store, 23)
+
+    assert result.name == "motion-23.mp4"
+    assert len(calls) == 2
+    assert calls[0][0].isoformat() == "2026-08-29T22:04:43+00:00"
+    assert calls[0][1].isoformat() == "2026-08-29T22:05:32+00:00"
+    assert calls[1][0].isoformat() == "2026-08-29T22:04:53+00:00"
+    assert calls[1][1].isoformat() == "2026-08-29T22:05:12+00:00"
+    assert calls[1][2] == "motion-23"
+
+
+@pytest.mark.asyncio
 async def test_retention_clears_cache_then_deletes_oldest_complete_only(tmp_path: Path):
     dvr = _dvr(tmp_path, reserve_bytes=256 * 1024 * 1024)
     dvr.recordings_dir.mkdir(parents=True)
-    oldest = dvr.recordings_dir / "20260829-120000.mkv"
-    newest = dvr.recordings_dir / "20260829-120500.mkv"
+    session = "20260829T120000000000Z"
+    oldest = dvr.recordings_dir / f"{session}-000000.mkv"
+    newest = dvr.recordings_dir / f"{session}-000001.mkv"
     oldest.write_bytes(b"old")
     newest.write_bytes(b"active")
     dvr.playback_dir.mkdir(parents=True)
     cached = dvr.playback_dir / "motion-1.mp4"
     cached.write_bytes(b"cache")
     dvr._process = SimpleNamespace(returncode=None)
+    dvr._current_session_prefix = session
     await dvr._index_segments(force=True)
 
     usages = iter(

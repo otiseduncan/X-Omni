@@ -389,6 +389,50 @@ async def test_time_range_uses_historical_timelapse_and_positive_later_caption(
 
 
 @pytest.mark.asyncio
+async def test_time_range_returns_truthful_completed_overlap_at_archive_boundary(
+    tmp_path: Path,
+):
+    store = FakeStore()
+    dvr = SimpleNamespace(
+        range_clip=AsyncMock(
+            side_effect=[
+                FileNotFoundError("requested start predates archive"),
+                Path("range-overlap.mp4"),
+            ]
+        ),
+        list_segments=AsyncMock(
+            return_value=[
+                {
+                    "started_at": "2026-08-29T21:31:58Z",
+                    "ended_at": "2026-08-29T21:37:01Z",
+                }
+            ]
+        ),
+    )
+
+    result = await camera_security.camera_motion_clip(
+        store,
+        _settings(tmp_path),
+        tmp_path / "ffmpeg.exe",
+        {
+            "since": "2026-08-29T17:30:00-04:00",
+            "until": "2026-08-29T17:35:00-04:00",
+        },
+        dvr=dvr,
+    )
+
+    second_call = dvr.range_clip.await_args_list[1]
+    assert second_call.args[0].isoformat() == "2026-08-29T21:31:58+00:00"
+    assert second_call.args[1].isoformat() == "2026-08-29T21:35:00+00:00"
+    assert result["ok"] is True
+    assert result["source"] == "continuous_dvr"
+    assert result["partial"] is True
+    assert result["clip_url"] == "/dvr/api/clips/range-overlap.mp4"
+    assert "05:30:00 PM" in result["requested_started_at_local"]
+    assert "Daylight" in result["requested_started_at_local"]
+
+
+@pytest.mark.asyncio
 async def test_continuous_event_clip_prefers_positive_later_caption(tmp_path: Path):
     store = FakeStore()
     store.burst_rows[7] = [

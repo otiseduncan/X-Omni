@@ -23,10 +23,25 @@ from . import exterior_camera as exterior_camera_svc
 from . import push_notifications
 log = logging.getLogger("xomni.camera_security")
 
-SECURITY_TOOL_SCHEMAS = copy.deepcopy(legacy.CAMERA_MONITORING_TOOL_SCHEMAS)
+SECURITY_TOOL_SCHEMAS = {
+    # Put media-rendering capabilities before the broad history reader in the
+    # model catalog.  The model still owns intent and argument selection, but
+    # a request to show media should encounter the exact rendering contracts
+    # before the tempting collection read.
+    "camera_footage": copy.deepcopy(
+        legacy.CAMERA_MONITORING_TOOL_SCHEMAS["camera_motion_clip"]
+    ),
+    "camera_snapshot_analyze": copy.deepcopy(
+        legacy.CAMERA_MONITORING_TOOL_SCHEMAS["camera_snapshot_analyze"]
+    ),
+    "camera_event_history": copy.deepcopy(
+        legacy.CAMERA_MONITORING_TOOL_SCHEMAS["camera_event_history"]
+    ),
+}
 SECURITY_TOOL_SCHEMAS["camera_event_history"]["description"] = (
-    "Read stored exterior-camera snapshots and motion events, plus continuous-DVR "
-    "status and (when requested) recording segments. Use for security history."
+    "List/count event metadata and thumbnails; optionally list DVR segment metadata. "
+    "Never use for playable footage/video/recordings/clips/time ranges; use "
+    "camera_footage."
 )
 SECURITY_TOOL_SCHEMAS["camera_event_history"]["parameters"]["properties"][
     "include_recordings"
@@ -34,19 +49,19 @@ SECURITY_TOOL_SCHEMAS["camera_event_history"]["parameters"]["properties"][
     "type": "boolean",
     "description": "Include bounded continuous-DVR segment metadata for the same time range.",
 }
-SECURITY_TOOL_SCHEMAS["camera_motion_clip"]["description"] = (
-    "Show real continuous DVR footage for a motion event or explicit time range. "
-    "If continuous footage is unavailable, fall back to the stored-frame timelapse."
+SECURITY_TOOL_SCHEMAS["camera_footage"]["description"] = (
+    "Sole tool to show/play/watch camera footage, video, recordings, clips, or a clock "
+    "time. Returns a playable continuous-DVR card or legacy fallback."
 )
-SECURITY_TOOL_SCHEMAS["camera_motion_clip"]["parameters"]["properties"].update(
+SECURITY_TOOL_SCHEMAS["camera_footage"]["parameters"]["properties"].update(
     {
         "since": {
             "type": "string",
-            "description": "Optional ISO start time for continuous DVR playback.",
+            "description": "ISO start with local UTC offset (for EDT use -04:00, never Z).",
         },
         "until": {
             "type": "string",
-            "description": "Optional ISO end time for continuous DVR playback.",
+            "description": "ISO end with the same explicit UTC offset.",
         },
     }
 )
@@ -648,34 +663,91 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
     if since or until:
         if since is None or until is None:
             return {"ok": False, "error": "Both since and until are required for DVR time-range playback."}
+        playback_since = since
+        playback_until = until
+        partial = False
         try:
-            path = await dvr.range_clip(since, until, cache_name=f"range-{int(since.timestamp())}-{int(until.timestamp())}")
+            path = await dvr.range_clip(
+                playback_since,
+                playback_until,
+                cache_name=(
+                    f"range-{int(playback_since.timestamp())}-"
+                    f"{int(playback_until.timestamp())}"
+                ),
+            )
+        except Exception:
+            # "Around 5:33" commonly expands to a window whose first minute
+            # predates the first retained segment.  Return the truthful
+            # overlapping completed portion instead of discarding available
+            # footage.  range_clip still enforces continuity and source truth.
+            try:
+                overlapping = await dvr.list_segments(
+                    since=_dvr_iso(since),
+                    until=_dvr_iso(until),
+                    limit=camera_dvr_svc.MAX_PLAYBACK_SEGMENTS,
+                    complete_only=True,
+                )
+            except Exception:
+                overlapping = []
+            starts = [
+                value
+                for value in (_parse_iso(row.get("started_at")) for row in overlapping)
+                if value is not None
+            ]
+            ends = [
+                value
+                for value in (_parse_iso(row.get("ended_at")) for row in overlapping)
+                if value is not None
+            ]
+            if starts and ends:
+                playback_since = max(since, min(starts))
+                playback_until = min(until, max(ends))
+            if playback_until <= playback_since or (
+                playback_since == since and playback_until == until
+            ):
+                path = None
+            else:
+                try:
+                    path = await dvr.range_clip(
+                        playback_since,
+                        playback_until,
+                        cache_name=(
+                            f"range-{int(playback_since.timestamp())}-"
+                            f"{int(playback_until.timestamp())}"
+                        ),
+                    )
+                    partial = True
+                except Exception:
+                    path = None
+        if path is not None:
             return {
                 "ok": True,
                 "clip_url": f"/dvr/api/clips/{path.name}",
-                "started_at_local": since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
-                "ended_at_local": until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+                "started_at_local": playback_since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+                "ended_at_local": playback_until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+                "requested_started_at_local": since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+                "requested_ended_at_local": until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+                "partial": partial,
                 "source": "continuous_dvr",
                 "cached": True,
             }
-        except Exception:
-            historical = _motion_event_in_range(store, since, until)
-            if historical is not None:
-                fallback = await legacy.camera_motion_clip(
-                    store,
-                    settings,
-                    ffmpeg_path,
-                    {"event_id": historical["id"]},
-                )
-                fallback = _decorate_legacy_clip(
-                    store, fallback, int(historical["burst_id"])
-                )
-                if fallback.get("ok"):
-                    return fallback
-            return {
-                "ok": False,
-                "error": "Continuous DVR footage is unavailable for that time range.",
-            }
+        historical = _motion_event_in_range(store, since, until)
+        if historical is not None:
+            fallback = await legacy.camera_motion_clip(
+                store,
+                settings,
+                ffmpeg_path,
+                {"event_id": historical["id"]},
+            )
+            fallback = _decorate_legacy_clip(
+                store, fallback, int(historical["burst_id"])
+            )
+            if fallback.get("ok"):
+                return fallback
+        return {
+            "ok": False,
+            "error": "Continuous DVR footage is unavailable for that time range.",
+        }
 
     raw_event_id = args.get("event_id")
     if raw_event_id is not None:

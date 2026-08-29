@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 import uuid
@@ -47,7 +49,11 @@ MAX_RESTART_DELAY_SECONDS = 60
 RECORDER_STALL_SECONDS = 120
 INDEX_REFRESH_SECONDS = 5
 SUBSCRIPTION_RECREATE_SECONDS = 4 * 60
+ONVIF_MIN_PULL_CYCLE_SECONDS = 1.0
 PLAYBACK_TIMEOUT_SECONDS = 10 * 60
+SEGMENT_PROBE_TIMEOUT_SECONDS = 10
+SEGMENT_PROBE_RETRY_SECONDS = 60
+MAX_SEGMENT_PROBES_PER_INDEX = 4
 MAX_PLAYBACK_GAP_SECONDS = 1.0
 MAX_PLAYBACK_DURATION_SECONDS = 30 * 60
 MAX_PLAYBACK_SEGMENTS = 8
@@ -187,6 +193,8 @@ class CameraDVR:
         self._recording_started_at: Optional[str] = None
         self._last_error: Optional[str] = None
         self._profile: Optional[RecordingProfile] = None
+        self._actual_profile: Optional[RecordingProfile] = None
+        self._current_session_prefix: Optional[str] = None
         self._events_healthy = False
         self._subscription_renew_at = 0.0
         self._last_motion_at: Optional[str] = None
@@ -198,6 +206,7 @@ class CameraDVR:
         self._progress_size = -1
         self._last_progress_at = time.monotonic()
         self._playback_processes: dict[int, Any] = {}
+        self._probe_retry_at: dict[tuple[str, int, int], float] = {}
         self._storage_initialized = False
 
     @property
@@ -244,9 +253,29 @@ class CameraDVR:
                     width INTEGER,
                     height INTEGER,
                     complete INTEGER NOT NULL DEFAULT 0 CHECK (complete IN (0,1)),
+                    probed INTEGER NOT NULL DEFAULT 0 CHECK (probed IN (0,1)),
+                    source_mtime_ns INTEGER NOT NULL DEFAULT 0,
                     indexed_at TEXT NOT NULL
                 )
                 """
+            )
+            segment_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(segments)")
+            }
+            if "probed" not in segment_columns:
+                conn.execute(
+                    "ALTER TABLE segments ADD COLUMN probed INTEGER NOT NULL "
+                    "DEFAULT 0 CHECK (probed IN (0,1))"
+                )
+            if "source_mtime_ns" not in segment_columns:
+                conn.execute(
+                    "ALTER TABLE segments ADD COLUMN source_mtime_ns INTEGER NOT NULL DEFAULT 0"
+                )
+            # Rows from builds that trusted advertised ONVIF metadata are not
+            # bitstream-verified.  Keep them explicitly unknown until ffprobe
+            # verifies the local MKV; never silently retain a wrong codec.
+            conn.execute(
+                "UPDATE segments SET codec=NULL, width=NULL, height=NULL WHERE probed=0"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_started ON segments(started_at)")
             conn.execute(
@@ -312,6 +341,66 @@ class CameraDVR:
             return modified
         return nominal
 
+    def _ffprobe_path(self) -> Optional[Path]:
+        try:
+            ffmpeg = Path(self.camera._require_ffmpeg())
+        except (AttributeError, OSError, RuntimeError):
+            return None
+        sibling = ffmpeg.with_name(
+            "ffprobe.exe" if ffmpeg.suffix.casefold() == ".exe" else "ffprobe"
+        )
+        if sibling.is_file():
+            return sibling
+        discovered = shutil.which("ffprobe")
+        return Path(discovered).resolve() if discovered else None
+
+    def _probe_segment_sync(self, path: Path) -> Optional[tuple[str, int, int]]:
+        """Return the bitstream's real video metadata without decoding it."""
+        ffprobe = self._ffprobe_path()
+        if ffprobe is None:
+            return None
+        creationflags = 0x08000000 if os.name == "nt" else 0
+        try:
+            completed = subprocess.run(
+                [
+                    str(ffprobe),
+                    "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name,width,height",
+                    "-of", "json",
+                    str(path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=SEGMENT_PROBE_TIMEOUT_SECONDS,
+                check=False,
+                creationflags=creationflags,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        try:
+            streams = json.loads(completed.stdout.decode("utf-8", "strict")).get(
+                "streams", []
+            )
+            stream = streams[0]
+            raw_codec = str(stream["codec_name"]).strip().casefold()
+            width = int(stream["width"])
+            height = int(stream["height"])
+        except (IndexError, KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not raw_codec or width <= 0 or height <= 0:
+            return None
+        codec = {
+            "h264": "H264",
+            "avc": "H264",
+            "hevc": "HEVC",
+            "h265": "HEVC",
+        }.get(raw_codec, re.sub(r"[^a-z0-9_.-]", "", raw_codec).upper())
+        return (codec, width, height) if codec else None
+
     async def _index_segments(self, *, force: bool = False) -> None:
         now = time.monotonic()
         if not force and now - self._last_index_at < INDEX_REFRESH_SECONDS:
@@ -351,25 +440,144 @@ class CameraDVR:
             parsed.append((safe_path, started))
         parsed.sort(key=lambda item: (item[1], item[0].name))
         active = self._process is not None and getattr(self._process, "returncode", None) is None
-        profile = self._profile
+        active_filename: Optional[str] = None
+        if active and self._current_session_prefix:
+            current_session_files = [
+                path
+                for path, _started in parsed
+                if path.name.startswith(f"{self._current_session_prefix}-")
+            ]
+            if current_session_files:
+                active_filename = current_session_files[-1].name
         stamp = _utc_iso(_utc_now())
+        present = {path.name for path, _ in parsed}
+        file_state: dict[str, tuple[int, int, bool]] = {}
+        for index, (path, _started) in enumerate(parsed):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            complete = path.name != active_filename
+            file_state[path.name] = (stat.st_size, stat.st_mtime_ns, complete)
+
+        # Snapshot the index under its own short lock, then run the bounded
+        # local probes without holding either the DB or playback/retention lock.
         async with self._db_lock:
             conn = self._conn()
             try:
-                present = {path.name for path, _ in parsed}
                 existing = {
-                    row["filename"]: row
+                    row["filename"]: dict(row)
                     for row in conn.execute("SELECT * FROM segments").fetchall()
                 }
+            finally:
+                conn.close()
+
+        now = time.monotonic()
+        candidates: list[tuple[Path, tuple[int, int, bool]]] = []
+        for path, _started in reversed(parsed):
+            state = file_state.get(path.name)
+            if state is None or not state[2] or state[0] <= 0:
+                continue
+            size, mtime_ns, _complete = state
+            prior = existing.get(path.name)
+            prior_matches = (
+                prior is not None
+                and int(prior.get("bytes") or -1) == size
+                and int(prior.get("source_mtime_ns") or -1) == mtime_ns
+            )
+            if prior_matches and bool(prior.get("probed")):
+                continue
+            retry_key = (path.name, size, mtime_ns)
+            if now < self._probe_retry_at.get(retry_key, 0.0):
+                continue
+            candidates.append((path, state))
+            if len(candidates) >= MAX_SEGMENT_PROBES_PER_INDEX:
+                break
+
+        probe_results: dict[str, tuple[tuple[int, int, bool], tuple[str, int, int]]] = {}
+        if candidates:
+            results = await asyncio.gather(
+                *(
+                    asyncio.to_thread(self._probe_segment_sync, path)
+                    for path, _state in candidates
+                ),
+                return_exceptions=True,
+            )
+            retry_base = time.monotonic()
+            for (path, state), result in zip(candidates, results):
+                metadata = result if isinstance(result, tuple) else None
+                retry_key = (path.name, state[0], state[1])
+                if metadata is None:
+                    self._probe_retry_at[retry_key] = (
+                        retry_base + SEGMENT_PROBE_RETRY_SECONDS
+                    )
+                else:
+                    probe_results[path.name] = (state, metadata)
+                    self._probe_retry_at.pop(retry_key, None)
+        self._probe_retry_at = {
+            retry_key: retry_at
+            for retry_key, retry_at in self._probe_retry_at.items()
+            if retry_key[0] in present
+        }
+
+        async with self._db_lock:
+            conn = self._conn()
+            try:
                 for index, (path, started) in enumerate(parsed):
-                    complete = (index + 1 < len(parsed)) or not active
+                    complete = path.name != active_filename
                     prior = existing.get(path.name)
-                    if prior is not None and bool(prior["complete"]) and complete:
-                        continue
+                    captured = file_state.get(path.name)
                     try:
-                        size = path.stat().st_size
+                        current_stat = path.stat()
                     except OSError:
                         continue
+                    size = current_stat.st_size
+                    mtime_ns = current_stat.st_mtime_ns
+                    capture_unchanged = (
+                        captured is not None
+                        and captured[0] == size
+                        and captured[1] == mtime_ns
+                        and captured[2] == complete
+                    )
+                    actual_metadata: Optional[tuple[str, int, int]] = None
+                    prior_verified = (
+                        prior is not None
+                        and bool(prior.get("probed"))
+                        and int(prior.get("bytes") or -1) == size
+                        and int(prior.get("source_mtime_ns") or -1) == mtime_ns
+                    )
+                    if prior_verified:
+                        try:
+                            actual_metadata = (
+                                str(prior["codec"]),
+                                int(prior["width"]),
+                                int(prior["height"]),
+                            )
+                        except (TypeError, ValueError):
+                            prior_verified = False
+                            actual_metadata = None
+                    fresh_probe = probe_results.get(path.name)
+                    fresh_verified = bool(
+                        fresh_probe is not None
+                        and capture_unchanged
+                        and fresh_probe[0] == captured
+                    )
+                    if fresh_verified and fresh_probe is not None:
+                        actual_metadata = fresh_probe[1]
+                    probed = int(prior_verified or fresh_verified)
+                    if (
+                        prior is not None
+                        and bool(prior["complete"])
+                        and complete
+                        and fresh_probe is None
+                        and int(prior.get("bytes") or -1) == size
+                        and int(prior.get("source_mtime_ns") or -1) == mtime_ns
+                    ):
+                        continue
+                    if actual_metadata is not None:
+                        row_codec, row_width, row_height = actual_metadata
+                    else:
+                        row_codec = row_width = row_height = None
                     ended = (
                         self._completed_end(path, started)
                         if complete
@@ -379,16 +587,18 @@ class CameraDVR:
                         """
                         INSERT INTO segments
                             (filename, started_at, ended_at, bytes, codec, width, height,
-                             complete, indexed_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             complete, probed, source_mtime_ns, indexed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(filename) DO UPDATE SET
                             started_at=excluded.started_at,
                             ended_at=excluded.ended_at,
                             bytes=excluded.bytes,
-                            codec=COALESCE(excluded.codec, segments.codec),
-                            width=COALESCE(excluded.width, segments.width),
-                            height=COALESCE(excluded.height, segments.height),
+                            codec=excluded.codec,
+                            width=excluded.width,
+                            height=excluded.height,
                             complete=excluded.complete,
+                            probed=excluded.probed,
+                            source_mtime_ns=excluded.source_mtime_ns,
                             indexed_at=excluded.indexed_at
                         """,
                         (
@@ -396,13 +606,29 @@ class CameraDVR:
                             _utc_iso(started),
                             _utc_iso(ended),
                             size,
-                            profile.encoding if profile else None,
-                            profile.width if profile else None,
-                            profile.height if profile else None,
+                            row_codec,
+                            row_width,
+                            row_height,
                             int(complete),
+                            int(probed),
+                            mtime_ns,
                             stamp,
                         ),
                     )
+                    if (
+                        fresh_verified
+                        and actual_metadata is not None
+                        and self._current_session_prefix
+                        and path.name.startswith(f"{self._current_session_prefix}-")
+                        and self._profile is not None
+                    ):
+                        self._actual_profile = RecordingProfile(
+                            token=self._profile.token,
+                            name=self._profile.name,
+                            encoding=actual_metadata[0],
+                            width=actual_metadata[1],
+                            height=actual_metadata[2],
+                        )
                     if active and not complete:
                         if self._progress_name != path.name or self._progress_size != size:
                             self._progress_name = path.name
@@ -642,7 +868,8 @@ class CameraDVR:
                     "|".join(
                         str(row.get(field) or "")
                         for field in (
-                            "id", "filename", "started_at", "ended_at", "bytes", "codec"
+                            "id", "filename", "started_at", "ended_at", "bytes",
+                            "codec", "width", "height", "probed", "source_mtime_ns"
                         )
                     )
                     for _started, _ended, row in parsed
@@ -737,6 +964,8 @@ class CameraDVR:
 
     def _record_args(self) -> list[str]:
         session = _utc_now().strftime("%Y%m%dT%H%M%S%fZ")
+        self._current_session_prefix = session
+        self._actual_profile = None
         output = str(self.recordings_dir / f"{session}-%06d.mkv")
         return self.camera._base_args() + [
             "-map", "0:v:0",
@@ -991,13 +1220,20 @@ class CameraDVR:
                 "reserve_bytes": self.reserve_bytes,
             }
         latest = (await self.list_segments(limit=1))
+        actual_profile = self._actual_profile.public() if self._actual_profile else None
+        if actual_profile is not None:
+            actual_profile["metadata_source"] = "bitstream"
+        advertised_profile = self._profile.public() if self._profile else None
+        if advertised_profile is not None:
+            advertised_profile["metadata_source"] = "onvif_advertised"
         return {
             "ok": recording,
             "recording": recording,
             "recorder_pid": getattr(self._process, "pid", None) if recording else None,
             "root": str(self.root),
             "segment_seconds": self.segment_seconds,
-            "profile": self._profile.public() if self._profile else None,
+            "profile": actual_profile,
+            "advertised_profile": advertised_profile,
             "recording_started_at": self._recording_started_at,
             "last_error": self._last_error,
             "onvif_motion_events": self._events_healthy,
@@ -1258,6 +1494,11 @@ class CameraDVR:
                 states.append(candidate)
         return states
 
+    @staticmethod
+    def _pull_cycle_delay(started_at: float, *, now: Optional[float] = None) -> float:
+        elapsed = (time.monotonic() if now is None else now) - started_at
+        return max(0.0, ONVIF_MIN_PULL_CYCLE_SECONDS - max(0.0, elapsed))
+
     async def motion_states(self) -> AsyncIterator[bool]:
         try:
             while not self._stopped:
@@ -1283,6 +1524,7 @@ class CameraDVR:
                                     ET.SubElement(operation, f"{{{_EVENTS_NS}}}Timeout").text = "PT5S"
                                     ET.SubElement(operation, f"{{{_EVENTS_NS}}}MessageLimit").text = "32"
 
+                                pull_started_at = time.monotonic()
                                 body = await self._post_event(
                                     client,
                                     credentials=credentials,
@@ -1303,6 +1545,12 @@ class CameraDVR:
                                     if state:
                                         self._last_motion_at = _utc_iso(_utc_now())
                                     yield state
+                                # XM530 may ignore the requested PT5S long poll
+                                # and return immediately. Cap all fast cycles so
+                                # a healthy subscription cannot become a busy loop.
+                                pull_delay = self._pull_cycle_delay(pull_started_at)
+                                if pull_delay > 0:
+                                    await asyncio.sleep(pull_delay)
                         finally:
                             self._events_healthy = False
                             await self._unsubscribe_best_effort(
@@ -1358,14 +1606,27 @@ class CameraDVR:
     @staticmethod
     def _playback_codec_args(codec: object) -> list[str]:
         normalized = str(codec or "").replace(".", "").upper()
-        if normalized in {"H265", "HEVC", "HEV1", "HVC1"}:
-            # Archive recording remains native stream copy.  Only an explicit
-            # browser playback artifact is transcoded, on demand and on CPU.
-            return [
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-                "-pix_fmt", "yuv420p",
-            ]
-        return ["-c:v", "copy"]
+        if normalized in {"H264", "AVC", "AVC1"}:
+            return ["-c:v", "copy"]
+        # Archive recording remains native stream copy.  Only an explicit
+        # browser playback artifact is transcoded, on demand and on CPU.  An
+        # unknown/unprobed codec must fail safe to compatible H.264, never copy
+        # an accidentally HEVC stream into a browser MP4.
+        return [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-pix_fmt", "yuv420p",
+        ]
+
+    @staticmethod
+    def _segment_source_key(segment: dict[str, Any]) -> str:
+        fingerprint = "|".join(
+            str(segment.get(field) or "")
+            for field in (
+                "id", "filename", "started_at", "ended_at", "bytes", "codec",
+                "width", "height", "probed", "source_mtime_ns",
+            )
+        )
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
 
     async def _write_playback_target(
         self,
@@ -1400,24 +1661,52 @@ class CameraDVR:
             temp_target.unlink(missing_ok=True)
 
     async def segment_playback(self, segment_id: int) -> Path:
-        segment = await self.get_segment(segment_id)
-        if not segment:
-            raise FileNotFoundError("Recording segment was not found.")
-        if not bool(segment.get("complete")):
-            raise FileNotFoundError("Recording segment is still being written.")
-        source = self._segment_path(segment["filename"], require_file=True)
+        # Refresh and, when needed, bitstream-probe the immutable source before
+        # taking the playback/retention lock. A cache key is only authoritative
+        # when the indexed size and mtime still match the local archive file.
+        await self._index_segments(force=True)
         self.playback_dir.mkdir(parents=True, exist_ok=True)
         target = self.playback_dir / f"segment-{segment_id}.mp4"
         async with self._io_lock:
-            if target.is_file() and target.stat().st_size > 0:
+            # Re-read only after acquiring the same lock used by retention and
+            # playback creation so the source and cache fingerprint are one
+            # coherent immutable view.
+            segment = await self.get_segment(segment_id)
+            if not segment:
+                raise FileNotFoundError("Recording segment was not found.")
+            if not bool(segment.get("complete")):
+                raise FileNotFoundError("Recording segment is still being written.")
+            source = self._segment_path(segment["filename"], require_file=True)
+            try:
+                source_stat = source.stat()
+            except OSError as exc:
+                raise FileNotFoundError("Recording segment is unavailable.") from exc
+            if (
+                int(segment.get("bytes") or -1) != source_stat.st_size
+                or int(segment.get("source_mtime_ns") or -1) != source_stat.st_mtime_ns
+            ):
+                raise FileNotFoundError("Recording segment changed; retry playback.")
+            source_key = self._segment_source_key(segment)
+            if (
+                target.is_file()
+                and target.stat().st_size > 0
+                and self.cache_artifact_is_tracked(
+                    target.name, source_key=source_key
+                )
+            ):
                 return target
+            target.unlink(missing_ok=True)
             return await self._write_playback_target(
                 target,
                 [
                     "-y", "-i", str(source), "-map", "0:v:0", "-an",
-                    *self._playback_codec_args(segment.get("codec")),
+                    *self._playback_codec_args(
+                        segment.get("codec") if segment.get("probed") else None
+                    ),
                     "-movflags", "+faststart",
                 ],
+                artifact_kind="segment",
+                source_key=source_key,
             )
 
     async def range_clip(self, since: datetime, until: datetime, *, cache_name: str) -> Path:
@@ -1427,6 +1716,7 @@ class CameraDVR:
         until = until.replace(tzinfo=timezone.utc) if until.tzinfo is None else until.astimezone(timezone.utc)
         if (until - since).total_seconds() > MAX_PLAYBACK_DURATION_SECONDS:
             raise ValueError("Continuous playback clips are limited to 30 minutes.")
+        await self._index_segments(force=True)
         segments = await self.list_segments(
             since=_utc_iso(since),
             until=_utc_iso(until),
@@ -1444,6 +1734,25 @@ class CameraDVR:
         target = self.playback_dir / f"{safe_name}.mp4"
         artifact_kind = "motion" if safe_name.startswith("motion-") else "range"
         async with self._io_lock:
+            source_paths = [
+                self._segment_path(row["filename"], require_file=True)
+                for row in segments
+            ]
+            for row, source_path in zip(segments, source_paths):
+                try:
+                    source_stat = source_path.stat()
+                except OSError as exc:
+                    raise FileNotFoundError(
+                        "Continuous recording source is unavailable."
+                    ) from exc
+                if (
+                    int(row.get("bytes") or -1) != source_stat.st_size
+                    or int(row.get("source_mtime_ns") or -1)
+                    != source_stat.st_mtime_ns
+                ):
+                    raise FileNotFoundError(
+                        "Continuous recording changed; retry playback."
+                    )
             if (
                 target.is_file()
                 and target.stat().st_size > 0
@@ -1453,15 +1762,36 @@ class CameraDVR:
             ):
                 return target
             target.unlink(missing_ok=True)
-            source_paths = [
-                self._segment_path(row["filename"], require_file=True)
-                for row in segments
-            ]
             first_start = _parse_time(segments[0]["started_at"]) or since
             offset = max(0.0, (since - first_start).total_seconds())
             duration = max(1.0, (until - since).total_seconds())
-            codecs = {str(row.get("codec") or "").upper() for row in segments}
-            playback_codec = next(iter(codecs)) if len(codecs) == 1 else "H265"
+            if len(segments) > 1:
+                if not all(row.get("probed") for row in segments):
+                    raise FileNotFoundError(
+                        "Continuous recording metadata is still being verified."
+                    )
+                formats = {
+                    (
+                        str(row.get("codec") or "").upper(),
+                        int(row.get("width") or 0),
+                        int(row.get("height") or 0),
+                    )
+                    for row in segments
+                }
+                if len(formats) != 1:
+                    raise FileNotFoundError(
+                        "Continuous recording format changed inside that time range."
+                    )
+            codecs = {
+                str(row.get("codec") or "").upper()
+                for row in segments
+                if row.get("probed")
+            }
+            playback_codec = (
+                next(iter(codecs))
+                if len(codecs) == 1 and all(row.get("probed") for row in segments)
+                else None
+            )
             # Any multi-segment scratch stays on the assigned DVR volume.  A
             # playback request must never duplicate a large archive onto C:.
             with tempfile.TemporaryDirectory(
@@ -1511,11 +1841,22 @@ class CameraDVR:
         )
         if not captured:
             raise ValueError("Motion event timestamps are invalid.")
-        return await self.range_clip(
-            captured[0] - timedelta(seconds=10),
-            captured[-1] + timedelta(seconds=20),
-            cache_name=f"motion-{burst_id}",
-        )
+        try:
+            return await self.range_clip(
+                captured[0] - timedelta(seconds=10),
+                captured[-1] + timedelta(seconds=20),
+                cache_name=f"motion-{burst_id}",
+            )
+        except FileNotFoundError:
+            # Padding is desirable, but a retention/restart boundary just
+            # outside the documented burst must not demote real event footage
+            # to the legacy still-frame timelapse. Retry the event itself.
+            event_end = max(captured[-1], captured[0] + timedelta(seconds=1))
+            return await self.range_clip(
+                captured[0],
+                event_end,
+                cache_name=f"motion-{burst_id}",
+            )
 
     async def tool_recordings(
         self, *, since: Optional[str], until: Optional[str], limit: int
@@ -1532,6 +1873,7 @@ class CameraDVR:
                     "codec": row["codec"],
                     "width": row["width"],
                     "height": row["height"],
+                    "metadata_source": "bitstream" if row.get("probed") else "pending",
                     "complete": bool(row["complete"]),
                 }
                 for row in segments

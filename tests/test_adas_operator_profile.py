@@ -38,7 +38,7 @@ EXPECTED_ADAS_TOOLS = {
     "exterior_camera_request",
     "camera_event_history",
     "camera_snapshot_analyze",
-    "camera_motion_clip",
+    "camera_footage",
     "adas_si_search",
     "adas_si_inventory",
     "adas_si_open",

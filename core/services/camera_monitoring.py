@@ -73,9 +73,8 @@ CAMERA_MONITORING_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "camera_snapshot_analyze": {
         "description": (
-            "Analyze one stored camera snapshot by event id and cache the "
-            "result. Use after camera_event_history to answer what was in "
-            "a specific frame."
+            "Render/analyze a stored camera still. Omit event_id for the latest motion "
+            "still. Required for its image card; text URLs are insufficient."
         ),
         "parameters": {
             "type": "object",
@@ -83,7 +82,6 @@ CAMERA_MONITORING_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "event_id": {"type": "integer"},
                 "prompt": {"type": "string", "maxLength": 1000},
             },
-            "required": ["event_id"],
             "additionalProperties": False,
         },
     },
@@ -366,14 +364,23 @@ async def camera_event_history(store, args: dict) -> dict:
 
 
 async def camera_snapshot_analyze(store, router, settings, args: dict) -> dict:
-    try:
-        event_id = int(args.get("event_id"))
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "event_id must be an integer."}
-    event = store.get_camera_event(event_id)
+    raw_event_id = args.get("event_id")
+    if raw_event_id is None:
+        event = store.get_last_camera_event(trigger="motion")
+        if event is None:
+            return {"ok": False, "error": "No stored motion event is available."}
+        event_id = int(event["id"])
+    else:
+        try:
+            event_id = int(raw_event_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "event_id must be an integer."}
+        event = store.get_camera_event(event_id)
     if event is None:
         return {"ok": False, "error": f"No stored camera event with id {event_id}."}
-    if event.get("caption"):
+    custom_prompt = args.get("prompt")
+    has_custom_prompt = bool(str(custom_prompt or "").strip())
+    if event.get("caption") and not has_custom_prompt:
         return {
             "ok": True,
             "id": event["id"],
@@ -401,8 +408,11 @@ async def camera_snapshot_analyze(store, router, settings, args: dict) -> dict:
     except ValueError as exc:
         return {"ok": False, "error": f"Stored snapshot could not be decoded: {exc}"}
 
-    custom_prompt = args.get("prompt")
-    prompt = camera_svc.camera_prompt(custom_prompt) if custom_prompt else _MOTION_ANALYSIS_PROMPT
+    prompt = (
+        camera_svc.camera_prompt(custom_prompt)
+        if has_custom_prompt
+        else _MOTION_ANALYSIS_PROMPT
+    )
 
     if not router.supports_vision():
         try:
@@ -414,14 +424,21 @@ async def camera_snapshot_analyze(store, router, settings, args: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"Analysis failed: {type(exc).__name__}."}
 
-    if custom_prompt:
+    if has_custom_prompt:
         description, person, vehicle = raw_caption.strip(), None, None
     else:
         person, vehicle, description = _parse_structured_caption(raw_caption)
 
-    store.update_camera_event_caption(
-        event_id, caption=description, person_detected=person, vehicle_detected=vehicle,
-    )
+    # An ad-hoc question must not replace the event's canonical security
+    # caption or its person/vehicle classification.  Fresh default analysis
+    # still populates the cache exactly as before.
+    if not (has_custom_prompt and event.get("caption")):
+        store.update_camera_event_caption(
+            event_id,
+            caption=description,
+            person_detected=person,
+            vehicle_detected=vehicle,
+        )
     return {
         "ok": True,
         "id": event["id"],

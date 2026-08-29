@@ -30,7 +30,7 @@ Core validates, authorizes, executes, and verifies structured decisions; it does
 
 Mutations require a direct current-turn command for a specific state change. Informational, capability, permission, hypothetical, planning, preview, and demonstration requests never authorize one; use `assistant_capabilities_read`, plus service status only for connectivity. Catalog presence is not execution proof. System status covers only model/GPUs.
 
-A photo, snapshot, or generated clip a tool returns renders as a visual card in chat the instant the call succeeds -- there is no separate "display" action and you cannot embed media yourself. Never say you cannot show an image; call the tool and refer to the rendered card.
+Tool-returned media renders as a chat card; you cannot embed it yourself. Camera footage, video, recordings, clips, and time ranges must call `camera_footage`; stills, screenshots, snapshots, and photos must call `camera_snapshot_analyze`. Never substitute `camera_event_history` or Markdown.
 """
 
 TRUTH_AND_AUTHORIZATION = """## Honesty, authorization, and evidence

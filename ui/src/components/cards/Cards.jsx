@@ -1410,12 +1410,36 @@ function CameraSnapshotCard({ data }) {
   );
 }
 
+function cameraMotionClipPresentation(data = {}) {
+  const isContinuousDvr = data.source === "continuous_dvr";
+  const timeRange = [data.started_at_local, data.ended_at_local].filter(Boolean).join(" – ");
+  const details = [
+    timeRange,
+    Number.isFinite(data.frame_count) ? `${data.frame_count} frames` : null,
+    isContinuousDvr ? "continuous DVR" : null,
+    data.partial ? "available portion" : null,
+    data.cached ? "cached" : null,
+  ].filter(Boolean);
+
+  return {
+    title: isContinuousDvr ? "Continuous DVR footage" : "Motion event clip",
+    descriptionFallback: isContinuousDvr
+      ? "Requested continuous camera footage."
+      : "No description available.",
+    errorFallback: isContinuousDvr
+      ? "This continuous DVR footage could not be assembled."
+      : "This motion event's clip could not be assembled.",
+    details: details.join(" · "),
+  };
+}
+
 function CameraMotionClipCard({ data }) {
+  const presentation = cameraMotionClipPresentation(data);
   if (!data?.ok) {
     return (
-      <Card icon={Camera} title="Motion clip" className="image-generation-warning">
+      <Card icon={Camera} title={presentation.title} className="image-generation-warning">
         <p className="card-note" role="alert">
-          {displayText(data?.error, "This motion event's clip could not be assembled.")}
+          {displayText(data?.error, presentation.errorFallback)}
         </p>
       </Card>
     );
@@ -1424,7 +1448,7 @@ function CameraMotionClipCard({ data }) {
     <figure className="card camera-snapshot-card">
       <div className="card-head">
         <Camera size={14} aria-hidden="true" />
-        <span>Motion event clip</span>
+        <span>{presentation.title}</span>
       </div>
       {data.clip_url && (
         <video
@@ -1433,17 +1457,14 @@ function CameraMotionClipCard({ data }) {
           controls
           playsInline
           preload="metadata"
-          aria-label={displayText(data.caption, "Motion event clip")}
+          aria-label={displayText(data.caption, presentation.title)}
         />
       )}
       <figcaption>
         <p className="camera-snapshot-caption">
-          {displayText(data.caption, "No description available.")}
+          {displayText(data.caption, presentation.descriptionFallback)}
         </p>
-        <p className="card-note">
-          {data.started_at_local} – {data.ended_at_local} · {data.frame_count} frames
-          {data.cached ? " · cached" : ""}
-        </p>
+        {presentation.details && <p className="card-note">{presentation.details}</p>}
       </figcaption>
     </figure>
   );

@@ -383,7 +383,98 @@ async def test_camera_snapshot_analyze_returns_cached_caption_without_reanalyzin
     assert result["ok"] is True
     assert result["cached"] is True
     assert result["caption"] == "already known"
+    assert result["snapshot_url"] == "/api/camera-snapshots/x.jpg"
     assert called == []
+
+
+@pytest.mark.asyncio
+async def test_camera_snapshot_custom_prompt_reanalyzes_captioned_event_without_replacing_security_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = Store(tmp_path / "analyze-custom.sqlite")
+    settings = _settings(tmp_path)
+    settings.camera_snapshot_dir.mkdir(parents=True, exist_ok=True)
+    frame = _jpeg_frame()
+    (settings.camera_snapshot_dir / "captioned.jpg").write_bytes(frame.raw)
+    event_id = store.add_camera_event(
+        trigger="motion",
+        snapshot_filename="captioned.jpg",
+        caption="A vehicle is in the driveway.",
+    )
+    store.update_camera_event_caption(
+        event_id,
+        caption="A vehicle is in the driveway.",
+        person_detected=False,
+        vehicle_detected=True,
+    )
+    prompts = []
+
+    async def fake_caption(_router, _frame, prompt):
+        prompts.append(prompt)
+        return "The vehicle is blue."
+
+    monkeypatch.setattr(camera_svc, "caption_frame", fake_caption)
+
+    result = await camera_monitoring.camera_snapshot_analyze(
+        store,
+        FakeRouter(),
+        settings,
+        {"event_id": event_id, "prompt": "What color is the vehicle?"},
+    )
+
+    assert prompts == ["What color is the vehicle?"]
+    assert result["ok"] is True
+    assert result["cached"] is False
+    assert result["caption"] == "The vehicle is blue."
+    assert result["snapshot_url"] == "/api/camera-snapshots/captioned.jpg"
+    assert result["person_detected"] is None
+    assert result["vehicle_detected"] is None
+
+    stored = store.get_camera_event(event_id)
+    assert stored["caption"] == "A vehicle is in the driveway."
+    assert stored["person_detected"] == 0
+    assert stored["vehicle_detected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_camera_snapshot_analyze_defaults_to_latest_motion_not_newer_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    store = Store(tmp_path / "analyze-latest-motion.sqlite")
+    settings = _settings(tmp_path)
+    settings.camera_snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (settings.camera_snapshot_dir / "motion.jpg").write_bytes(_jpeg_frame().raw)
+    motion_id = store.add_camera_event(
+        trigger="motion", snapshot_filename="motion.jpg", caption="motion still"
+    )
+    store.add_camera_event(
+        trigger="interval", snapshot_filename="newer.jpg", caption="newer baseline"
+    )
+
+    result = await camera_monitoring.camera_snapshot_analyze(
+        store, FakeRouter(), settings, {}
+    )
+
+    assert result["ok"] is True
+    assert result["id"] == motion_id
+    assert result["caption"] == "motion still"
+    assert result["snapshot_url"] == "/api/camera-snapshots/motion.jpg"
+    assert result["cached"] is True
+
+
+@pytest.mark.asyncio
+async def test_camera_snapshot_analyze_without_id_reports_no_motion(tmp_path: Path):
+    store = Store(tmp_path / "analyze-no-motion.sqlite")
+    settings = _settings(tmp_path)
+    store.add_camera_event(
+        trigger="interval", snapshot_filename="baseline.jpg", caption="baseline"
+    )
+
+    result = await camera_monitoring.camera_snapshot_analyze(
+        store, FakeRouter(), settings, {}
+    )
+
+    assert result == {"ok": False, "error": "No stored motion event is available."}
 
 
 @pytest.mark.asyncio

@@ -114,6 +114,9 @@ def test_launcher_reconciles_only_verified_dvr_recorders_after_core_stop() -> No
     assert "Stop-Process -Id $processId" in stop_function
     assert "Stop-Process -Name" not in stop_function
     assert 'Get-CimInstance Win32_Process -Filter "ProcessId=$processId"' in stop_function
+    assert "Wait-Process" not in stop_function
+    assert "[DateTime]::UtcNow.AddSeconds(15)" in stop_function
+    assert "Start-Sleep -Milliseconds 100" in stop_function
     assert "$Process.ExecutablePath" in script
     assert "$Process.CommandLine" in script
     assert "$commandLine" not in "\n".join(

@@ -69,6 +69,8 @@ test("DVR status and viewer lifecycle expose the complete safe operator contract
   assert.match(source, /videoPlayer\.removeAttribute\("src"\)[\s\S]*videoPlayer\.load\(\)/);
   assert.match(html, /aria-labelledby="viewerTitle"/);
   assert.match(html, /aria-describedby="viewerMeta"/);
+  assert.match(html, /Motion events with person and vehicle classification\./);
+  assert.doesNotMatch(html, /ONVIF-triggered events/);
 });
 
 test("DVR phone layouts retain readable grids and 44px touch controls", async () => {
