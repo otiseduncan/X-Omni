@@ -354,6 +354,18 @@ async def test_camera_event_history_reports_truncation(tmp_path: Path):
     assert result["truncated"] is True
     assert all("snapshot_url" in item for item in result["items"])
     assert result["items"][0]["snapshot_url"].startswith("/api/camera-snapshots/")
+    assert all("captured_at_local" in item for item in result["items"])
+
+
+def test_local_time_str_converts_naive_utc_to_local_and_never_raises():
+    local = camera_monitoring._local_time_str("2026-08-29 10:31:35")
+    # Exact wall-clock text depends on the test machine's timezone, but it
+    # must actually be a conversion, not the raw UTC string echoed back.
+    assert local != "2026-08-29 10:31:35"
+    assert "2026-08-29" in local
+    # Malformed input must degrade to the raw string, never raise.
+    assert camera_monitoring._local_time_str("not a timestamp") == "not a timestamp"
+    assert camera_monitoring._local_time_str(None) is None
 
 
 @pytest.mark.asyncio
