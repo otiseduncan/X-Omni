@@ -13,6 +13,7 @@ import ctypes
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -31,6 +32,8 @@ import httpx
 import psutil
 
 from . import camera as camera_svc
+
+log = logging.getLogger("xomni.exterior_camera")
 
 MAX_CREDENTIAL_FILE_BYTES = 64 * 1024
 MAX_LABEL_CHARS = 80
@@ -749,7 +752,11 @@ class ExteriorCameraService:
             try:
                 credentials = self._load_credentials()
                 return await self._probe_frame(credentials)
-            except (ExteriorCameraError, OSError, httpx.HTTPError):
+            except (ExteriorCameraError, OSError, httpx.HTTPError) as exc:
+                log.warning(
+                    "Background snapshot capture failed (%s): %s",
+                    type(exc).__name__, exc,
+                )
                 return None
 
     async def configure(

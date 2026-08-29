@@ -149,6 +149,7 @@ class CameraMonitor:
             return
         frame = await self.exterior_camera.capture_snapshot()
         if frame is None:
+            log.info("camera monitoring tick skipped: no frame captured")
             self._sweep_retention()
             return
 
