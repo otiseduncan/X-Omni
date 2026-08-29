@@ -610,6 +610,48 @@ async def test_camera_motion_clip_reports_an_ffmpeg_encode_failure(tmp_path: Pat
     assert result["ok"] is False
 
 
+def test_migration_backfills_burst_ids_for_pre_existing_motion_rows(tmp_path: Path):
+    store = Store(tmp_path / "backfill.sqlite")
+    # Two close-together motion rows (one real burst) followed by a third
+    # motion row long afterward (a separate later event), all inserted the
+    # way a pre-burst-feature installation actually stored them: no
+    # burst_id at all.
+    first_id = store.add_camera_event(trigger="motion", snapshot_filename="a.jpg")
+    second_id = store.add_camera_event(trigger="motion", snapshot_filename="b.jpg")
+    third_id = store.add_camera_event(trigger="motion", snapshot_filename="c.jpg")
+    store._exec(
+        "UPDATE camera_events SET captured_at = '2026-08-29 16:56:03' WHERE id = ?",
+        (first_id,),
+    )
+    store._exec(
+        "UPDATE camera_events SET captured_at = '2026-08-29 16:56:15' WHERE id = ?",
+        (second_id,),
+    )
+    store._exec(
+        "UPDATE camera_events SET captured_at = '2026-08-29 17:30:00' WHERE id = ?",
+        (third_id,),
+    )
+    store._exec(
+        "UPDATE camera_events SET burst_id = NULL WHERE id IN (?, ?, ?)",
+        (first_id, second_id, third_id),
+    )
+
+    store._backfill_camera_event_burst_ids()
+
+    first = store.get_camera_event(first_id)
+    second = store.get_camera_event(second_id)
+    third = store.get_camera_event(third_id)
+    assert first["burst_id"] is not None
+    assert first["burst_id"] == second["burst_id"]
+    assert third["burst_id"] is not None
+    assert third["burst_id"] != first["burst_id"]
+
+    # Idempotent: running it again must not reassign or duplicate ids.
+    store._backfill_camera_event_burst_ids()
+    assert store.get_camera_event(first_id)["burst_id"] == first["burst_id"]
+    assert store.get_camera_event(third_id)["burst_id"] == third["burst_id"]
+
+
 def test_retention_sweep_also_removes_orphaned_clips(tmp_path: Path):
     store = Store(tmp_path / "clip-retention.sqlite")
     settings = _settings(tmp_path, camera_snapshot_retention_days=30)
