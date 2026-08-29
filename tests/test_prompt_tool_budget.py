@@ -60,13 +60,13 @@ def test_adas_profile_prompt_and_catalog_budget_is_reviewable_and_bounded() -> N
         "current_time",
     }
     assert metrics["advertised_tools"]["count"] == _configured_profile_tool_count()
-    assert metrics["advertised_tools"]["count"] <= 34
+    assert metrics["advertised_tools"]["count"] <= 35
     assert metrics["base_system"]["chars"] <= 6_000
     assert metrics["base_system"]["tokens"] <= 1_800
-    assert metrics["advertised_tools"]["catalog_chars"] <= 42_200
-    assert metrics["advertised_tools"]["catalog_tokens"] <= 12_100
-    assert metrics["total_input_used_tokens"] <= 13_650
-    assert metrics["remaining_normal_turn_tokens"] >= 17_700
+    assert metrics["advertised_tools"]["catalog_chars"] <= 42_800
+    assert metrics["advertised_tools"]["catalog_tokens"] <= 12_300
+    assert metrics["total_input_used_tokens"] <= 13_800
+    assert metrics["remaining_normal_turn_tokens"] >= 17_400
 
 
 def test_adas_profile_contains_field_surface_not_experimental_catalog_noise() -> None:
@@ -164,7 +164,7 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     # Separating sections adds four newline characters; conservative integer
     # rounding can move the combined estimate by a token.
     assert abs(metrics["fixed_prompt"]["tokens"] - summed_sections) <= 2
-    assert metrics["remaining_normal_turn_tokens"] >= 15_400
+    assert metrics["remaining_normal_turn_tokens"] >= 15_200
 
 
 def test_budget_metrics_match_actual_generated_system_prompt() -> None:

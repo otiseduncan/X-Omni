@@ -103,6 +103,7 @@ class Store:
         self.conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         self._migrate_identity_model()
         self._migrate_tool_calls()
+        self._migrate_camera_events()
         self.conn.commit()
         # An approval left in `executing` belongs to an interrupted prior
         # process. Its external side effect cannot be inferred safely after a
@@ -334,6 +335,23 @@ class Store:
                 raise
             finally:
                 self.conn.execute("PRAGMA foreign_keys=ON")
+
+    def _migrate_camera_events(self) -> None:
+        """Add burst_id to installations that created camera_events before
+        motion clips existed."""
+        exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'camera_events'"
+        ).fetchone()
+        if not exists:
+            return
+        columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(camera_events)").fetchall()
+        }
+        if "burst_id" not in columns:
+            self.conn.execute("ALTER TABLE camera_events ADD COLUMN burst_id INTEGER")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_camera_events_burst_id ON camera_events(burst_id)"
+        )
 
     def _migrate_tool_calls(self) -> None:
         """Add correlation columns to installations created by the prototype."""
@@ -1763,18 +1781,20 @@ class Store:
         caption: Optional[str] = None,
         person_detected: Optional[bool] = None,
         vehicle_detected: Optional[bool] = None,
+        burst_id: Optional[int] = None,
     ) -> int:
         return self._exec(
             """
             INSERT INTO camera_events
                 (trigger, snapshot_filename, motion_score, caption,
-                 person_detected, vehicle_detected)
-            VALUES (?, ?, ?, ?, ?, ?)
+                 person_detected, vehicle_detected, burst_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trigger, snapshot_filename, motion_score, caption,
                 None if person_detected is None else int(person_detected),
                 None if vehicle_detected is None else int(vehicle_detected),
+                burst_id,
             ),
         ).lastrowid
 
@@ -1867,6 +1887,80 @@ class Store:
         )
         filenames = [r["snapshot_filename"] for r in rows]
         self._exec("DELETE FROM camera_events WHERE captured_at < ?", (cutoff_iso,))
+        return filenames
+
+    def list_camera_events_by_burst(self, burst_id: int) -> list[dict]:
+        rows = self._query(
+            "SELECT * FROM camera_events WHERE burst_id = ? ORDER BY id ASC",
+            (burst_id,),
+        )
+        return [dict(r) for r in rows]
+
+    def get_latest_motion_burst_id(self) -> Optional[int]:
+        row = self._one(
+            "SELECT burst_id FROM camera_events "
+            "WHERE trigger = 'motion' AND burst_id IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        return int(row["burst_id"]) if row and row["burst_id"] is not None else None
+
+    def get_max_camera_burst_id(self) -> int:
+        """Used to seed CameraMonitor's in-memory burst counter after a
+        restart so a new burst never reuses an id from before the restart."""
+        row = self._one("SELECT MAX(burst_id) AS n FROM camera_events")
+        return int(row["n"]) if row and row["n"] is not None else 0
+
+    def add_camera_motion_clip(
+        self, *, burst_id: int, filename: str, frame_count: int,
+        first_event_id: int, last_event_id: int,
+    ) -> None:
+        self._exec(
+            """
+            INSERT INTO camera_motion_clips
+                (burst_id, filename, frame_count, first_event_id, last_event_id)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(burst_id) DO UPDATE SET
+                filename = excluded.filename,
+                frame_count = excluded.frame_count,
+                first_event_id = excluded.first_event_id,
+                last_event_id = excluded.last_event_id
+            """,
+            (burst_id, filename, frame_count, first_event_id, last_event_id),
+        )
+
+    def get_camera_motion_clip(self, burst_id: int) -> Optional[dict]:
+        row = self._one(
+            "SELECT * FROM camera_motion_clips WHERE burst_id = ?", (burst_id,)
+        )
+        return dict(row) if row else None
+
+    def camera_clip_is_tracked(self, filename: str) -> bool:
+        """Belt-and-suspenders alongside the filename's own safe-pattern
+        check -- only ever serve a clip this app actually encoded and logged."""
+        return self._one(
+            "SELECT 1 FROM camera_motion_clips WHERE filename = ? LIMIT 1", (filename,)
+        ) is not None
+
+    def delete_camera_motion_clips_without_events(self) -> list[str]:
+        """Sweep clips whose burst was fully retention-expired. Returns the
+        deleted rows' filenames so the caller can unlink the matching files."""
+        rows = self._query(
+            """
+            SELECT filename FROM camera_motion_clips
+            WHERE burst_id NOT IN (
+                SELECT DISTINCT burst_id FROM camera_events WHERE burst_id IS NOT NULL
+            )
+            """
+        )
+        filenames = [r["filename"] for r in rows]
+        self._exec(
+            """
+            DELETE FROM camera_motion_clips
+            WHERE burst_id NOT IN (
+                SELECT DISTINCT burst_id FROM camera_events WHERE burst_id IS NOT NULL
+            )
+            """
+        )
         return filenames
 
     # ---------- push subscriptions ----------

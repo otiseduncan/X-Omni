@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import shutil
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +40,9 @@ log = logging.getLogger("xomni.camera_monitoring")
 MOTION_DIFF_SIZE = (64, 48)
 MAX_HISTORY_ITEMS = 50
 DEFAULT_HISTORY_ITEMS = 20
+
+CLIP_SUBDIR = "clips"
+CLIP_FRAMERATE_FPS = 2
 
 _MOTION_ANALYSIS_PROMPT = (
     "Reply in exactly this three-line format:\n"
@@ -79,6 +84,24 @@ CAMERA_MONITORING_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "prompt": {"type": "string", "maxLength": 1000},
             },
             "required": ["event_id"],
+            "additionalProperties": False,
+        },
+    },
+    "camera_motion_clip": {
+        "description": (
+            "Assemble the full documented motion window into one playable "
+            "timelapse clip, most recent event first if event_id is omitted. "
+            "Use whenever Otis asks to see or play the video/footage of a "
+            "motion event, not just one still."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "event_id": {
+                    "type": "integer",
+                    "description": "Any motion event id from the burst to assemble; omit for the most recent burst.",
+                },
+            },
             "additionalProperties": False,
         },
     },
@@ -126,6 +149,10 @@ class CameraMonitor:
         self._previous_raw: Optional[bytes] = None
         self._last_baseline_at: Optional[float] = None
         self._burst_until: Optional[float] = None
+        self._current_burst_id: Optional[int] = None
+        # Seeded from the DB, not zero, so a burst opened right after a Core
+        # restart never reuses an id from before the restart.
+        self._next_burst_id = store.get_max_camera_burst_id() + 1
         self._stopped = False
 
     def stop(self) -> None:
@@ -168,6 +195,9 @@ class CameraMonitor:
         self._previous_raw = frame.raw
 
         starting_new_burst = motion_now and not already_in_burst
+        if starting_new_burst:
+            self._current_burst_id = self._next_burst_id
+            self._next_burst_id += 1
         if motion_now:
             # Continued activity re-arms the rolling window instead of
             # letting it lapse -- floodlights staying on, someone still
@@ -181,6 +211,7 @@ class CameraMonitor:
             # window left dangling in the past would wrongly pin it to the
             # fast burst cadence forever after the first-ever motion event.
             self._burst_until = None
+            self._current_burst_id = None
 
         is_baseline = (
             self._last_baseline_at is None
@@ -195,6 +226,7 @@ class CameraMonitor:
             filename = self._write_snapshot(frame.raw, "motion")
             event_id = self.store.add_camera_event(
                 trigger="motion", snapshot_filename=filename, motion_score=score,
+                burst_id=self._current_burst_id,
             )
             if starting_new_burst:
                 # Caption/notify only once per burst, on the frame that
@@ -269,6 +301,13 @@ class CameraMonitor:
                 (directory / filename).unlink(missing_ok=True)
             except OSError:
                 log.warning("could not remove expired snapshot %s", filename)
+        clip_filenames = self.store.delete_camera_motion_clips_without_events()
+        clip_dir = directory / CLIP_SUBDIR
+        for filename in clip_filenames:
+            try:
+                (clip_dir / filename).unlink(missing_ok=True)
+            except OSError:
+                log.warning("could not remove orphaned motion clip %s", filename)
 
 
 # --------------------------------------------------------------------------
@@ -394,4 +433,125 @@ async def camera_snapshot_analyze(store, router, settings, args: dict) -> dict:
         "vehicle_detected": vehicle,
         "snapshot_url": _snapshot_url(event["snapshot_filename"]),
         "cached": False,
+    }
+
+
+def _clip_url(filename: str) -> str:
+    return f"/api/camera-clips/{filename}"
+
+
+async def _run_ffmpeg(ffmpeg_path, args, process_factory=None) -> tuple[int, bytes]:
+    factory = process_factory or asyncio.create_subprocess_exec
+    proc = await factory(
+        str(ffmpeg_path), *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    returncode = proc.returncode
+    return (returncode if returncode is not None else -1), (stderr or b"")
+
+
+async def _encode_motion_clip(
+    settings, ffmpeg_path, events: list[dict], burst_id: int, *, process_factory=None,
+) -> dict:
+    """Stitch a burst's frames into a small constant-rate timelapse mp4. Not
+    real editing -- just enough for Otis to watch the whole documented
+    window play back instead of stepping through stills one at a time."""
+    if not ffmpeg_path or not Path(ffmpeg_path).is_file():
+        return {"ok": False, "error": "ffmpeg is not available; cannot assemble a clip."}
+
+    source_dir = Path(settings.camera_snapshot_dir)
+    clip_dir = source_dir / CLIP_SUBDIR
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"motion-{burst_id}.mp4"
+    output_path = clip_dir / filename
+
+    with tempfile.TemporaryDirectory(prefix="xomni-motion-clip-") as tmp:
+        tmp_path = Path(tmp)
+        frame_count = 0
+        for event in events:
+            source = source_dir / event["snapshot_filename"]
+            try:
+                shutil.copy(source, tmp_path / f"frame{frame_count + 1:04d}.jpg")
+                frame_count += 1
+            except OSError:
+                log.warning("motion clip source frame missing: %s", event["snapshot_filename"])
+        if frame_count == 0:
+            return {"ok": False, "error": "None of this event's stored frames could be read."}
+
+        ffmpeg_args = [
+            "-y",
+            "-framerate", str(CLIP_FRAMERATE_FPS),
+            "-i", str(tmp_path / "frame%04d.jpg"),
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        returncode, stderr = await _run_ffmpeg(ffmpeg_path, ffmpeg_args, process_factory)
+        if returncode != 0:
+            output_path.unlink(missing_ok=True)
+            log.warning(
+                "ffmpeg motion clip encode failed (rc=%s): %s",
+                returncode, stderr.decode("utf-8", "replace")[-500:],
+            )
+            return {"ok": False, "error": "The clip could not be encoded."}
+
+    return {"ok": True, "filename": filename, "frame_count": frame_count}
+
+
+async def camera_motion_clip(
+    store, settings, ffmpeg_path, args: dict, *, process_factory=None,
+) -> dict:
+    raw_event_id = args.get("event_id")
+    if raw_event_id is not None:
+        try:
+            requested_event_id = int(raw_event_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "event_id must be an integer."}
+        event = store.get_camera_event(requested_event_id)
+        if event is None:
+            return {"ok": False, "error": f"No stored camera event with id {requested_event_id}."}
+        burst_id = event.get("burst_id")
+        if burst_id is None:
+            return {
+                "ok": False,
+                "error": (
+                    "That event is a documentation baseline, not a motion "
+                    "event -- there is no clip for it."
+                ),
+            }
+    else:
+        burst_id = store.get_latest_motion_burst_id()
+        if burst_id is None:
+            return {"ok": False, "error": "No motion event has been recorded yet."}
+
+    events = store.list_camera_events_by_burst(burst_id)
+    if not events:
+        return {"ok": False, "error": f"No stored frames for motion event {burst_id}."}
+
+    cached = store.get_camera_motion_clip(burst_id)
+    if cached is not None:
+        filename, frame_count, is_cached = cached["filename"], cached["frame_count"], True
+    else:
+        encoded = await _encode_motion_clip(
+            settings, ffmpeg_path, events, burst_id, process_factory=process_factory,
+        )
+        if not encoded.get("ok"):
+            return encoded
+        filename, frame_count, is_cached = encoded["filename"], encoded["frame_count"], False
+        store.add_camera_motion_clip(
+            burst_id=burst_id, filename=filename, frame_count=frame_count,
+            first_event_id=events[0]["id"], last_event_id=events[-1]["id"],
+        )
+
+    caption = next((e["caption"] for e in events if e.get("caption")), None)
+    return {
+        "ok": True,
+        "burst_id": burst_id,
+        "clip_url": _clip_url(filename),
+        "frame_count": frame_count,
+        "started_at_local": _local_time_str(events[0]["captured_at"]),
+        "ended_at_local": _local_time_str(events[-1]["captured_at"]),
+        "caption": caption,
+        "cached": is_cached,
     }

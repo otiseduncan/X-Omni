@@ -21,6 +21,7 @@ from ..models.router import WorkerSwapError
 from ..services import camera as camera_svc
 from ..services import calendar as calendar_svc
 from ..services import calibration_iq as calibration_iq_svc
+from ..services import camera_monitoring as camera_monitoring_svc
 from ..services import exterior_camera as exterior_camera_svc
 from ..services.image_generation import ImageGenerationError, generated_image_path
 from ..services.video_generation import (
@@ -34,6 +35,7 @@ log = logging.getLogger("xomni.routes")
 
 MAX_EXTERIOR_CAMERA_CONFIG_BYTES = 16 * 1024
 _SAFE_CAMERA_SNAPSHOT_FILENAME_RE = re.compile(r"^\d{9,11}-(?:interval|motion)(?:-\d+)?\.jpg$")
+_SAFE_CAMERA_CLIP_FILENAME_RE = re.compile(r"^motion-\d+\.mp4$")
 
 _CALIBRATION_IQ_PROXY_STATUS = {
     "invalid_input": 400,
@@ -408,6 +410,26 @@ def create_router(
         return FileResponse(
             path,
             media_type="image/jpeg",
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Cache-Control": "private, max-age=86400",
+            },
+        )
+
+    @api.get("/camera-clips/{filename}")
+    async def camera_motion_clip_video(filename: str, _session: dict = Depends(require_owner)):
+        """Serve only an assembled motion clip this app actually encoded and
+        logged, to the Owner only -- same access level as camera stills."""
+        if not _SAFE_CAMERA_CLIP_FILENAME_RE.match(filename):
+            raise HTTPException(404, "Camera clip not found.")
+        if not store.camera_clip_is_tracked(filename):
+            raise HTTPException(404, "Camera clip not found.")
+        path = Path(settings.camera_snapshot_dir) / camera_monitoring_svc.CLIP_SUBDIR / filename
+        if not path.is_file():
+            raise HTTPException(404, "Camera clip not found.")
+        return FileResponse(
+            path,
+            media_type="video/mp4",
             headers={
                 "Content-Disposition": f'inline; filename="{filename}"',
                 "Cache-Control": "private, max-age=86400",

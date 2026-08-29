@@ -1410,6 +1410,45 @@ function CameraSnapshotCard({ data }) {
   );
 }
 
+function CameraMotionClipCard({ data }) {
+  if (!data?.ok) {
+    return (
+      <Card icon={Camera} title="Motion clip" className="image-generation-warning">
+        <p className="card-note" role="alert">
+          {displayText(data?.error, "This motion event's clip could not be assembled.")}
+        </p>
+      </Card>
+    );
+  }
+  return (
+    <figure className="card camera-snapshot-card">
+      <div className="card-head">
+        <Camera size={14} aria-hidden="true" />
+        <span>Motion event clip</span>
+      </div>
+      {data.clip_url && (
+        <video
+          className="camera-motion-clip-video"
+          src={data.clip_url}
+          controls
+          playsInline
+          preload="metadata"
+          aria-label={displayText(data.caption, "Motion event clip")}
+        />
+      )}
+      <figcaption>
+        <p className="camera-snapshot-caption">
+          {displayText(data.caption, "No description available.")}
+        </p>
+        <p className="card-note">
+          {data.started_at_local} – {data.ended_at_local} · {data.frame_count} frames
+          {data.cached ? " · cached" : ""}
+        </p>
+      </figcaption>
+    </figure>
+  );
+}
+
 function ImageGenerationStatusCard({ data }) {
   const successful = data?.status === "completed" && data?.verified === true;
   const configured = data?.generation_available === true;
@@ -1717,6 +1756,7 @@ const REGISTRY = {
   camera_observation: CameraObservationCard,
   camera_event_history: CameraEventHistoryCard,
   camera_snapshot: CameraSnapshotCard,
+  camera_motion_clip: CameraMotionClipCard,
   generated_image: GeneratedImageCard,
   image_generation_status: ImageGenerationStatusCard,
   generated_video: GeneratedVideoCard,

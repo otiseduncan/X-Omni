@@ -216,9 +216,28 @@ CREATE TABLE IF NOT EXISTS camera_events (
     caption           TEXT,
     person_detected   INTEGER CHECK (person_detected IN (0,1)),
     vehicle_detected  INTEGER CHECK (vehicle_detected IN (0,1)),
-    notified          INTEGER NOT NULL DEFAULT 0 CHECK (notified IN (0,1))
+    notified          INTEGER NOT NULL DEFAULT 0 CHECK (notified IN (0,1)),
+    -- Groups every 'motion' frame captured during one rolling documentation
+    -- window (see camera_motion_burst_seconds) so they can be assembled into
+    -- one clip. NULL for 'interval' frames, which never belong to a burst.
+    burst_id          INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_camera_events_captured_at ON camera_events(captured_at);
+-- burst_id's index is created by _migrate_camera_events() instead of here:
+-- on an installation that created this table before burst_id existed,
+-- CREATE TABLE IF NOT EXISTS is a no-op and an index on the column here
+-- would fail until the migration's ALTER TABLE has actually added it.
+
+-- One assembled timelapse clip per motion burst, cached so re-asking for the
+-- same event's video is free after the first ffmpeg encode.
+CREATE TABLE IF NOT EXISTS camera_motion_clips (
+    burst_id       INTEGER PRIMARY KEY,
+    filename       TEXT NOT NULL,
+    frame_count    INTEGER NOT NULL,
+    first_event_id INTEGER NOT NULL,
+    last_event_id  INTEGER NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 -- Web Push subscriptions. Scoped to the person (not one session/device TTL)
 -- so a subscription outlives any single login.
