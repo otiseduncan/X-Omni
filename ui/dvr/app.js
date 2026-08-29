@@ -14,6 +14,20 @@ function localDateString(date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[char]));
+}
+
+function dayBounds(dayText) {
+  const [year, month, day] = dayText.split("-").map(Number);
+  const start = new Date(year, month - 1, day, 0, 0, 0);
+  const end = new Date(year, month - 1, day + 1, 0, 0, 0);
+  const sqliteUtc = (date) => date.toISOString().slice(0, 19).replace("T", " ");
+  return { since: sqliteUtc(start), until: sqliteUtc(end) };
+}
+
 function formatBytes(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "—";
@@ -99,7 +113,7 @@ function renderEvents(items) {
       ${item.snapshot_url ? `<img class="event-thumb" src="${item.snapshot_url}" alt="Motion event snapshot" data-image="${item.snapshot_url}" />` : '<div class="event-thumb"></div>'}
       <div class="event-body">
         <div class="event-top"><span class="event-time">${formatTime(item.started_at)} – ${formatTime(item.ended_at)}</span><span class="recording-meta">${item.frame_count} frames</span></div>
-        <div class="event-caption">${item.caption || "Motion detected"}</div>
+        <div class="event-caption">${escapeHtml(item.caption || "Motion detected")}</div>
         <div class="event-top"><div class="tags">${tagsFor(item)}</div><button class="play-button" data-burst="${item.burst_id}">Play footage</button></div>
       </div>
     </article>`).join("");
@@ -117,7 +131,7 @@ function renderScreenshots(items) {
   if (!items.length) { list.className = "shot-grid empty-state"; list.textContent = "No screenshots for this date."; return; }
   list.className = "shot-grid";
   list.innerHTML = items.map((item) => `
-    <article class="shot" data-image="${item.snapshot_url}" data-title="${item.caption || (item.trigger === "motion" ? "Motion snapshot" : "Baseline snapshot")}">
+    <article class="shot" data-image="${item.snapshot_url}" data-title="${escapeHtml(item.caption || (item.trigger === "motion" ? "Motion snapshot" : "Baseline snapshot"))}">
       <img src="${item.snapshot_url}" alt="Exterior camera snapshot" loading="lazy" />
       <div class="shot-overlay">${formatTime(item.captured_at)} · ${item.trigger}</div>
     </article>`).join("");
@@ -158,13 +172,16 @@ function closeViewer() {
 }
 
 async function refresh() {
-  const day = encodeURIComponent(datePicker.value || localDateString());
+  const selectedDay = datePicker.value || localDateString();
+  const day = encodeURIComponent(selectedDay);
+  const bounds = dayBounds(selectedDay);
+  const eventQuery = new URLSearchParams(bounds).toString();
   $("#refreshButton").disabled = true;
   try {
     const [status, segments, events] = await Promise.all([
       request("/dvr/api/status"),
       request(`/dvr/api/segments?date=${day}`),
-      request(`/dvr/api/events?date=${day}`),
+      request(`/dvr/api/events?${eventQuery}`),
     ]);
     renderStatus(status);
     renderRecordings(segments.items || []);
