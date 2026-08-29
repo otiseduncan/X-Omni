@@ -9,6 +9,7 @@ import base64
 import hashlib
 import logging
 import re
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -32,6 +33,7 @@ from ..services import weather as weather_svc
 log = logging.getLogger("xomni.routes")
 
 MAX_EXTERIOR_CAMERA_CONFIG_BYTES = 16 * 1024
+_SAFE_CAMERA_SNAPSHOT_FILENAME_RE = re.compile(r"^\d{9,11}-(?:interval|motion)(?:-\d+)?\.jpg$")
 
 _CALIBRATION_IQ_PROXY_STATUS = {
     "invalid_input": 400,
@@ -389,6 +391,27 @@ def create_router(
             path,
             media_type="image/png",
             headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+
+    @api.get("/camera-snapshots/{filename}")
+    async def camera_snapshot_image(filename: str, _session: dict = Depends(require_owner)):
+        """Serve only a snapshot this app actually wrote and logged, to the
+        Owner only -- exterior-camera imagery is surveillance data, same
+        access level as the live stream itself."""
+        if not _SAFE_CAMERA_SNAPSHOT_FILENAME_RE.match(filename):
+            raise HTTPException(404, "Camera snapshot not found.")
+        if not store.camera_snapshot_is_tracked(filename):
+            raise HTTPException(404, "Camera snapshot not found.")
+        path = Path(settings.camera_snapshot_dir) / filename
+        if not path.is_file():
+            raise HTTPException(404, "Camera snapshot not found.")
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Cache-Control": "private, max-age=86400",
+            },
         )
 
     @api.get("/generated-videos/{filename}")

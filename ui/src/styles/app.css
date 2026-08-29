@@ -679,6 +679,87 @@
   border-color: rgba(255, 196, 87, 0.5);
 }
 
+.camera-history-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px;
+}
+
+.camera-history-item {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  min-width: 0;
+}
+
+.camera-history-thumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #080b12;
+  object-fit: cover;
+}
+
+.camera-history-item figcaption {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.camera-history-time {
+  color: var(--text-soft);
+  font-size: 0.68rem;
+}
+
+.camera-history-trigger {
+  width: fit-content;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+  font-size: 0.6rem;
+  text-transform: capitalize;
+}
+
+.camera-history-trigger.is-motion {
+  background: rgba(255, 191, 71, 0.14);
+  color: #ffd893;
+}
+
+.camera-snapshot-card {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  overflow: hidden;
+}
+
+.camera-snapshot-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: min(68vh, 720px);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #080b12;
+  object-fit: contain;
+}
+
+.camera-snapshot-card figcaption {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.camera-snapshot-caption {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 0.84rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .generated-video-card {
   display: grid;
   gap: 10px;

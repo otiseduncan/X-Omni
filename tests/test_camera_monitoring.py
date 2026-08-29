@@ -281,6 +281,8 @@ async def test_camera_event_history_reports_truncation(tmp_path: Path):
     assert result["total_count"] == 5
     assert result["shown_count"] == 2
     assert result["truncated"] is True
+    assert all("snapshot_url" in item for item in result["items"])
+    assert result["items"][0]["snapshot_url"].startswith("/api/camera-snapshots/")
 
 
 @pytest.mark.asyncio
@@ -322,6 +324,7 @@ async def test_camera_snapshot_analyze_runs_and_caches_a_fresh_analysis(tmp_path
     assert result["cached"] is False
     assert result["caption"] == "a van in the driveway"
     assert result["vehicle_detected"] is True
+    assert result["snapshot_url"] == "/api/camera-snapshots/shot.jpg"
 
     stored = store.get_camera_event(event_id)
     assert stored["caption"] == "a van in the driveway"
