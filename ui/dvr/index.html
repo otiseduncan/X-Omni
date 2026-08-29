@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>X Omni DVR</title>
+  <link rel="stylesheet" href="/dvr/style.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">X OMNI</div>
+        <h1>DVR</h1>
+      </div>
+      <div id="recordingBadge" class="badge muted">Checking recorder…</div>
+    </header>
+
+    <section class="overview card">
+      <div class="overview-row">
+        <div>
+          <span class="label">Storage</span>
+          <strong id="storageText">—</strong>
+        </div>
+        <div>
+          <span class="label">Camera</span>
+          <strong id="profileText">—</strong>
+        </div>
+        <div>
+          <span class="label">ONVIF motion</span>
+          <strong id="motionText">—</strong>
+        </div>
+      </div>
+      <div class="storage-track"><div id="storageFill" class="storage-fill"></div></div>
+      <div id="statusNote" class="note"></div>
+    </section>
+
+    <section class="toolbar">
+      <label class="date-control">
+        <span>Date</span>
+        <input id="datePicker" type="date" />
+      </label>
+      <button id="refreshButton" class="button secondary" type="button">Refresh</button>
+      <nav class="tabs" aria-label="DVR views">
+        <button class="tab active" data-view="recordings" type="button">Recordings</button>
+        <button class="tab" data-view="events" type="button">Motion</button>
+        <button class="tab" data-view="screenshots" type="button">Screenshots</button>
+      </nav>
+    </section>
+
+    <section id="recordingsView" class="view active">
+      <div class="section-head">
+        <div><h2>Continuous recordings</h2><p>Five-minute rolling segments from E:\XOmni-DVR.</p></div>
+        <span id="recordingCount" class="count"></span>
+      </div>
+      <div id="recordingsList" class="recording-list empty-state">Loading recordings…</div>
+    </section>
+
+    <section id="eventsView" class="view">
+      <div class="section-head">
+        <div><h2>Motion events</h2><p>ONVIF-triggered events with person and vehicle classification.</p></div>
+        <span id="eventCount" class="count"></span>
+      </div>
+      <div id="eventsList" class="event-grid empty-state">Loading events…</div>
+    </section>
+
+    <section id="screenshotsView" class="view">
+      <div class="section-head">
+        <div><h2>Screenshots</h2><p>Baseline and motion documentation captured by X.</p></div>
+        <span id="snapshotCount" class="count"></span>
+      </div>
+      <div id="screenshotsList" class="shot-grid empty-state">Loading screenshots…</div>
+    </section>
+  </main>
+
+  <dialog id="viewer" class="viewer">
+    <div class="viewer-head">
+      <div><strong id="viewerTitle">Playback</strong><span id="viewerMeta"></span></div>
+      <button id="closeViewer" class="icon-button" type="button" aria-label="Close">×</button>
+    </div>
+    <video id="videoPlayer" controls playsinline preload="metadata"></video>
+    <img id="imageViewer" alt="Camera snapshot" />
+  </dialog>
+
+  <script type="module" src="/dvr/app.js"></script>
+</body>
+</html>
