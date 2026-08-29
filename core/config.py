@@ -75,6 +75,7 @@ class Settings:
     calibration_iq_base_url: str = "http://127.0.0.1:8084/api/v1/tools/v1/calibration-iq"
     calibration_iq_project_path: Path = Path(r"X:\calibration iq")
     scrapex_base_url: str = "http://127.0.0.1:8125"
+    scrapex_project_path: Path = Path(r"X:\ScrapeX")
     automotive_knowledge_db: Path | None = None
     tool_profile: str = "adas_operator"
 
@@ -129,6 +130,9 @@ class Settings:
             scrapex_base_url=os.getenv(
                 "XOMNI_SCRAPEX_BASE_URL", "http://127.0.0.1:8125"
             ).strip().rstrip("/"),
+            scrapex_project_path=Path(
+                os.getenv("XOMNI_SCRAPEX_PROJECT_PATH", r"X:\ScrapeX")
+            ),
             automotive_knowledge_db=Path(
                 os.getenv(
                     "XOMNI_AUTOMOTIVE_KNOWLEDGE_DB",

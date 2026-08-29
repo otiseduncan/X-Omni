@@ -2092,6 +2092,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "description": "Check whether Calibration IQ is running and the service token is accepted.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
+    "calibration_iq_start_native": {
+        "description": (
+            "Start Calibration IQ's local stack if unreachable, then verify "
+            "health. Safe even if already healthy."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
     "calibration_iq_summary": {
         "description": (
             "Return a verified aggregate count and status/phase/shop breakdown for a "

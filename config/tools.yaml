@@ -44,6 +44,7 @@ profiles:
       - automotive_knowledge_read
       - automotive_knowledge_capture
       - calibration_iq_status
+      - calibration_iq_start_native
       - calibration_iq_summary
       - calibration_iq_read
       - calibration_iq_ro
@@ -53,6 +54,7 @@ profiles:
       - collision_research
       - research_provider_setup
       - scrapex_status
+      - scrapex_start_native
       - scrapex_read
       - scrapex_adas_map
 
@@ -267,10 +269,18 @@ tools:
       Calibration IQ reconciliation; authentication-required and partial states
       are returned truthfully and never converted to success.
 
+  scrapex_start_native:
+    tier: operator_authorized
+    description: "Start ScrapeX's local server when unreachable, then verify it answers."
+
   # ---- Calibration IQ: routine operator work is authorized; destructive deletes are gated ----
   calibration_iq_status:
     tier: read_only
     description: "Is Calibration IQ reachable and is the service token accepted."
+
+  calibration_iq_start_native:
+    tier: operator_authorized
+    description: "Start Calibration IQ's local stack when unreachable, then verify health."
 
   calibration_iq_summary:
     tier: read_only

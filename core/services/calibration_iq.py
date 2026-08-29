@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
@@ -69,6 +70,9 @@ MAX_ITEMS = 20
 PAGE_SIZE = 100
 MAX_COLLECT = 400
 MAX_PAGE_REQUESTS = 100
+
+NATIVE_START_TIMEOUT_S = 300.0
+MAX_NATIVE_START_DETAIL_CHARS = 4000
 
 OPERATOR_TIMEOUT = 60.0
 OPERATOR_MAX_ACTIONS = 50
@@ -267,6 +271,87 @@ async def health(settings) -> dict[str, Any]:
         "token_present": bool(_service_token(settings.calibration_iq_project_path)),
         "base_url": base,
     }
+
+
+# --------------------------------------------------------------------------
+# native lifecycle
+# --------------------------------------------------------------------------
+
+def _run_start_native_script(project_path: Path) -> subprocess.CompletedProcess:
+    """Blocking. Called only via asyncio.to_thread -- this can take minutes
+    on a cold start (postgres, minio, alembic migrate/seed, caddy, three
+    sequential health-poll waits inside the script itself)."""
+    script = project_path / "Start-CalibrationIQ-Native.ps1"
+    return subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-Profile",
+            "Production",
+            "-NoBrowser",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=NATIVE_START_TIMEOUT_S,
+    )
+
+
+async def start_native(settings) -> dict[str, Any]:
+    """Bring Calibration IQ's native stack (database, object storage,
+    backend, Caddy) up if it is not already healthy, then verify with a
+    fresh health() call -- the script's own exit code is never trusted on
+    its own, matching the rest of this codebase's execution-truth rule."""
+    project_path = settings.calibration_iq_project_path
+    already = await health(settings)
+    if already.get("status") == "available":
+        return {
+            "service": "Calibration IQ",
+            "action": "start_native",
+            "status": "already_healthy",
+            "executed": False,
+            "verified": True,
+            "base_url": already.get("base_url"),
+        }
+
+    script = project_path / "Start-CalibrationIQ-Native.ps1"
+    if not script.is_file():
+        return {
+            "service": "Calibration IQ",
+            "action": "start_native",
+            "status": "failed",
+            "executed": False,
+            "verified": False,
+            "error": f"Native launcher not found at {script}.",
+        }
+
+    try:
+        proc = await asyncio.to_thread(_run_start_native_script, project_path)
+        exit_code: Optional[int] = proc.returncode
+        detail = ((proc.stdout or "") + (proc.stderr or ""))[-MAX_NATIVE_START_DETAIL_CHARS:]
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        exit_code = None
+        detail = "Native launcher did not finish within the startup timeout."
+        timed_out = True
+
+    verified = await health(settings)
+    healthy = verified.get("status") == "available"
+    result: dict[str, Any] = {
+        "service": "Calibration IQ",
+        "action": "start_native",
+        "status": "healthy" if healthy else "failed",
+        "executed": not timed_out,
+        "verified": healthy,
+        "exit_code": exit_code,
+        "base_url": verified.get("base_url"),
+    }
+    if not healthy:
+        result["detail"] = detail
+    return result
 
 
 def _candidate_bases(base: str) -> list[str]:

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toSpeechText } from "../lib/speechText.js";
+import { correctDomainVocabulary } from "../lib/speechDomainCorrections.js";
 import {
   speechResultSlotsText,
   updateSpeechResultSlots,
@@ -215,7 +216,9 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
           return;
         }
         session.resultSlots = updateSpeechResultSlots(session.resultSlots, event);
-        session.latestText = speechResultSlotsText(session.resultSlots);
+        session.latestText = correctDomainVocabulary(
+          speechResultSlotsText(session.resultSlots)
+        );
         cb.current.onInterim?.(session.latestText);
         requestFinishAfterSilence();
       };

@@ -41,6 +41,7 @@ EXPECTED_ADAS_TOOLS = {
     "automotive_knowledge_read",
     "automotive_knowledge_capture",
     "calibration_iq_status",
+    "calibration_iq_start_native",
     "calibration_iq_summary",
     "calibration_iq_read",
     "calibration_iq_ro",
@@ -50,6 +51,7 @@ EXPECTED_ADAS_TOOLS = {
     "collision_research",
     "research_provider_setup",
     "scrapex_status",
+    "scrapex_start_native",
     "scrapex_read",
     "scrapex_adas_map",
 }
@@ -106,8 +108,8 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
     full_names = {item["function"]["name"] for item in full_catalog}
 
     assert adas_names == EXPECTED_ADAS_TOOLS
-    assert len(adas_catalog) == 28
-    assert len(full_catalog) == 45
+    assert len(adas_catalog) == 30
+    assert len(full_catalog) == 47
     assert NON_ADAS_NORMAL_TOOLS <= full_names
 
 
@@ -396,7 +398,7 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
     assert metrics["stored_artifact_context"]["chars"] <= 8_000
-    assert metrics["advertised_tools"]["count"] == 28
+    assert metrics["advertised_tools"]["count"] == 30
     assert metrics["advertised_tools"]["catalog_chars"] < 41_000
     assert metrics["advertised_tools"]["catalog_tokens"] < 11_750
     # Visibility ceiling with regression headroom; the independent remaining
