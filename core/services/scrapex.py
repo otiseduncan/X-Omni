@@ -1280,6 +1280,15 @@ def _tail_native_start_log(log_path: Path) -> str:
     return text[-MAX_NATIVE_START_LOG_CHARS:]
 
 
+def _windows_powershell_exe() -> str:
+    """The exact Windows PowerShell path launch-x-omni.ps1 itself uses to
+    spawn Core, rather than a bare "powershell" that depends on this
+    process's own PATH resolving it -- Core's child-process environment is
+    not guaranteed to match an interactive shell's."""
+    exact = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(exact) if exact.is_file() else "powershell"
+
+
 async def start_native(settings: Any) -> dict[str, Any]:
     """Start ScrapeX's local server if it is not already answering
     /api/health, then verify with a fresh probe -- the spawned process
@@ -1309,7 +1318,7 @@ async def start_native(settings: Any) -> dict[str, Any]:
         with log_path.open("w", encoding="utf-8") as log_file:
             process = subprocess.Popen(
                 [
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    _windows_powershell_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass",
                     "-File", str(script),
                 ],
                 cwd=str(project_path),

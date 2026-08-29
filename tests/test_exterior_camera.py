@@ -1411,7 +1411,7 @@ def test_exterior_camera_tool_is_read_only_inline_and_starts_nothing():
     handler = exterior_camera.make_exterior_camera_request(service)
     normal_registry = Registry("config/tools.yaml")
     normal_registry.register("exterior_camera_request", handler)
-    assert "exterior_camera_request" not in {
+    assert "exterior_camera_request" in {
         item["function"]["name"] for item in normal_registry.model_tools()
     }
 
@@ -1444,8 +1444,7 @@ def test_exterior_camera_tool_is_read_only_inline_and_starts_nothing():
     system = prompt_module.system_prompt(OmniRouter())
     assert "exterior_camera_request" not in system
     schema_description = TOOL_SCHEMAS["exterior_camera_request"]["description"]
-    assert "does not start a stream" in schema_description
-    assert "does not" in schema_description
+    assert "Doesn't start a stream" in schema_description
 
 
 def test_exterior_camera_observation_is_model_selected_inline():

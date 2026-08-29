@@ -48,12 +48,13 @@ def test_camera_request_is_truthful_and_does_not_claim_capture():
     }
 
 
-def test_camera_request_remains_available_in_full_profile_without_prompt_routing():
+def test_camera_request_is_available_in_the_default_and_full_profile_without_prompt_routing():
     normal_registry = Registry("config/tools.yaml")
     normal_registry.register("camera_request", camera.make_camera_request())
-    assert "camera_request" not in {
+    normal_advertised = {
         item["function"]["name"] for item in normal_registry.model_tools()
     }
+    assert "camera_request" in normal_advertised
 
     registry = Registry("config/tools.yaml", profile="full")
     registry.register("camera_request", camera.make_camera_request())
@@ -74,7 +75,7 @@ def test_camera_request_remains_available_in_full_profile_without_prompt_routing
     assert "camera_request" not in system
     schema_description = TOOL_SCHEMAS["camera_request"]["description"]
     assert "operator" in schema_description
-    assert "does not itself open the camera" in schema_description
+    assert "Doesn't open the camera" in schema_description
 
 
 def test_camera_frame_is_fully_decoded_and_metadata_only_artifact_is_built():

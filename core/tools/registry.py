@@ -1539,9 +1539,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "camera_request": {
         "description": (
-            "Ask the operator to start an inline live browser camera preview and, when "
-            "they choose, submit the current frame for Omni analysis. This request does "
-            "not itself open the camera or claim that a frame was analyzed."
+            "Start an inline camera preview; operator submits a frame for "
+            "analysis. Doesn't open the camera or claim a frame was seen."
         ),
         "parameters": {
             "type": "object",
@@ -1549,7 +1548,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "prompt": {
                     "type": "string",
                     "maxLength": 1000,
-                    "description": "What should be examined in each submitted current frame.",
+                    "description": "What to look for in each submitted frame.",
                 },
             },
             "required": ["prompt"],
@@ -1557,9 +1556,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "exterior_camera_request": {
         "description": (
-            "Request the configured exterior camera inline. Returns only safe "
-            "configuration status and a prompt; it does not start a stream or claim "
-            "that a frame was analyzed."
+            "Request the exterior camera inline; returns status only. Doesn't "
+            "start a stream or claim a frame was seen."
         ),
         "parameters": {
             "type": "object",
@@ -1567,7 +1565,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "prompt": {
                     "type": "string",
                     "maxLength": 1000,
-                    "description": "What should be examined in a submitted exterior-camera frame.",
+                    "description": "What to look for in the submitted frame.",
                 },
             },
             "required": ["prompt"],

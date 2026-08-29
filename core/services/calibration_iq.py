@@ -277,6 +277,15 @@ async def health(settings) -> dict[str, Any]:
 # native lifecycle
 # --------------------------------------------------------------------------
 
+def _windows_powershell_exe() -> str:
+    """The exact Windows PowerShell path launch-x-omni.ps1 itself uses to
+    spawn Core, rather than a bare "powershell" that depends on this
+    process's own PATH resolving it -- Core's child-process environment is
+    not guaranteed to match an interactive shell's."""
+    exact = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(exact) if exact.is_file() else "powershell"
+
+
 def _run_start_native_script(project_path: Path) -> subprocess.CompletedProcess:
     """Blocking. Called only via asyncio.to_thread -- this can take minutes
     on a cold start (postgres, minio, alembic migrate/seed, caddy, three
@@ -284,7 +293,7 @@ def _run_start_native_script(project_path: Path) -> subprocess.CompletedProcess:
     script = project_path / "Start-CalibrationIQ-Native.ps1"
     return subprocess.run(
         [
-            "powershell",
+            _windows_powershell_exe(),
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
