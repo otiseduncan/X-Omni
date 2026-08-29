@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from jwt.algorithms import RSAAlgorithm
 from pydantic import BaseModel, SecretStr
 
+from ..env_file import atomic_update_env, read_env_values
 from ..services import google_auth
 
 log = logging.getLogger("xomni.auth")
@@ -197,47 +198,6 @@ def _validate_setup_values(request: LocalOAuthSetup) -> tuple[str, str, Optional
     return client_id, client_secret, public_origin
 
 
-def _read_env_values(path: Path) -> dict[str, str]:
-    if not path.is_file():
-        return {}
-    values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8-sig").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip()
-    return values
-
-
-def _atomic_update_env(path: Path, updates: dict[str, str]) -> None:
-    """Preserve unrelated env entries and atomically replace scoped keys."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = path.read_text(encoding="utf-8-sig").splitlines() if path.is_file() else []
-    output: list[str] = []
-    replaced: set[str] = set()
-    for raw in lines:
-        stripped = raw.strip()
-        key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
-        if key in updates:
-            if key not in replaced:
-                output.append(f"{key}={updates[key]}")
-                replaced.add(key)
-            continue
-        output.append(raw)
-    for key, value in updates.items():
-        if key not in replaced:
-            output.append(f"{key}={value}")
-
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
-    try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as stream:
-            stream.write("\n".join(output).rstrip("\n") + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _binding_digest(settings, binding: str) -> str:
@@ -344,7 +304,7 @@ def create_router(settings, store) -> APIRouter:
         with _setup_lock:
             if store.get_owner():
                 raise HTTPException(403, "Owner is already bound; OAuth setup is permanently closed.")
-            existing = _read_env_values(env_path)
+            existing = read_env_values(env_path)
             if (
                 existing.get("XOMNI_AUTH_ENABLED", "").casefold() in {"1", "true", "yes", "on"}
                 and existing.get("XOMNI_GOOGLE_CLIENT_ID")
@@ -358,7 +318,7 @@ def create_router(settings, store) -> APIRouter:
             }
             if public_origin is not None:
                 updates["XOMNI_PUBLIC_ORIGIN"] = public_origin
-            _atomic_update_env(env_path, updates)
+            atomic_update_env(env_path, updates)
 
         audit = getattr(store, "audit", None)
         if callable(audit):

@@ -1755,6 +1755,143 @@ class Store:
                 return True
         return False
 
+    # ---------- camera monitoring ----------
+
+    def add_camera_event(
+        self, *, trigger: str, snapshot_filename: str,
+        motion_score: Optional[float] = None,
+        caption: Optional[str] = None,
+        person_detected: Optional[bool] = None,
+        vehicle_detected: Optional[bool] = None,
+    ) -> int:
+        return self._exec(
+            """
+            INSERT INTO camera_events
+                (trigger, snapshot_filename, motion_score, caption,
+                 person_detected, vehicle_detected)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trigger, snapshot_filename, motion_score, caption,
+                None if person_detected is None else int(person_detected),
+                None if vehicle_detected is None else int(vehicle_detected),
+            ),
+        ).lastrowid
+
+    def list_camera_events(
+        self, *, since: Optional[str] = None, until: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list = []
+        if since:
+            clauses.append("captured_at >= ?")
+            params.append(since)
+        if until:
+            clauses.append("captured_at <= ?")
+            params.append(until)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self._query(
+            f"SELECT * FROM camera_events {where} ORDER BY captured_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [dict(r) for r in rows]
+
+    def count_camera_events(
+        self, *, since: Optional[str] = None, until: Optional[str] = None,
+    ) -> int:
+        clauses: list[str] = []
+        params: list = []
+        if since:
+            clauses.append("captured_at >= ?")
+            params.append(since)
+        if until:
+            clauses.append("captured_at <= ?")
+            params.append(until)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self._one(f"SELECT COUNT(*) AS n FROM camera_events {where}", tuple(params))
+        return int(row["n"]) if row else 0
+
+    def get_camera_event(self, event_id: int) -> Optional[dict]:
+        row = self._one("SELECT * FROM camera_events WHERE id = ?", (event_id,))
+        return dict(row) if row else None
+
+    def get_last_camera_event(self, *, trigger: Optional[str] = None) -> Optional[dict]:
+        if trigger:
+            row = self._one(
+                "SELECT * FROM camera_events WHERE trigger = ? "
+                "ORDER BY captured_at DESC LIMIT 1",
+                (trigger,),
+            )
+        else:
+            row = self._one("SELECT * FROM camera_events ORDER BY captured_at DESC LIMIT 1")
+        return dict(row) if row else None
+
+    def update_camera_event_caption(
+        self, event_id: int, *, caption: str,
+        person_detected: Optional[bool] = None,
+        vehicle_detected: Optional[bool] = None,
+    ) -> None:
+        self._exec(
+            """
+            UPDATE camera_events
+            SET caption = ?, person_detected = ?, vehicle_detected = ?
+            WHERE id = ?
+            """,
+            (
+                caption,
+                None if person_detected is None else int(person_detected),
+                None if vehicle_detected is None else int(vehicle_detected),
+                event_id,
+            ),
+        )
+
+    def mark_camera_event_notified(self, event_id: int) -> None:
+        self._exec("UPDATE camera_events SET notified = 1 WHERE id = ?", (event_id,))
+
+    def delete_camera_events_older_than(self, cutoff_iso: str) -> list[str]:
+        """Returns the deleted rows' snapshot_filenames so the caller can
+        unlink the matching files -- the DB row and its file are always
+        removed together, never one without the other left dangling."""
+        rows = self._query(
+            "SELECT snapshot_filename FROM camera_events WHERE captured_at < ?",
+            (cutoff_iso,),
+        )
+        filenames = [r["snapshot_filename"] for r in rows]
+        self._exec("DELETE FROM camera_events WHERE captured_at < ?", (cutoff_iso,))
+        return filenames
+
+    # ---------- push subscriptions ----------
+
+    def add_push_subscription(
+        self, *, user_id: str, endpoint: str, p256dh_key: str, auth_key: str,
+    ) -> None:
+        """Upsert by endpoint -- re-subscribing (e.g. a browser silently
+        rotating its push endpoint) replaces the stale keys instead of
+        accumulating duplicates."""
+        self._exec(
+            """
+            INSERT INTO push_subscriptions (user_id, endpoint, p256dh_key, auth_key)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(endpoint) DO UPDATE SET
+                user_id = excluded.user_id,
+                p256dh_key = excluded.p256dh_key,
+                auth_key = excluded.auth_key
+            """,
+            (user_id, endpoint, p256dh_key, auth_key),
+        )
+
+    def remove_push_subscription(self, endpoint: str) -> None:
+        self._exec("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
+
+    def list_push_subscriptions(self, user_id: str) -> list[dict]:
+        rows = self._query(
+            "SELECT * FROM push_subscriptions WHERE user_id = ? ORDER BY id",
+            (user_id,),
+        )
+        return [dict(r) for r in rows]
+
     # ---------- audit ----------
 
     def audit(self, event_type: str, detail: Optional[dict] = None) -> None:
