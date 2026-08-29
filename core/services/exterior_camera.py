@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
@@ -734,6 +734,23 @@ class ExteriorCameraService:
             "camera_source_id": "exterior",
             "camera_label": record["label"],
         }
+
+    async def capture_snapshot(self) -> Optional[camera_svc.CameraFrame]:
+        """Public, lock-guarded single-frame capture for the background
+        monitoring loop. Returns None (never raises) when the camera isn't
+        configured, an Owner-initiated live session is active, or the probe
+        itself fails -- a monitoring tick must never crash on a transient
+        camera hiccup, and it must never contend with an Owner actively
+        viewing the stream."""
+        async with self._lock:
+            await self._expire_locked()
+            if self._session is not None:
+                return None
+            try:
+                credentials = self._load_credentials()
+                return await self._probe_frame(credentials)
+            except (ExteriorCameraError, OSError, httpx.HTTPError):
+                return None
 
     async def configure(
         self, *, label: object, host: object, username: object, password: object

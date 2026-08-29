@@ -131,6 +131,16 @@ class ExteriorCameraSessionRequest(BaseModel):
     conversation_id: int
 
 
+class PushSubscribeRequest(BaseModel):
+    endpoint: str
+    p256dh: str
+    auth: str
+
+
+class PushUnsubscribeRequest(BaseModel):
+    endpoint: str
+
+
 def create_router(
     settings,
     store,
@@ -843,6 +853,35 @@ def create_router(
         store.audit("exterior_camera_session_stopped", {"streaming": False})
         return result
 
+    # ---------- push notifications ----------
+
+    @api.get("/push/public-key")
+    async def push_public_key(_session: dict = Depends(require_session)):
+        return {"key": settings.vapid_public_key}
+
+    @api.post("/push/subscribe")
+    async def push_subscribe(
+        body: PushSubscribeRequest, session: dict = Depends(require_session),
+    ):
+        endpoint = body.endpoint.strip()
+        p256dh = body.p256dh.strip()
+        auth = body.auth.strip()
+        if not (endpoint.startswith("https://") and p256dh and auth):
+            raise HTTPException(400, "A valid push subscription is required.")
+        if len(endpoint) > 2048 or len(p256dh) > 512 or len(auth) > 512:
+            raise HTTPException(400, "Push subscription fields exceed the allowed length.")
+        store.add_push_subscription(
+            user_id=user_id(session), endpoint=endpoint, p256dh_key=p256dh, auth_key=auth,
+        )
+        return {"ok": True}
+
+    @api.post("/push/unsubscribe")
+    async def push_unsubscribe(
+        body: PushUnsubscribeRequest, _session: dict = Depends(require_session),
+    ):
+        store.remove_push_subscription(body.endpoint.strip())
+        return {"ok": True}
+
     # ---------- camera still -> native Omni vision ----------
 
     @api.post("/vision/analyze")
@@ -974,9 +1013,6 @@ def create_router(
         if not router_.supports_vision():
             raise HTTPException(503, "The active model worker does not support vision.")
 
-        from ..models.client import ModelClient  # local import avoids a cycle
-        client = ModelClient(router_, temperature=0.0)
-
         def audit_failure(exc: BaseException) -> None:
             try:
                 store.audit("camera_frame_analysis_failed", {
@@ -996,16 +1032,7 @@ def create_router(
                 log.warning("Could not persist camera failure audit metadata.")
 
         try:
-            description = await asyncio.wait_for(
-                client.complete(
-                    camera_svc.vision_messages(frame, bounded_prompt),
-                    max_tokens=camera_svc.VISION_COMPLETION_TOKENS,
-                    temperature=0.0,
-                ),
-                timeout=camera_svc.VISION_TIMEOUT_SECONDS,
-            )
-            if not description.strip():
-                raise ValueError("The vision worker returned an empty description.")
+            description = await camera_svc.caption_frame(router_, frame, bounded_prompt)
         except asyncio.TimeoutError as exc:
             log.warning(
                 "camera frame analysis exceeded %.0fs",

@@ -8,10 +8,15 @@ here and none are logged.
 
 from __future__ import annotations
 
+import base64
 import os
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric import ec
+
+from .env_file import atomic_update_env
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,6 +46,40 @@ def _flag(name: str, default: bool) -> bool:
 def _int(name: str, default: int) -> int:
     raw = os.getenv(name)
     return int(raw) if raw and raw.strip() else default
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _generate_vapid_keypair() -> tuple[str, str]:
+    """(public_key, private_key), base64url-encoded in the raw
+    uncompressed-point / raw-scalar format Web Push, py_vapid, and pywebpush
+    all expect -- not PEM."""
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    private_b64 = _b64url(private_key.private_numbers().private_value.to_bytes(32, "big"))
+    public_numbers = private_key.public_key().public_numbers()
+    public_raw = b"\x04" + public_numbers.x.to_bytes(32, "big") + public_numbers.y.to_bytes(32, "big")
+    return _b64url(public_raw), private_b64
+
+
+def _ensure_vapid_keys(env_path: Path) -> tuple[str, str]:
+    """Web Push needs a stable keypair -- a subscription is bound to the
+    public key it was created against, so unlike session_secret's fresh-
+    every-restart fallback, this one is generated once and persisted so
+    existing browser subscriptions keep working across restarts."""
+    public_key = os.getenv("XOMNI_VAPID_PUBLIC_KEY", "").strip()
+    private_key = os.getenv("XOMNI_VAPID_PRIVATE_KEY", "").strip()
+    if public_key and private_key:
+        return public_key, private_key
+    public_key, private_key = _generate_vapid_keypair()
+    atomic_update_env(env_path, {
+        "XOMNI_VAPID_PUBLIC_KEY": public_key,
+        "XOMNI_VAPID_PRIVATE_KEY": private_key,
+    })
+    os.environ["XOMNI_VAPID_PUBLIC_KEY"] = public_key
+    os.environ["XOMNI_VAPID_PRIVATE_KEY"] = private_key
+    return public_key, private_key
 
 
 @dataclass(frozen=True)
@@ -79,6 +118,19 @@ class Settings:
     automotive_knowledge_db: Path | None = None
     tool_profile: str = "adas_operator"
 
+    # Web Push
+    vapid_public_key: str = ""
+    vapid_private_key: str = ""
+    vapid_subject: str = ""
+
+    # Background exterior-camera monitoring
+    camera_snapshot_dir: Path = Path("data") / "camera-snapshots"
+    camera_monitor_interval_seconds: int = 60
+    camera_baseline_interval_seconds: int = 600
+    camera_snapshot_retention_days: int = 30
+    camera_motion_threshold: float = 18.0
+    camera_motion_cooldown_seconds: int = 120
+
     @property
     def local_origin(self) -> str:
         return f"http://127.0.0.1:{self.port}"
@@ -99,6 +151,9 @@ class Settings:
     @classmethod
     def load(cls) -> "Settings":
         port = _int("XOMNI_PORT", 8100)
+        vapid_public_key, vapid_private_key = _ensure_vapid_keys(
+            ROOT / "config" / ".env.local"
+        )
         return cls(
             root=ROOT,
             # Core always binds loopback. Remote reach is Tailscale's job --
@@ -154,4 +209,15 @@ class Settings:
             context_tokens=_int("XOMNI_CONTEXT_TOKENS", 32768),
             max_response_tokens=_int("XOMNI_MAX_RESPONSE_TOKENS", 1536),
             temperature=float(os.getenv("XOMNI_TEMPERATURE", "0.4")),
+            vapid_public_key=vapid_public_key,
+            vapid_private_key=vapid_private_key,
+            vapid_subject=os.getenv("XOMNI_VAPID_SUBJECT", "mailto:otiseduncan@gmail.com").strip(),
+            camera_snapshot_dir=Path(
+                os.getenv("XOMNI_CAMERA_SNAPSHOT_DIR", str(ROOT / "data" / "camera-snapshots"))
+            ),
+            camera_monitor_interval_seconds=_int("XOMNI_CAMERA_MONITOR_INTERVAL_SECONDS", 60),
+            camera_baseline_interval_seconds=_int("XOMNI_CAMERA_BASELINE_INTERVAL_SECONDS", 600),
+            camera_snapshot_retention_days=_int("XOMNI_CAMERA_SNAPSHOT_RETENTION_DAYS", 30),
+            camera_motion_threshold=float(os.getenv("XOMNI_CAMERA_MOTION_THRESHOLD", "18.0")),
+            camera_motion_cooldown_seconds=_int("XOMNI_CAMERA_MOTION_COOLDOWN_SECONDS", 120),
         )

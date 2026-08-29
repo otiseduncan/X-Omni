@@ -201,3 +201,33 @@ CREATE TABLE IF NOT EXISTS worker_state (
     status       TEXT,
     last_swap_at TEXT
 );
+
+-- Background exterior-camera monitoring. `interval` rows are the every-N-
+-- minute documentation baseline (never captioned automatically); `motion`
+-- rows are frame-diff-triggered and get captioned immediately so a
+-- notification can be decided. Retention sweep deletes rows (and their
+-- files) past camera_snapshot_retention_days.
+CREATE TABLE IF NOT EXISTS camera_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    trigger           TEXT NOT NULL CHECK (trigger IN ('interval','motion')),
+    snapshot_filename TEXT NOT NULL,
+    motion_score      REAL,
+    caption           TEXT,
+    person_detected   INTEGER CHECK (person_detected IN (0,1)),
+    vehicle_detected  INTEGER CHECK (vehicle_detected IN (0,1)),
+    notified          INTEGER NOT NULL DEFAULT 0 CHECK (notified IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS idx_camera_events_captured_at ON camera_events(captured_at);
+
+-- Web Push subscriptions. Scoped to the person (not one session/device TTL)
+-- so a subscription outlives any single login.
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    endpoint    TEXT NOT NULL UNIQUE,
+    p256dh_key  TEXT NOT NULL,
+    auth_key    TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);

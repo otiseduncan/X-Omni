@@ -52,7 +52,7 @@ test("auth UI uses POST boundaries and has no client-side secret persistence or 
   assert.match(source, /fetch\("\/api\/auth\/setup"/);
   assert.match(source, /fetch\("\/api\/auth\/logout"/);
   assert.match(source, /Sign in with Google and become Owner/);
-  assert.equal((source.match(/method: "POST"/g) || []).length, 3);
+  assert.equal((source.match(/method: "POST"/g) || []).length, 4);
   assert.equal((source.match(/method: "PATCH"/g) || []).length, 1);
   assert.match(source, /Authorized test users/);
   assert.match(source, /invite-qr\.png/);

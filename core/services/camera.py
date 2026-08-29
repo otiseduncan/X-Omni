@@ -8,6 +8,7 @@ Raw image bytes and data URLs are never returned for persistence.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -184,6 +185,30 @@ def vision_messages(frame: CameraFrame, prompt: str) -> list[dict]:
             ],
         },
     ]
+
+
+async def caption_frame(router, frame: CameraFrame, prompt: str) -> str:
+    """Send exactly one already-validated frame to the active worker and
+    return its description. Assumes the caller already ensured the active
+    worker supports vision -- this does not swap workers itself, since a
+    live request and a background tick want different swap/error handling.
+    Raises asyncio.TimeoutError or ValueError on failure; callers decide how
+    to surface those (HTTPException for a live request, a log line for a
+    background tick)."""
+    from ..models.client import ModelClient  # local import avoids a cycle
+
+    client = ModelClient(router, temperature=0.0)
+    description = await asyncio.wait_for(
+        client.complete(
+            vision_messages(frame, prompt),
+            max_tokens=VISION_COMPLETION_TOKENS,
+            temperature=0.0,
+        ),
+        timeout=VISION_TIMEOUT_SECONDS,
+    )
+    if not description.strip():
+        raise ValueError("The vision worker returned an empty description.")
+    return description
 
 
 def observation_artifact(

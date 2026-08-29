@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Ban,
+  Bell,
+  BellOff,
   Copy,
   ExternalLink,
   KeyRound,
@@ -19,6 +21,11 @@ import {
   buildGoogleAuthSetupPayload,
   LOCAL_GOOGLE_CALLBACK,
 } from "../lib/authSetup.js";
+import {
+  pushSupported,
+  subscriptionPayload,
+  urlBase64ToUint8Array,
+} from "../lib/pushNotifications.js";
 
 async function readResponse(response) {
   const payload = await response.json().catch(() => ({}));
@@ -41,6 +48,7 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
   const [testUsers, setTestUsers] = useState([]);
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteUrl, setInviteUrl] = useState("");
+  const [pushState, setPushState] = useState("unsupported");
   const firstFieldRef = useRef(null);
   const closeRef = useRef(null);
 
@@ -66,6 +74,55 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
       });
     return () => { active = false; };
   }, [canLogout, auth?.current_user?.role]);
+
+  useEffect(() => {
+    if (!canLogout || !pushSupported()) return;
+    if (Notification.permission === "denied") {
+      setPushState("denied");
+      return;
+    }
+    let active = true;
+    navigator.serviceWorker.ready
+      .then((registration) => registration.pushManager.getSubscription())
+      .then((subscription) => {
+        if (active) setPushState(subscription ? "subscribed" : "available");
+      })
+      .catch(() => {
+        if (active) setPushState("available");
+      });
+    return () => { active = false; };
+  }, [canLogout]);
+
+  async function enableNotifications() {
+    setBusy(true);
+    setError("");
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        setPushState("denied");
+        return;
+      }
+      const keyResponse = await fetch("/api/push/public-key", { credentials: "include" });
+      const { key } = await readResponse(keyResponse);
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(key),
+      });
+      const response = await fetch("/api/push/subscribe", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(subscriptionPayload(subscription)),
+      });
+      await readResponse(response);
+      setPushState("subscribed");
+    } catch (requestError) {
+      setError(`Could not enable notifications: ${requestError.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function logout() {
     setBusy(true);
@@ -282,6 +339,28 @@ export default function AuthPanel({ auth, onClose, onLoggedOut }) {
                   the tailnet is a separate Tailscale administrator action.
                 </p>
               </section>
+            )}
+            {pushState !== "unsupported" && (
+              <div className="auth-notifications">
+                {pushState === "subscribed" ? (
+                  <p className="auth-private-note">
+                    <Bell size={14} /> Notifications are enabled on this device.
+                  </p>
+                ) : pushState === "denied" ? (
+                  <p className="auth-private-note">
+                    <BellOff size={14} /> Notifications are blocked in the browser's site settings.
+                  </p>
+                ) : (
+                  <button
+                    type="button"
+                    className="auth-secondary"
+                    onClick={enableNotifications}
+                    disabled={busy}
+                  >
+                    <Bell size={14} /> Enable notifications
+                  </button>
+                )}
+              </div>
             )}
             <button className="auth-primary auth-logout" onClick={logout} disabled={busy}>
               {busy ? <Loader2 size={16} className="spin" /> : <LogOut size={16} />}

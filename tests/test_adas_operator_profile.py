@@ -36,6 +36,8 @@ EXPECTED_ADAS_TOOLS = {
     "system_status",
     "camera_request",
     "exterior_camera_request",
+    "camera_event_history",
+    "camera_snapshot_analyze",
     "adas_si_search",
     "adas_si_inventory",
     "adas_si_open",
@@ -108,8 +110,8 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
     full_names = {item["function"]["name"] for item in full_catalog}
 
     assert adas_names == EXPECTED_ADAS_TOOLS
-    assert len(adas_catalog) == 32
-    assert len(full_catalog) == 47
+    assert len(adas_catalog) == 34
+    assert len(full_catalog) == 49
     assert NON_ADAS_NORMAL_TOOLS <= full_names
 
 
@@ -398,14 +400,14 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
     assert metrics["stored_artifact_context"]["chars"] <= 8_000
-    assert metrics["advertised_tools"]["count"] == 32
-    assert metrics["advertised_tools"]["catalog_chars"] < 41_500
-    assert metrics["advertised_tools"]["catalog_tokens"] < 11_900
+    assert metrics["advertised_tools"]["count"] == 34
+    assert metrics["advertised_tools"]["catalog_chars"] < 42_200
+    assert metrics["advertised_tools"]["catalog_tokens"] < 12_100
     # Visibility ceiling with regression headroom; the independent remaining
     # context floor below is the authoritative 32K safety contract.
-    assert metrics["total_input_used_tokens"] < 13_700
+    assert metrics["total_input_used_tokens"] < 13_900
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
-    assert metrics["remaining_normal_turn_tokens"] > 15_700
+    assert metrics["remaining_normal_turn_tokens"] > 15_600
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

@@ -11,6 +11,7 @@ never binds beyond loopback.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -31,6 +32,7 @@ from .services import adas_si as adas_si_svc
 from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
 from .services import camera as camera_svc
+from .services import camera_monitoring as camera_monitoring_svc
 from .services import calendar as calendar_svc
 from .services import exterior_camera as exterior_camera_svc
 from .services import image_generation as image_svc
@@ -65,6 +67,7 @@ def configured_profile_catalog(
     """
 
     TOOL_SCHEMAS.update(scrapex_svc.SCRAPEX_TOOL_SCHEMAS)
+    TOOL_SCHEMAS.update(camera_monitoring_svc.CAMERA_MONITORING_TOOL_SCHEMAS)
     registry = Registry(
         settings.tools_config,
         profile=profile or getattr(settings, "tool_profile", None),
@@ -90,12 +93,16 @@ def build_app(settings: Settings) -> FastAPI:
     # catalog.  Keeping their implementation modules independent avoids
     # importing external-service clients into the security gateway itself.
     TOOL_SCHEMAS.update(scrapex_svc.SCRAPEX_TOOL_SCHEMAS)
+    TOOL_SCHEMAS.update(camera_monitoring_svc.CAMERA_MONITORING_TOOL_SCHEMAS)
     registry = Registry(
         settings.tools_config,
         store=store,
         profile=getattr(settings, "tool_profile", None),
     )
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
+    camera_monitor = camera_monitoring_svc.CameraMonitor(
+        settings, exterior_camera, router, store
+    )
     image_config = None
     image_generation = None
     try:
@@ -271,6 +278,15 @@ def build_app(settings: Settings) -> FastAPI:
     registry.register("calibration_iq_operator", calibration_iq_operator)
     registry.register("calibration_iq_destructive", calibration_iq_destructive)
 
+    registry.register(
+        "camera_event_history",
+        lambda a: camera_monitoring_svc.camera_event_history(store, a),
+    )
+    registry.register(
+        "camera_snapshot_analyze",
+        lambda a: camera_monitoring_svc.camera_snapshot_analyze(store, router, settings, a),
+    )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         log.info("Starting default worker '%s' (cold start takes ~15-20s)...",
@@ -294,20 +310,26 @@ def build_app(settings: Settings) -> FastAPI:
             # which beats an opaque crash at startup.
             log.error("Could not start default worker: %s", exc)
             store.audit("worker_start_failed", {"error": str(exc)})
+        monitor_task = asyncio.create_task(camera_monitor.run_forever())
         try:
             yield
         finally:
-            log.info("Shutting down; stopping camera and model workers...")
+            log.info("Shutting down; stopping camera monitor, camera, and model workers...")
             try:
-                await exterior_camera.shutdown()
+                camera_monitor.stop()
+                monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
             finally:
                 try:
-                    await router.shutdown()
+                    await exterior_camera.shutdown()
                 finally:
                     try:
-                        knowledge_repository.close()
+                        await router.shutdown()
                     finally:
-                        store.close()
+                        try:
+                            knowledge_repository.close()
+                        finally:
+                            store.close()
 
     app = FastAPI(
         title="X Omni",

@@ -1,4 +1,4 @@
-const CACHE_NAME = "x-omni-shell-2026-08-26-12";
+const CACHE_NAME = "x-omni-shell-2026-08-29-13";
 const SHELL_URLS = [
   "/manifest.webmanifest",
   "/icons/icon.svg",
@@ -78,4 +78,39 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   event.respondWith(staticResponse(request));
+});
+
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = { title: "X Omni", body: event.data ? event.data.text() : "" };
+  }
+  const title = String(payload.title || "X Omni").slice(0, 120);
+  const body = String(payload.body || "").slice(0, 500);
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body,
+      icon: "/icons/icon-192.png",
+      badge: "/icons/icon-192.png",
+      data: { url: "/" },
+    })
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const targetUrl = (event.notification.data && event.notification.data.url) || "/";
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if (client.url.startsWith(self.location.origin) && "focus" in client) {
+          return client.focus();
+        }
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(targetUrl);
+      return undefined;
+    })
+  );
 });

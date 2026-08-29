@@ -21,3 +21,5 @@ onnxruntime>=1.28,<2
 # Server-side authenticated research browser. Uses the installed Chrome
 # channel first; bundled Chromium is only a fallback if separately installed.
 playwright>=1.62,<2
+# Web Push delivery for the background camera-monitoring notification.
+pywebpush>=2.0,<3
