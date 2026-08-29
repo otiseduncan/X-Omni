@@ -32,7 +32,9 @@ from .services import adas_si as adas_si_svc
 from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
 from .services import camera as camera_svc
+from .services import camera_dvr as camera_dvr_svc
 from .services import camera_monitoring as camera_monitoring_svc
+from .services import camera_security as camera_security_svc
 from .services import calendar as calendar_svc
 from .services import exterior_camera as exterior_camera_svc
 from .services import image_generation as image_svc
@@ -67,7 +69,7 @@ def configured_profile_catalog(
     """
 
     TOOL_SCHEMAS.update(scrapex_svc.SCRAPEX_TOOL_SCHEMAS)
-    TOOL_SCHEMAS.update(camera_monitoring_svc.CAMERA_MONITORING_TOOL_SCHEMAS)
+    TOOL_SCHEMAS.update(camera_security_svc.SECURITY_TOOL_SCHEMAS)
     registry = Registry(
         settings.tools_config,
         profile=profile or getattr(settings, "tool_profile", None),
@@ -90,18 +92,19 @@ def build_app(settings: Settings) -> FastAPI:
         max_tokens=settings.max_response_tokens,
     )
     # Capability-owned schemas are still advertised through the one Registry
-    # catalog.  Keeping their implementation modules independent avoids
+    # catalog. Keeping their implementation modules independent avoids
     # importing external-service clients into the security gateway itself.
     TOOL_SCHEMAS.update(scrapex_svc.SCRAPEX_TOOL_SCHEMAS)
-    TOOL_SCHEMAS.update(camera_monitoring_svc.CAMERA_MONITORING_TOOL_SCHEMAS)
+    TOOL_SCHEMAS.update(camera_security_svc.SECURITY_TOOL_SCHEMAS)
     registry = Registry(
         settings.tools_config,
         store=store,
         profile=getattr(settings, "tool_profile", None),
     )
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
-    camera_monitor = camera_monitoring_svc.CameraMonitor(
-        settings, exterior_camera, router, store
+    camera_dvr = camera_dvr_svc.CameraDVR(exterior_camera)
+    camera_monitor = camera_security_svc.OnvifCameraMonitor(
+        settings, exterior_camera, router, store, dvr=camera_dvr
     )
     image_config = None
     image_generation = None
@@ -205,8 +208,10 @@ def build_app(settings: Settings) -> FastAPI:
         knowledge_repository
     )
     if not adas.available():
-        log.warning("ADAS SI library not found at %s -- tools will report unavailable.",
-                    settings.adas_si_root)
+        log.warning(
+            "ADAS SI library not found at %s -- tools will report unavailable.",
+            settings.adas_si_root,
+        )
 
     registry.register("adas_si_search", lambda a: adas.model_search(a))
     registry.register("adas_si_open", lambda a: adas.open_document(a))
@@ -280,7 +285,7 @@ def build_app(settings: Settings) -> FastAPI:
 
     registry.register(
         "camera_event_history",
-        lambda a: camera_monitoring_svc.camera_event_history(store, a),
+        lambda a: camera_security_svc.camera_event_history(store, a, dvr=camera_dvr),
     )
     registry.register(
         "camera_snapshot_analyze",
@@ -288,15 +293,17 @@ def build_app(settings: Settings) -> FastAPI:
     )
     registry.register(
         "camera_motion_clip",
-        lambda a: camera_monitoring_svc.camera_motion_clip(
-            store, settings, exterior_camera.ffmpeg_path, a
+        lambda a: camera_security_svc.camera_motion_clip(
+            store, settings, exterior_camera.ffmpeg_path, a, dvr=camera_dvr
         ),
     )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        log.info("Starting default worker '%s' (cold start takes ~15-20s)...",
-                 router.default_worker)
+        log.info(
+            "Starting default worker '%s' (cold start takes ~15-20s)...",
+            router.default_worker,
+        )
         try:
             result = await router.start_default(
                 pre_start=(
@@ -306,25 +313,37 @@ def build_app(settings: Settings) -> FastAPI:
                 )
             )
             cfg = router.configs[router.active_name]
-            store.upsert_worker_state(router.active_name, cfg.port, router.active_pid, "active")
+            store.upsert_worker_state(
+                router.active_name, cfg.port, router.active_pid, "active"
+            )
             store.audit("worker_started", result)
-            log.info("Worker '%s' ready. %s", router.active_name,
-                     "(adopted existing process)" if result.get("adopted") else
-                     f"(started in {result.get('startup_s')}s)")
+            log.info(
+                "Worker '%s' ready. %s",
+                router.active_name,
+                "(adopted existing process)"
+                if result.get("adopted")
+                else f"(started in {result.get('startup_s')}s)",
+            )
         except WorkerSwapError as exc:
             # Serve anyway -- the UI can show the failure and let Otis retry,
             # which beats an opaque crash at startup.
             log.error("Could not start default worker: %s", exc)
             store.audit("worker_start_failed", {"error": str(exc)})
+        dvr_task = asyncio.create_task(camera_dvr.run_forever())
         monitor_task = asyncio.create_task(camera_monitor.run_forever())
         try:
             yield
         finally:
-            log.info("Shutting down; stopping camera monitor, camera, and model workers...")
+            log.info(
+                "Shutting down; stopping DVR, camera monitor, camera, and model workers..."
+            )
             try:
                 camera_monitor.stop()
+                camera_dvr.stop()
                 monitor_task.cancel()
-                await asyncio.gather(monitor_task, return_exceptions=True)
+                dvr_task.cancel()
+                await asyncio.gather(monitor_task, dvr_task, return_exceptions=True)
+                await camera_dvr.shutdown()
             finally:
                 try:
                     await exterior_camera.shutdown()
@@ -351,6 +370,7 @@ def build_app(settings: Settings) -> FastAPI:
     app.state.registry = registry
     app.state.automotive_knowledge = automotive_knowledge
     app.state.exterior_camera = exterior_camera
+    app.state.camera_dvr = camera_dvr
     app.state.image_generation = image_generation
     app.state.image_generation_config = image_config
     app.state.video_generation = video_generation
@@ -385,22 +405,31 @@ def build_app(settings: Settings) -> FastAPI:
             "https://*.rainviewer.com; "
             "media-src 'self' blob:; worker-src 'self' blob:; form-action 'self'"
         )
-        if request.url.path.startswith(("/api/", "/healthz")):
+        if request.url.path.startswith(("/api/", "/healthz", "/dvr/api/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     require_session = auth_api.make_require_session(settings, store)
     app.include_router(auth_api.create_router(settings, store))
     app.include_router(
+        camera_dvr_svc.create_router(settings, store, require_session, camera_dvr)
+    )
+    app.include_router(
         core_routes.create_router(
-            settings, store, router, registry, require_session,
+            settings,
+            store,
+            router,
+            registry,
+            require_session,
             image_config=image_config,
             video_config=video_config,
             exterior_camera=exterior_camera,
             adas=adas,
         )
     )
-    app.include_router(chat_api.create_router(settings, store, router, client, registry))
+    app.include_router(
+        chat_api.create_router(settings, store, router, client, registry)
+    )
 
     @app.get("/healthz")
     async def healthz():
@@ -424,20 +453,23 @@ def build_app(settings: Settings) -> FastAPI:
         async def spa(full_path: str):
             # Never let the SPA fallback swallow an unmatched API path --
             # that turns a 404 into a confusing page of HTML.
-            if full_path.startswith(("api/", "ws/")):
+            if full_path.startswith(("api/", "ws/", "dvr/api/")):
                 return JSONResponse({"detail": "Not found"}, status_code=404)
             candidate = dist / full_path
             if full_path and candidate.is_file():
                 return FileResponse(candidate)
             return FileResponse(dist / "index.html")
     else:
+
         @app.get("/")
         async def no_ui():
-            return JSONResponse({
-                "detail": "UI is not built yet.",
-                "fix": "cd ui && npm install && npm run build",
-                "api": "/api/status",
-            })
+            return JSONResponse(
+                {
+                    "detail": "UI is not built yet.",
+                    "fix": "cd ui && npm install && npm run build",
+                    "api": "/api/status",
+                }
+            )
 
     return app
 
@@ -454,9 +486,11 @@ def main() -> None:
         log.warning("indistinguishable from you sitting at the machine.")
         log.warning("=" * 68)
     elif not settings.google_configured:
-        log.warning("Auth is enabled but Google OAuth is not configured. "
-                    "Set XOMNI_GOOGLE_CLIENT_ID / XOMNI_GOOGLE_CLIENT_SECRET "
-                    "in config/.env.local, or set XOMNI_AUTH_ENABLED=0 for local dev.")
+        log.warning(
+            "Auth is enabled but Google OAuth is not configured. "
+            "Set XOMNI_GOOGLE_CLIENT_ID / XOMNI_GOOGLE_CLIENT_SECRET "
+            "in config/.env.local, or set XOMNI_AUTH_ENABLED=0 for local dev."
+        )
 
     app = build_app(settings)
     log.info("X Omni Core -> http://127.0.0.1:%d", settings.port)
