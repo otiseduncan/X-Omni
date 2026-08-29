@@ -125,7 +125,7 @@ class CameraMonitor:
         self.store = store
         self._previous_raw: Optional[bytes] = None
         self._last_baseline_at: Optional[float] = None
-        self._last_motion_at: Optional[float] = None
+        self._burst_until: Optional[float] = None
         self._stopped = False
 
     def stop(self) -> None:
@@ -139,8 +139,13 @@ class CameraMonitor:
                 raise
             except Exception:  # noqa: BLE001
                 log.exception("camera monitoring tick failed")
+            interval = (
+                self.settings.camera_motion_burst_interval_seconds
+                if self._burst_until is not None
+                else self.settings.camera_monitor_interval_seconds
+            )
             try:
-                await asyncio.sleep(self.settings.camera_monitor_interval_seconds)
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
 
@@ -154,35 +159,49 @@ class CameraMonitor:
             return
 
         now = time.monotonic()
+        already_in_burst = self._burst_until is not None and now < self._burst_until
         score: Optional[float] = None
-        is_motion = False
+        motion_now = False
         if self._previous_raw is not None:
             score = motion_score(self._previous_raw, frame.raw)
-            cooldown_elapsed = (
-                self._last_motion_at is None
-                or now - self._last_motion_at >= self.settings.camera_motion_cooldown_seconds
-            )
-            if score >= self.settings.camera_motion_threshold and cooldown_elapsed:
-                is_motion = True
+            motion_now = score >= self.settings.camera_motion_threshold
         self._previous_raw = frame.raw
+
+        starting_new_burst = motion_now and not already_in_burst
+        if motion_now:
+            # Continued activity re-arms the rolling window instead of
+            # letting it lapse -- floodlights staying on, someone still
+            # moving, etc. all keep documentation going for as long as
+            # they last, not just one snapshot.
+            self._burst_until = now + self.settings.camera_motion_burst_seconds
+        in_burst = self._burst_until is not None and now < self._burst_until
+        if not in_burst:
+            # Clear a stale/expired window outright -- run_forever only
+            # checks "is this set at all" to pick its sleep interval, so a
+            # window left dangling in the past would wrongly pin it to the
+            # fast burst cadence forever after the first-ever motion event.
+            self._burst_until = None
 
         is_baseline = (
             self._last_baseline_at is None
             or now - self._last_baseline_at >= self.settings.camera_baseline_interval_seconds
         )
-
         if is_baseline:
             self._last_baseline_at = now
             filename = self._write_snapshot(frame.raw, "interval")
             self.store.add_camera_event(trigger="interval", snapshot_filename=filename)
 
-        if is_motion:
-            self._last_motion_at = now
+        if in_burst:
             filename = self._write_snapshot(frame.raw, "motion")
             event_id = self.store.add_camera_event(
                 trigger="motion", snapshot_filename=filename, motion_score=score,
             )
-            await self._handle_motion_event(event_id, frame)
+            if starting_new_burst:
+                # Caption/notify only once per burst, on the frame that
+                # opened it -- every frame documents the event, but only
+                # one vision call and one notification per event, not one
+                # per five-second frame.
+                await self._handle_motion_event(event_id, frame)
 
         self._sweep_retention()
 
