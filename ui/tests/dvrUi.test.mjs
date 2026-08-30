@@ -209,7 +209,7 @@ test("DVR status and viewer lifecycle expose the complete safe operator contract
 });
 
 test("continuous timeline seeks by absolute time and hands off across segment boundaries", async () => {
-  const source = await dvrSource("app.js");
+  const [source, html] = await Promise.all([dvrSource("app.js"), dvrSource("index.html")]);
   assert.match(source, /function findSegmentForTime\(target\)/);
   assert.match(source, /async function seekAbsolute\(target/);
   assert.match(source, /function nextSegmentAfter\(segment\)/);
@@ -225,6 +225,17 @@ test("continuous timeline seeks by absolute time and hands off across segment bo
   assert.match(source, /prefetchSegment\(nextSegmentAfter\(segment\)\)/);
   assert.match(source, /function beginAdvancing\(\)/);
   assert.match(source, /videoPlayer\.addEventListener\("error", \(\) => \{[\s\S]*state\.player\.advancing = false/);
+  // Auto-advance passes the already-known next segment directly instead of
+  // re-deriving it from ambiguous boundary time math, and a manual seek
+  // always clears any (possibly stuck) advancing flag rather than being
+  // silently ignored by it.
+  assert.match(source, /segmentHint: next, isAutoAdvance: true/);
+  assert.match(source, /if \(!isAutoAdvance\) \{[\s\S]*state\.player\.advancing = false/);
+  // A visible loading indicator distinguishes "preparing a cold segment" from
+  // "broken", since a human can't tell those apart otherwise.
+  assert.match(html, /id="playerLoading"[^>]*hidden/);
+  assert.match(source, /playerLoading\.hidden = false/);
+  assert.match(source, /playerLoading\.hidden = true/);
   // Required visible playback controls (spec: 10s/30s skip, prev/next event,
   // 0.5x-20x speed, fullscreen) -- keyboard shortcuts only supplement these.
   for (const id of [
@@ -235,7 +246,6 @@ test("continuous timeline seeks by absolute time and hands off across segment bo
     assert.match(source, new RegExp(`\\$\\("#${id}"\\)`), `${id} must be wired`);
   }
   for (const speed of ["0.5", "1", "2", "4", "8", "10", "15", "20"]) {
-    const html = await dvrSource("index.html");
     assert.match(html, new RegExp(`<option value="${speed}"`));
   }
 });

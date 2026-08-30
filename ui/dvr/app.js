@@ -37,6 +37,7 @@ const liveStage = $("#liveStage");
 const liveActions = $("#liveActions");
 const playbackStage = $("#playbackStage");
 const playerEmpty = $("#playerEmpty");
+const playerLoading = $("#playerLoading");
 const playerControls = $("#playerControls");
 const playerTimeEl = $("#playerTime");
 const timelineEl = $("#timeline");
@@ -484,14 +485,28 @@ function beginAdvancing() {
   // stay stuck forever -- that previously required reloading the page to
   // recover, since it silently blocked every future auto-advance too.
   state.player.advanceWatchdog = setTimeout(() => {
+    console.debug("[dvr] advance watchdog fired -- segment load never completed");
     state.player.advancing = false;
     state.player.advanceWatchdog = null;
+    playerLoading.hidden = true;
     setPlayerEmpty("The next recording is taking longer than expected. Try skip or the timeline.");
   }, 60000);
 }
 
-async function seekAbsolute(target, { autoplay = true } = {}) {
-  const segment = findSegmentForTime(target);
+async function seekAbsolute(target, { autoplay = true, segmentHint = null, isAutoAdvance = false } = {}) {
+  if (!isAutoAdvance) {
+    // A manual seek (timeline click, skip, event navigation) is fresh,
+    // deliberate intent and must always win over an auto-advance in
+    // progress -- including one stuck from a bug -- rather than silently
+    // doing nothing because a stale flag was still set from before.
+    state.player.advancing = false;
+    clearAdvanceWatchdog();
+  }
+  // segmentHint bypasses time-based lookup entirely for auto-advance, where
+  // the target segment is already known with certainty (via
+  // nextSegmentAfter) -- avoiding any dependency on ambiguous boundary math
+  // for the one path where getting the segment wrong freezes playback.
+  const segment = segmentHint || findSegmentForTime(target);
   const segmentId = segment && positiveId(segment.id);
   if (!segment || segmentId === null) {
     setPlayerEmpty("No recording covers that time.");
@@ -506,8 +521,13 @@ async function seekAbsolute(target, { autoplay = true } = {}) {
   const offsetSeconds = Math.max(0, (clamped - segment.startedAt) / 1000);
   updatePlayheadUI(clamped);
   updatePlayerTimeUI(clamped);
+  console.debug(
+    "[dvr] seekAbsolute target=", target.toISOString(), "resolvedSegment=", segment.id,
+    "offset=", offsetSeconds.toFixed(2), "sameSegment=", state.player.currentSegmentId === segment.id,
+  );
   if (state.player.currentSegmentId !== segment.id) {
     setPlayerEmpty(null);
+    playerLoading.hidden = false;
     state.player.currentSegmentId = segment.id;
     state.player.anchorAbsolute = segment.startedAt;
     state.player.pendingOffset = offsetSeconds;
@@ -555,6 +575,7 @@ videoPlayer.addEventListener("loadedmetadata", () => {
   }
   state.player.advancing = false;
   clearAdvanceWatchdog();
+  playerLoading.hidden = true;
   updatePlayPauseUI();
 });
 videoPlayer.addEventListener("error", () => {
@@ -564,6 +585,7 @@ videoPlayer.addEventListener("error", () => {
   // player had broken.
   state.player.advancing = false;
   clearAdvanceWatchdog();
+  playerLoading.hidden = true;
   if (videoPlayer.getAttribute("src")) setPlayerEmpty("This recording could not be played.");
 });
 videoPlayer.addEventListener("play", updatePlayPauseUI);
@@ -599,8 +621,13 @@ function advanceToNextSegment(segment, currentAbs) {
   const next = nextSegmentAfter(segment);
   if (!next) return;
   const target = advanceTarget(next.startedAt, currentAbs);
+  console.debug(
+    "[dvr] advance", segment.id, "->", next.id,
+    "currentAbs=", currentAbs?.toISOString(), "nextStart=", next.startedAt.toISOString(),
+    "target=", target.toISOString(),
+  );
   beginAdvancing();
-  seekAbsolute(target, { autoplay: true });
+  seekAbsolute(target, { autoplay: true, segmentHint: next, isAutoAdvance: true });
 }
 
 function updatePlayPauseUI() {
