@@ -7,11 +7,57 @@
  * archive boundaries never replace <video>.src during ordinary playback.
  */
 
+const CONTINUOUS_STALL_RECOVERY_MS = 15000;
+let continuousStallTimer = null;
+let continuousRequestGeneration = 0;
+
 function continuousCoveringSegment(target) {
   const playable = state.segments
     .filter((row) => row.complete && target >= row.startedAt && target < row.endedAt)
     .sort((a, b) => b.startedAt - a.startedAt);
   return playable[0] || null;
+}
+
+function clearContinuousStallTimer() {
+  if (continuousStallTimer !== null) {
+    clearTimeout(continuousStallTimer);
+    continuousStallTimer = null;
+  }
+}
+
+function cancelContinuousMediaRequest() {
+  clearContinuousStallTimer();
+  continuousRequestGeneration += 1;
+  // Merely assigning a new src does not guarantee Chrome immediately closes
+  // the old streaming HTTP response. Pause, detach, and load the empty element
+  // first so the DVR service sees a real disconnect and can retire its FFmpeg
+  // worker before a new seek starts.
+  videoPlayer.pause();
+  videoPlayer.removeAttribute("src");
+  videoPlayer.load();
+}
+
+function armContinuousStallRecovery() {
+  if (state.player.directSource || !videoPlayer.currentSrc) return;
+  clearContinuousStallTimer();
+  const generation = continuousRequestGeneration;
+  continuousStallTimer = setTimeout(() => {
+    if (generation !== continuousRequestGeneration || state.player.directSource) return;
+    const when = currentAbsoluteTime();
+    cancelContinuousMediaRequest();
+    state.player.currentSegmentId = null;
+    state.player.anchorAbsolute = null;
+    state.player.pendingOffset = null;
+    state.player.autoplayAfterLoad = false;
+    timelinePlayheadEl.hidden = true;
+    playerLoading.hidden = true;
+    setPlayerEmpty(
+      when
+        ? `Playback stalled near ${formatClock(when)}. Pick another point on the timeline to continue.`
+        : "Playback stalled. Pick another point on the timeline to continue."
+    );
+    updatePlayPauseUI();
+  }, CONTINUOUS_STALL_RECOVERY_MS);
 }
 
 async function continuousSeekAbsolute(target, { autoplay = true } = {}) {
@@ -36,12 +82,12 @@ async function continuousSeekAbsolute(target, { autoplay = true } = {}) {
   const clamped = target < segment.startedAt ? segment.startedAt : target;
   setMode("playback");
   setPlayerEmpty(null);
-
-  // Normal DVR playback should look like a DVR, not a file-preparation tool.
-  // Keep the legacy diagnostic badge available to old direct-file paths, but
-  // never flash "Loading next recording" for the continuous transport. The
-  // video simply remains on its current/black frame until metadata is ready.
   playerLoading.hidden = true;
+
+  // Explicitly close the prior HTTP media request before opening another one.
+  // This prevents stale FFmpeg workers from piling up when an operator scrubs
+  // or seeks away from a damaged segment.
+  cancelContinuousMediaRequest();
 
   state.player.directSource = false;
   state.player.currentSegmentId = segment.id;
@@ -55,6 +101,7 @@ async function continuousSeekAbsolute(target, { autoplay = true } = {}) {
 
   const params = new URLSearchParams({ start: clamped.toISOString() });
   params.set("request", String(Date.now()));
+  continuousRequestGeneration += 1;
   videoPlayer.src = `/dvr/api/playback/continuous.mp4?${params.toString()}`;
   videoPlayer.load();
 }
@@ -65,14 +112,24 @@ advanceToNextSegment = function continuousAdvanceBookkeeping(_segment, currentAb
   if (state.player.directSource || !(currentAbs instanceof Date)) return;
   const covering = continuousCoveringSegment(currentAbs);
   if (covering) state.player.currentSegmentId = covering.id;
-  // No source replacement. FFmpeg already carries the physical next segment
-  // inside this one browser response.
 };
 
 prefetchSegment = function continuousPrefetchNoop() {};
 
-// Defense in depth: app.js retains the old loading element for historical
-// direct-file playback. Continuous timeline playback never needs it.
+// Normal buffering should be invisible. A prolonged stall, however, must
+// release the media request so the entire DVR console cannot become hostage to
+// one bad recording.
 videoPlayer.addEventListener("loadstart", () => {
   if (!state.player.directSource) playerLoading.hidden = true;
 });
+videoPlayer.addEventListener("waiting", armContinuousStallRecovery);
+videoPlayer.addEventListener("stalled", armContinuousStallRecovery);
+for (const eventName of ["playing", "canplay", "progress", "timeupdate", "loadeddata"]) {
+  videoPlayer.addEventListener(eventName, () => {
+    if (!state.player.directSource) clearContinuousStallTimer();
+  });
+}
+videoPlayer.addEventListener("error", () => {
+  if (!state.player.directSource) clearContinuousStallTimer();
+});
+window.addEventListener("beforeunload", cancelContinuousMediaRequest);
