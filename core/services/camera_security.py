@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from . import camera as camera_svc
 from . import camera_monitoring as legacy
-from . import camera_dvr as camera_dvr_svc
+from . import mediamtx_dvr
 from . import exterior_camera as exterior_camera_svc
 from . import push_notifications
 log = logging.getLogger("xomni.camera_security")
@@ -72,196 +72,9 @@ SECURITY_TOOL_SCHEMAS["camera_footage"]["parameters"]["properties"].update(
     }
 )
 
-_DEVICE_NS = "http://www.onvif.org/ver10/device/wsdl"
-_EVENT_TOPIC_MARKERS = ("motion", "move", "human", "people", "person", "vehicle", "car")
-_EVENT_STATE_NAME_MARKERS = ("motion", "move", "alarm", "active", "trigger", "detect")
-_EVENT_STATE_NAMES = {"state", "status", "value", "level", "event"}
 _EVENT_HEALTH_POLL_SECONDS = 2.0
 _EVENT_CONSUMER_RESTART_SECONDS = 1.0
 _SECOND_LOOK_DELAY_SECONDS = 2.0
-
-
-def _security_marker_in(value: object) -> bool:
-    """Match security topic/name words without treating ``CardReader`` as ``car``."""
-
-    text = str(value or "")
-    folded = text.casefold()
-    if any(marker in folded for marker in _EVENT_TOPIC_MARKERS if marker != "car"):
-        return True
-    words = re.findall(
-        r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+",
-        text.replace("_", " ").replace("-", " "),
-    )
-    return "car" in {word.casefold() for word in words}
-
-
-def _state_name_is_specific(value: object) -> bool:
-    name = str(value or "").strip().casefold()
-    return any(marker in name for marker in _EVENT_STATE_NAME_MARKERS)
-
-
-def _state_name_is_generic(value: object) -> bool:
-    return str(value or "").strip().casefold() in _EVENT_STATE_NAMES
-
-
-class XiongmaiDVR(camera_dvr_svc.CameraDVR):
-    """DVR with Xiongmai-tolerant ONVIF event discovery and topic parsing."""
-
-    @staticmethod
-    def _parse_bool(value: object) -> Optional[bool]:
-        text = str(value or "").strip().casefold()
-        if text in {"trigger", "triggered", "start", "started", "detected"}:
-            return True
-        if text in {"clear", "cleared", "stop", "stopped", "ended", "idle"}:
-            return False
-        return camera_dvr_svc.CameraDVR._parse_bool(value)
-
-    async def _discover_event_url(self, client, credentials) -> Optional[str]:
-        def body_builder(operation):
-            import xml.etree.ElementTree as ET
-            ET.SubElement(operation, f"{{{_DEVICE_NS}}}Category").text = "Events"
-
-        payload = exterior_camera_svc._soap_envelope(
-            namespace=_DEVICE_NS, operation="GetCapabilities",
-            credentials=credentials, body_builder=body_builder,
-        )
-        url = f"http://{credentials.host}:{exterior_camera_svc._ONVIF_PORT}/onvif/device_service"
-        action = f"{_DEVICE_NS}/GetCapabilities"
-        try:
-            async with client.stream(
-                "POST", url,
-                headers={
-                    "Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"',
-                    "Accept": "application/soap+xml, text/xml",
-                },
-                content=payload,
-            ) as response:
-                if response.status_code < 200 or response.status_code >= 300:
-                    return None
-                raw = bytearray()
-                async for chunk in response.aiter_bytes():
-                    raw.extend(chunk)
-                    if len(raw) > exterior_camera_svc.MAX_ONVIF_RESPONSE_BYTES:
-                        return None
-            body = exterior_camera_svc._parse_onvif_xml(bytes(raw))
-            for node in body.iter():
-                if exterior_camera_svc._xml_name(node) != "Events":
-                    continue
-                for child in node.iter():
-                    if exterior_camera_svc._xml_name(child) == "XAddr" and str(child.text or "").strip():
-                        return self._pinned_subscription_url(str(child.text).strip(), host=credentials.host)
-        except Exception:
-            return None
-        finally:
-            payload = b""
-        return None
-
-    async def _create_subscription(self, client, credentials) -> str:
-        discovered = await self._discover_event_url(client, credentials)
-        candidates = [
-            discovered,
-            f"http://{credentials.host}:{exterior_camera_svc._ONVIF_PORT}/onvif/event_service",
-            f"http://{credentials.host}:{exterior_camera_svc._ONVIF_PORT}/onvif/events_service",
-        ]
-        seen = set()
-        last_error = None
-        for event_url in candidates:
-            if not event_url or event_url in seen:
-                continue
-            seen.add(event_url)
-            try:
-                def body_builder(operation):
-                    import xml.etree.ElementTree as ET
-                    ET.SubElement(
-                        operation,
-                        f"{{{camera_dvr_svc._EVENTS_NS}}}InitialTerminationTime",
-                    ).text = "PT10M"
-
-                body = await self._post_event(
-                    client, credentials=credentials, url=event_url,
-                    operation="CreatePullPointSubscription", body_builder=body_builder,
-                )
-                response = self._event_response(
-                    body, "CreatePullPointSubscriptionResponse"
-                )
-                addresses = [
-                    str(node.text or "").strip()
-                    for node in response.iter()
-                    if exterior_camera_svc._xml_name(node) == "Address" and str(node.text or "").strip()
-                ]
-                self._set_subscription_renewal(response, require_times=True)
-                return (
-                    self._pinned_subscription_url(addresses[0], host=credentials.host)
-                    if addresses else event_url
-                )
-            except Exception as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        raise exterior_camera_svc.ExteriorCameraUnavailable("Exterior camera event service was not found.")
-
-    @classmethod
-    def motion_states_from_body(cls, body):
-        """Return one state per relevant notification, preserving camera order.
-
-        Xiongmai messages commonly put source metadata such as ``Channel=1``
-        before the actual ``State=false`` item.  Only explicitly state-like
-        fields are eligible; arbitrary parseable values are never promoted to
-        motion.  Parsing notification-by-notification also keeps a normal
-        MotionAlarm clear from hiding a later vehicle/person trigger in the
-        same PullMessages response.
-        """
-
-        states: list[bool] = []
-        notifications = [
-            node
-            for node in body.iter()
-            if exterior_camera_svc._xml_name(node) == "NotificationMessage"
-        ]
-        for notification in notifications:
-            topic = " ".join(
-                str(node.text or "")
-                for node in notification.iter()
-                if exterior_camera_svc._xml_name(node) == "Topic"
-            )
-            simple_items = [
-                node
-                for node in notification.iter()
-                if exterior_camera_svc._xml_name(node) == "SimpleItem"
-            ]
-            security_named = any(
-                _security_marker_in(node.attrib.get("Name")) for node in simple_items
-            )
-            if not _security_marker_in(topic) and not security_named:
-                continue
-
-            candidate: Optional[bool] = None
-            # Prefer a motion/alarm-specific field over a generic State/Level
-            # item, while preserving the order among equally specific fields.
-            for predicate in (_state_name_is_specific, _state_name_is_generic):
-                for node in simple_items:
-                    if not predicate(node.attrib.get("Name")):
-                        continue
-                    candidate = cls._parse_bool(node.attrib.get("Value"))
-                    if candidate is not None:
-                        break
-                if candidate is not None:
-                    break
-
-            if candidate is None:
-                for node in notification.iter():
-                    local_name = exterior_camera_svc._xml_name(node)
-                    if not (
-                        _state_name_is_specific(local_name)
-                        or _state_name_is_generic(local_name)
-                    ):
-                        continue
-                    candidate = cls._parse_bool(node.text)
-                    if candidate is not None:
-                        break
-            if candidate is not None:
-                states.append(candidate)
-        return states
 
 
 _SECURITY_ANALYSIS_PROMPT = (
@@ -465,7 +278,7 @@ def _temporal_event_window(
         raise ValueError("Motion event timestamps are invalid.")
     since = captured[0] - timedelta(seconds=30)
     until = captured[-1] + timedelta(seconds=75)
-    if (until - since).total_seconds() > camera_dvr_svc.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
+    if (until - since).total_seconds() > mediamtx_dvr.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
         raise ValueError("The selected motion event is too long for bounded DVR analysis.")
     return since, until, events
 
@@ -818,7 +631,7 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
             return _temporal_error(str(exc), status="invalid_event", event=event)
     elif requested_since is not None and requested_until is not None:
         since, until = requested_since, requested_until
-        if (until - since).total_seconds() > camera_dvr_svc.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
+        if (until - since).total_seconds() > mediamtx_dvr.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
             event = _motion_event_in_range(store, since, until)
             if event is None:
                 return _temporal_error(
@@ -860,7 +673,7 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
             until=until,
             event=event,
         )
-    except camera_dvr_svc.PlaybackPreparationError:
+    except mediamtx_dvr.PlaybackPreparationError:
         return _temporal_error(
             "DVR frame extraction could not complete promptly; no temporal conclusion was made.",
             status="frame_extraction_failed",
@@ -949,7 +762,7 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
             cache_name=f"range-{int(since.timestamp())}-{int(until.timestamp())}",
         )
         clip_url = f"/dvr/api/clips/{path.name}"
-    except camera_dvr_svc.PlaybackPreparationError:
+    except mediamtx_dvr.PlaybackPreparationError:
         playback_error = "The analyzed frames are available, but a playable DVR clip could not be prepared promptly."
     except Exception:
         log.info("DVR temporal analysis playback clip was unavailable", exc_info=True)
@@ -1033,7 +846,7 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
     if since or until:
         if since is None or until is None:
             return {"ok": False, "error": "Both since and until are required for DVR time-range playback."}
-        if (until - since).total_seconds() > camera_dvr_svc.MAX_TOOL_PLAYBACK_DURATION_SECONDS:
+        if (until - since).total_seconds() > mediamtx_dvr.MAX_TOOL_PLAYBACK_DURATION_SECONDS:
             # A broad history query is useful to find motion, but it is not a
             # reasonable synchronous browser artifact.  Prefer the actual
             # motion window it contains rather than holding chat while FFmpeg
@@ -1053,7 +866,7 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
                     selected["selected_motion_event_id"] = historical.get("id")
                     selected["selected_from_broad_range"] = True
                     return selected
-                except camera_dvr_svc.PlaybackPreparationError:
+                except mediamtx_dvr.PlaybackPreparationError:
                     return {
                         "ok": False,
                         "source": "continuous_dvr",
@@ -1078,7 +891,7 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
                     f"{int(playback_until.timestamp())}"
                 ),
             )
-        except camera_dvr_svc.PlaybackPreparationError:
+        except mediamtx_dvr.PlaybackPreparationError:
             return {
                 "ok": False,
                 "source": "continuous_dvr",
@@ -1093,7 +906,7 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
                 overlapping = await dvr.list_segments(
                     since=_dvr_iso(since),
                     until=_dvr_iso(until),
-                    limit=camera_dvr_svc.MAX_PLAYBACK_SEGMENTS,
+                    limit=mediamtx_dvr.MAX_PLAYBACK_SEGMENTS,
                     complete_only=True,
                 )
             except Exception:
@@ -1126,7 +939,7 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
                         ),
                     )
                     partial = True
-                except camera_dvr_svc.PlaybackPreparationError:
+                except mediamtx_dvr.PlaybackPreparationError:
                     return {
                         "ok": False,
                         "source": "continuous_dvr",
@@ -1177,7 +990,7 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
     if burst_id is not None:
         try:
             return await _continuous_event_clip_result(store, dvr, int(burst_id))
-        except camera_dvr_svc.PlaybackPreparationError:
+        except mediamtx_dvr.PlaybackPreparationError:
             return {
                 "ok": False,
                 "source": "continuous_dvr",

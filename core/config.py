@@ -155,12 +155,26 @@ class Settings:
     camera_motion_burst_seconds: int = 90
     camera_motion_burst_interval_seconds: int = 5
 
-    # X DVR -- the independent recording service (core/dvr_service.py). It
-    # survives Core restarts; this is only the address Core's client and the
-    # DVR service's own exact-origin check use, not a claim that DVR runs
-    # inside Core.
+    # X DVR -- the standalone operator GUI (core/dvr_service.py). It survives
+    # Core restarts; this is only the address Core's client and the DVR
+    # service's own exact-origin check use, not a claim that DVR runs inside
+    # Core. Actual recording/playback now lives entirely in MediaMTX, an
+    # independently-managed process outside this repo (see mediamtx_client.py).
     dvr_port: int = 8300
     internal_dvr_token: str = ""
+
+    # MediaMTX -- the exterior camera's media transport (RTSP connection,
+    # continuous native recording, HLS/WebRTC live delivery, recorded-range
+    # playback). All addresses are loopback; MediaMTX itself is started
+    # independently (scripts/launch-mediamtx.ps1), never by Core or the DVR
+    # GUI process.
+    mediamtx_control_base_url: str = "http://127.0.0.1:9997"
+    mediamtx_playback_base_url: str = "http://127.0.0.1:9996"
+    mediamtx_hls_base_url: str = "http://127.0.0.1:8888"
+    mediamtx_webrtc_base_url: str = "http://127.0.0.1:8889"
+    mediamtx_rtsp_base_url: str = "rtsp://127.0.0.1:8554"
+    mediamtx_recordings_root: Path = Path("E:/MediaMTX/recordings")
+    mediamtx_clips_root: Path = Path("E:/MediaMTX/clips")
 
     @property
     def local_origin(self) -> str:
@@ -260,5 +274,26 @@ class Settings:
             camera_motion_burst_seconds=_int("XOMNI_CAMERA_MOTION_BURST_SECONDS", 90),
             camera_motion_burst_interval_seconds=_int(
                 "XOMNI_CAMERA_MOTION_BURST_INTERVAL_SECONDS", 5
+            ),
+            mediamtx_control_base_url=os.getenv(
+                "XOMNI_MEDIAMTX_CONTROL_BASE_URL", "http://127.0.0.1:9997"
+            ).strip().rstrip("/"),
+            mediamtx_playback_base_url=os.getenv(
+                "XOMNI_MEDIAMTX_PLAYBACK_BASE_URL", "http://127.0.0.1:9996"
+            ).strip().rstrip("/"),
+            mediamtx_hls_base_url=os.getenv(
+                "XOMNI_MEDIAMTX_HLS_BASE_URL", "http://127.0.0.1:8888"
+            ).strip().rstrip("/"),
+            mediamtx_webrtc_base_url=os.getenv(
+                "XOMNI_MEDIAMTX_WEBRTC_BASE_URL", "http://127.0.0.1:8889"
+            ).strip().rstrip("/"),
+            mediamtx_rtsp_base_url=os.getenv(
+                "XOMNI_MEDIAMTX_RTSP_BASE_URL", "rtsp://127.0.0.1:8554"
+            ).strip().rstrip("/"),
+            mediamtx_recordings_root=Path(
+                os.getenv("XOMNI_MEDIAMTX_RECORDINGS_ROOT", r"E:\MediaMTX\recordings")
+            ),
+            mediamtx_clips_root=Path(
+                os.getenv("XOMNI_MEDIAMTX_CLIPS_ROOT", r"E:\MediaMTX\clips")
             ),
         )

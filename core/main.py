@@ -17,11 +17,10 @@ import re
 import sys
 from contextlib import asynccontextmanager
 
-import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import auth as auth_api
@@ -34,12 +33,14 @@ from .services import adas_si as adas_si_svc
 from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
 from .services import camera as camera_svc
-from .services import camera_dvr_client as camera_dvr_client_svc
 from .services import camera_monitoring as camera_monitoring_svc
 from .services import camera_security as camera_security_svc
 from .services import calendar as calendar_svc
 from .services import exterior_camera as exterior_camera_svc
 from .services import image_generation as image_svc
+from .services import mediamtx_dvr as mediamtx_dvr_svc
+from .services.mediamtx_client import MediaMTXClient, PATH_MAIN
+from .services import onvif_motion as onvif_motion_svc
 from .services import research as research_svc
 from .services import scrapex as scrapex_svc
 from .services import video_generation as video_svc
@@ -104,20 +105,32 @@ def build_app(settings: Settings) -> FastAPI:
         profile=getattr(settings, "tool_profile", None),
     )
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
-    # Continuous recording, E:\XOmni-DVR, and retention are owned by the
-    # independent X DVR service (core/dvr_service.py) now -- it keeps
-    # recording across a Core restart, a model swap, or the DVR GUI closing.
-    # This CameraDVR instance never touches E: or runs its recorder loop; it
-    # exists only so OnvifCameraMonitor can read the camera's own ONVIF
-    # motion-subscription state (motion_states()/events_healthy), which is
-    # independent of the recorder. dvr_client is Core's actual client for
-    # DVR playback/analysis, reached over its bounded HTTP API.
-    camera_dvr = camera_security_svc.XiongmaiDVR(exterior_camera)
+    # Continuous recording, E:\MediaMTX\recordings, and retention are all
+    # owned by MediaMTX now -- an independently-managed process started by
+    # scripts/launch-mediamtx.ps1, never by Core. This OnvifMotionWatcher
+    # instance never touches a recording; it exists only so
+    # OnvifCameraMonitor can read the camera's own ONVIF motion-subscription
+    # state (motion_states()/events_healthy). mediamtx_dvr is Core's actual
+    # client for DVR playback/analysis, reached over MediaMTX's own bounded
+    # local HTTP APIs.
+    camera_dvr = onvif_motion_svc.OnvifMotionWatcher(exterior_camera)
     camera_monitor = camera_security_svc.OnvifCameraMonitor(
         settings, exterior_camera, router, store, dvr=camera_dvr
     )
-    dvr_client = camera_dvr_client_svc.DVRServiceClient(
-        settings.dvr_local_origin, settings.internal_dvr_token
+    mediamtx_client = MediaMTXClient(
+        control_base_url=settings.mediamtx_control_base_url,
+        playback_base_url=settings.mediamtx_playback_base_url,
+        hls_base_url=settings.mediamtx_hls_base_url,
+        webrtc_base_url=settings.mediamtx_webrtc_base_url,
+        rtsp_base_url=settings.mediamtx_rtsp_base_url,
+    )
+    mediamtx_dvr = mediamtx_dvr_svc.MediaMTXDVR(
+        mediamtx_client,
+        path=PATH_MAIN,
+        ffmpeg_path=exterior_camera.ffmpeg_path,
+        recordings_root=settings.mediamtx_recordings_root,
+        clips_dir=settings.mediamtx_clips_root / "_cache",
+        saved_clips_dir=settings.mediamtx_clips_root / "saved",
     )
     image_config = None
     image_generation = None
@@ -298,7 +311,7 @@ def build_app(settings: Settings) -> FastAPI:
 
     registry.register(
         "camera_event_history",
-        lambda a: camera_security_svc.camera_event_history(store, a, dvr=dvr_client),
+        lambda a: camera_security_svc.camera_event_history(store, a, dvr=mediamtx_dvr),
     )
     registry.register(
         "camera_snapshot_analyze",
@@ -306,9 +319,9 @@ def build_app(settings: Settings) -> FastAPI:
     )
     async def camera_footage_handler(args: dict) -> dict:
         if args.get("analysis") is True:
-            return await camera_security_svc.camera_footage_analyze(store, router, args, dvr=dvr_client)
+            return await camera_security_svc.camera_footage_analyze(store, router, args, dvr=mediamtx_dvr)
         return await camera_security_svc.camera_motion_clip(
-            store, settings, exterior_camera.ffmpeg_path, args, dvr=dvr_client
+            store, settings, exterior_camera.ffmpeg_path, args, dvr=mediamtx_dvr
         )
 
     registry.register(
@@ -386,6 +399,8 @@ def build_app(settings: Settings) -> FastAPI:
     app.state.automotive_knowledge = automotive_knowledge
     app.state.exterior_camera = exterior_camera
     app.state.camera_dvr = camera_dvr
+    app.state.mediamtx_client = mediamtx_client
+    app.state.mediamtx_dvr = mediamtx_dvr
     app.state.image_generation = image_generation
     app.state.image_generation_config = image_config
     app.state.video_generation = video_generation
@@ -428,56 +443,31 @@ def build_app(settings: Settings) -> FastAPI:
     app.include_router(auth_api.create_router(settings, store))
 
     _dvr_clip_name_re = re.compile(r"^[A-Za-z0-9_.-]{1,160}\.mp4$")
-    _dvr_proxy_forward_headers = {"content-type", "content-length", "content-range", "accept-ranges"}
 
     @app.get("/dvr/api/clips/{filename}")
-    async def dvr_clip_proxy(
-        filename: str, request: Request, _session: dict = Depends(require_session)
-    ):
-        # Chat camera cards render clip_url values the DVR service issued
-        # (e.g. "/dvr/api/clips/range-....mp4"); this is the one DVR-service
-        # path chat needs, proxied (with Range support, for in-card scrubbing)
-        # so those relative URLs keep resolving against Core's own origin
-        # without loosening CSP media-src/connect-src to a second origin. The
-        # standalone DVR GUI talks to the DVR service directly, not this route.
+    async def dvr_clip_proxy(filename: str, _session: dict = Depends(require_session)):
+        # Chat camera cards render clip_url values Core itself issued (e.g.
+        # "/dvr/api/clips/range-....mp4") when mediamtx_dvr.range_clip()/
+        # event_clip() cached that time range. Core and the standalone DVR
+        # GUI process both read MediaMTX over HTTP and share this one cache
+        # directory on disk -- no cross-process proxy or shared secret is
+        # needed to serve a file Core already has locally.
         if not _dvr_clip_name_re.fullmatch(filename):
             raise HTTPException(404, "Clip not found.")
-        forward_headers = {"X-XOmni-Internal-Token": settings.internal_dvr_token}
-        range_header = request.headers.get("range")
-        if range_header:
-            forward_headers["Range"] = range_header
-        client = httpx.AsyncClient(
-            base_url=settings.dvr_local_origin, timeout=30.0, trust_env=False,
-        )
+        path = mediamtx_dvr.clips_dir / filename
         try:
-            upstream_request = client.build_request(
-                "GET", f"/dvr/api/clips/{filename}", headers=forward_headers
-            )
-            upstream = await client.send(upstream_request, stream=True)
-        except httpx.HTTPError:
-            await client.aclose()
-            raise HTTPException(503, "The DVR service is unreachable.") from None
-        if upstream.status_code not in (200, 206):
-            await upstream.aclose()
-            await client.aclose()
-            raise HTTPException(404 if upstream.status_code == 404 else 503, "Clip not found.")
-
-        async def body():
-            try:
-                async for chunk in upstream.aiter_bytes():
-                    yield chunk
-            finally:
-                await upstream.aclose()
-                await client.aclose()
-
-        headers = {
-            key: value
-            for key, value in upstream.headers.items()
-            if key.lower() in _dvr_proxy_forward_headers
-        }
-        headers["Content-Disposition"] = f'inline; filename="{filename}"'
-        headers["Cache-Control"] = "private, no-store"
-        return StreamingResponse(body(), status_code=upstream.status_code, headers=headers)
+            if path.resolve().parent != mediamtx_dvr.clips_dir.resolve() or not path.is_file():
+                raise HTTPException(404, "Clip not found.")
+        except OSError:
+            raise HTTPException(404, "Clip not found.")
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Cache-Control": "private, no-store",
+            },
+        )
 
     @app.get("/dvr")
     @app.get("/dvr/{rest:path}")

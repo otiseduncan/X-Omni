@@ -1,36 +1,34 @@
-"""X DVR -- independent continuous-recording service entrypoint.
+"""X DVR -- standalone operator GUI entrypoint.
 
     cd "X:\\X Omni"
     python -m core.dvr_service
 
-This process owns the exterior camera's continuous RTSP recording, ONVIF
-motion-subscription health used by its own retention/status reporting, the
-E:\\XOmni-DVR archive, and the standalone DVR operator GUI/API. It is
-deliberately independent of X Omni Core: starting, stopping, or restarting
-Core (or its model worker) never starts, stops, or restarts this process,
-and closing the DVR GUI in a browser never touches recording either.
+This process owns nothing but the browser-facing DVR GUI/API. Continuous
+recording, the RTSP connection to the camera, live delivery, and recorded
+playback all live in MediaMTX (X:\\MediaMTX), an independently-managed
+process started by scripts/launch-mediamtx.ps1 -- not by this service, not
+by X Omni Core. Starting, stopping, or restarting this GUI process never
+touches recording, and closing it in a browser never does either.
 """
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import logging
-import secrets
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from .api import auth as auth_api
 from .config import Settings
-from .services import camera_dvr as camera_dvr_svc
-from .services import camera_security as camera_security_svc
-from .services import dvr_continuous_playback as continuous_playback_svc
-from .services import exterior_camera as exterior_camera_svc
+from .services import mediamtx_dvr as mediamtx_dvr_svc
+from .services import mediamtx_dvr_routes
+from .services.exterior_camera import ExteriorCameraService
+from .services.mediamtx_client import MediaMTXClient, PATH_MAIN
 from .state.db import Store
 
 logging.basicConfig(
@@ -43,39 +41,36 @@ log = logging.getLogger("xomni.dvr")
 
 def build_app(settings: Settings) -> FastAPI:
     store = Store(settings.db_path)
-    exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
-    camera_dvr = camera_security_svc.XiongmaiDVR(exterior_camera)
+    exterior_camera = ExteriorCameraService(settings.root)
+    client = MediaMTXClient(
+        control_base_url=settings.mediamtx_control_base_url,
+        playback_base_url=settings.mediamtx_playback_base_url,
+        hls_base_url=settings.mediamtx_hls_base_url,
+        webrtc_base_url=settings.mediamtx_webrtc_base_url,
+        rtsp_base_url=settings.mediamtx_rtsp_base_url,
+    )
+    dvr = mediamtx_dvr_svc.MediaMTXDVR(
+        client,
+        path=PATH_MAIN,
+        ffmpeg_path=exterior_camera.ffmpeg_path,
+        recordings_root=settings.mediamtx_recordings_root,
+        clips_dir=settings.mediamtx_clips_root / "_cache",
+        saved_clips_dir=settings.mediamtx_clips_root / "saved",
+    )
     dvr_auth_settings = dataclasses.replace(settings, port=settings.dvr_port)
     require_session = auth_api.make_require_session(dvr_auth_settings, store)
 
-    async def _track_motion_health() -> None:
-        while not camera_dvr._stopped:
-            try:
-                async for _active in camera_dvr.motion_states():
-                    if camera_dvr._stopped:
-                        return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.warning("X DVR motion-health consumer failed; retrying", exc_info=True)
-            if camera_dvr._stopped:
-                return
-            await asyncio.sleep(30)
-
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        log.info("X DVR recording E:\\XOmni-DVR independent of X Omni Core.")
-        recorder_task = asyncio.create_task(camera_dvr.run_forever())
-        motion_health_task = asyncio.create_task(_track_motion_health())
+        log.info(
+            "X DVR GUI serving MediaMTX-backed playback -- recording is owned "
+            "independently by MediaMTX (%s), not this process.",
+            settings.mediamtx_control_base_url,
+        )
         try:
             yield
         finally:
-            log.info("Shutting down X DVR recorder...")
-            camera_dvr.stop()
-            recorder_task.cancel()
-            motion_health_task.cancel()
-            await asyncio.gather(recorder_task, motion_health_task, return_exceptions=True)
-            await camera_dvr.shutdown()
+            log.info("Shutting down X DVR GUI...")
             try:
                 await exterior_camera.shutdown()
             finally:
@@ -83,14 +78,15 @@ def build_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="X DVR",
-        version="1.0.0",
+        version="2.0.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
     )
     app.state.settings = settings
     app.state.store = store
-    app.state.camera_dvr = camera_dvr
+    app.state.mediamtx_client = client
+    app.state.mediamtx_dvr = dvr
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -102,85 +98,28 @@ def build_app(settings: Settings) -> FastAPI:
             "default-src 'self'; base-uri 'self'; object-src 'none'; "
             "frame-ancestors 'none'; script-src 'self'; "
             "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
-            "connect-src 'self'; media-src 'self' blob:; "
+            f"connect-src 'self' {settings.mediamtx_webrtc_base_url} {settings.mediamtx_hls_base_url}; "
+            f"media-src 'self' blob: {settings.mediamtx_hls_base_url}; "
             "worker-src 'self' blob:; form-action 'self'"
         )
-        if request.url.path.startswith(("/dvr/api/",)):
+        if request.url.path.startswith("/dvr/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     app.include_router(
-        continuous_playback_svc.create_router(require_session, camera_dvr)
-    )
-
-    ui_root = Path(settings.root) / "ui" / "dvr"
-
-    @app.get("/dvr/continuous-playback.js")
-    async def dvr_continuous_js():
-        path = ui_root / "continuous-playback.js"
-        if not path.is_file():
-            return JSONResponse(
-                {"detail": "DVR playback adapter is not installed."},
-                status_code=404,
-            )
-        return FileResponse(
-            path,
-            media_type="text/javascript",
-            headers={"Cache-Control": "no-store"},
-        )
-
-    async def _require_owner(session: dict = Depends(require_session)) -> dict:
-        if session.get("role") != "owner":
-            raise HTTPException(403, "Owner authorization is required.")
-        return session
-
-    def _owner_session_id(session: dict) -> str:
-        token_hash = str(session.get("token_hash") or "").strip()
-        if token_hash:
-            return f"session:{token_hash}"
-        return f"local:{session.get('google_sub') or 'local-dev'}"
-
-    @app.delete("/dvr/api/live/reset")
-    async def reset_owner_live_session(session: dict = Depends(_require_owner)):
-        """Clear an orphaned standalone Live View session for this Owner.
-
-        A browser reload can lose the opaque live session id before its
-        keepalive DELETE reaches the service. Without this bounded reset the
-        invisible pending session blocks Start Live until its five-minute TTL.
-        It never touches the continuous recorder or historical playback.
-        """
-        owner_id = _owner_session_id(session)
-        async with exterior_camera._lock:
-            await exterior_camera._expire_locked()
-            current = exterior_camera._session
-            if current is None:
-                return {"ok": True, "stopped": False}
-            if not secrets.compare_digest(current.owner_id, owner_id):
-                raise HTTPException(403, "The active camera session belongs to another Owner.")
-            live_session_id = current.session_id
-        try:
-            await exterior_camera.delete_session(
-                session_id=live_session_id,
-                owner_id=owner_id,
-            )
-        except exterior_camera_svc.ExteriorCameraSessionNotFound:
-            return {"ok": True, "stopped": False}
-        return {"ok": True, "stopped": True}
-
-    app.include_router(
-        camera_dvr_svc.create_router(
-            settings,
-            store,
-            require_session,
-            camera_dvr,
-            internal_token=settings.internal_dvr_token,
-            extra_allowed_origins=(settings.dvr_local_origin,),
+        mediamtx_dvr_routes.create_router(
+            require_session=require_session,
+            client=client,
+            dvr=dvr,
+            store=store,
+            ui_root=Path(settings.root) / "ui" / "dvr",
+            camera_snapshot_dir=Path(settings.camera_snapshot_dir),
         )
     )
 
     @app.get("/healthz")
     async def healthz():
-        status = await camera_dvr.status()
+        status = await dvr.status()
         return JSONResponse({"ok": True, "service": "dvr", "status": status})
 
     @app.get("/")
