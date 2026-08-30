@@ -5,7 +5,7 @@ retention. Human playback must not expose those file boundaries. This module
 selects the contiguous completed run that covers an absolute timestamp, trims
 normal recorder overlap at each boundary, and feeds FFmpeg one concat manifest.
 FFmpeg emits one fragmented H.264 MP4 stream to the browser, so a single <video>
-source keeps playing until a genuine recording gap or the end of retained data.
+source keeps playing until a genuine recording break or the end of retained data.
 
 The archive is never modified and the recorder remains native stream-copy. The
 CPU transcode exists only while a human is actively watching the standalone DVR.
@@ -18,7 +18,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -28,7 +28,11 @@ from . import camera_dvr as camera_dvr_svc
 
 STREAM_CHUNK_BYTES = 256 * 1024
 MAX_STREAM_SEGMENTS = camera_dvr_svc.MAX_UI_SEGMENTS
-MAX_CONTIGUOUS_GAP_SECONDS = camera_dvr_svc.MAX_PLAYBACK_GAP_SECONDS
+# Legacy filenames have no explicit session/ordinal relationship, so tolerate
+# only a small amount of close-time/index jitter before treating them as a real
+# recording break. New filenames are handled by their recorder sequence below.
+LEGACY_INDEX_JITTER_SECONDS = 10.0
+CROSS_SESSION_GAP_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -45,15 +49,52 @@ def _parse_utc(value: object) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _segment_sequence(filename: object) -> Optional[tuple[str, int]]:
+    """Return (recording-session, ordinal) for the recorder's new filenames."""
+    match = camera_dvr_svc._SEGMENT_RE.fullmatch(str(filename or ""))
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def _is_expected_successor(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Decide continuity from recorder identity before noisy close-time metadata.
+
+    Completed-segment ``ended_at`` may be based on filesystem close time. That
+    can be a couple seconds earlier/later than the next nominal 300-second
+    boundary even though the recorder produced consecutive files. New recorder
+    filenames encode the session and ordinal explicitly; consecutive ordinals in
+    the same session are authoritative continuity and must never be split merely
+    because mtime-derived ``ended_at`` drifted by a second or two.
+    """
+    prev_seq = _segment_sequence(previous.get("filename"))
+    cur_seq = _segment_sequence(current.get("filename"))
+    if prev_seq and cur_seq:
+        prev_session, prev_ordinal = prev_seq
+        cur_session, cur_ordinal = cur_seq
+        if prev_session == cur_session:
+            return cur_ordinal == prev_ordinal + 1
+        # A recorder restart creates a new session prefix. Preserve a genuinely
+        # continuous restart only when wall-clock coverage is effectively
+        # adjacent; otherwise the UI should stop at the real outage.
+        prev_end = _parse_utc(previous.get("ended_at"))
+        cur_start = _parse_utc(current.get("started_at"))
+        return (cur_start - prev_end).total_seconds() <= CROSS_SESSION_GAP_SECONDS
+
+    # Legacy local-wall-clock names predate session ordinals. Their five-minute
+    # starts are reliable enough to distinguish normal close-time jitter from a
+    # true missing recording without trusting mtime to sub-second precision.
+    prev_start = _parse_utc(previous.get("started_at"))
+    cur_start = _parse_utc(current.get("started_at"))
+    start_delta = (cur_start - prev_start).total_seconds()
+    nominal = 300.0
+    return 0.0 < start_delta <= nominal + LEGACY_INDEX_JITTER_SECONDS
+
+
 def _select_contiguous_rows(
     rows: list[dict[str, Any]], start: datetime
 ) -> list[tuple[dict[str, Any], float]]:
-    """Return rows from ``start`` through the first real archive gap.
-
-    The first tuple's float is the offset into the first source. Later values
-    trim any overlap with the preceding source, so normal 1-2 second recorder
-    overlap never appears to the operator as a rewind at a five-minute boundary.
-    """
+    """Return rows from ``start`` through the first genuine recording break."""
     start = start.astimezone(timezone.utc)
     ordered = sorted(
         rows,
@@ -61,64 +102,62 @@ def _select_contiguous_rows(
             _parse_utc(row.get("started_at")), int(row.get("id") or 0)
         ),
     )
-    first_index = None
-    for index, row in enumerate(ordered):
-        row_start = _parse_utc(row.get("started_at"))
-        row_end = _parse_utc(row.get("ended_at"))
-        if row_start <= start < row_end:
-            first_index = index
-            break
-    if first_index is None:
-        return []
 
-    selected: list[tuple[dict[str, Any], float]] = []
-    first = ordered[first_index]
+    # Boundary overlaps are normal. If two files both cover the requested
+    # instant, choose the later-started one so playback never begins in the last
+    # second of an outgoing segment.
+    covering = [
+        (index, row)
+        for index, row in enumerate(ordered)
+        if _parse_utc(row.get("started_at")) <= start < _parse_utc(row.get("ended_at"))
+    ]
+    if not covering:
+        return []
+    first_index, first = max(
+        covering,
+        key=lambda item: (_parse_utc(item[1].get("started_at")), int(item[1].get("id") or 0)),
+    )
+
     first_start = _parse_utc(first.get("started_at"))
     first_end = _parse_utc(first.get("ended_at"))
-    selected.append((first, max(0.0, (start - first_start).total_seconds())))
+    selected: list[tuple[dict[str, Any], float]] = [
+        (first, max(0.0, (start - first_start).total_seconds()))
+    ]
+    previous = first
     coverage_end = first_end
 
     for row in ordered[first_index + 1 :]:
+        if not _is_expected_successor(previous, row):
+            break
         row_start = _parse_utc(row.get("started_at"))
         row_end = _parse_utc(row.get("ended_at"))
-        gap = (row_start - coverage_end).total_seconds()
-        if gap > MAX_CONTIGUOUS_GAP_SECONDS:
-            break
         overlap = max(0.0, (coverage_end - row_start).total_seconds())
         row_duration = max(0.0, (row_end - row_start).total_seconds())
-        # A pathological/duplicate row fully covered by the previous file adds
-        # no new footage and should not be handed to concat at all.
         if overlap < row_duration - 0.001:
             selected.append((row, overlap))
+            previous = row
         coverage_end = max(coverage_end, row_end)
     return selected
 
 
 def _ffconcat_text(parts: list[PlaybackPart]) -> str:
-    """Build a concat manifest with wall-clock overlap removed from its clock.
+    """Build a concat manifest with duplicate boundary time removed.
 
-    `inpoint` alone skips duplicate packets but FFmpeg may still use the source's
-    full duration when calculating the next file timestamp. Supplying the
-    effective duration as well keeps the concatenated timeline gapless.
+    The source files themselves carry their real packet timing. ``inpoint``
+    trims an overlap from the incoming file. Deliberately do not inject a
+    synthetic ``duration`` from the SQLite ``ended_at`` value: that value may be
+    filesystem-close time, not media duration, and was the source of false
+    1-3 second discontinuities in historical playback.
     """
     lines = ["ffconcat version 1.0"]
     for part in parts:
-        started = _parse_utc(part.row.get("started_at"))
-        ended = _parse_utc(part.row.get("ended_at"))
-        effective_duration = max(
-            0.001, (ended - started).total_seconds() - part.inpoint_seconds
-        )
         lines.append(f"file '{camera_dvr_svc._ffconcat_path(part.path)}'")
         if part.inpoint_seconds > 0.001:
             lines.append(f"inpoint {part.inpoint_seconds:.3f}")
-        lines.append(f"duration {effective_duration:.3f}")
     return "\n".join(lines) + "\n"
 
 
 async def _continuous_parts(dvr, start: datetime) -> list[PlaybackPart]:
-    # One throttled refresh is enough; the recorder's maintenance loop owns
-    # authoritative full-index refreshes. Only immutable completed files are
-    # eligible for this playback stream.
     await dvr._index_segments()
     rows = await dvr.list_segments(
         since=camera_dvr_svc._utc_iso(
@@ -170,10 +209,6 @@ async def continuous_stream(
         "-fflags", "+genpts",
         "-f", "concat", "-safe", "0", "-i", str(manifest),
         "-map", "0:v:0", "-an",
-        # Normalize all archive codecs to one browser-safe stream. This is
-        # deliberately review quality; evidentiary HEVC/H.264 MKVs stay
-        # untouched on E:. Existing measurements show this preset comfortably
-        # outruns the UI's maximum playback speed on Omega.
         "-vf", "scale=1280:-2",
         "-c:v", "libx264", "-preset", "superfast", "-crf", "23",
         "-pix_fmt", "yuv420p",
