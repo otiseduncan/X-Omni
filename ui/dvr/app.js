@@ -20,6 +20,8 @@ const state = {
     pendingOffset: null,
     autoplayAfterLoad: false,
     advancing: false,
+    advanceWatchdog: null,
+    prefetchedSegmentId: null,
     speed: 1,
     directSource: false,    // true when a saved clip (not a timeline segment) is loaded
   },
@@ -444,6 +446,42 @@ function setPlayerEmpty(message) {
   if (message) playerEmpty.textContent = message;
 }
 
+function prefetchSegment(segment) {
+  // A cold segment can take real seconds to remux/transcode server-side.
+  // Warming the next one in the background, as soon as the current one
+  // starts, hides that behind normal playback time instead of stalling
+  // the handoff at the boundary -- the earlier this starts, the more
+  // margin it has, which matters most at high playback speeds.
+  const segmentId = segment && positiveId(segment.id);
+  if (segmentId === null || segmentId === undefined) return;
+  if (state.player.prefetchedSegmentId === segmentId) return;
+  state.player.prefetchedSegmentId = segmentId;
+  fetch(`/dvr/api/segments/${segmentId}/video.mp4`, {
+    credentials: "same-origin", cache: "no-store",
+  }).catch(() => {});
+}
+
+function clearAdvanceWatchdog() {
+  if (state.player.advanceWatchdog != null) {
+    clearTimeout(state.player.advanceWatchdog);
+    state.player.advanceWatchdog = null;
+  }
+}
+
+function beginAdvancing() {
+  state.player.advancing = true;
+  clearAdvanceWatchdog();
+  // Defense in depth: if neither loadedmetadata nor error ever fires (a
+  // silently dropped connection, a backgrounded tab), advancing must not
+  // stay stuck forever -- that previously required reloading the page to
+  // recover, since it silently blocked every future auto-advance too.
+  state.player.advanceWatchdog = setTimeout(() => {
+    state.player.advancing = false;
+    state.player.advanceWatchdog = null;
+    setPlayerEmpty("The next recording is taking longer than expected. Try skip or the timeline.");
+  }, 60000);
+}
+
 async function seekAbsolute(target, { autoplay = true } = {}) {
   const segment = findSegmentForTime(target);
   const segmentId = segment && positiveId(segment.id);
@@ -468,6 +506,7 @@ async function seekAbsolute(target, { autoplay = true } = {}) {
     state.player.autoplayAfterLoad = autoplay;
     videoPlayer.src = `/dvr/api/segments/${segmentId}/video.mp4`;
     videoPlayer.load();
+    prefetchSegment(nextSegmentAfter(segment));
   } else {
     videoPlayer.currentTime = offsetSeconds;
     if (autoplay) videoPlayer.play().catch(() => {});
@@ -507,9 +546,16 @@ videoPlayer.addEventListener("loadedmetadata", () => {
     state.player.autoplayAfterLoad = false;
   }
   state.player.advancing = false;
+  clearAdvanceWatchdog();
   updatePlayPauseUI();
 });
 videoPlayer.addEventListener("error", () => {
+  // A failed load must never leave advancing stuck true -- that silently
+  // disabled every future auto-advance until the page was reloaded, which
+  // is exactly what made one slow/failed segment look like the whole
+  // player had broken.
+  state.player.advancing = false;
+  clearAdvanceWatchdog();
   if (videoPlayer.getAttribute("src")) setPlayerEmpty("This recording could not be played.");
 });
 videoPlayer.addEventListener("play", updatePlayPauseUI);
@@ -524,7 +570,7 @@ videoPlayer.addEventListener("timeupdate", () => {
   if (abs >= new Date(segment.endedAt.getTime() - 250)) {
     const next = nextSegmentAfter(segment);
     if (next) {
-      state.player.advancing = true;
+      beginAdvancing();
       seekAbsolute(next.startedAt, { autoplay: true });
     }
   }
@@ -534,7 +580,7 @@ videoPlayer.addEventListener("ended", () => {
   if (!segment || state.player.advancing) return;
   const next = nextSegmentAfter(segment);
   if (next) {
-    state.player.advancing = true;
+    beginAdvancing();
     seekAbsolute(next.startedAt, { autoplay: true });
   }
 });

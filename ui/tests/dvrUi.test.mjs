@@ -149,6 +149,14 @@ test("continuous timeline seeks by absolute time and hands off across segment bo
   assert.match(source, /state\.player\.advancing/);
   assert.match(source, /videoPlayer\.addEventListener\("timeupdate"/);
   assert.match(source, /videoPlayer\.addEventListener\("ended"/);
+  // A cold segment can take real seconds to prepare server-side; the next
+  // one is pre-fetched during current playback so the boundary handoff
+  // doesn't stall on it, and a failed/never-completing load must not leave
+  // advancing stuck true forever (that previously required a page reload).
+  assert.match(source, /function prefetchSegment\(segment\)/);
+  assert.match(source, /prefetchSegment\(nextSegmentAfter\(segment\)\)/);
+  assert.match(source, /function beginAdvancing\(\)/);
+  assert.match(source, /videoPlayer\.addEventListener\("error", \(\) => \{[\s\S]*state\.player\.advancing = false/);
   // Required visible playback controls (spec: 10s/30s skip, prev/next event,
   // 0.5x-8x speed, fullscreen) -- keyboard shortcuts only supplement these.
   for (const id of [

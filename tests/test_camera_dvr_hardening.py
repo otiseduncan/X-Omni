@@ -413,6 +413,12 @@ def test_hevc_playback_is_cpu_transcoded_but_h264_is_remuxed():
     assert "libx264" in hevc
     assert "libx264" in unknown
     assert not any("cuda" in value.casefold() or "nvenc" in value.casefold() for value in hevc)
+    # A full-resolution software transcode measured ~30s/segment on real
+    # hardware -- long enough to read as playback stopping. Downscaled,
+    # it measured ~5.6s; that is what actually keeps this off the GPU
+    # (already saturated by the model) while staying human-patience-fast.
+    assert "-vf" in hevc
+    assert hevc[hevc.index("-vf") + 1].startswith("scale=")
 
 
 def test_segment_probe_reads_actual_bitstream_metadata_without_decoding(

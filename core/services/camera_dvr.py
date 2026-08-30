@@ -1669,8 +1669,17 @@ class CameraDVR:
         # browser playback artifact is transcoded, on demand and on CPU.  An
         # unknown/unprobed codec must fail safe to compatible H.264, never copy
         # an accidentally HEVC stream into a browser MP4.
+        #
+        # A full-resolution (2304x1296) software encode measured ~30s per
+        # five-minute segment on this host -- long enough that a human
+        # scrubbing the DVR timeline experiences it as playback simply
+        # stopping. This is a review/scrub artifact, not the archive, so
+        # downscaling it to keep on-demand prep well under human patience
+        # (measured ~5.6s) is the right tradeoff; the GUI also pre-fetches
+        # the next segment during playback so this rarely blocks at all.
         return [
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-vf", "scale=1280:-2",
+            "-c:v", "libx264", "-preset", "superfast", "-crf", "23",
             "-pix_fmt", "yuv420p",
         ]
 
