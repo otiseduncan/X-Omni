@@ -1,13 +1,13 @@
 """Continuous browser playback over the DVR's five-minute archive segments.
 
 The recorder intentionally keeps small native MKV files for crash resilience and
-retention.  Human playback must not expose those file boundaries.  This module
+retention. Human playback must not expose those file boundaries. This module
 selects the contiguous completed run that covers an absolute timestamp, trims
 normal recorder overlap at each boundary, and feeds FFmpeg one concat manifest.
 FFmpeg emits one fragmented H.264 MP4 stream to the browser, so a single <video>
 source keeps playing until a genuine recording gap or the end of retained data.
 
-The archive is never modified and the recorder remains native stream-copy.  The
+The archive is never modified and the recorder remains native stream-copy. The
 CPU transcode exists only while a human is actively watching the standalone DVR.
 """
 from __future__ import annotations
@@ -50,12 +50,17 @@ def _select_contiguous_rows(
 ) -> list[tuple[dict[str, Any], float]]:
     """Return rows from ``start`` through the first real archive gap.
 
-    The first tuple's float is the offset into the first source.  Later values
+    The first tuple's float is the offset into the first source. Later values
     trim any overlap with the preceding source, so normal 1-2 second recorder
     overlap never appears to the operator as a rewind at a five-minute boundary.
     """
     start = start.astimezone(timezone.utc)
-    ordered = sorted(rows, key=lambda row: (_parse_utc(row.get("started_at")), int(row.get("id") or 0)))
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            _parse_utc(row.get("started_at")), int(row.get("id") or 0)
+        ),
+    )
     first_index = None
     for index, row in enumerate(ordered):
         row_start = _parse_utc(row.get("started_at"))
@@ -90,21 +95,35 @@ def _select_contiguous_rows(
 
 
 def _ffconcat_text(parts: list[PlaybackPart]) -> str:
+    """Build a concat manifest with wall-clock overlap removed from its clock.
+
+    `inpoint` alone skips duplicate packets but FFmpeg may still use the source's
+    full duration when calculating the next file timestamp. Supplying the
+    effective duration as well keeps the concatenated timeline gapless.
+    """
     lines = ["ffconcat version 1.0"]
     for part in parts:
+        started = _parse_utc(part.row.get("started_at"))
+        ended = _parse_utc(part.row.get("ended_at"))
+        effective_duration = max(
+            0.001, (ended - started).total_seconds() - part.inpoint_seconds
+        )
         lines.append(f"file '{camera_dvr_svc._ffconcat_path(part.path)}'")
         if part.inpoint_seconds > 0.001:
             lines.append(f"inpoint {part.inpoint_seconds:.3f}")
+        lines.append(f"duration {effective_duration:.3f}")
     return "\n".join(lines) + "\n"
 
 
 async def _continuous_parts(dvr, start: datetime) -> list[PlaybackPart]:
     # One throttled refresh is enough; the recorder's maintenance loop owns
-    # authoritative full-index refreshes.  Only immutable completed files are
+    # authoritative full-index refreshes. Only immutable completed files are
     # eligible for this playback stream.
     await dvr._index_segments()
     rows = await dvr.list_segments(
-        since=camera_dvr_svc._utc_iso(start - timedelta(seconds=dvr.segment_seconds)),
+        since=camera_dvr_svc._utc_iso(
+            start - timedelta(seconds=dvr.segment_seconds)
+        ),
         until=None,
         limit=MAX_STREAM_SEGMENTS,
         complete_only=True,
@@ -118,12 +137,18 @@ async def _continuous_parts(dvr, start: datetime) -> list[PlaybackPart]:
             int(row.get("bytes") or -1) != stat.st_size
             or int(row.get("source_mtime_ns") or -1) != stat.st_mtime_ns
         ):
-            raise FileNotFoundError("Continuous recording changed; retry playback.")
-        parts.append(PlaybackPart(row=row, path=path, inpoint_seconds=inpoint))
+            raise FileNotFoundError(
+                "Continuous recording changed; retry playback."
+            )
+        parts.append(
+            PlaybackPart(row=row, path=path, inpoint_seconds=inpoint)
+        )
     return parts
 
 
-async def continuous_stream(dvr, start: datetime) -> tuple[AsyncIterator[bytes], dict[str, str]]:
+async def continuous_stream(
+    dvr, start: datetime
+) -> tuple[AsyncIterator[bytes], dict[str, str]]:
     """Create one browser stream spanning every contiguous completed segment."""
     parts = await _continuous_parts(dvr, start)
     if not parts:
@@ -142,15 +167,17 @@ async def continuous_stream(dvr, start: datetime) -> tuple[AsyncIterator[bytes],
     proc = await dvr._process_factory(
         str(ffmpeg),
         "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
+        "-fflags", "+genpts",
         "-f", "concat", "-safe", "0", "-i", str(manifest),
         "-map", "0:v:0", "-an",
-        # Normalize all archive codecs to one browser-safe stream.  This is
-        # deliberately review quality; the evidentiary HEVC/H.264 MKVs stay
-        # untouched on E:.  Existing measurements show this preset comfortably
+        # Normalize all archive codecs to one browser-safe stream. This is
+        # deliberately review quality; evidentiary HEVC/H.264 MKVs stay
+        # untouched on E:. Existing measurements show this preset comfortably
         # outruns the UI's maximum playback speed on Omega.
         "-vf", "scale=1280:-2",
         "-c:v", "libx264", "-preset", "superfast", "-crf", "23",
         "-pix_fmt", "yuv420p",
+        "-avoid_negative_ts", "make_zero",
         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4", "pipe:1",
         stdout=asyncio.subprocess.PIPE,
@@ -160,7 +187,9 @@ async def continuous_stream(dvr, start: datetime) -> tuple[AsyncIterator[bytes],
     if proc.stdout is None or proc.stderr is None:
         manifest.unlink(missing_ok=True)
         await dvr._terminate_process(proc)
-        raise RuntimeError("DVR playback worker did not expose its media pipes.")
+        raise RuntimeError(
+            "DVR playback worker did not expose its media pipes."
+        )
 
     key = id(proc)
     dvr._playback_processes[key] = proc
@@ -173,12 +202,7 @@ async def continuous_stream(dvr, start: datetime) -> tuple[AsyncIterator[bytes],
                 if not chunk:
                     break
                 yield chunk
-            rc = await proc.wait()
-            if rc != 0:
-                # The HTTP stream may already contain playable bytes.  Log via
-                # the DVR's normal diagnostics path rather than fabricating a
-                # second response after headers have been sent.
-                await asyncio.sleep(0)
+            await proc.wait()
         except asyncio.CancelledError:
             await dvr._terminate_process(proc)
             raise
@@ -190,9 +214,9 @@ async def continuous_stream(dvr, start: datetime) -> tuple[AsyncIterator[bytes],
             await asyncio.gather(stderr_task, return_exceptions=True)
             manifest.unlink(missing_ok=True)
 
-    first_start = _parse_utc(parts[0].row.get("started_at")) + timedelta(
-        seconds=parts[0].inpoint_seconds
-    )
+    first_start = _parse_utc(
+        parts[0].row.get("started_at")
+    ) + timedelta(seconds=parts[0].inpoint_seconds)
     last_end = _parse_utc(parts[-1].row.get("ended_at"))
     headers = {
         "Cache-Control": "private, no-store",
@@ -206,7 +230,9 @@ async def continuous_stream(dvr, start: datetime) -> tuple[AsyncIterator[bytes],
 def create_router(require_session, dvr) -> APIRouter:
     router = APIRouter(prefix="/dvr", tags=["dvr-continuous-playback"])
 
-    async def require_owner(session: dict = Depends(require_session)) -> dict:
+    async def require_owner(
+        session: dict = Depends(require_session),
+    ) -> dict:
         if session.get("role") != "owner":
             raise HTTPException(403, "Owner authorization is required.")
         return session
@@ -225,7 +251,9 @@ def create_router(require_session, dvr) -> APIRouter:
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(503, "Continuous DVR playback could not be started.") from exc
+            raise HTTPException(
+                503, "Continuous DVR playback could not be started."
+            ) from exc
         if await request.is_disconnected():
             await iterator.aclose()
             raise HTTPException(499, "Playback request was cancelled.")
