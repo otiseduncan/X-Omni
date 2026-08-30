@@ -36,11 +36,18 @@ function cancelContinuousMediaRequest() {
 
 async function stopHistoricalPlaybackOnServer() {
   try {
-    await fetch("/dvr/api/playback/active", {
-      method: "DELETE",
-      credentials: "same-origin",
-      cache: "no-store",
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      await fetch("/dvr/api/playback/active", {
+        method: "DELETE",
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (_error) {
     // Best effort. Browser teardown plus the backend watchdog still bounds it.
   }
@@ -48,11 +55,18 @@ async function stopHistoricalPlaybackOnServer() {
 
 async function resetOrphanedLiveSession() {
   try {
-    await fetch("/dvr/api/live/reset", {
-      method: "DELETE",
-      credentials: "same-origin",
-      cache: "no-store",
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      await fetch("/dvr/api/live/reset", {
+        method: "DELETE",
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (_error) {
     // A reset failure should not hide the camera's real Start Live error.
   }
@@ -180,7 +194,11 @@ for (const eventName of ["playing", "canplay", "progress", "timeupdate", "loaded
 videoPlayer.addEventListener("error", () => {
   if (!state.player.directSource) clearContinuousStallTimer();
 });
-window.addEventListener("beforeunload", () => {
-  cancelContinuousMediaRequest();
-  void stopHistoricalPlaybackOnServer();
+
+// Do not call video.load(), fetch(), or server cleanup from beforeunload.
+// Hard refresh/navigation must remain a pure browser operation. The browser
+// closes the media connection itself; backend disconnect/watchdog cleanup is
+// intentionally independent and bounded.
+window.addEventListener("pagehide", () => {
+  clearContinuousStallTimer();
 });
