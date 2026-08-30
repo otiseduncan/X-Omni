@@ -25,15 +25,17 @@ import dataclasses
 import logging
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from .api import auth as auth_api
 from .config import Settings
 from .services import camera_dvr as camera_dvr_svc
 from .services import camera_security as camera_security_svc
+from .services import dvr_continuous_playback as continuous_playback_svc
 from .services import exterior_camera as exterior_camera_svc
 from .state.db import Store
 
@@ -127,6 +129,30 @@ def build_app(settings: Settings) -> FastAPI:
         if request.url.path.startswith(("/dvr/api/",)):
             response.headers["Cache-Control"] = "no-store"
         return response
+
+    # Continuous human playback is registered before the legacy per-segment
+    # DVR router. The archive still consists of resilient five-minute MKVs,
+    # but the operator's <video> element gets one fragmented MP4 stream that
+    # crosses those boundaries without replacing its source every five minutes.
+    app.include_router(
+        continuous_playback_svc.create_router(require_session, camera_dvr)
+    )
+
+    ui_root = Path(settings.root) / "ui" / "dvr"
+
+    @app.get("/dvr/continuous-playback.js")
+    async def dvr_continuous_js():
+        # Authentication is still enforced by the actual playback API. This
+        # static script contains no DVR data or credentials and matches the
+        # existing no-store static UI behavior.
+        path = ui_root / "continuous-playback.js"
+        if not path.is_file():
+            return JSONResponse({"detail": "DVR playback adapter is not installed."}, status_code=404)
+        return FileResponse(
+            path,
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
 
     app.include_router(
         camera_dvr_svc.create_router(
