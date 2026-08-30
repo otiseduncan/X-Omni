@@ -68,6 +68,17 @@ def test_mediamtx_startup_installer_creates_a_hidden_logon_shortcut() -> None:
     assert "-NoOpen" in startup
 
 
+def test_mediamtx_desktop_installer_creates_a_real_shortcut_with_app_icon() -> None:
+    installer = (ROOT / "scripts" / "install-mediamtx-launcher.ps1").read_text(encoding="utf-8")
+    assert "WScript.Shell" in installer
+    assert "MediaMTX.lnk" in installer
+    assert "x-omni.ico" in installer
+    assert "GetFolderPath('Desktop')" in installer
+    # Unlike the Startup entry, a double-clicked desktop icon should open
+    # MediaMTX's own status page -- no -NoOpen here.
+    assert "-NoOpen" not in installer
+
+
 def test_double_click_x_dvr_launcher_uses_bounded_windows_launcher() -> None:
     command = (ROOT / "Launch-X-DVR.cmd").read_text(encoding="utf-8")
     assert "scripts\\launch-x-dvr.ps1" in command
