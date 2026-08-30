@@ -96,6 +96,26 @@ def test_camera_frame_is_fully_decoded_and_metadata_only_artifact_is_built():
     assert url not in str(artifact)
 
 
+def test_vision_messages_accepts_a_long_system_authored_prompt():
+    # camera_prompt()'s MAX_CAMERA_PROMPT_CHARS bounds raw operator/model text
+    # at the point it is first accepted (already enforced by every call site
+    # that takes user input). vision_messages must not re-apply that same
+    # bound to its own already-finalized prompt string -- a real regression:
+    # camera_security's structured temporal-evidence instructions
+    # (_FOOTAGE_ANALYSIS_PROMPT) are System-authored and legitimately longer
+    # than any single operator request should be.
+    raw = _jpeg(40, 30)
+    frame = camera.validate_camera_frame(raw, "image/jpeg")
+    long_prompt = "Reply in exactly these lines:\n" + ("PERSON: yes, no, or uncertain\n" * 40)
+    assert len(long_prompt) > camera.MAX_CAMERA_PROMPT_CHARS
+    messages = camera.vision_messages(frame, long_prompt)
+    assert messages[1]["content"][0]["text"] == long_prompt.strip()
+
+    assert camera.vision_messages(frame, "")[1]["content"][0]["text"] == (
+        "Describe what is visible in this camera frame."
+    )
+
+
 @pytest.mark.parametrize(
     ("raw", "mime", "message"),
     [

@@ -21,6 +21,7 @@ wider than 127.0.0.1.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -48,19 +49,51 @@ def build_app(settings: Settings) -> FastAPI:
     store = Store(settings.db_path)
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
     camera_dvr = camera_security_svc.XiongmaiDVR(exterior_camera)
-    require_session = auth_api.make_require_session(settings, store)
+    # auth_api's Host/Origin checks are keyed off settings.port -- this
+    # process serves its own origin (dvr_port), not Core's, so give the
+    # shared session-cookie logic a settings view with that port swapped in.
+    # Everything else (session_secret, public_origin, auth_enabled, ...)
+    # stays identical to Core's real settings; only local-origin acceptance
+    # changes, so the same Owner cookie set by Core's login validates here.
+    dvr_auth_settings = dataclasses.replace(settings, port=settings.dvr_port)
+    require_session = auth_api.make_require_session(dvr_auth_settings, store)
+
+    async def _track_motion_health() -> None:
+        """Keep status()'s onvif_motion_events/last_motion_at honest here too.
+
+        Recording never needs this (motion_states() only touches ONVIF
+        subscription state, never E:\\XOmni-DVR -- see camera_dvr.py's module
+        docstring). This exists solely so the standalone GUI's own status
+        reads true camera-event-subscription health directly, without
+        depending on X Omni Core (which independently runs the real
+        motion-triggered capture/captioning pipeline via OnvifCameraMonitor).
+        """
+        while not camera_dvr._stopped:
+            try:
+                async for _active in camera_dvr.motion_states():
+                    if camera_dvr._stopped:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("X DVR motion-health consumer failed; retrying", exc_info=True)
+            if camera_dvr._stopped:
+                return
+            await asyncio.sleep(30)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         log.info("X DVR recording E:\\XOmni-DVR independent of X Omni Core.")
         recorder_task = asyncio.create_task(camera_dvr.run_forever())
+        motion_health_task = asyncio.create_task(_track_motion_health())
         try:
             yield
         finally:
             log.info("Shutting down X DVR recorder...")
             camera_dvr.stop()
             recorder_task.cancel()
-            await asyncio.gather(recorder_task, return_exceptions=True)
+            motion_health_task.cancel()
+            await asyncio.gather(recorder_task, motion_health_task, return_exceptions=True)
             await camera_dvr.shutdown()
             try:
                 await exterior_camera.shutdown()

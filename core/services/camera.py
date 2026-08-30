@@ -163,7 +163,17 @@ def validate_camera_frame(raw: bytes, declared_mime: str) -> CameraFrame:
 
 
 def vision_messages(frame: CameraFrame, prompt: str) -> list[dict]:
+    """Build the vision request from an already-finalized prompt string.
+
+    Length/content bounding of any user- or model-supplied text is each
+    caller's job at the point that text is first accepted (camera_prompt() is
+    called there already) -- not here. A caller may also pass a longer,
+    system-authored instruction (e.g. camera_security's structured temporal-
+    evidence prompt) that was never meant to fit a raw operator request's
+    bound.
+    """
     encoded = base64.b64encode(frame.raw).decode("ascii")
+    text = str(prompt or "").strip() or "Describe what is visible in this camera frame."
     return [
         {
             "role": "system",
@@ -177,7 +187,7 @@ def vision_messages(frame: CameraFrame, prompt: str) -> list[dict]:
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": camera_prompt(prompt)},
+                {"type": "text", "text": text},
                 {
                     "type": "image_url",
                     "image_url": {"url": f"data:{frame.mime};base64,{encoded}"},
