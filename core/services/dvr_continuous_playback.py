@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,11 +29,21 @@ from . import camera_dvr as camera_dvr_svc
 
 STREAM_CHUNK_BYTES = 256 * 1024
 MAX_STREAM_SEGMENTS = camera_dvr_svc.MAX_UI_SEGMENTS
-# Legacy filenames have no explicit session/ordinal relationship, so tolerate
-# only a small amount of close-time/index jitter before treating them as a real
-# recording break. New filenames are handled by their recorder sequence below.
 LEGACY_INDEX_JITTER_SECONDS = 10.0
 CROSS_SESSION_GAP_SECONDS = 2.0
+# Historical playback is file-backed, so a healthy FFmpeg worker should always
+# produce another fragment promptly. If it produces nothing for this long it is
+# wedged on a damaged/odd input and must not be allowed to freeze the DVR API.
+STREAM_NO_PROGRESS_SECONDS = 12.0
+
+# X DVR is currently single-owner. Keep exactly one human continuous-playback
+# FFmpeg worker per DVR process. Browser source changes are not guaranteed to
+# tear an old HTTP media request down immediately, so relying on client TCP
+# disconnect alone can leave orphan transcodes stacked up and starve status,
+# timeline, and event API calls. A new human seek owns playback and explicitly
+# retires the previous worker first.
+_ACTIVE_PLAYBACK_LOCK = asyncio.Lock()
+_ACTIVE_PLAYBACK: dict[int, Any] = {}
 
 
 @dataclass(frozen=True)
@@ -50,7 +61,6 @@ def _parse_utc(value: object) -> datetime:
 
 
 def _segment_sequence(filename: object) -> Optional[tuple[str, int]]:
-    """Return (recording-session, ordinal) for the recorder's new filenames."""
     match = camera_dvr_svc._SEGMENT_RE.fullmatch(str(filename or ""))
     if not match:
         return None
@@ -58,15 +68,6 @@ def _segment_sequence(filename: object) -> Optional[tuple[str, int]]:
 
 
 def _is_expected_successor(previous: dict[str, Any], current: dict[str, Any]) -> bool:
-    """Decide continuity from recorder identity before noisy close-time metadata.
-
-    Completed-segment ``ended_at`` may be based on filesystem close time. That
-    can be a couple seconds earlier/later than the next nominal 300-second
-    boundary even though the recorder produced consecutive files. New recorder
-    filenames encode the session and ordinal explicitly; consecutive ordinals in
-    the same session are authoritative continuity and must never be split merely
-    because mtime-derived ``ended_at`` drifted by a second or two.
-    """
     prev_seq = _segment_sequence(previous.get("filename"))
     cur_seq = _segment_sequence(current.get("filename"))
     if prev_seq and cur_seq:
@@ -74,16 +75,10 @@ def _is_expected_successor(previous: dict[str, Any], current: dict[str, Any]) ->
         cur_session, cur_ordinal = cur_seq
         if prev_session == cur_session:
             return cur_ordinal == prev_ordinal + 1
-        # A recorder restart creates a new session prefix. Preserve a genuinely
-        # continuous restart only when wall-clock coverage is effectively
-        # adjacent; otherwise the UI should stop at the real outage.
         prev_end = _parse_utc(previous.get("ended_at"))
         cur_start = _parse_utc(current.get("started_at"))
         return (cur_start - prev_end).total_seconds() <= CROSS_SESSION_GAP_SECONDS
 
-    # Legacy local-wall-clock names predate session ordinals. Their five-minute
-    # starts are reliable enough to distinguish normal close-time jitter from a
-    # true missing recording without trusting mtime to sub-second precision.
     prev_start = _parse_utc(previous.get("started_at"))
     cur_start = _parse_utc(current.get("started_at"))
     start_delta = (cur_start - prev_start).total_seconds()
@@ -102,10 +97,6 @@ def _select_contiguous_rows(
             _parse_utc(row.get("started_at")), int(row.get("id") or 0)
         ),
     )
-
-    # Boundary overlaps are normal. If two files both cover the requested
-    # instant, choose the later-started one so playback never begins in the last
-    # second of an outgoing segment.
     covering = [
         (index, row)
         for index, row in enumerate(ordered)
@@ -141,14 +132,6 @@ def _select_contiguous_rows(
 
 
 def _ffconcat_text(parts: list[PlaybackPart]) -> str:
-    """Build a concat manifest with duplicate boundary time removed.
-
-    The source files themselves carry their real packet timing. ``inpoint``
-    trims an overlap from the incoming file. Deliberately do not inject a
-    synthetic ``duration`` from the SQLite ``ended_at`` value: that value may be
-    filesystem-close time, not media duration, and was the source of false
-    1-3 second discontinuities in historical playback.
-    """
     lines = ["ffconcat version 1.0"]
     for part in parts:
         lines.append(f"file '{camera_dvr_svc._ffconcat_path(part.path)}'")
@@ -176,19 +159,32 @@ async def _continuous_parts(dvr, start: datetime) -> list[PlaybackPart]:
             int(row.get("bytes") or -1) != stat.st_size
             or int(row.get("source_mtime_ns") or -1) != stat.st_mtime_ns
         ):
-            raise FileNotFoundError(
-                "Continuous recording changed; retry playback."
-            )
-        parts.append(
-            PlaybackPart(row=row, path=path, inpoint_seconds=inpoint)
-        )
+            raise FileNotFoundError("Continuous recording changed; retry playback.")
+        parts.append(PlaybackPart(row=row, path=path, inpoint_seconds=inpoint))
     return parts
+
+
+async def _claim_active_playback(dvr, proc: Any) -> None:
+    """Make ``proc`` the sole human playback worker for this DVR process."""
+    key = id(dvr)
+    async with _ACTIVE_PLAYBACK_LOCK:
+        previous = _ACTIVE_PLAYBACK.get(key)
+        if previous is not None and previous is not proc and getattr(previous, "returncode", None) is None:
+            await dvr._terminate_process(previous)
+        _ACTIVE_PLAYBACK[key] = proc
+
+
+async def _release_active_playback(dvr, proc: Any) -> None:
+    key = id(dvr)
+    async with _ACTIVE_PLAYBACK_LOCK:
+        if _ACTIVE_PLAYBACK.get(key) is proc:
+            _ACTIVE_PLAYBACK.pop(key, None)
 
 
 async def continuous_stream(
     dvr, start: datetime
 ) -> tuple[AsyncIterator[bytes], dict[str, str]]:
-    """Create one browser stream spanning every contiguous completed segment."""
+    """Create one bounded, cancellable browser stream over contiguous footage."""
     parts = await _continuous_parts(dvr, start)
     if not parts:
         raise FileNotFoundError("No completed recording covers that time.")
@@ -222,36 +218,52 @@ async def continuous_stream(
     if proc.stdout is None or proc.stderr is None:
         manifest.unlink(missing_ok=True)
         await dvr._terminate_process(proc)
-        raise RuntimeError(
-            "DVR playback worker did not expose its media pipes."
-        )
+        raise RuntimeError("DVR playback worker did not expose its media pipes.")
 
+    await _claim_active_playback(dvr, proc)
     key = id(proc)
     dvr._playback_processes[key] = proc
     stderr_task = asyncio.create_task(dvr._drain_stderr(proc.stderr))
 
     async def iterator() -> AsyncIterator[bytes]:
+        last_progress = time.monotonic()
         try:
             while True:
-                chunk = await proc.stdout.read(STREAM_CHUNK_BYTES)
+                try:
+                    chunk = await asyncio.wait_for(
+                        proc.stdout.read(STREAM_CHUNK_BYTES),
+                        timeout=STREAM_NO_PROGRESS_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # A file-backed historical transcode should never sit this
+                    # long without producing bytes. Kill only the playback
+                    # worker; the recorder is a completely different process.
+                    await dvr._terminate_process(proc)
+                    break
                 if not chunk:
                     break
+                last_progress = time.monotonic()
                 yield chunk
-            await proc.wait()
-        except asyncio.CancelledError:
+            if getattr(proc, "returncode", None) is None:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    await dvr._terminate_process(proc)
+        except (asyncio.CancelledError, GeneratorExit):
             await dvr._terminate_process(proc)
             raise
         finally:
             if getattr(proc, "returncode", None) is None:
                 await dvr._terminate_process(proc)
+            await _release_active_playback(dvr, proc)
             dvr._playback_processes.pop(key, None)
             stderr_task.cancel()
             await asyncio.gather(stderr_task, return_exceptions=True)
             manifest.unlink(missing_ok=True)
 
-    first_start = _parse_utc(
-        parts[0].row.get("started_at")
-    ) + timedelta(seconds=parts[0].inpoint_seconds)
+    first_start = _parse_utc(parts[0].row.get("started_at")) + timedelta(
+        seconds=parts[0].inpoint_seconds
+    )
     last_end = _parse_utc(parts[-1].row.get("ended_at"))
     headers = {
         "Cache-Control": "private, no-store",
@@ -265,9 +277,7 @@ async def continuous_stream(
 def create_router(require_session, dvr) -> APIRouter:
     router = APIRouter(prefix="/dvr", tags=["dvr-continuous-playback"])
 
-    async def require_owner(
-        session: dict = Depends(require_session),
-    ) -> dict:
+    async def require_owner(session: dict = Depends(require_session)) -> dict:
         if session.get("role") != "owner":
             raise HTTPException(403, "Owner authorization is required.")
         return session
@@ -286,16 +296,10 @@ def create_router(require_session, dvr) -> APIRouter:
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(
-                503, "Continuous DVR playback could not be started."
-            ) from exc
+            raise HTTPException(503, "Continuous DVR playback could not be started.") from exc
         if await request.is_disconnected():
             await iterator.aclose()
             raise HTTPException(499, "Playback request was cancelled.")
-        return StreamingResponse(
-            iterator,
-            media_type="video/mp4",
-            headers=headers,
-        )
+        return StreamingResponse(iterator, media_type="video/mp4", headers=headers)
 
     return router
