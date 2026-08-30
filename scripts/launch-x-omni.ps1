@@ -266,10 +266,11 @@ try {
     if ($owner) {
         Stop-VerifiedCore -Port $corePort
     }
-    # X DVR (core/dvr_service.py) owns continuous recording as its own
-    # independent process now and is launched/managed separately by
-    # launch-x-dvr.ps1 -- restarting Core must never stop it. See
-    # install-x-dvr-startup.ps1 for how it starts automatically at logon.
+    # Continuous recording is owned by MediaMTX (an independently-managed
+    # process outside this repo, started by launch-mediamtx.ps1) and the
+    # standalone DVR GUI is its own service (core/dvr_service.py, launched
+    # separately) -- restarting Core must never stop either one. See
+    # install-mediamtx-startup.ps1 for how MediaMTX starts at logon.
 
     Invoke-UiRebuild
 

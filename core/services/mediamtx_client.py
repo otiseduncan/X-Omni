@@ -115,6 +115,7 @@ class MediaMTXClient:
         hls_base_url: str = "http://127.0.0.1:8888",
         webrtc_base_url: str = "http://127.0.0.1:8889",
         rtsp_base_url: str = "rtsp://127.0.0.1:8554",
+        transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         self.control_base_url = _require_loopback(control_base_url, label="MediaMTX control API")
         self.playback_base_url = _require_loopback(playback_base_url, label="MediaMTX playback API")
@@ -124,6 +125,9 @@ class MediaMTXClient:
         self.hls_base_url = _require_loopback(hls_base_url, label="MediaMTX HLS")
         self.webrtc_base_url = _require_loopback(webrtc_base_url, label="MediaMTX WebRTC")
         self.rtsp_base_url = rtsp_base_url.rstrip("/")
+        # None in production (a real loopback connection); tests pass a
+        # MockTransport to exercise this adapter without a socket.
+        self._transport = transport
 
     # ---------- URL builders (no network I/O) ----------
 
@@ -140,7 +144,7 @@ class MediaMTXClient:
 
     async def health(self) -> dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=_HEALTH_TIMEOUT_SECONDS, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=_HEALTH_TIMEOUT_SECONDS, trust_env=False, transport=self._transport) as client:
                 response = await client.get(f"{self.control_base_url}/v3/info")
         except httpx.HTTPError as exc:
             raise MediaMTXUnavailable("MediaMTX control API is unreachable.") from exc
@@ -154,7 +158,7 @@ class MediaMTXClient:
     async def path_status(self, path: str) -> Optional[dict[str, Any]]:
         """Return MediaMTX's status for one path, or None if it has no source."""
         try:
-            async with httpx.AsyncClient(timeout=_STATUS_TIMEOUT_SECONDS, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=_STATUS_TIMEOUT_SECONDS, trust_env=False, transport=self._transport) as client:
                 response = await client.get(f"{self.control_base_url}/v3/paths/get/{path}")
         except httpx.HTTPError as exc:
             raise MediaMTXUnavailable("MediaMTX control API is unreachable.") from exc
@@ -186,7 +190,7 @@ class MediaMTXClient:
             raise MediaMTXInvalidRequest("until must be after since.")
         params = {"path": path, "start": self._iso(since), "end": self._iso(until)}
         try:
-            async with httpx.AsyncClient(timeout=_LIST_TIMEOUT_SECONDS, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=_LIST_TIMEOUT_SECONDS, trust_env=False, transport=self._transport) as client:
                 response = await client.get(f"{self.playback_base_url}/list", params=params)
         except httpx.HTTPError as exc:
             raise MediaMTXUnavailable("MediaMTX playback API is unreachable.") from exc
@@ -242,7 +246,7 @@ class MediaMTXClient:
             "duration": f"{duration_seconds:.3f}", "format": container,
         }
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False, transport=self._transport) as client:
                 response = await client.get(f"{self.playback_base_url}/get", params=params)
         except httpx.TimeoutException as exc:
             raise MediaMTXUnavailable("MediaMTX clip retrieval timed out.") from exc

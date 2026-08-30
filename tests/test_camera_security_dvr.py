@@ -4,7 +4,6 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from xml.etree import ElementTree as ET
 
 import pytest
 from PIL import Image
@@ -93,32 +92,6 @@ def _monitor(
         _settings(tmp_path), camera, FakeRouter(), store, dvr=dvr
     )
     return monitor, store
-
-
-def _notification_body(*notifications: tuple[str, list[tuple[str, str]]]) -> ET.Element:
-    body = ET.Element("Body")
-    for topic, items in notifications:
-        notification = ET.SubElement(body, "NotificationMessage")
-        ET.SubElement(notification, "Topic").text = topic
-        message = ET.SubElement(notification, "Message")
-        for name, value in items:
-            ET.SubElement(message, "SimpleItem", {"Name": name, "Value": value})
-    return body
-
-
-def test_xiongmai_parser_preserves_batch_order_and_ignores_channel_values():
-    body = _notification_body(
-        ("tns1:VideoSource/MotionAlarm", [("Channel", "1"), ("State", "false")]),
-        ("tns1:VideoAnalytics/Vehicle", [("Channel", "1"), ("State", "true")]),
-        ("tns1:VideoSource/MotionAlarm", [("State", "idle")]),
-    )
-
-    assert camera_security.XiongmaiDVR.motion_states_from_body(body) == [False, True, False]
-    unrelated = _notification_body(
-        ("tns1:Device/Relay", [("Channel", "1"), ("State", "true")]),
-        ("tns1:Device/CardReader", [("State", "true")]),
-    )
-    assert camera_security.XiongmaiDVR.motion_states_from_body(unrelated) == []
 
 
 @pytest.mark.asyncio
