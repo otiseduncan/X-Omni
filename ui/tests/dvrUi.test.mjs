@@ -45,6 +45,42 @@ async function liveSessionValidator() {
   return sandbox.safeLiveSession;
 }
 
+async function segmentResolver() {
+  const source = await dvrSource("app.js");
+  const start = source.indexOf("function findSegmentForTime");
+  const end = source.indexOf("\n}\n\nfunction nextSegmentAfter", start);
+  assert.ok(start >= 0 && end > start, "segment resolver must remain independently testable");
+  const sandbox = { state: { segments: [] } };
+  vm.runInNewContext(source.slice(start, end + 2), sandbox, { filename: "dvr-segment-resolver.js" });
+  return sandbox;
+}
+
+test("an overlapping segment boundary resolves forward, not back into the segment already playing", async () => {
+  // Real archive data: consecutive segments can overlap by about a second
+  // (the outgoing segment's real close time vs. the next one's start).
+  // Picking the earlier segment at that exact instant re-seeks near the end
+  // of the segment already loaded -- which never fires loadedmetadata or
+  // error, so the auto-advance guard never clears. This reproduced an
+  // exact, deterministic freeze at that timestamp on real hardware.
+  const sandbox = await segmentResolver();
+  const outgoing = {
+    id: 379, complete: true,
+    startedAt: new Date("2026-08-30T06:42:57Z"), endedAt: new Date("2026-08-30T06:47:58Z"),
+  };
+  const incoming = {
+    id: 389, complete: true,
+    startedAt: new Date("2026-08-30T06:47:57Z"), endedAt: new Date("2026-08-30T06:52:59Z"),
+  };
+  sandbox.state.segments = [outgoing, incoming];
+
+  const resolved = sandbox.findSegmentForTime(incoming.startedAt);
+  assert.equal(resolved.id, incoming.id);
+
+  // Ordinary (non-overlapping) lookups are unaffected.
+  assert.equal(sandbox.findSegmentForTime(new Date("2026-08-30T06:44:00Z")).id, outgoing.id);
+  assert.equal(sandbox.findSegmentForTime(new Date("2026-08-30T06:50:00Z")).id, incoming.id);
+});
+
 test("DVR media URLs are same-origin and constrained to owned route families", async () => {
   const validate = await mediaUrlValidator();
   const snapshots = ["/api/camera-snapshots/"];

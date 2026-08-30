@@ -428,8 +428,16 @@ function currentAbsoluteTime() {
 
 function findSegmentForTime(target) {
   const playable = state.segments.filter((row) => row.complete).sort((a, b) => a.startedAt - b.startedAt);
-  const covering = playable.find((row) => target >= row.startedAt && target < row.endedAt);
-  if (covering) return covering;
+  const covering = playable.filter((row) => target >= row.startedAt && target < row.endedAt);
+  if (covering.length) {
+    // Consecutive archive segments can overlap by about a second at their
+    // boundary (the outgoing segment's real close time vs. the next one's
+    // start). Picking the earlier one there re-seeks near the end of the
+    // segment already loaded instead of advancing -- since that never
+    // triggers a new load, neither loadedmetadata nor error ever fires,
+    // which was a real, exactly-reproducible freeze at that timestamp.
+    return covering.reduce((latest, row) => (row.startedAt > latest.startedAt ? row : latest));
+  }
   const after = playable.filter((row) => row.startedAt > target).sort((a, b) => a.startedAt - b.startedAt)[0];
   if (after) return after;
   return playable[playable.length - 1] || null;
