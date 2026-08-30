@@ -42,9 +42,19 @@ async function stopHistoricalPlaybackOnServer() {
       cache: "no-store",
     });
   } catch (_error) {
-    // Browser teardown still closes the HTTP response. The backend also has a
-    // no-progress watchdog, so a failed best-effort control request must never
-    // prevent the operator from attempting Live View.
+    // Best effort. Browser teardown plus the backend watchdog still bounds it.
+  }
+}
+
+async function resetOrphanedLiveSession() {
+  try {
+    await fetch("/dvr/api/live/reset", {
+      method: "DELETE",
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } catch (_error) {
+    // A reset failure should not hide the camera's real Start Live error.
   }
 }
 
@@ -103,9 +113,6 @@ async function continuousSeekAbsolute(target, { autoplay = true } = {}) {
   setPlayerEmpty(null);
   playerLoading.hidden = true;
 
-  // Do not stack historical transcodes while scrubbing. Shut the browser side
-  // immediately; the new backend playback request itself also supersedes any
-  // older server worker through the single-owner playback guard.
   cancelContinuousMediaRequest();
 
   state.player.directSource = false;
@@ -135,8 +142,6 @@ advanceToNextSegment = function continuousAdvanceBookkeeping(_segment, currentAb
 
 prefetchSegment = function continuousPrefetchNoop() {};
 
-// setMode's Live tab is an immediate media-lifecycle boundary. The base UI only
-// paused the hidden <video>, which left its HTTP/FFmpeg playback request alive.
 const baseSetMode = setMode;
 setMode = function isolatedDvrMode(mode) {
   if (mode === "live" && !state.player.directSource) {
@@ -147,9 +152,9 @@ setMode = function isolatedDvrMode(mode) {
   return baseSetMode(mode);
 };
 
-// app.js registered the original startLiveWatch function object directly as
-// the button listener before this adapter loaded. Remove that exact reference
-// and replace it with a guarded start that waits for archive playback teardown.
+// app.js registered this function object directly before the adapter loaded.
+// Replace that exact listener so Start Live always begins from a clean server
+// state: no archive playback worker and no orphaned camera session.
 const baseStartLiveWatch = startLiveWatch;
 const startLiveButton = $("#startLiveButton");
 startLiveButton.removeEventListener("click", baseStartLiveWatch);
@@ -157,6 +162,7 @@ async function startLiveAfterPlaybackStops() {
   cancelContinuousMediaRequest();
   resetHistoricalPlayerState();
   await stopHistoricalPlaybackOnServer();
+  await resetOrphanedLiveSession();
   return baseStartLiveWatch();
 }
 startLiveButton.addEventListener("click", startLiveAfterPlaybackStops);
