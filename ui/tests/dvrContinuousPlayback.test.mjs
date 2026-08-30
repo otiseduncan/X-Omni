@@ -70,3 +70,10 @@ test("Live View clears an orphaned server camera session before a fresh start", 
   assert.match(js, /\/dvr\/api\/live\/reset/);
   assert.match(js, /await resetOrphanedLiveSession\(\)[\s\S]*return baseStartLiveWatch\(\)/);
 });
+
+test("hard refresh never runs media load or cleanup fetch from beforeunload", async () => {
+  const js = await source("continuous-playback.js");
+  assert.doesNotMatch(js, /addEventListener\("beforeunload"/);
+  assert.match(js, /addEventListener\("pagehide"/);
+  assert.match(js, /AbortController/);
+});
