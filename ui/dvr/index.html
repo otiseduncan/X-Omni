@@ -59,7 +59,7 @@
       <div id="playbackStage" class="player-stage">
         <video id="videoPlayer" playsinline preload="metadata"></video>
         <div id="playerEmpty" class="player-empty">Pick a time on the timeline, or a recording, event, or clip below.</div>
-        <div id="playerLoading" class="player-loading" role="status" aria-live="polite" hidden>Loading next recording…</div>
+        <div id="playerLoading" class="player-loading" role="status" aria-live="polite" hidden>Loading recording…</div>
       </div>
       <div id="playerControls" class="player-controls">
         <button id="playPauseButton" class="icon-btn" type="button" aria-label="Play">▶</button>
@@ -163,6 +163,10 @@
     <img id="imageViewer" alt="Camera snapshot" />
   </dialog>
 
-  <script type="module" src="/dvr/app.js"></script>
+  <!-- app.js has no module imports/exports. Loading it as a classic script
+       lets the narrowly-scoped continuous playback adapter reuse the existing
+       UI state/functions without copying or forking the rest of the DVR GUI. -->
+  <script src="/dvr/app.js"></script>
+  <script src="/dvr/continuous-playback.js"></script>
 </body>
 </html>
