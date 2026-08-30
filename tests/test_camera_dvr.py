@@ -109,5 +109,8 @@ def test_camera_media_tools_precede_broad_history_in_model_catalog():
     ]["description"]
     assert "show me the DVR" in history_description
     assert "present that link" in history_description
+    footage = camera_security.SECURITY_TOOL_SCHEMAS["camera_footage"]
+    assert "temporal action" in footage["description"]
+    assert footage["parameters"]["properties"]["analysis"]["type"] == "boolean"
     assert "camera_event_history" not in tool_registry.TEST_USER_TOOLS
     assert "camera_footage" not in tool_registry.TEST_USER_TOOLS

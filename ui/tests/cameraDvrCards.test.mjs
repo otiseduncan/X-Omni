@@ -68,3 +68,19 @@ test("camera history exposes only the server-declared standalone DVR handoff", a
   assert.equal(cards.match(/Open standalone DVR/g)?.length, 2);
   assert.match(styles, /\.camera-dvr-link \{[^}]*text-decoration: none/);
 });
+
+test("temporal DVR analysis card preserves observed versus unresolved evidence", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/Cards.jsx", import.meta.url),
+    "utf8",
+  );
+  const start = cards.indexOf("function CameraFootageAnalysisCard");
+  const end = cards.indexOf("\n}\n\nfunction ImageGenerationStatusCard", start);
+  assert.ok(start >= 0 && end > start, "temporal DVR analysis card must be present");
+  const card = cards.slice(start, end + 2);
+  assert.match(cards, /camera_footage_analysis:\s*CameraFootageAnalysisCard/);
+  assert.match(card, /vehicle_movement_observation === "observed"/);
+  assert.match(card, /not observed in sampled frames/);
+  assert.match(card, /No absence-of-action conclusion is drawn from insufficient DVR samples/);
+  assert.match(card, /<video[\s\S]*?src=\{data\.clip_url\}[\s\S]*?controls[\s\S]*?playsInline/);
+});

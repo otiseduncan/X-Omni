@@ -8,7 +8,6 @@ $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $startScript = Join-Path $PSScriptRoot 'start.ps1'
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
 $logDirectory = Join-Path $root 'logs\launcher'
-$dvrRecordingsRoot = [IO.Path]::GetFullPath('E:\XOmni-DVR\recordings')
 $localOrigin = 'http://127.0.0.1'
 $mutex = New-Object System.Threading.Mutex($false, 'Local\XOmniWindowsLauncher')
 $hasMutex = $false
@@ -74,192 +73,6 @@ function Test-XOmniCoreProcess {
         $commandLine.IndexOf($expectedPython, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
         $commandLine -match '(?i)(?:^|\s)-m\s+core\.main(?:\s|$)'
     )
-}
-
-function ConvertFrom-WindowsCommandLine {
-    param([Parameter(Mandatory)][string]$CommandLine)
-
-    try {
-        if (-not ('XOmniLauncher.NativeCommandLine' -as [type])) {
-            Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-namespace XOmniLauncher {
-    public static class NativeCommandLine {
-        [DllImport("shell32.dll", SetLastError = true)]
-        public static extern IntPtr CommandLineToArgvW(
-            [MarshalAs(UnmanagedType.LPWStr)] string commandLine,
-            out int argumentCount
-        );
-
-        [DllImport("kernel32.dll")]
-        public static extern IntPtr LocalFree(IntPtr memory);
-    }
-}
-'@ -ErrorAction Stop
-        }
-
-        $argumentCount = 0
-        $argumentVector = [XOmniLauncher.NativeCommandLine]::CommandLineToArgvW(
-            $CommandLine,
-            [ref]$argumentCount
-        )
-        if ($argumentVector -eq [IntPtr]::Zero -or $argumentCount -lt 1) {
-            return $null
-        }
-        try {
-            $arguments = @()
-            for ($index = 0; $index -lt $argumentCount; $index++) {
-                $slot = [IntPtr]::Add($argumentVector, $index * [IntPtr]::Size)
-                $value = [Runtime.InteropServices.Marshal]::ReadIntPtr($slot)
-                $arguments += [Runtime.InteropServices.Marshal]::PtrToStringUni($value)
-            }
-            return ,$arguments
-        } finally {
-            [void][XOmniLauncher.NativeCommandLine]::LocalFree($argumentVector)
-        }
-    } catch {
-        return $null
-    }
-}
-
-function Test-XOmniDvrRecorderArguments {
-    param(
-        [Parameter(Mandatory)][string]$ExecutablePath,
-        [Parameter(Mandatory)][string[]]$Arguments
-    )
-
-    try {
-        $actualExecutable = [IO.Path]::GetFullPath($ExecutablePath)
-        if ([IO.Path]::GetFileName($actualExecutable) -ine 'ffmpeg.exe') {
-            return $false
-        }
-        if (-not $Arguments -or $Arguments.Count -lt 2) {
-            return $false
-        }
-        $argvExecutable = [IO.Path]::GetFullPath([string]$Arguments[0])
-        if (-not [string]::Equals(
-            $actualExecutable,
-            $argvExecutable,
-            [StringComparison]::OrdinalIgnoreCase
-        )) {
-            return $false
-        }
-
-        # This is the complete, credential-free argv emitted by
-        # CameraDVR._record_args(). Any extra, missing, reordered, or changed
-        # argument means the process is not ours and must be left untouched.
-        $expected = @(
-            '-hide_banner',
-            '-loglevel', 'error',
-            '-f', 'concat',
-            '-safe', '0',
-            '-protocol_whitelist', 'file,pipe,tcp,rtsp',
-            '-i', 'pipe:0',
-            '-map', '0:v:0',
-            '-an',
-            '-c:v', 'copy',
-            '-f', 'segment',
-            '-segment_format', 'matroska',
-            '-segment_time', '300',
-            '-reset_timestamps', '1'
-        )
-        if ($Arguments.Count -ne ($expected.Count + 2)) {
-            return $false
-        }
-        for ($index = 0; $index -lt $expected.Count; $index++) {
-            if (-not [string]::Equals(
-                [string]$Arguments[$index + 1],
-                [string]$expected[$index],
-                [StringComparison]::Ordinal
-            )) {
-                return $false
-            }
-        }
-
-        $output = [IO.Path]::GetFullPath([string]$Arguments[$Arguments.Count - 1])
-        $outputDirectory = [IO.Path]::GetDirectoryName($output)
-        $outputName = [IO.Path]::GetFileName($output)
-        if (-not [string]::Equals(
-            $outputDirectory,
-            $script:dvrRecordingsRoot,
-            [StringComparison]::OrdinalIgnoreCase
-        )) {
-            return $false
-        }
-        return $outputName -match '^[0-9]{8}T[0-9]{12}Z-%06d[.]mkv$'
-    } catch {
-        return $false
-    }
-}
-
-function Test-XOmniDvrRecorderProcess {
-    param([AllowNull()]$Process)
-
-    if (-not $Process -or $Process.Name -ine 'ffmpeg.exe') {
-        return $false
-    }
-    $executablePath = [string]$Process.ExecutablePath
-    $commandLine = [string]$Process.CommandLine
-    if (-not $executablePath -or -not $commandLine) {
-        return $false
-    }
-    $arguments = ConvertFrom-WindowsCommandLine -CommandLine $commandLine
-    if (-not $arguments) {
-        return $false
-    }
-    return Test-XOmniDvrRecorderArguments `
-        -ExecutablePath $executablePath `
-        -Arguments $arguments
-}
-
-function Stop-VerifiedDvrRecorders {
-    # Name narrows discovery only. Every stop is by PID after executable and
-    # complete argv verification; preview, playback, and foreign FFmpeg jobs
-    # deliberately fail Test-XOmniDvrRecorderProcess and remain untouched.
-    $candidates = @(
-        Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" -ErrorAction SilentlyContinue
-    )
-    foreach ($candidate in $candidates) {
-        if (-not (Test-XOmniDvrRecorderProcess -Process $candidate)) {
-            continue
-        }
-        $processId = [int]$candidate.ProcessId
-        # Re-read immediately before the destructive action so PID reuse or a
-        # process exit cannot turn the earlier verification into authority.
-        $current = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
-        if (-not (Test-XOmniDvrRecorderProcess -Process $current)) {
-            continue
-        }
-
-        Write-LauncherLog "Stopping exact X Omni DVR recorder PID $processId before Core restart."
-        try {
-            Stop-Process -Id $processId -Force -ErrorAction Stop
-        } catch {
-            $remaining = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
-            if ($remaining) {
-                throw "Verified X Omni DVR recorder PID $processId could not be stopped."
-            }
-            continue
-        }
-        # Windows PowerShell 5.1 lacks a bounded process-wait parameter. Poll CIM so the
-        # normal desktop shortcut waits for the verified recorder to disappear
-        # instead of treating an unsupported parameter as an immediate timeout.
-        $exited = $false
-        $deadline = [DateTime]::UtcNow.AddSeconds(15)
-        do {
-            $remaining = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
-            if (-not $remaining -or -not (Test-XOmniDvrRecorderProcess -Process $remaining)) {
-                $exited = $true
-                break
-            }
-            Start-Sleep -Milliseconds 100
-        } while ([DateTime]::UtcNow -lt $deadline)
-        if (-not $exited) {
-            throw "Verified X Omni DVR recorder PID $processId did not exit."
-        }
-    }
 }
 
 function Get-CoreHealth {
@@ -453,7 +266,10 @@ try {
     if ($owner) {
         Stop-VerifiedCore -Port $corePort
     }
-    Stop-VerifiedDvrRecorders
+    # X DVR (core/dvr_service.py) owns continuous recording as its own
+    # independent process now and is launched/managed separately by
+    # launch-x-dvr.ps1 -- restarting Core must never stop it. See
+    # install-x-dvr-startup.ps1 for how it starts automatically at logon.
 
     Invoke-UiRebuild
 

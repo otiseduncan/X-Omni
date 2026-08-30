@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import auth as auth_api
@@ -32,7 +34,7 @@ from .services import adas_si as adas_si_svc
 from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
 from .services import camera as camera_svc
-from .services import camera_dvr as camera_dvr_svc
+from .services import camera_dvr_client as camera_dvr_client_svc
 from .services import camera_monitoring as camera_monitoring_svc
 from .services import camera_security as camera_security_svc
 from .services import calendar as calendar_svc
@@ -102,9 +104,20 @@ def build_app(settings: Settings) -> FastAPI:
         profile=getattr(settings, "tool_profile", None),
     )
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
+    # Continuous recording, E:\XOmni-DVR, and retention are owned by the
+    # independent X DVR service (core/dvr_service.py) now -- it keeps
+    # recording across a Core restart, a model swap, or the DVR GUI closing.
+    # This CameraDVR instance never touches E: or runs its recorder loop; it
+    # exists only so OnvifCameraMonitor can read the camera's own ONVIF
+    # motion-subscription state (motion_states()/events_healthy), which is
+    # independent of the recorder. dvr_client is Core's actual client for
+    # DVR playback/analysis, reached over its bounded HTTP API.
     camera_dvr = camera_security_svc.XiongmaiDVR(exterior_camera)
     camera_monitor = camera_security_svc.OnvifCameraMonitor(
         settings, exterior_camera, router, store, dvr=camera_dvr
+    )
+    dvr_client = camera_dvr_client_svc.DVRServiceClient(
+        settings.dvr_local_origin, settings.internal_dvr_token
     )
     image_config = None
     image_generation = None
@@ -285,17 +298,22 @@ def build_app(settings: Settings) -> FastAPI:
 
     registry.register(
         "camera_event_history",
-        lambda a: camera_security_svc.camera_event_history(store, a, dvr=camera_dvr),
+        lambda a: camera_security_svc.camera_event_history(store, a, dvr=dvr_client),
     )
     registry.register(
         "camera_snapshot_analyze",
         lambda a: camera_monitoring_svc.camera_snapshot_analyze(store, router, settings, a),
     )
+    async def camera_footage_handler(args: dict) -> dict:
+        if args.get("analysis") is True:
+            return await camera_security_svc.camera_footage_analyze(store, router, args, dvr=dvr_client)
+        return await camera_security_svc.camera_motion_clip(
+            store, settings, exterior_camera.ffmpeg_path, args, dvr=dvr_client
+        )
+
     registry.register(
         "camera_footage",
-        lambda a: camera_security_svc.camera_motion_clip(
-            store, settings, exterior_camera.ffmpeg_path, a, dvr=camera_dvr
-        ),
+        camera_footage_handler,
     )
 
     @asynccontextmanager
@@ -329,21 +347,18 @@ def build_app(settings: Settings) -> FastAPI:
             # which beats an opaque crash at startup.
             log.error("Could not start default worker: %s", exc)
             store.audit("worker_start_failed", {"error": str(exc)})
-        dvr_task = asyncio.create_task(camera_dvr.run_forever())
         monitor_task = asyncio.create_task(camera_monitor.run_forever())
         try:
             yield
         finally:
             log.info(
-                "Shutting down; stopping DVR, camera monitor, camera, and model workers..."
+                "Shutting down; stopping camera monitor, camera, and model workers... "
+                "(the X DVR recording service is independent and keeps running)"
             )
             try:
                 camera_monitor.stop()
-                camera_dvr.stop()
                 monitor_task.cancel()
-                dvr_task.cancel()
-                await asyncio.gather(monitor_task, dvr_task, return_exceptions=True)
-                await camera_dvr.shutdown()
+                await asyncio.gather(monitor_task, return_exceptions=True)
             finally:
                 try:
                     await exterior_camera.shutdown()
@@ -411,9 +426,71 @@ def build_app(settings: Settings) -> FastAPI:
 
     require_session = auth_api.make_require_session(settings, store)
     app.include_router(auth_api.create_router(settings, store))
-    app.include_router(
-        camera_dvr_svc.create_router(settings, store, require_session, camera_dvr)
-    )
+
+    _dvr_clip_name_re = re.compile(r"^[A-Za-z0-9_.-]{1,160}\.mp4$")
+    _dvr_proxy_forward_headers = {"content-type", "content-length", "content-range", "accept-ranges"}
+
+    @app.get("/dvr/api/clips/{filename}")
+    async def dvr_clip_proxy(
+        filename: str, request: Request, _session: dict = Depends(require_session)
+    ):
+        # Chat camera cards render clip_url values the DVR service issued
+        # (e.g. "/dvr/api/clips/range-....mp4"); this is the one DVR-service
+        # path chat needs, proxied (with Range support, for in-card scrubbing)
+        # so those relative URLs keep resolving against Core's own origin
+        # without loosening CSP media-src/connect-src to a second origin. The
+        # standalone DVR GUI talks to the DVR service directly, not this route.
+        if not _dvr_clip_name_re.fullmatch(filename):
+            raise HTTPException(404, "Clip not found.")
+        forward_headers = {"X-XOmni-Internal-Token": settings.internal_dvr_token}
+        range_header = request.headers.get("range")
+        if range_header:
+            forward_headers["Range"] = range_header
+        client = httpx.AsyncClient(
+            base_url=settings.dvr_local_origin, timeout=30.0, trust_env=False,
+        )
+        try:
+            upstream_request = client.build_request(
+                "GET", f"/dvr/api/clips/{filename}", headers=forward_headers
+            )
+            upstream = await client.send(upstream_request, stream=True)
+        except httpx.HTTPError:
+            await client.aclose()
+            raise HTTPException(503, "The DVR service is unreachable.") from None
+        if upstream.status_code not in (200, 206):
+            await upstream.aclose()
+            await client.aclose()
+            raise HTTPException(404 if upstream.status_code == 404 else 503, "Clip not found.")
+
+        async def body():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        headers = {
+            key: value
+            for key, value in upstream.headers.items()
+            if key.lower() in _dvr_proxy_forward_headers
+        }
+        headers["Content-Disposition"] = f'inline; filename="{filename}"'
+        headers["Cache-Control"] = "private, no-store"
+        return StreamingResponse(body(), status_code=upstream.status_code, headers=headers)
+
+    @app.get("/dvr")
+    @app.get("/dvr/{rest:path}")
+    async def dvr_gui_redirect(rest: str = ""):
+        # The standalone DVR GUI moved to its own independent service/origin
+        # (X DVR); this only forgives an old bookmark or habit of opening it
+        # through Core. /dvr/api/... is handled above (clip proxy) or by
+        # dvr_clip_proxy's 404 -- never silently redirected.
+        if rest.startswith("api/") or rest == "api":
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+        target = f"{settings.dvr_local_origin}/dvr/{rest}".rstrip("/")
+        return RedirectResponse(url=target)
+
     app.include_router(
         core_routes.create_router(
             settings,

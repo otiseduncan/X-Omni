@@ -164,7 +164,10 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     # Separating sections adds four newline characters; conservative integer
     # rounding can move the combined estimate by a token.
     assert abs(metrics["fixed_prompt"]["tokens"] - summed_sections) <= 2
-    assert metrics["remaining_normal_turn_tokens"] >= 15_200
+    # The camera_footage system-prompt guidance grew to require analysis:
+    # true for temporal/action questions (see camera_dvr.footage_analysis_
+    # samples); this floor moved down with it, not toward zero headroom.
+    assert metrics["remaining_normal_turn_tokens"] >= 15_150
 
 
 def test_budget_metrics_match_actual_generated_system_prompt() -> None:

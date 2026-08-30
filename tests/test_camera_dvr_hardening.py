@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import sqlite3
 import threading
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from core.services import camera_dvr
 from core.services import camera_security
@@ -102,6 +104,103 @@ async def test_range_playback_is_bounded_before_archive_or_scratch_access(tmp_pa
             start,
             start + timedelta(minutes=31),
             cache_name="range-too-large",
+        )
+
+    assert not dvr.playback_dir.exists()
+
+
+def _jpeg_bytes() -> bytes:
+    # A compact fully-decodable JPEG fixture without involving a camera or FFmpeg.
+    encoded = io.BytesIO()
+    Image.new("RGB", (8, 8), "black").save(encoded, format="JPEG")
+    return encoded.getvalue()
+
+
+class _PlaybackReader:
+    async def read(self, _size):
+        return b""
+
+
+class _CompletedPlaybackProcess:
+    def __init__(self):
+        self.stderr = _PlaybackReader()
+        self.returncode = 0
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_footage_analysis_extracts_bounded_chronological_samples_from_immutable_segments(
+    tmp_path: Path,
+):
+    recordings = tmp_path / "recordings"
+    recordings.mkdir()
+    source = recordings / "20260830T060000000000Z-000000.mkv"
+    source.write_bytes(b"immutable-dvr-source")
+    stat = source.stat()
+    observed_commands: list[tuple] = []
+
+    async def factory(*args, **_kwargs):
+        observed_commands.append(args)
+        Path(args[-1]).write_bytes(_jpeg_bytes())
+        return _CompletedPlaybackProcess()
+
+    camera = SimpleNamespace(_require_ffmpeg=lambda: tmp_path / "ffmpeg.exe")
+    dvr = camera_dvr.CameraDVR(
+        camera, root=tmp_path, required_drive=None, process_factory=factory
+    )
+    since = datetime(2026, 8, 30, 6, 0, tzinfo=timezone.utc)
+    until = since + timedelta(minutes=1)
+    row = {
+        "id": 1,
+        "filename": source.name,
+        "started_at": since.isoformat().replace("+00:00", "Z"),
+        "ended_at": (since + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+        "bytes": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "codec": "HEVC",
+        "width": 2304,
+        "height": 1296,
+        "complete": 1,
+        "probed": 1,
+    }
+
+    async def no_index(*, force=False):
+        return None
+
+    async def rows(**_kwargs):
+        return [row]
+
+    dvr._index_segments = no_index
+    dvr.list_segments = rows
+    result = await dvr.footage_analysis_samples(since, until, sample_count=8)
+
+    assert result["sample_count"] == 8
+    assert result["sampled_at"][0] == "2026-08-30T06:00:00Z"
+    assert result["sampled_at"][-1] == "2026-08-30T06:01:00Z"
+    assert result["source_segments"] == [{
+        "id": 1,
+        "started_at": "2026-08-30T06:00:00Z",
+        "ended_at": "2026-08-30T06:05:00Z",
+        "codec": "HEVC",
+        "width": 2304,
+        "height": 1296,
+    }]
+    assert result["contact_sheet"].startswith(b"\xff\xd8\xff")
+    assert len(observed_commands) == 8
+    assert all("-nostdin" in command and "-xerror" in command for command in observed_commands)
+
+
+@pytest.mark.asyncio
+async def test_footage_analysis_rejects_a_broad_interval_before_touching_dvr_storage(tmp_path: Path):
+    dvr = _dvr(tmp_path)
+    since = datetime(2026, 8, 30, 6, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="three-minute"):
+        await dvr.footage_analysis_samples(
+            since,
+            since + timedelta(seconds=camera_dvr.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS + 1),
         )
 
     assert not dvr.playback_dir.exists()
@@ -990,7 +1089,7 @@ def test_dvr_trailing_slash_is_the_owner_dvr_not_chat_spa(tmp_path: Path):
     app, _dvr_instance = _router_app(tmp_path, {"role": "owner"})
     response = TestClient(app).get("/dvr/")
     assert response.status_code == 200
-    assert "X Omni DVR" in response.text
+    assert "X DVR" in response.text
 
 
 def test_dvr_live_watch_is_owner_bound_exact_origin_and_conversation_free(

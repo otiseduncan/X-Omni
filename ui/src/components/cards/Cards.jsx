@@ -1481,6 +1481,65 @@ function CameraMotionClipCard({ data }) {
   );
 }
 
+function CameraFootageAnalysisCard({ data }) {
+  if (!data?.ok) {
+    return (
+      <Card icon={Camera} title="DVR footage analysis" className="image-generation-warning">
+        <p className="card-note" role="alert">
+          {displayText(data?.error, "No temporal conclusion was made from the DVR footage.")}
+        </p>
+      </Card>
+    );
+  }
+  const timeRange = [data.started_at_local, data.ended_at_local].filter(Boolean).join(" – ");
+  const sourceCount = Array.isArray(data.source_segments) ? data.source_segments.length : 0;
+  const movement = data.vehicle_movement_observation === "observed"
+    ? "vehicle movement observed"
+    : data.vehicle_movement_observation === "not_observed"
+      ? "vehicle movement not observed in sampled frames"
+      : "vehicle movement unresolved";
+  const interaction = data.person_interaction_observation === "observed"
+    ? "person interaction observed"
+    : data.person_interaction_observation === "not_observed"
+      ? "person interaction not observed in sampled frames"
+      : "person interaction unresolved";
+  const sufficient = data.analysis_status === "sufficient";
+  return (
+    <figure className={`card camera-snapshot-card${sufficient ? "" : " image-generation-warning"}`}>
+      <div className="card-head">
+        <Camera size={14} aria-hidden="true" />
+        <span>{sufficient ? "DVR temporal analysis" : "DVR temporal analysis — insufficient evidence"}</span>
+      </div>
+      {data.clip_url && (
+        <video
+          className="camera-motion-clip-video"
+          src={data.clip_url}
+          controls
+          playsInline
+          preload="metadata"
+          aria-label="Playable DVR footage analyzed for temporal changes"
+        />
+      )}
+      <figcaption>
+        <p className="camera-snapshot-caption">
+          {displayText(data.description, "Chronological DVR samples were analyzed.")}
+        </p>
+        {data.evidence && <p className="card-note">Evidence · {displayText(data.evidence)}</p>}
+        <p className="card-note">
+          {[movement, interaction, timeRange, Number.isFinite(data.sample_count) ? `${data.sample_count} sampled frames` : null, sourceCount ? `${sourceCount} DVR segment${sourceCount === 1 ? "" : "s"}` : null]
+            .filter(Boolean).join(" · ")}
+        </p>
+        {!sufficient && (
+          <p className="card-note" role="alert">
+            No absence-of-action conclusion is drawn from insufficient DVR samples.
+          </p>
+        )}
+        {data.playback_error && <p className="card-note" role="alert">{displayText(data.playback_error)}</p>}
+      </figcaption>
+    </figure>
+  );
+}
+
 function ImageGenerationStatusCard({ data }) {
   const successful = data?.status === "completed" && data?.verified === true;
   const configured = data?.generation_available === true;
@@ -1789,6 +1848,7 @@ const REGISTRY = {
   camera_event_history: CameraEventHistoryCard,
   camera_snapshot: CameraSnapshotCard,
   camera_motion_clip: CameraMotionClipCard,
+  camera_footage_analysis: CameraFootageAnalysisCard,
   generated_image: GeneratedImageCard,
   image_generation_status: ImageGenerationStatusCard,
   generated_video: GeneratedVideoCard,

@@ -1151,6 +1151,8 @@ def tool_result_visible_to_model(name: str, result: Any) -> Any:
 
 def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
     """Choose media success cards only when result truth is self-consistent."""
+    if name == "camera_footage" and isinstance(result, dict) and "analysis_status" in result:
+        return "camera_footage_analysis"
     if name not in {"image_generate", "video_generate"}:
         return ARTIFACT_FOR_TOOL.get(name)
     if name == "video_generate":

@@ -63,6 +63,24 @@ def _generate_vapid_keypair() -> tuple[str, str]:
     return _b64url(public_raw), private_b64
 
 
+def _ensure_internal_dvr_token(env_path: Path) -> str:
+    """A stable, loopback-only secret shared by Core and the DVR service.
+
+    It authenticates Core's server-to-server calls into the DVR service's
+    API (Core's tool handlers run with no browser session/cookie of their
+    own). Generated once and persisted, like the VAPID keypair, so both
+    independently-started processes agree on the same value without a
+    coordinated restart.
+    """
+    token = os.getenv("XOMNI_INTERNAL_DVR_TOKEN", "").strip()
+    if token:
+        return token
+    token = secrets.token_urlsafe(32)
+    atomic_update_env(env_path, {"XOMNI_INTERNAL_DVR_TOKEN": token})
+    os.environ["XOMNI_INTERNAL_DVR_TOKEN"] = token
+    return token
+
+
 def _ensure_vapid_keys(env_path: Path) -> tuple[str, str]:
     """Web Push needs a stable keypair -- a subscription is bound to the
     public key it was created against, so unlike session_secret's fresh-
@@ -137,9 +155,20 @@ class Settings:
     camera_motion_burst_seconds: int = 90
     camera_motion_burst_interval_seconds: int = 5
 
+    # X DVR -- the independent recording service (core/dvr_service.py). It
+    # survives Core restarts; this is only the address Core's client and the
+    # DVR service's own exact-origin check use, not a claim that DVR runs
+    # inside Core.
+    dvr_port: int = 8300
+    internal_dvr_token: str = ""
+
     @property
     def local_origin(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def dvr_local_origin(self) -> str:
+        return f"http://127.0.0.1:{self.dvr_port}"
 
     @property
     def redirect_uris(self) -> list[str]:
@@ -160,6 +189,7 @@ class Settings:
         vapid_public_key, vapid_private_key = _ensure_vapid_keys(
             ROOT / "config" / ".env.local"
         )
+        internal_dvr_token = _ensure_internal_dvr_token(ROOT / "config" / ".env.local")
         return cls(
             root=ROOT,
             # Core always binds loopback. Remote reach is Tailscale's job --
@@ -171,6 +201,8 @@ class Settings:
             tools_config=ROOT / "config" / "tools.yaml",
             db_path=ROOT / "data" / "x_omni.sqlite",
             audio_tmp=ROOT / "data" / "audio",
+            dvr_port=_int("XOMNI_DVR_PORT", 8300),
+            internal_dvr_token=internal_dvr_token,
             auth_enabled=_flag("XOMNI_AUTH_ENABLED", True),
             google_client_id=os.getenv("XOMNI_GOOGLE_CLIENT_ID", "").strip(),
             google_client_secret=os.getenv("XOMNI_GOOGLE_CLIENT_SECRET", "").strip(),

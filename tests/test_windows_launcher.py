@@ -18,7 +18,10 @@ def _windows_command_line(arguments: list[str]) -> str:
 
 def _evaluate_dvr_recorder_processes(cases: list[dict[str, object]]) -> dict[str, bool]:
     payload = base64.b64encode(json.dumps(cases).encode("utf-8")).decode("ascii")
-    launcher_path = str(ROOT / "scripts" / "launch-x-omni.ps1").replace("'", "''")
+    # The DVR-recorder verification/stop functions live in X DVR's own
+    # launcher now, not X Omni's -- Core's launcher never touches the
+    # recorder (see test_x_omni_launcher_no_longer_manages_dvr_recorder).
+    launcher_path = str(ROOT / "scripts" / "launch-x-dvr.ps1").replace("'", "''")
     powershell = rf"""
 $ErrorActionPreference = 'Stop'
 $tokens = $null
@@ -93,22 +96,43 @@ def test_launcher_preserves_foreign_processes_and_gates_browser_on_health() -> N
     assert '-ExecutionPolicy Bypass -File `"$startScript`"' in script
 
 
-def test_launcher_reconciles_only_verified_dvr_recorders_after_core_stop() -> None:
+def test_x_omni_launcher_no_longer_manages_dvr_recorder() -> None:
+    # X DVR (core/dvr_service.py) owns continuous recording as its own
+    # independent process now; X Omni Core's launcher must never start,
+    # stop, or verify the DVR recorder -- restarting Core must never
+    # interrupt recording. This is the regression guard for that boundary.
     script = (ROOT / "scripts" / "launch-x-omni.ps1").read_text(encoding="utf-8")
+    for forbidden in (
+        "function Test-XOmniDvrRecorderArguments",
+        "function Test-XOmniDvrRecorderProcess",
+        "function Stop-VerifiedDvrRecorders",
+        "Stop-VerifiedDvrRecorders",
+        "CommandLineToArgvW",
+        "dvrRecordingsRoot",
+    ):
+        assert forbidden not in script, f"launch-x-omni.ps1 must not reference {forbidden!r}"
+
+
+def test_x_dvr_launcher_reconciles_only_verified_dvr_recorders_and_service() -> None:
+    script = (ROOT / "scripts" / "launch-x-dvr.ps1").read_text(encoding="utf-8")
     assert "function Test-XOmniDvrRecorderArguments" in script
     assert "function Test-XOmniDvrRecorderProcess" in script
     assert "function Stop-VerifiedDvrRecorders" in script
+    assert "function Test-XDvrProcess" in script
+    assert "function Stop-VerifiedDvrService" in script
     assert "CommandLineToArgvW" in script
+    assert "dvr_service" in script
+    # This launcher must never touch X Omni Core's own port/process.
+    assert "-m core.main" not in script
 
-    main_flow = script[script.index("$owner = Get-PortOwner -Port $corePort") :]
-    core_stop = main_flow.index("Stop-VerifiedCore -Port $corePort")
-    dvr_stop = main_flow.index("Stop-VerifiedDvrRecorders")
-    rebuild = main_flow.index("Invoke-UiRebuild")
-    assert core_stop < dvr_stop < rebuild
+    main_flow = script[script.index("$owner = Get-PortOwner -Port $dvrPort") :]
+    service_stop = main_flow.index("Stop-VerifiedDvrService -Port $dvrPort")
+    start = main_flow.index("Start-Process -FilePath $hostExe")
+    assert service_stop < start
 
     stop_function = script[
         script.index("function Stop-VerifiedDvrRecorders") : script.index(
-            "function Get-CoreHealth"
+            "function Get-DvrHealth"
         )
     ]
     assert "Stop-Process -Id $processId" in stop_function
@@ -122,6 +146,24 @@ def test_launcher_reconciles_only_verified_dvr_recorders_after_core_stop() -> No
     assert "$commandLine" not in "\n".join(
         line for line in stop_function.splitlines() if "Write-LauncherLog" in line
     )
+
+
+def test_double_click_x_dvr_launcher_uses_bounded_windows_launcher() -> None:
+    command = (ROOT / "Launch-X-DVR.cmd").read_text(encoding="utf-8")
+    assert "scripts\\launch-x-dvr.ps1" in command
+    assert "-WindowStyle Hidden" in command
+
+
+def test_x_dvr_installer_creates_desktop_and_startup_shortcuts() -> None:
+    installer = (ROOT / "scripts" / "install-x-dvr-launcher.ps1").read_text(encoding="utf-8")
+    assert "WScript.Shell" in installer
+    assert "X DVR.lnk" in installer
+    assert "x-omni.ico" in installer
+
+    startup = (ROOT / "scripts" / "install-x-dvr-startup.ps1").read_text(encoding="utf-8")
+    assert "WScript.Shell" in startup
+    assert "GetFolderPath('Startup')" in startup
+    assert "-NoOpen" in startup
 
 
 @pytest.mark.skipif(

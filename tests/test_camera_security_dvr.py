@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from xml.etree import ElementTree as ET
 
 import pytest
+from PIL import Image
 
 from core.services import camera_security
 
@@ -17,6 +19,8 @@ class FakeStore:
         self.marked: list[int] = []
         self.range_rows: list[dict] = []
         self.burst_rows: dict[int, list[dict]] = {}
+        self.events_by_id: dict[int, dict] = {}
+        self.last_motion: dict | None = None
 
     def get_max_camera_burst_id(self) -> int:
         return 0
@@ -36,6 +40,12 @@ class FakeStore:
 
     def list_camera_events_by_burst(self, burst_id: int) -> list[dict]:
         return list(self.burst_rows.get(int(burst_id), []))
+
+    def get_camera_event(self, event_id: int):
+        return self.events_by_id.get(int(event_id))
+
+    def get_last_camera_event(self, *, trigger: str):
+        return self.last_motion if trigger == "motion" else None
 
 
 class FakeRouter:
@@ -463,3 +473,193 @@ async def test_continuous_event_clip_prefers_positive_later_caption(tmp_path: Pa
 
     assert result["source"] == "continuous_dvr"
     assert result["caption"] == "a van arrived"
+
+
+def _analysis_contact_sheet() -> bytes:
+    image = Image.new("RGB", (640, 360), "black")
+    encoded = io.BytesIO()
+    image.save(encoded, format="JPEG")
+    return encoded.getvalue()
+
+
+class _FootageAnalysisDVR:
+    def __init__(self):
+        self.sample_calls: list[tuple] = []
+        self.range_calls: list[tuple] = []
+
+    async def footage_analysis_samples(self, since, until):
+        self.sample_calls.append((since, until))
+        return {
+            "analyzed_started_at": since.isoformat().replace("+00:00", "Z"),
+            "analyzed_ended_at": until.isoformat().replace("+00:00", "Z"),
+            "sample_count": 12,
+            "sampled_at": [since.isoformat().replace("+00:00", "Z")],
+            "contact_sheet": _analysis_contact_sheet(),
+            "source_segments": [
+                {"id": 1, "started_at": since.isoformat(), "ended_at": until.isoformat()},
+                {"id": 2, "started_at": since.isoformat(), "ended_at": until.isoformat()},
+            ],
+        }
+
+    async def range_clip(self, since, until, *, cache_name):
+        self.range_calls.append((since, until, cache_name))
+        return Path("range-1-2.mp4")
+
+
+def _temporal_caption(
+    *, person: str, vehicle: str, movement: str, interaction: str, sufficiency: str = "sufficient"
+) -> str:
+    return "\n".join([
+        f"PERSON: {person}",
+        f"VEHICLE: {vehicle}",
+        f"VEHICLE_MOVEMENT: {movement}",
+        f"PERSON_INTERACTION: {interaction}",
+        f"SUFFICIENCY: {sufficiency}",
+        "DESCRIPTION: chronological camera frames were compared.",
+        "EVIDENCE: the before, during, and after tiles support this limited observation.",
+    ])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caption", "expected_person", "expected_vehicle", "expected_movement", "expected_interaction"),
+    [
+        (
+            _temporal_caption(person="yes", vehicle="yes", movement="not_observed", interaction="not_observed"),
+            True, True, "not_observed", "not_observed",
+        ),
+        (
+            _temporal_caption(person="yes", vehicle="yes", movement="observed", interaction="observed"),
+            True, True, "observed", "observed",
+        ),
+        (
+            _temporal_caption(person="no", vehicle="yes", movement="observed", interaction="uncertain"),
+            False, True, "observed", "uncertain",
+        ),
+    ],
+    ids=["person-walks-no-vehicle-move", "person-and-vehicle-move", "vehicle-only"],
+)
+async def test_temporal_footage_analysis_returns_only_pixel_supported_action_claims(
+    monkeypatch,
+    caption: str,
+    expected_person: bool,
+    expected_vehicle: bool,
+    expected_movement: str,
+    expected_interaction: str,
+):
+    store = FakeStore()
+    event = {
+        "id": 51,
+        "burst_id": 9,
+        "captured_at": "2026-08-30 06:43:20",
+        "trigger": "motion",
+    }
+    store.events_by_id[51] = event
+    store.burst_rows[9] = [
+        event,
+        {"id": 52, "burst_id": 9, "captured_at": "2026-08-30 06:44:01"},
+    ]
+    dvr = _FootageAnalysisDVR()
+    vision = AsyncMock(return_value=caption)
+    monkeypatch.setattr(camera_security.camera_svc, "caption_frame", vision)
+
+    result = await camera_security.camera_footage_analyze(
+        store,
+        FakeRouter(),
+        {"event_id": 51, "prompt": "Did the person move the vehicle?"},
+        dvr=dvr,
+    )
+
+    assert result["ok"] is True
+    assert result["analysis_status"] == "sufficient"
+    assert result["person_detected"] is expected_person
+    assert result["vehicle_detected"] is expected_vehicle
+    assert result["vehicle_movement_observation"] == expected_movement
+    assert result["person_interaction_observation"] == expected_interaction
+    assert result["vehicle_movement_observed"] is (True if expected_movement == "observed" else None)
+    assert result["sample_count"] == 12
+    assert len(result["source_segments"]) == 2
+    assert result["clip_url"] == "/dvr/api/clips/range-1-2.mp4"
+    assert dvr.sample_calls and dvr.range_calls
+    vision.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_temporal_footage_analysis_never_concludes_absence_from_insufficient_samples(
+    monkeypatch,
+):
+    store = FakeStore()
+    event = {
+        "id": 51,
+        "burst_id": 9,
+        "captured_at": "2026-08-30 06:43:20",
+        "trigger": "motion",
+    }
+    store.events_by_id[51] = event
+    store.burst_rows[9] = [event]
+    dvr = _FootageAnalysisDVR()
+    monkeypatch.setattr(
+        camera_security.camera_svc,
+        "caption_frame",
+        AsyncMock(return_value=_temporal_caption(
+            person="yes", vehicle="yes", movement="not_observed", interaction="not_observed", sufficiency="insufficient"
+        )),
+    )
+
+    result = await camera_security.camera_footage_analyze(
+        store, FakeRouter(), {"event_id": 51}, dvr=dvr
+    )
+
+    assert result["ok"] is True
+    assert result["analysis_status"] == "insufficient_evidence"
+    assert result["vehicle_movement_observation"] == "uncertain"
+    assert result["vehicle_movement_observed"] is None
+    assert result["person_interaction_observed"] is None
+
+
+@pytest.mark.asyncio
+async def test_temporal_footage_analysis_reports_missing_dvr_without_running_vision(monkeypatch):
+    store = FakeStore()
+    event = {"id": 51, "burst_id": 9, "captured_at": "2026-08-30 06:43:20"}
+    store.events_by_id[51] = event
+    store.burst_rows[9] = [event]
+    dvr = SimpleNamespace(footage_analysis_samples=AsyncMock(side_effect=FileNotFoundError("missing")))
+    vision = AsyncMock()
+    monkeypatch.setattr(camera_security.camera_svc, "caption_frame", vision)
+
+    result = await camera_security.camera_footage_analyze(
+        store, FakeRouter(), {"event_id": 51}, dvr=dvr
+    )
+
+    assert result["ok"] is False
+    assert result["analysis_status"] == "insufficient_footage"
+    assert "does not retain" in result["error"]
+    vision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_broad_playback_selects_its_motion_window_instead_of_transcoding_the_range(tmp_path: Path):
+    store = FakeStore()
+    event = {
+        "id": 51,
+        "burst_id": 9,
+        "captured_at": "2026-08-30 06:43:20",
+        "trigger": "motion",
+    }
+    store.range_rows = [event]
+    store.burst_rows[9] = [event]
+    dvr = SimpleNamespace(event_clip=AsyncMock(return_value=Path("motion-9.mp4")))
+
+    result = await camera_security.camera_motion_clip(
+        store,
+        _settings(tmp_path),
+        tmp_path / "ffmpeg.exe",
+        {"since": "2026-08-30T06:00:00Z", "until": "2026-08-30T07:00:00Z"},
+        dvr=dvr,
+    )
+
+    assert result["ok"] is True
+    assert result["selected_from_broad_range"] is True
+    assert result["selected_motion_event_id"] == 51
+    assert result["clip_url"] == "/dvr/api/clips/motion-9.mp4"
+    dvr.event_clip.assert_awaited_once_with(store, 9)

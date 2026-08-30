@@ -13,9 +13,13 @@ person/vehicle analysis, while the continuous recorder preserves everything.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import hmac
+import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -34,6 +38,8 @@ from xml.etree import ElementTree as ET
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from PIL import Image, ImageDraw, ImageOps
+from pydantic import BaseModel
 from starlette.requests import ClientDisconnect
 
 from . import exterior_camera as exterior_camera_svc
@@ -51,13 +57,26 @@ RECORDER_STALL_SECONDS = 120
 INDEX_REFRESH_SECONDS = 5
 SUBSCRIPTION_RECREATE_SECONDS = 4 * 60
 ONVIF_MIN_PULL_CYCLE_SECONDS = 1.0
-PLAYBACK_TIMEOUT_SECONDS = 10 * 60
+# Playback must never keep a chat request pending for minutes.  This applies
+# only to on-demand browser artifacts; the archive recorder remains an
+# independent stream-copy process.
+PLAYBACK_TIMEOUT_SECONDS = 45
+CONCAT_TIMEOUT_SECONDS = 20
 SEGMENT_PROBE_TIMEOUT_SECONDS = 10
 SEGMENT_PROBE_RETRY_SECONDS = 60
 MAX_SEGMENT_PROBES_PER_INDEX = 4
 MAX_PLAYBACK_GAP_SECONDS = 1.0
 MAX_PLAYBACK_DURATION_SECONDS = 30 * 60
 MAX_PLAYBACK_SEGMENTS = 8
+# Five-minute clips are the recorder's native segment duration and finish
+# quickly on this host.  Longer chat requests are narrowed to a motion event
+# before FFmpeg is invoked so a broad history question cannot block a reply.
+MAX_TOOL_PLAYBACK_DURATION_SECONDS = 300
+MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS = 180
+MIN_FOOTAGE_ANALYSIS_SAMPLES = 8
+MAX_FOOTAGE_ANALYSIS_SAMPLES = 20
+FOOTAGE_ANALYSIS_FRAME_TIMEOUT_SECONDS = 12
+FOOTAGE_ANALYSIS_FRAME_WIDTH = 640
 PROCESS_STOP_TIMEOUT_SECONDS = 5.0
 PLAYBACK_CACHE_MAX_AGE = timedelta(hours=24)
 MAX_TOOL_SEGMENTS = 40
@@ -91,6 +110,7 @@ _LEGACY_SEGMENT_RE = re.compile(r"^(\d{8})-(\d{6})\.mkv$")
 _SAFE_CACHED_MP4_RE = re.compile(
     r"^(?:motion-[1-9]\d*|range-\d+-\d+)\.mp4$"
 )
+_SAFE_CLIP_FILENAME_RE = re.compile(r"^clip-\d+-\d+-[0-9a-f]{12}\.mp4$")
 _XIONGMAI_PULLPOINT_PATH_RE = re.compile(
     r"^/(?:event_service|events_service)(?:/[A-Za-z0-9._~-]{1,128}){1,4}/?$",
     re.IGNORECASE,
@@ -161,6 +181,10 @@ class RecordingProfile:
         }
 
 
+class PlaybackPreparationError(RuntimeError):
+    """A bounded DVR playback worker could not produce a trustworthy artifact."""
+
+
 class CameraDVR:
     """Own one continuous stream-copy recorder and its bounded metadata index."""
 
@@ -178,6 +202,7 @@ class CameraDVR:
         self.root = Path(root).resolve()
         self.recordings_dir = self.root / "recordings"
         self.playback_dir = self.root / "playback-cache"
+        self.clips_dir = self.root / "clips"
         self.db_path = self.root / "dvr.sqlite"
         self.segment_seconds = max(60, int(segment_seconds))
         self.reserve_bytes = max(256 * 1024 * 1024, int(reserve_bytes))
@@ -237,6 +262,7 @@ class CameraDVR:
             raise RuntimeError("DVR drive E: is not available.")
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
         self.playback_dir.mkdir(parents=True, exist_ok=True)
+        self.clips_dir.mkdir(parents=True, exist_ok=True)
         if self._storage_initialized and self.db_path.is_file():
             return
         conn = sqlite3.connect(self.db_path)
@@ -285,6 +311,23 @@ class CameraDVR:
                     filename TEXT PRIMARY KEY,
                     kind TEXT NOT NULL,
                     source_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            # Saved/exported clips live in self.clips_dir, never self.playback_dir,
+            # and this table is never touched by _prune_locked -- a clip an
+            # operator explicitly saved must survive circular retention until
+            # they explicitly delete it.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS clips (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL UNIQUE,
+                    title TEXT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    bytes INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -1566,11 +1609,21 @@ class CameraDVR:
         finally:
             self._events_healthy = False
 
-    async def _run_ffmpeg(self, args: list[str]) -> tuple[int, bytes]:
+    async def _run_ffmpeg(
+        self,
+        args: list[str],
+        *,
+        timeout_seconds: float = PLAYBACK_TIMEOUT_SECONDS,
+    ) -> tuple[int, bytes]:
+        """Run one bounded playback worker while continually draining stderr.
+
+        FFmpeg sends diagnostics to stderr. Keep draining that pipe while the
+        worker runs so corrupt media cannot hold a failed request open.
+        """
         ffmpeg = self.camera._require_ffmpeg()
         creationflags = 0x08000000 if os.name == "nt" else 0
         proc = await self._process_factory(
-            str(ffmpeg), *args,
+            str(ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror", *args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             creationflags=creationflags,
@@ -1584,7 +1637,9 @@ class CameraDVR:
         timed_out = False
         try:
             try:
-                await asyncio.wait_for(proc.wait(), timeout=PLAYBACK_TIMEOUT_SECONDS)
+                await asyncio.wait_for(
+                    proc.wait(), timeout=max(1.0, float(timeout_seconds))
+                )
             except asyncio.TimeoutError:
                 timed_out = True
                 await self._terminate_process(proc)
@@ -1599,9 +1654,10 @@ class CameraDVR:
             stderr = await asyncio.wait_for(asyncio.shield(stderr_task), timeout=2)
         except asyncio.TimeoutError:
             stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
             stderr = b""
         if timed_out:
-            return -1, b"Playback preparation timed out."
+            return -1, b"Playback preparation timed out. " + (stderr or b"")[-512:]
         return int(proc.returncode if proc.returncode is not None else -1), stderr or b""
 
     @staticmethod
@@ -1644,10 +1700,11 @@ class CameraDVR:
         try:
             rc, stderr = await self._run_ffmpeg([*args_without_output, str(temp_target)])
             if rc != 0 or not temp_target.is_file() or temp_target.stat().st_size <= 0:
-                raise RuntimeError(
-                    stderr.decode("utf-8", "replace")[-500:]
-                    or "Playback preparation failed."
-                )
+                detail = stderr.decode("utf-8", "replace")[-500:]
+                log.warning("DVR playback preparation failed (rc=%s): %s", rc, detail or "no FFmpeg diagnostic")
+                if "timed out" in detail.casefold():
+                    raise PlaybackPreparationError("Playback preparation timed out.")
+                raise PlaybackPreparationError("Playback preparation failed.")
             os.replace(temp_target, target)
             if artifact_kind and source_key:
                 async with self._db_lock:
@@ -1813,12 +1870,13 @@ class CameraDVR:
                     rc, stderr = await self._run_ffmpeg([
                         "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file),
                         "-map", "0:v:0", "-an", "-c:v", "copy", str(merged),
-                    ])
+                    ], timeout_seconds=CONCAT_TIMEOUT_SECONDS)
                     if rc != 0 or not merged.is_file():
-                        raise RuntimeError(
-                            stderr.decode("utf-8", "replace")[-500:]
-                            or "Segment concat failed."
-                        )
+                        detail = stderr.decode("utf-8", "replace")[-500:]
+                        log.warning("DVR segment concat failed (rc=%s): %s", rc, detail or "no FFmpeg diagnostic")
+                        if "timed out" in detail.casefold():
+                            raise PlaybackPreparationError("Segment preparation timed out.")
+                        raise PlaybackPreparationError("Segment preparation failed.")
                 return await self._write_playback_target(
                     target,
                     [
@@ -1830,6 +1888,300 @@ class CameraDVR:
                     artifact_kind=artifact_kind,
                     source_key=source_key,
                 )
+
+    def _insert_clip_sync(
+        self, filename: str, title: Optional[str], since: datetime, until: datetime, size: int
+    ) -> int:
+        conn = self._conn()
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO clips (filename, title, started_at, ended_at, bytes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (filename, title, _utc_iso(since), _utc_iso(until), int(size), _utc_iso(_utc_now())),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+        finally:
+            conn.close()
+
+    def _list_saved_clips_sync(self) -> list[dict[str, Any]]:
+        if not self.db_path.is_file():
+            return []
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM clips ORDER BY started_at DESC LIMIT ?", (MAX_UI_SEGMENTS,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    async def list_saved_clips(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_saved_clips_sync)
+
+    def _get_saved_clip_sync(self, clip_id: int) -> Optional[dict[str, Any]]:
+        if not self.db_path.is_file():
+            return None
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    async def get_saved_clip(self, clip_id: int) -> Optional[dict[str, Any]]:
+        return await asyncio.to_thread(self._get_saved_clip_sync, int(clip_id))
+
+    def saved_clip_path(self, filename: object, *, require_file: bool = False) -> Path:
+        name = str(filename or "")
+        if not _SAFE_CLIP_FILENAME_RE.fullmatch(name):
+            raise FileNotFoundError("Saved clip filename is invalid.")
+        root = self.clips_dir.resolve()
+        path = (self.clips_dir / name).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise FileNotFoundError("Saved clip is outside the DVR clip archive.") from exc
+        if require_file and not path.is_file():
+            raise FileNotFoundError("Saved clip file is missing.")
+        return path
+
+    async def delete_saved_clip(self, clip_id: int) -> bool:
+        """Permanently remove one operator-saved clip. Never called by retention."""
+        row = await self.get_saved_clip(clip_id)
+        if row is None:
+            return False
+        async with self._io_lock:
+            try:
+                path = self.saved_clip_path(row["filename"])
+            except FileNotFoundError:
+                path = None
+            if path is not None:
+                await asyncio.to_thread(path.unlink, True)
+            async with self._db_lock:
+                conn = self._conn()
+                try:
+                    conn.execute("DELETE FROM clips WHERE id = ?", (clip_id,))
+                    conn.commit()
+                finally:
+                    conn.close()
+        return True
+
+    async def export_clip(
+        self, since: datetime, until: datetime, *, title: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Save a human-selected time range as a protected clip under clips/.
+
+        Reuses the same bounded, hardened range-preparation pipeline as chat
+        playback, then copies the result into storage retention never touches.
+        """
+        since = since.replace(tzinfo=timezone.utc) if since.tzinfo is None else since.astimezone(timezone.utc)
+        until = until.replace(tzinfo=timezone.utc) if until.tzinfo is None else until.astimezone(timezone.utc)
+        prepared = await self.range_clip(since, until, cache_name=f"export-{uuid.uuid4().hex}")
+        self.clips_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"clip-{int(since.timestamp())}-{int(until.timestamp())}-{uuid.uuid4().hex[:12]}.mp4"
+        target = self.clips_dir / filename
+        async with self._io_lock:
+            await asyncio.to_thread(shutil.copy2, prepared, target)
+        safe_title = (str(title).strip()[:200] or None) if title else None
+        size = target.stat().st_size
+        clip_id = await asyncio.to_thread(
+            self._insert_clip_sync, filename, safe_title, since, until, size
+        )
+        return {
+            "id": clip_id,
+            "filename": filename,
+            "title": safe_title,
+            "started_at": _utc_iso(since),
+            "ended_at": _utc_iso(until),
+            "bytes": size,
+        }
+
+    @staticmethod
+    def _footage_sample_times(
+        since: datetime, until: datetime, sample_count: int
+    ) -> list[datetime]:
+        """Return chronological, inclusive strategic sample times.
+
+        Including both endpoints is deliberate: a temporal conclusion needs a
+        before and after view, not a collection of near-duplicate middle frames.
+        """
+        count = min(max(int(sample_count), MIN_FOOTAGE_ANALYSIS_SAMPLES), MAX_FOOTAGE_ANALYSIS_SAMPLES)
+        span_seconds = max(0.0, (until - since).total_seconds())
+        if count == 1 or span_seconds <= 0:
+            return [since]
+        return [
+            since + timedelta(seconds=span_seconds * index / (count - 1))
+            for index in range(count)
+        ]
+
+    @staticmethod
+    def _footage_contact_sheet(samples: list[tuple[datetime, bytes]]) -> bytes:
+        """Build one bounded chronological JPEG for the existing vision worker."""
+        if not samples:
+            raise PlaybackPreparationError("No DVR frames were available for analysis.")
+        columns = min(3, len(samples))
+        tile_width, tile_height, label_height, gutter = 400, 225, 24, 8
+        rows = math.ceil(len(samples) / columns)
+        sheet = Image.new(
+            "RGB",
+            (
+                gutter + columns * (tile_width + gutter),
+                gutter + rows * (tile_height + label_height + gutter),
+            ),
+            "black",
+        )
+        draw = ImageDraw.Draw(sheet)
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        for index, (captured_at, raw) in enumerate(samples):
+            with Image.open(io.BytesIO(raw)) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGB")
+                image.thumbnail((tile_width, tile_height), resampling)
+                tile = Image.new("RGB", (tile_width, tile_height), "black")
+                tile.paste(
+                    image,
+                    ((tile_width - image.width) // 2, (tile_height - image.height) // 2),
+                )
+            column, row = index % columns, index // columns
+            x = gutter + column * (tile_width + gutter)
+            y = gutter + row * (tile_height + label_height + gutter)
+            sheet.paste(tile, (x, y))
+            timestamp = captured_at.astimezone().strftime("%H:%M:%S %Z")
+            draw.text((x + 3, y + tile_height + 3), f"{index + 1}. {timestamp}", fill="white")
+        encoded = io.BytesIO()
+        sheet.save(encoded, format="JPEG", quality=88, optimize=True)
+        return encoded.getvalue()
+
+    async def footage_analysis_samples(
+        self,
+        since: datetime,
+        until: datetime,
+        *,
+        sample_count: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Extract bounded, chronological actual-DVR samples for temporal review.
+
+        This never decodes the recording continuously and never touches an
+        active segment.  Each source is revalidated under the DVR I/O lock
+        before FFmpeg reads it, so the model receives only immutable archive
+        footage from the exact resolved interval.
+        """
+        if until <= since:
+            raise ValueError("Footage-analysis end time must be after start time.")
+        since = since.replace(tzinfo=timezone.utc) if since.tzinfo is None else since.astimezone(timezone.utc)
+        until = until.replace(tzinfo=timezone.utc) if until.tzinfo is None else until.astimezone(timezone.utc)
+        duration_seconds = (until - since).total_seconds()
+        if duration_seconds > MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
+            raise ValueError("Footage analysis is limited to a three-minute DVR interval.")
+        derived_count = max(
+            MIN_FOOTAGE_ANALYSIS_SAMPLES,
+            min(MAX_FOOTAGE_ANALYSIS_SAMPLES, math.ceil(duration_seconds / 12.0) + 1),
+        )
+        count = derived_count if sample_count is None else min(
+            max(int(sample_count), MIN_FOOTAGE_ANALYSIS_SAMPLES),
+            MAX_FOOTAGE_ANALYSIS_SAMPLES,
+        )
+        await self._index_segments(force=True)
+        segments = await self.list_segments(
+            since=_utc_iso(since),
+            until=_utc_iso(until),
+            limit=MAX_PLAYBACK_SEGMENTS,
+            complete_only=True,
+        )
+        segments = sorted(segments, key=lambda row: row["started_at"])
+        if not segments:
+            raise FileNotFoundError("No continuous recording covers that analysis interval.")
+        if len(segments) > MAX_PLAYBACK_SEGMENTS:
+            raise ValueError("Footage analysis requires too many recording segments.")
+        self._validate_range_coverage(segments, since, until)
+        if not all(bool(row.get("probed")) for row in segments):
+            raise FileNotFoundError("Continuous DVR metadata is still being verified.")
+        sample_times = self._footage_sample_times(since, until, count)
+        self.playback_dir.mkdir(parents=True, exist_ok=True)
+        async with self._io_lock:
+            indexed: list[tuple[datetime, datetime, dict[str, Any], Path]] = []
+            for row in segments:
+                source = self._segment_path(row["filename"], require_file=True)
+                try:
+                    source_stat = source.stat()
+                except OSError as exc:
+                    raise FileNotFoundError("Continuous recording source is unavailable.") from exc
+                if (
+                    int(row.get("bytes") or -1) != source_stat.st_size
+                    or int(row.get("source_mtime_ns") or -1) != source_stat.st_mtime_ns
+                ):
+                    raise FileNotFoundError("Continuous recording changed; retry analysis.")
+                started = _parse_time(row.get("started_at"))
+                ended = _parse_time(row.get("ended_at"))
+                if started is None or ended is None or ended <= started:
+                    raise FileNotFoundError("Continuous recording coverage is incomplete.")
+                indexed.append((started, ended, row, source))
+
+            with tempfile.TemporaryDirectory(
+                prefix=".xomni-dvr-analysis-", dir=self.playback_dir
+            ) as temp:
+                temp_dir = Path(temp)
+                extracted: list[tuple[datetime, bytes]] = []
+                for index, captured_at in enumerate(sample_times):
+                    matches = [
+                        item for item in indexed
+                        if item[0] <= captured_at <= item[1]
+                    ]
+                    if not matches:
+                        raise FileNotFoundError(
+                            "Continuous recording does not cover a requested analysis frame."
+                        )
+                    started, ended, _row, source = max(matches, key=lambda item: item[0])
+                    offset = min(
+                        max(0.0, (captured_at - started).total_seconds()),
+                        max(0.0, (ended - started).total_seconds() - 0.05),
+                    )
+                    frame_path = temp_dir / f"frame-{index:02d}.jpg"
+                    rc, stderr = await self._run_ffmpeg(
+                        [
+                            "-y", "-ss", f"{offset:.3f}", "-i", str(source),
+                            "-map", "0:v:0", "-frames:v", "1",
+                            "-vf", f"scale={FOOTAGE_ANALYSIS_FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease",
+                            "-q:v", "4", str(frame_path),
+                        ],
+                        timeout_seconds=FOOTAGE_ANALYSIS_FRAME_TIMEOUT_SECONDS,
+                    )
+                    if rc != 0 or not frame_path.is_file() or frame_path.stat().st_size <= 0:
+                        detail = stderr.decode("utf-8", "replace")[-500:]
+                        log.warning("DVR frame extraction failed (rc=%s): %s", rc, detail or "no FFmpeg diagnostic")
+                        if "timed out" in detail.casefold():
+                            raise PlaybackPreparationError("DVR frame extraction timed out.")
+                        raise PlaybackPreparationError("DVR frame extraction failed.")
+                    try:
+                        raw = frame_path.read_bytes()
+                    except OSError as exc:
+                        raise PlaybackPreparationError("DVR frame extraction failed.") from exc
+                    if raw:
+                        extracted.append((captured_at, raw))
+                if len(extracted) < MIN_FOOTAGE_ANALYSIS_SAMPLES:
+                    raise PlaybackPreparationError("Insufficient DVR frames were extracted for temporal analysis.")
+                contact_sheet = await asyncio.to_thread(self._footage_contact_sheet, extracted)
+
+        return {
+            "analyzed_started_at": _utc_iso(since),
+            "analyzed_ended_at": _utc_iso(until),
+            "sample_count": len(extracted),
+            "sampled_at": [_utc_iso(value) for value, _raw in extracted],
+            "contact_sheet": contact_sheet,
+            "source_segments": [
+                {
+                    "id": row["id"],
+                    "started_at": row["started_at"],
+                    "ended_at": row["ended_at"],
+                    "codec": row.get("codec"),
+                    "width": row.get("width"),
+                    "height": row.get("height"),
+                }
+                for row in segments
+            ],
+        }
 
     async def event_clip(self, store, burst_id: int) -> Path:
         events = store.list_camera_events_by_burst(int(burst_id))
@@ -1882,11 +2234,50 @@ class CameraDVR:
         }
 
 
-def create_router(settings, store, require_session, dvr: CameraDVR) -> APIRouter:
-    """Standalone, Owner-only DVR UI. It is separate from chat but shares auth."""
+class DvrRangeClipRequest(BaseModel):
+    since: str
+    until: str
+
+
+class DvrAnalysisSamplesRequest(BaseModel):
+    since: str
+    until: str
+
+
+class DvrClipExportRequest(BaseModel):
+    since: str
+    until: str
+    title: Optional[str] = None
+
+
+def create_router(
+    settings,
+    store,
+    require_session,
+    dvr: CameraDVR,
+    *,
+    internal_token: Optional[str] = None,
+    extra_allowed_origins: tuple[str, ...] = (),
+) -> APIRouter:
+    """Standalone, Owner-only DVR UI. It is separate from chat but shares auth.
+
+    A narrow second credential -- a loopback-only shared token, never sent to
+    a browser or the model -- lets X Omni Core call the handful of read/prep
+    endpoints it needs as a server-to-server client with no session cookie of
+    its own. It grants nothing a cookie-holding Owner could not already do.
+    """
     router = APIRouter(prefix="/dvr", tags=["dvr"])
 
     async def require_owner(session: dict = Depends(require_session)) -> dict:
+        if session.get("role") != "owner":
+            raise HTTPException(403, "Owner authorization is required.")
+        return session
+
+    async def require_owner_or_internal(request: Request) -> dict:
+        token = str(request.headers.get("x-xomni-internal-token") or "")
+        if internal_token and token and hmac.compare_digest(token, internal_token):
+            return {"role": "owner", "user_id": "xomni-core", "internal": True}
+        session = await require_session(request)
         if session.get("role") != "owner":
             raise HTTPException(403, "Owner authorization is required.")
         return session
@@ -1905,6 +2296,7 @@ def create_router(settings, store, require_session, dvr: CameraDVR) -> APIRouter
             "http://127.0.0.1:5173",
             "http://localhost:5173",
         }
+        allowed_origins.update(origin.rstrip("/") for origin in extra_allowed_origins if origin)
         allowed_origins.discard("")
         if not origin or origin not in allowed_origins:
             raise HTTPException(403, message)
@@ -1985,7 +2377,7 @@ def create_router(settings, store, require_session, dvr: CameraDVR) -> APIRouter
         )
 
     @router.get("/api/status")
-    async def dvr_status(_session: dict = Depends(require_owner)):
+    async def dvr_status(_session: dict = Depends(require_owner_or_internal)):
         return await dvr.status()
 
     @router.post("/api/live/sessions")
@@ -2093,7 +2485,7 @@ def create_router(settings, store, require_session, dvr: CameraDVR) -> APIRouter
         day: Optional[str] = Query(default=None, alias="date"),
         since: Optional[str] = None,
         until: Optional[str] = None,
-        _session: dict = Depends(require_owner),
+        _session: dict = Depends(require_owner_or_internal),
     ):
         if day:
             try:
@@ -2224,5 +2616,139 @@ def create_router(settings, store, require_session, dvr: CameraDVR) -> APIRouter
         if not dvr.cache_artifact_is_tracked(filename):
             raise HTTPException(404, "Clip not found.")
         return inline_video(path)
+
+    def _required_iso(value: str, label: str) -> datetime:
+        parsed = _parse_time(value)
+        if parsed is None:
+            raise HTTPException(400, f"{label} must be a valid ISO timestamp.")
+        return parsed
+
+    def _prep_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, PlaybackPreparationError):
+            return HTTPException(503, str(exc))
+        if isinstance(exc, FileNotFoundError):
+            return HTTPException(404, str(exc))
+        if isinstance(exc, ValueError):
+            return HTTPException(400, str(exc))
+        log.warning("DVR playback preparation failed", exc_info=True)
+        return HTTPException(503, "DVR playback could not be prepared.")
+
+    @router.post("/api/clips/range")
+    async def dvr_prepare_range_clip(
+        body: DvrRangeClipRequest,
+        _session: dict = Depends(require_owner_or_internal),
+    ):
+        """Server-to-server-only bounded range prep; range_clip enforces bounds."""
+        since = _required_iso(body.since, "since")
+        until = _required_iso(body.until, "until")
+        if until <= since:
+            raise HTTPException(400, "until must be after since.")
+        try:
+            path = await dvr.range_clip(
+                since, until,
+                cache_name=f"range-{int(since.timestamp())}-{int(until.timestamp())}",
+            )
+        except (PlaybackPreparationError, FileNotFoundError, ValueError) as exc:
+            raise _prep_error(exc) from exc
+        return {"filename": path.name}
+
+    @router.post("/api/events/{burst_id}/clip")
+    async def dvr_prepare_event_clip(
+        burst_id: int,
+        _session: dict = Depends(require_owner_or_internal),
+    ):
+        burst_id = bounded_id(burst_id, "Motion event")
+        try:
+            path = await dvr.event_clip(store, burst_id)
+        except (PlaybackPreparationError, FileNotFoundError, ValueError) as exc:
+            raise _prep_error(exc) from exc
+        except Exception as exc:
+            raise HTTPException(404, "Motion event footage could not be prepared.") from exc
+        return {"filename": path.name}
+
+    @router.post("/api/analysis/samples")
+    async def dvr_analysis_samples(
+        body: DvrAnalysisSamplesRequest,
+        _session: dict = Depends(require_owner_or_internal),
+    ):
+        since = _required_iso(body.since, "since")
+        until = _required_iso(body.until, "until")
+        try:
+            samples = await dvr.footage_analysis_samples(since, until)
+        except (PlaybackPreparationError, FileNotFoundError, ValueError) as exc:
+            raise _prep_error(exc) from exc
+        payload = dict(samples)
+        contact_sheet = bytes(payload.pop("contact_sheet"))
+        payload["contact_sheet_base64"] = base64.b64encode(contact_sheet).decode("ascii")
+        return payload
+
+    @router.post("/api/clips/export")
+    async def dvr_export_clip(
+        body: DvrClipExportRequest,
+        request: Request,
+        session: dict = Depends(require_owner),
+    ):
+        require_exact_origin(request, "Saving a DVR clip requires the exact X Omni origin.")
+        since = _required_iso(body.since, "since")
+        until = _required_iso(body.until, "until")
+        if until <= since:
+            raise HTTPException(400, "Clip end must be after clip start.")
+        try:
+            result = await dvr.export_clip(since, until, title=body.title)
+        except (PlaybackPreparationError, FileNotFoundError, ValueError) as exc:
+            raise _prep_error(exc) from exc
+        audit = getattr(store, "audit", None)
+        if callable(audit):
+            audit(
+                "standalone_dvr_clip_saved",
+                {"clip_id": result["id"], "title": result.get("title")},
+            )
+        result["video_url"] = f"/dvr/api/clips-saved/{result['id']}/video.mp4"
+        return result
+
+    @router.get("/api/clips-saved")
+    async def dvr_saved_clips(_session: dict = Depends(require_owner)):
+        rows = await dvr.list_saved_clips()
+        return {
+            "items": [
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "started_at": row["started_at"],
+                    "ended_at": row["ended_at"],
+                    "bytes": row["bytes"],
+                    "created_at": row["created_at"],
+                    "video_url": f"/dvr/api/clips-saved/{row['id']}/video.mp4",
+                }
+                for row in rows
+            ]
+        }
+
+    @router.get("/api/clips-saved/{clip_id}/video.mp4")
+    async def dvr_saved_clip_video(clip_id: int, _session: dict = Depends(require_owner)):
+        clip_id = bounded_id(clip_id, "Saved clip")
+        row = await dvr.get_saved_clip(clip_id)
+        if row is None:
+            raise HTTPException(404, "Saved clip not found.")
+        path = dvr.saved_clip_path(row["filename"], require_file=True)
+        return inline_video(path)
+
+    @router.delete("/api/clips-saved/{clip_id}")
+    async def dvr_delete_saved_clip(
+        clip_id: int, request: Request, session: dict = Depends(require_owner)
+    ):
+        require_exact_origin(request, "Deleting a DVR clip requires the exact X Omni origin.")
+        clip_id = bounded_id(clip_id, "Saved clip")
+        deleted = await dvr.delete_saved_clip(clip_id)
+        if not deleted:
+            raise HTTPException(404, "Saved clip not found.")
+        audit = getattr(store, "audit", None)
+        if callable(audit):
+            audit("standalone_dvr_clip_deleted", {"clip_id": clip_id})
+        return {"ok": True}
+
+    @router.get("/api/healthz")
+    async def dvr_healthz():
+        return {"ok": True, "service": "dvr"}
 
     return router

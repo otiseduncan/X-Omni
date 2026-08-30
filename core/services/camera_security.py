@@ -13,7 +13,7 @@ import copy
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from . import camera as camera_svc
@@ -49,11 +49,18 @@ SECURITY_TOOL_SCHEMAS["camera_event_history"]["parameters"]["properties"][
     "description": "Include bounded continuous-DVR segment metadata for the same time range.",
 }
 SECURITY_TOOL_SCHEMAS["camera_footage"]["description"] = (
-    "Sole tool to show/play/watch camera footage, video, recordings, clips, or a clock "
-    "time. Returns a playable continuous-DVR card or legacy fallback."
+    "Show DVR footage, clips, or times. Set analysis true for temporal actions; it samples "
+    "DVR frames, not still captions."
+)
+SECURITY_TOOL_SCHEMAS["camera_footage"]["parameters"]["properties"]["event_id"]["description"] = (
+    "Motion event id; omit for the latest motion event."
 )
 SECURITY_TOOL_SCHEMAS["camera_footage"]["parameters"]["properties"].update(
     {
+        "analysis": {
+            "type": "boolean",
+            "description": "True only for a temporal action question.",
+        },
         "since": {
             "type": "string",
             "description": "ISO start with local UTC offset (for EDT use -04:00, never Z).",
@@ -268,6 +275,25 @@ _SECURITY_ANALYSIS_PROMPT = (
     "visible, report both as no and describe the scene."
 )
 
+_FOOTAGE_ANALYSIS_PROMPT = (
+    "You are analyzing one contact sheet made from chronological, time-labeled frames "
+    "from a continuous exterior DVR recording. Read left-to-right and top-to-bottom; the "
+    "first and last frames are intentional before/after evidence. Answer only from changes "
+    "visible across those pixels. A sparse sample can establish an observed change, but it "
+    "cannot prove that nothing happened between samples.\n"
+    "Reply in exactly these seven lines:\n"
+    "PERSON: yes, no, or uncertain\n"
+    "VEHICLE: yes, no, or uncertain\n"
+    "VEHICLE_MOVEMENT: observed, not_observed, or uncertain\n"
+    "PERSON_INTERACTION: observed, not_observed, or uncertain\n"
+    "SUFFICIENCY: sufficient or insufficient\n"
+    "DESCRIPTION: one plain sentence describing the chronological scene\n"
+    "EVIDENCE: one plain sentence naming the visible before/during/after change, or why it is insufficient\n"
+    "Use observed only when the sampled frames visibly support the temporal claim. Use "
+    "not_observed only with SUFFICIENCY: sufficient, and word it as not observed in the "
+    "sample rather than proof nothing happened."
+)
+
 
 def _parse_iso(value: object) -> Optional[datetime]:
     text = str(value or "").strip()
@@ -345,6 +371,47 @@ def _parse_security_caption(
     return decisions["PERSON"], decisions["VEHICLE"], descriptions[0]
 
 
+def _parse_footage_analysis_caption(text: str) -> Optional[dict[str, str]]:
+    """Accept only a complete temporal-analysis contract from the vision worker."""
+    allowed = {
+        "PERSON": {"yes", "no", "uncertain"},
+        "VEHICLE": {"yes", "no", "uncertain"},
+        "VEHICLE_MOVEMENT": {"observed", "not_observed", "uncertain"},
+        "PERSON_INTERACTION": {"observed", "not_observed", "uncertain"},
+        "SUFFICIENCY": {"sufficient", "insufficient"},
+    }
+    values: dict[str, str] = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.fullmatch(
+            r"(PERSON|VEHICLE|VEHICLE_MOVEMENT|PERSON_INTERACTION|SUFFICIENCY|DESCRIPTION|EVIDENCE)\s*:\s*(.+)",
+            line,
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        key, value = match.group(1).upper(), match.group(2).strip()
+        if key in values or not value:
+            return None
+        normalized = value.casefold()
+        if key in allowed:
+            if normalized not in allowed[key]:
+                return None
+            values[key] = normalized
+        else:
+            values[key] = value
+    required = set(allowed) | {"DESCRIPTION", "EVIDENCE"}
+    if set(values) != required:
+        return None
+    if values["SUFFICIENCY"] == "insufficient":
+        # Never turn sparse DVR samples into a negative action conclusion.
+        values["VEHICLE_MOVEMENT"] = "uncertain"
+        values["PERSON_INTERACTION"] = "uncertain"
+    return values
+
+
 def _motion_event_in_range(store, since: datetime, until: datetime) -> Optional[dict[str, Any]]:
     try:
         rows = store.list_camera_events(
@@ -369,6 +436,66 @@ def _motion_event_in_range(store, since: datetime, until: datetime) -> Optional[
         return abs((captured - midpoint).total_seconds()) if captured else float("inf")
 
     return min(candidates, key=distance)
+
+
+def _event_times(store, event: dict[str, Any]) -> tuple[list[dict[str, Any]], list[datetime]]:
+    """Return the full motion burst and its trustworthy UTC capture times."""
+    burst_id = event.get("burst_id")
+    if burst_id is not None:
+        try:
+            events = list(store.list_camera_events_by_burst(int(burst_id)))
+        except Exception:
+            events = []
+    else:
+        events = []
+    if not events:
+        events = [event]
+    captured = sorted(
+        value for value in (_parse_iso(row.get("captured_at")) for row in events)
+        if value is not None
+    )
+    return events, captured
+
+
+def _temporal_event_window(
+    store, event: dict[str, Any]
+) -> tuple[datetime, datetime, list[dict[str, Any]]]:
+    events, captured = _event_times(store, event)
+    if not captured:
+        raise ValueError("Motion event timestamps are invalid.")
+    since = captured[0] - timedelta(seconds=30)
+    until = captured[-1] + timedelta(seconds=75)
+    if (until - since).total_seconds() > camera_dvr_svc.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
+        raise ValueError("The selected motion event is too long for bounded DVR analysis.")
+    return since, until, events
+
+
+def _temporal_error(
+    error: str,
+    *,
+    status: str = "insufficient_footage",
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    event: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "analysis_status": status,
+        "error": error,
+        "source": "continuous_dvr",
+    }
+    if since is not None:
+        result["analyzed_started_at"] = _dvr_iso(since)
+        result["started_at_local"] = since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    if until is not None:
+        result["analyzed_ended_at"] = _dvr_iso(until)
+        result["ended_at_local"] = until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    if event is not None:
+        if event.get("id") is not None:
+            result["event_id"] = event["id"]
+        if event.get("burst_id") is not None:
+            result["burst_id"] = event["burst_id"]
+    return result
 
 
 def _decorate_legacy_clip(store, result: dict[str, Any], burst_id: Optional[int]) -> dict[str, Any]:
@@ -657,12 +784,262 @@ async def camera_event_history(store, args: dict, *, dvr) -> dict[str, Any]:
     return result
 
 
+async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str, Any]:
+    """Answer temporal security questions from actual DVR frames, never captions."""
+    event: Optional[dict[str, Any]] = None
+    raw_event_id = args.get("event_id")
+    if raw_event_id is not None:
+        try:
+            event = store.get_camera_event(int(raw_event_id))
+        except (TypeError, ValueError):
+            return _temporal_error("event_id must be an integer.", status="invalid_request")
+        if event is None:
+            return _temporal_error("The requested camera event was not found.", status="missing_event")
+
+    requested_since = _parse_iso(args.get("since"))
+    requested_until = _parse_iso(args.get("until"))
+    if (requested_since is None) != (requested_until is None):
+        return _temporal_error(
+            "Both since and until are required for a DVR temporal-analysis range.",
+            status="invalid_request",
+        )
+
+    selected_events: list[dict[str, Any]] = []
+    if event is not None:
+        try:
+            since, until, selected_events = _temporal_event_window(store, event)
+        except ValueError as exc:
+            return _temporal_error(str(exc), status="invalid_event", event=event)
+    elif requested_since is not None and requested_until is not None:
+        since, until = requested_since, requested_until
+        if (until - since).total_seconds() > camera_dvr_svc.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
+            event = _motion_event_in_range(store, since, until)
+            if event is None:
+                return _temporal_error(
+                    "A temporal DVR analysis needs a three-minute interval or a motion event within the requested range.",
+                    status="range_too_broad",
+                    since=since,
+                    until=until,
+                )
+            try:
+                since, until, selected_events = _temporal_event_window(store, event)
+            except ValueError as exc:
+                return _temporal_error(str(exc), status="invalid_event", event=event)
+    else:
+        try:
+            event = store.get_last_camera_event(trigger="motion")
+        except Exception:
+            event = None
+        if event is None:
+            return _temporal_error("No stored motion event is available for DVR analysis.", status="missing_event")
+        try:
+            since, until, selected_events = _temporal_event_window(store, event)
+        except ValueError as exc:
+            return _temporal_error(str(exc), status="invalid_event", event=event)
+
+    if until <= since:
+        return _temporal_error("DVR analysis end time must be after start time.", status="invalid_request", event=event)
+    try:
+        samples = await dvr.footage_analysis_samples(since, until)
+    except asyncio.CancelledError:
+        raise
+    except FileNotFoundError:
+        return _temporal_error(
+            "The continuous DVR does not retain a complete recording for that temporal analysis interval.",
+            since=since,
+            until=until,
+            event=event,
+        )
+    except camera_dvr_svc.PlaybackPreparationError:
+        return _temporal_error(
+            "DVR frame extraction could not complete promptly; no temporal conclusion was made.",
+            status="frame_extraction_failed",
+            since=since,
+            until=until,
+            event=event,
+        )
+    except ValueError as exc:
+        return _temporal_error(str(exc), status="invalid_request", since=since, until=until, event=event)
+    except Exception:
+        log.warning("DVR temporal frame extraction failed", exc_info=True)
+        return _temporal_error(
+            "DVR frame extraction failed; no temporal conclusion was made.",
+            status="frame_extraction_failed",
+            since=since,
+            until=until,
+            event=event,
+        )
+
+    try:
+        contact_sheet = camera_svc.validate_camera_frame(
+            bytes(samples["contact_sheet"]), "image/jpeg"
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        log.warning("DVR temporal contact sheet was invalid: %s", exc)
+        return _temporal_error(
+            "DVR analysis frames could not be validated; no temporal conclusion was made.",
+            status="frame_validation_failed",
+            since=since,
+            until=until,
+            event=event,
+        )
+
+    question = str(args.get("prompt") or "").strip()
+    if question:
+        try:
+            question = camera_svc.camera_prompt(question)
+        except ValueError as exc:
+            return _temporal_error(str(exc), status="invalid_request", since=since, until=until, event=event)
+    prompt = _FOOTAGE_ANALYSIS_PROMPT + (
+        f"\nOperator temporal question: {question}" if question else ""
+    )
+    if not router.supports_vision():
+        try:
+            await router.ensure_capability(vision=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _temporal_error(
+                "A vision-capable Omni worker could not be made available for DVR analysis.",
+                status="vision_unavailable",
+                since=since,
+                until=until,
+                event=event,
+            )
+    try:
+        raw_caption = await camera_svc.caption_frame(router, contact_sheet, prompt)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning("DVR temporal vision analysis failed", exc_info=True)
+        return _temporal_error(
+            "The DVR frames were extracted, but Omni could not analyze them; no temporal conclusion was made.",
+            status="vision_failed",
+            since=since,
+            until=until,
+            event=event,
+        )
+    parsed = _parse_footage_analysis_caption(raw_caption)
+    if parsed is None:
+        log.warning("DVR temporal vision response did not match its evidence contract")
+        return _temporal_error(
+            "Omni did not return a complete temporal-evidence result; no temporal conclusion was made.",
+            status="unstructured_vision_result",
+            since=since,
+            until=until,
+            event=event,
+        )
+
+    clip_url: Optional[str] = None
+    playback_error: Optional[str] = None
+    try:
+        path = await dvr.range_clip(
+            since,
+            until,
+            cache_name=f"range-{int(since.timestamp())}-{int(until.timestamp())}",
+        )
+        clip_url = f"/dvr/api/clips/{path.name}"
+    except camera_dvr_svc.PlaybackPreparationError:
+        playback_error = "The analyzed frames are available, but a playable DVR clip could not be prepared promptly."
+    except Exception:
+        log.info("DVR temporal analysis playback clip was unavailable", exc_info=True)
+        playback_error = "The analyzed frames are available, but a playable DVR clip is unavailable."
+
+    def detected(value: str) -> Optional[bool]:
+        return True if value == "yes" else False if value == "no" else None
+
+    movement = parsed["VEHICLE_MOVEMENT"]
+    interaction = parsed["PERSON_INTERACTION"]
+    sufficient = parsed["SUFFICIENCY"] == "sufficient"
+    result: dict[str, Any] = {
+        "ok": True,
+        "analysis_status": "sufficient" if sufficient else "insufficient_evidence",
+        "source": "continuous_dvr",
+        "analyzed_started_at": samples["analyzed_started_at"],
+        "analyzed_ended_at": samples["analyzed_ended_at"],
+        "started_at_local": since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+        "ended_at_local": until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+        "sample_count": int(samples["sample_count"]),
+        "sampled_at": list(samples["sampled_at"]),
+        "source_segments": list(samples["source_segments"]),
+        "person_detected": detected(parsed["PERSON"]),
+        "vehicle_detected": detected(parsed["VEHICLE"]),
+        "vehicle_movement_observation": movement,
+        "person_interaction_observation": interaction,
+        # Only an observed positive becomes a boolean conclusion.  Absence in
+        # sparse samples is deliberately represented by the explicit enum.
+        "vehicle_movement_observed": True if movement == "observed" else None,
+        "person_interaction_observed": True if interaction == "observed" else None,
+        "description": parsed["DESCRIPTION"],
+        "evidence": parsed["EVIDENCE"],
+        "contact_sheet_sha256": contact_sheet.sha256,
+        "clip_url": clip_url,
+        "playback_error": playback_error,
+    }
+    if event is not None:
+        result["event_id"] = event.get("id")
+        result["burst_id"] = event.get("burst_id")
+    if selected_events:
+        result["event_frame_count"] = len(selected_events)
+    return result
+
+
+async def _continuous_event_clip_result(store, dvr, burst_id: int) -> dict[str, Any]:
+    path = await dvr.event_clip(store, int(burst_id))
+    events = store.list_camera_events_by_burst(int(burst_id))
+    caption = _preferred_burst_caption(events)
+    return {
+        "ok": True,
+        "burst_id": int(burst_id),
+        "clip_url": f"/dvr/api/clips/{path.name}",
+        "frame_count": len(events),
+        "started_at_local": legacy._local_time_str(events[0]["captured_at"]) if events else None,
+        "ended_at_local": legacy._local_time_str(events[-1]["captured_at"]) if events else None,
+        "caption": caption,
+        "source": "continuous_dvr",
+        "cached": True,
+    }
+
+
 async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -> dict[str, Any]:
     since = _parse_iso(args.get("since"))
     until = _parse_iso(args.get("until"))
     if since or until:
         if since is None or until is None:
             return {"ok": False, "error": "Both since and until are required for DVR time-range playback."}
+        if (until - since).total_seconds() > camera_dvr_svc.MAX_TOOL_PLAYBACK_DURATION_SECONDS:
+            # A broad history query is useful to find motion, but it is not a
+            # reasonable synchronous browser artifact.  Prefer the actual
+            # motion window it contains rather than holding chat while FFmpeg
+            # transcodes many minutes of HEVC.
+            historical = _motion_event_in_range(store, since, until)
+            if historical is not None and historical.get("burst_id") is not None:
+                try:
+                    selected = await _continuous_event_clip_result(
+                        store, dvr, int(historical["burst_id"])
+                    )
+                    selected["requested_started_at_local"] = since.astimezone().strftime(
+                        "%Y-%m-%d %I:%M:%S %p %Z"
+                    )
+                    selected["requested_ended_at_local"] = until.astimezone().strftime(
+                        "%Y-%m-%d %I:%M:%S %p %Z"
+                    )
+                    selected["selected_motion_event_id"] = historical.get("id")
+                    selected["selected_from_broad_range"] = True
+                    return selected
+                except camera_dvr_svc.PlaybackPreparationError:
+                    return {
+                        "ok": False,
+                        "source": "continuous_dvr",
+                        "error": "DVR playback could not be prepared within the bounded time limit; no video was displayed.",
+                    }
+                except Exception:
+                    log.info("bounded event playback was unavailable", exc_info=True)
+            return {
+                "ok": False,
+                "source": "continuous_dvr",
+                "error": "Continuous DVR playback is limited to five minutes. Select a motion event or a shorter time range.",
+            }
         playback_since = since
         playback_until = until
         partial = False
@@ -675,6 +1052,12 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
                     f"{int(playback_until.timestamp())}"
                 ),
             )
+        except camera_dvr_svc.PlaybackPreparationError:
+            return {
+                "ok": False,
+                "source": "continuous_dvr",
+                "error": "DVR playback could not be prepared within the bounded time limit; no video was displayed.",
+            }
         except Exception:
             # "Around 5:33" commonly expands to a window whose first minute
             # predates the first retained segment.  Return the truthful
@@ -717,6 +1100,12 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
                         ),
                     )
                     partial = True
+                except camera_dvr_svc.PlaybackPreparationError:
+                    return {
+                        "ok": False,
+                        "source": "continuous_dvr",
+                        "error": "DVR playback could not be prepared within the bounded time limit; no video was displayed.",
+                    }
                 except Exception:
                     path = None
         if path is not None:
@@ -761,19 +1150,12 @@ async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -
 
     if burst_id is not None:
         try:
-            path = await dvr.event_clip(store, int(burst_id))
-            events = store.list_camera_events_by_burst(int(burst_id))
-            caption = _preferred_burst_caption(events)
+            return await _continuous_event_clip_result(store, dvr, int(burst_id))
+        except camera_dvr_svc.PlaybackPreparationError:
             return {
-                "ok": True,
-                "burst_id": int(burst_id),
-                "clip_url": f"/dvr/api/clips/{path.name}",
-                "frame_count": len(events),
-                "started_at_local": legacy._local_time_str(events[0]["captured_at"]) if events else None,
-                "ended_at_local": legacy._local_time_str(events[-1]["captured_at"]) if events else None,
-                "caption": caption,
+                "ok": False,
                 "source": "continuous_dvr",
-                "cached": True,
+                "error": "DVR playback could not be prepared within the bounded time limit; no video was displayed.",
             }
         except Exception:
             pass

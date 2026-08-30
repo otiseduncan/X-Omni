@@ -48,15 +48,15 @@ async function liveSessionValidator() {
 test("DVR media URLs are same-origin and constrained to owned route families", async () => {
   const validate = await mediaUrlValidator();
   const snapshots = ["/api/camera-snapshots/"];
-  const videos = ["/dvr/api/", "/api/camera-clips/"];
+  const videos = ["/dvr/api/"];
 
   assert.equal(
     validate("/api/camera-snapshots/camera-motion-1.jpg", snapshots),
     "https://omega.example/api/camera-snapshots/camera-motion-1.jpg",
   );
   assert.equal(
-    validate("/dvr/api/events/7/video.mp4#ignored", videos),
-    "https://omega.example/dvr/api/events/7/video.mp4",
+    validate("/dvr/api/segments/7/video.mp4#ignored", videos),
+    "https://omega.example/dvr/api/segments/7/video.mp4",
   );
   assert.equal(validate("https://attacker.example/image.jpg", snapshots), null);
   assert.equal(validate("//attacker.example/image.jpg", snapshots), null);
@@ -72,9 +72,9 @@ test("DVR renders API data through DOM text boundaries without innerHTML", async
   assert.match(source, /document\.createElement\(/);
   assert.match(source, /\.textContent\s*=/);
   assert.match(source, /\.replaceChildren\(/);
-  assert.match(source, /sameOriginMediaUrl\(item\.snapshot_url, SNAPSHOT_MEDIA_PREFIXES\)/);
+  assert.match(source, /sameOriginMediaUrl\(item\.snapshotUrl, SNAPSHOT_MEDIA_PREFIXES\)/);
+  assert.match(source, /positiveId\(segment\.id\)/);
   assert.match(source, /positiveId\(item\.id\)/);
-  assert.match(source, /positiveId\(item\.burst_id\)/);
 });
 
 test("standalone live watch accepts only its exact opaque same-origin stream", async () => {
@@ -109,25 +109,22 @@ test("standalone live watch accepts only its exact opaque same-origin stream", a
   }), null);
 });
 
-test("standalone live watch is explicit, disconnectable, and cleaned on page exit", async () => {
-  const [source, html, css] = await Promise.all([
-    dvrSource("app.js"), dvrSource("index.html"), dvrSource("style.css"),
-  ]);
-  assert.match(html, /data-view="live"[^>]*>Live watch</);
-  assert.match(html, /id="liveView"/);
+test("standalone live watch is a player mode, explicit, disconnectable, and cleaned on page exit", async () => {
+  const [source, html] = await Promise.all([dvrSource("app.js"), dvrSource("index.html")]);
+  assert.match(html, /id="modeLiveButton"[^>]*>Live</);
+  assert.match(html, /id="modePlaybackButton"[^>]* class="mode-tab active"[^>]*>Playback</);
   assert.match(html, /id="liveFeed"[^>]*hidden/);
   assert.match(html, /id="startLiveButton"[^>]*>Start live view</);
   assert.match(html, /id="stopLiveButton"[^>]*hidden>Disconnect \/ log out</);
-  assert.match(source, /request\("\/dvr\/api\/live\/sessions", \{[\s\S]*method: "POST"[\s\S]*signal: controller\.signal/);
+  assert.match(source, /request\("\/dvr\/api\/live\/sessions", \{ method: "POST", signal: controller\.signal \}\)/);
   assert.match(source, /liveFeed\.removeAttribute\("src"\)[\s\S]*method: "DELETE"/);
   assert.match(source, /pagehide[\s\S]*stopLiveWatch\(\{ keepalive: true, quiet: true \}\)/);
   assert.match(source, /state\.liveStartController\?\.abort\(\)/);
   assert.match(source, /state\.leaving \|\| state\.liveOperation !== operation[\s\S]*deleteLiveSession\(session, \{ keepalive: true \}\)/);
   assert.match(source, /liveFeed\.addEventListener\("error"[\s\S]*stopLiveWatch\(\{ quiet: true \}\)/);
   assert.doesNotMatch(source, /\nstartLiveWatch\(\);/);
-  assert.match(css, /\.live-surface \{[^}]*aspect-ratio:16\/9/);
-  assert.match(css, /\.live-surface img\[hidden\] \{ display:none; \}/);
-  assert.match(css, /\.live-actions \.button \{ flex:1; \}/);
+  // Switching to live pauses playback; switching away stops any open session.
+  assert.match(source, /function setMode\(mode\)[\s\S]*videoPlayer\.pause\(\)[\s\S]*stopLiveWatch\(\{ quiet: true \}\)/);
 });
 
 test("DVR status and viewer lifecycle expose the complete safe operator contract", async () => {
@@ -136,14 +133,45 @@ test("DVR status and viewer lifecycle expose the complete safe operator contract
   assert.match(source, /Used \$\{formatBytes\(drive\.used_bytes\)\}/);
   assert.match(source, /Free \$\{formatBytes\(drive\.free_bytes\)\}/);
   assert.match(source, /Total \$\{formatBytes\(drive\.total_bytes\)\}/);
-  assert.match(source, /viewer\.addEventListener\("cancel", cleanupViewerMedia\)/);
-  assert.match(source, /viewer\.addEventListener\("close", cleanupViewerMedia\)/);
-  assert.match(source, /window\.addEventListener\("pagehide", \(\) => \{[\s\S]*cleanupViewerMedia\(\)/);
-  assert.match(source, /videoPlayer\.removeAttribute\("src"\)[\s\S]*videoPlayer\.load\(\)/);
+  assert.match(source, /viewer\.addEventListener\("cancel", closeViewer\)/);
+  assert.match(source, /viewer\.addEventListener\("close", \(\) => imageViewer\.removeAttribute\("src"\)\)/);
   assert.match(html, /aria-labelledby="viewerTitle"/);
   assert.match(html, /aria-describedby="viewerMeta"/);
   assert.match(html, /Motion events with person and vehicle classification\./);
-  assert.doesNotMatch(html, /ONVIF-triggered events/);
+});
+
+test("continuous timeline seeks by absolute time and hands off across segment boundaries", async () => {
+  const source = await dvrSource("app.js");
+  assert.match(source, /function findSegmentForTime\(target\)/);
+  assert.match(source, /async function seekAbsolute\(target/);
+  assert.match(source, /function nextSegmentAfter\(segment\)/);
+  // Auto-advance is guarded so a rapid loadedmetadata race cannot double-fire it.
+  assert.match(source, /state\.player\.advancing/);
+  assert.match(source, /videoPlayer\.addEventListener\("timeupdate"/);
+  assert.match(source, /videoPlayer\.addEventListener\("ended"/);
+  // Required visible playback controls (spec: 10s/30s skip, prev/next event,
+  // 0.5x-8x speed, fullscreen) -- keyboard shortcuts only supplement these.
+  for (const id of [
+    "playPauseButton", "back10Button", "forward10Button", "back30Button",
+    "forward30Button", "prevEventButton", "nextEventButton", "speedSelect",
+    "fullscreenButton",
+  ]) {
+    assert.match(source, new RegExp(`\\$\\("#${id}"\\)`), `${id} must be wired`);
+  }
+  for (const speed of ["0.5", "1", "2", "4", "8"]) {
+    const html = await dvrSource("index.html");
+    assert.match(html, new RegExp(`<option value="${speed}"`));
+  }
+});
+
+test("saved clips are marked, exported, and explicitly deleted -- never auto-pruned client-side", async () => {
+  const [source, html] = await Promise.all([dvrSource("app.js"), dvrSource("index.html")]);
+  assert.match(html, /id="markStartButton"/);
+  assert.match(html, /id="markEndButton"/);
+  assert.match(html, /id="saveClipButton"[^>]*disabled/);
+  assert.match(source, /request\("\/dvr\/api\/clips\/export", \{/);
+  assert.match(source, /method: "DELETE"/);
+  assert.match(source, /window\.confirm\("Delete this saved clip\? This cannot be undone\."\)/);
 });
 
 test("DVR phone layouts retain readable grids and 44px touch controls", async () => {
@@ -153,6 +181,7 @@ test("DVR phone layouts retain readable grids and 44px touch controls", async ()
   assert.match(css, /\.tab \{[^}]*min-height:44px/);
   assert.match(css, /\.play-button \{[^}]*min-height:44px/);
   assert.match(css, /\.icon-button \{[^}]*width:44px; height:44px/);
+  assert.match(css, /\.icon-btn \{[^}]*min-height:40px/);
   assert.match(css, /\.button, \.tab, \.icon-button/);
   assert.match(css, /\.event-grid \{ grid-template-columns:minmax\(0,1fr\); \}/);
   assert.match(css, /\.shot-grid \{ grid-template-columns:repeat\(2,minmax\(0,1fr\)\); \}/);
