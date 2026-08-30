@@ -27,6 +27,12 @@ test("continuous adapter replaces five-minute source swapping", async () => {
   assert.match(js, /seekAbsolute = continuousSeekAbsolute/);
   assert.match(js, /\/dvr\/api\/playback\/continuous\.mp4/);
   assert.match(js, /advanceToNextSegment = function continuousAdvanceBookkeeping/);
-  assert.match(js, /Intentionally no source replacement/);
+  assert.match(js, /No source replacement/);
   assert.match(js, /prefetchSegment = function continuousPrefetchNoop/);
+});
+
+test("continuous playback does not flash segment-loading UI", async () => {
+  const js = await source("continuous-playback.js");
+  assert.match(js, /playerLoading\.hidden = true/);
+  assert.doesNotMatch(js, /playerLoading\.hidden = false/);
 });
