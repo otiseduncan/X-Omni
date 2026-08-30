@@ -4,18 +4,17 @@ The recorder intentionally keeps small native MKV files for crash resilience and
 retention. Human playback must not expose those file boundaries. This module
 selects the contiguous completed run that covers an absolute timestamp, trims
 normal recorder overlap at each boundary, and feeds FFmpeg one concat manifest.
-FFmpeg emits one fragmented H.264 MP4 stream to the browser, so a single <video>
-source keeps playing until a genuine recording break or the end of retained data.
 
-The archive is never modified and the recorder remains native stream-copy. The
-CPU transcode exists only while a human is actively watching the standalone DVR.
+Historical playback is deliberately isolated from recording and Live View. Only
+one human historical-playback FFmpeg worker may exist at a time, and Live View
+can explicitly cancel it before opening the camera. The archive is never
+modified and the recorder remains native stream-copy.
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import tempfile
-import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,17 +30,11 @@ STREAM_CHUNK_BYTES = 256 * 1024
 MAX_STREAM_SEGMENTS = camera_dvr_svc.MAX_UI_SEGMENTS
 LEGACY_INDEX_JITTER_SECONDS = 10.0
 CROSS_SESSION_GAP_SECONDS = 2.0
-# Historical playback is file-backed, so a healthy FFmpeg worker should always
-# produce another fragment promptly. If it produces nothing for this long it is
-# wedged on a damaged/odd input and must not be allowed to freeze the DVR API.
 STREAM_NO_PROGRESS_SECONDS = 12.0
 
-# X DVR is currently single-owner. Keep exactly one human continuous-playback
-# FFmpeg worker per DVR process. Browser source changes are not guaranteed to
-# tear an old HTTP media request down immediately, so relying on client TCP
-# disconnect alone can leave orphan transcodes stacked up and starve status,
-# timeline, and event API calls. A new human seek owns playback and explicitly
-# retires the previous worker first.
+# Single-owner DVR: at most one historical playback worker. Crucially this map
+# contains *only* archive playback workers -- never the recorder and never the
+# exterior-camera live-preview process.
 _ACTIVE_PLAYBACK_LOCK = asyncio.Lock()
 _ACTIVE_PLAYBACK: dict[int, Any] = {}
 
@@ -106,7 +99,9 @@ def _select_contiguous_rows(
         return []
     first_index, first = max(
         covering,
-        key=lambda item: (_parse_utc(item[1].get("started_at")), int(item[1].get("id") or 0)),
+        key=lambda item: (
+            _parse_utc(item[1].get("started_at")), int(item[1].get("id") or 0)
+        ),
     )
 
     first_start = _parse_utc(first.get("started_at"))
@@ -164,14 +159,32 @@ async def _continuous_parts(dvr, start: datetime) -> list[PlaybackPart]:
     return parts
 
 
+async def cancel_active_playback(dvr) -> bool:
+    """Terminate only the active historical playback worker, if any.
+
+    This is safe to call before Live View: recorder FFmpeg and camera-preview
+    FFmpeg are separately owned and are never present in _ACTIVE_PLAYBACK.
+    """
+    key = id(dvr)
+    async with _ACTIVE_PLAYBACK_LOCK:
+        proc = _ACTIVE_PLAYBACK.pop(key, None)
+    if proc is None or getattr(proc, "returncode", None) is not None:
+        return False
+    await dvr._terminate_process(proc)
+    return True
+
+
 async def _claim_active_playback(dvr, proc: Any) -> None:
-    """Make ``proc`` the sole human playback worker for this DVR process."""
     key = id(dvr)
     async with _ACTIVE_PLAYBACK_LOCK:
         previous = _ACTIVE_PLAYBACK.get(key)
-        if previous is not None and previous is not proc and getattr(previous, "returncode", None) is None:
-            await dvr._terminate_process(previous)
         _ACTIVE_PLAYBACK[key] = proc
+    if (
+        previous is not None
+        and previous is not proc
+        and getattr(previous, "returncode", None) is None
+    ):
+        await dvr._terminate_process(previous)
 
 
 async def _release_active_playback(dvr, proc: Any) -> None:
@@ -226,7 +239,6 @@ async def continuous_stream(
     stderr_task = asyncio.create_task(dvr._drain_stderr(proc.stderr))
 
     async def iterator() -> AsyncIterator[bytes]:
-        last_progress = time.monotonic()
         try:
             while True:
                 try:
@@ -235,14 +247,10 @@ async def continuous_stream(
                         timeout=STREAM_NO_PROGRESS_SECONDS,
                     )
                 except asyncio.TimeoutError:
-                    # A file-backed historical transcode should never sit this
-                    # long without producing bytes. Kill only the playback
-                    # worker; the recorder is a completely different process.
                     await dvr._terminate_process(proc)
                     break
                 if not chunk:
                     break
-                last_progress = time.monotonic()
                 yield chunk
             if getattr(proc, "returncode", None) is None:
                 try:
@@ -281,6 +289,11 @@ def create_router(require_session, dvr) -> APIRouter:
         if session.get("role") != "owner":
             raise HTTPException(403, "Owner authorization is required.")
         return session
+
+    @router.delete("/api/playback/active")
+    async def stop_active_playback(_session: dict = Depends(require_owner)):
+        stopped = await cancel_active_playback(dvr)
+        return {"ok": True, "stopped": stopped}
 
     @router.get("/api/playback/continuous.mp4")
     async def playback_continuous(
