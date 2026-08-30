@@ -226,7 +226,22 @@ class CameraDVR:
         self._last_motion_at: Optional[str] = None
         self._db_lock = asyncio.Lock()
         self._index_lock = asyncio.Lock()
-        self._io_lock = asyncio.Lock()
+        # Retention's rare, low-disk archive-deletion path only -- never held
+        # by ordinary playback prep, so a maintenance cycle can never stall a
+        # human watching the DVR. Everyday cache cleanup (_prune_old_
+        # playback_cache) needs no lock at all: it only removes artifacts
+        # untouched for 24h+, and already tolerates a losing race on unlink.
+        self._retention_lock = asyncio.Lock()
+        # One lock per prepared target (segment id, range clip name, analysis
+        # window, ...), created on first use. Different targets now prepare
+        # concurrently instead of serializing behind a single global lock;
+        # identical concurrent requests for the *same* target (e.g. the
+        # timeline's next-segment prefetch racing the actual auto-advance
+        # request) naturally dedupe -- the second one blocks briefly, then
+        # finds the first one's finished, cached result instead of re-running
+        # its own redundant FFmpeg job.
+        self._playback_locks: dict[str, asyncio.Lock] = {}
+        self._clip_lock = asyncio.Lock()
         self._last_index_at = 0.0
         self._progress_name: Optional[str] = None
         self._progress_size = -1
@@ -341,6 +356,13 @@ class CameraDVR:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _keyed_lock(self, key: str) -> asyncio.Lock:
+        lock = self._playback_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._playback_locks[key] = lock
+        return lock
 
     def _segment_path(self, filename: object, *, require_file: bool = False) -> Path:
         name = str(filename or "")
@@ -695,13 +717,12 @@ class CameraDVR:
         return shutil.disk_usage(self._volume_anchor())
 
     async def _prune(self) -> None:
-        async with self._io_lock:
-            try:
-                await self._prune_locked()
-            except asyncio.CancelledError:
-                raise
-            except (OSError, sqlite3.Error):
-                self._last_error = "DVR retention maintenance could not access its index."
+        try:
+            await self._prune_locked()
+        except asyncio.CancelledError:
+            raise
+        except (OSError, sqlite3.Error):
+            self._last_error = "DVR retention maintenance could not access its index."
 
     async def _prune_locked(self) -> None:
         try:
@@ -709,40 +730,43 @@ class CameraDVR:
         except (OSError, RuntimeError):
             return
         if usage.free >= self.reserve_bytes:
+            # The common case, by far: everyday age-based cache cleanup only,
+            # deliberately unlocked -- see _retention_lock's docstring.
             await self._prune_old_playback_cache()
             return
-        await self._clear_playback_cache()
-        if not self.db_path.is_file():
-            return
-        while True:
-            try:
-                usage = await asyncio.to_thread(self._disk_usage_sync)
-            except (OSError, RuntimeError):
+        async with self._retention_lock:
+            await self._clear_playback_cache()
+            if not self.db_path.is_file():
                 return
-            if usage.free >= self.reserve_bytes:
-                return
-            async with self._db_lock:
-                conn = self._conn()
+            while True:
                 try:
-                    row = conn.execute(
-                        "SELECT * FROM segments WHERE complete = 1 ORDER BY started_at ASC LIMIT 1"
-                    ).fetchone()
-                    if row is None:
-                        return
+                    usage = await asyncio.to_thread(self._disk_usage_sync)
+                except (OSError, RuntimeError):
+                    return
+                if usage.free >= self.reserve_bytes:
+                    return
+                async with self._db_lock:
+                    conn = self._conn()
                     try:
-                        path = self._segment_path(row["filename"])
-                    except FileNotFoundError:
+                        row = conn.execute(
+                            "SELECT * FROM segments WHERE complete = 1 ORDER BY started_at ASC LIMIT 1"
+                        ).fetchone()
+                        if row is None:
+                            return
+                        try:
+                            path = self._segment_path(row["filename"])
+                        except FileNotFoundError:
+                            conn.execute("DELETE FROM segments WHERE id = ?", (row["id"],))
+                            conn.commit()
+                            continue
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            return
                         conn.execute("DELETE FROM segments WHERE id = ?", (row["id"],))
                         conn.commit()
-                        continue
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        return
-                    conn.execute("DELETE FROM segments WHERE id = ?", (row["id"],))
-                    conn.commit()
-                finally:
-                    conn.close()
+                    finally:
+                        conn.close()
 
     async def _clear_playback_cache(self) -> None:
         if not self.playback_dir.exists():
@@ -1734,9 +1758,9 @@ class CameraDVR:
         await self._index_segments(force=True)
         self.playback_dir.mkdir(parents=True, exist_ok=True)
         target = self.playback_dir / f"segment-{segment_id}.mp4"
-        async with self._io_lock:
-            # Re-read only after acquiring the same lock used by retention and
-            # playback creation so the source and cache fingerprint are one
+        async with self._keyed_lock(target.name):
+            # Re-read only after acquiring this target's own lock so the
+            # source and cache fingerprint are one
             # coherent immutable view.
             segment = await self.get_segment(segment_id)
             if not segment:
@@ -1800,7 +1824,7 @@ class CameraDVR:
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", cache_name).strip("-.")[:130] or "clip"
         target = self.playback_dir / f"{safe_name}.mp4"
         artifact_kind = "motion" if safe_name.startswith("motion-") else "range"
-        async with self._io_lock:
+        async with self._keyed_lock(target.name):
             source_paths = [
                 self._segment_path(row["filename"], require_file=True)
                 for row in segments
@@ -1962,7 +1986,7 @@ class CameraDVR:
         row = await self.get_saved_clip(clip_id)
         if row is None:
             return False
-        async with self._io_lock:
+        async with self._clip_lock:
             try:
                 path = self.saved_clip_path(row["filename"])
             except FileNotFoundError:
@@ -1992,7 +2016,7 @@ class CameraDVR:
         self.clips_dir.mkdir(parents=True, exist_ok=True)
         filename = f"clip-{int(since.timestamp())}-{int(until.timestamp())}-{uuid.uuid4().hex[:12]}.mp4"
         target = self.clips_dir / filename
-        async with self._io_lock:
+        async with self._clip_lock:
             await asyncio.to_thread(shutil.copy2, prepared, target)
         safe_title = (str(title).strip()[:200] or None) if title else None
         size = target.stat().st_size
@@ -2073,9 +2097,9 @@ class CameraDVR:
         """Extract bounded, chronological actual-DVR samples for temporal review.
 
         This never decodes the recording continuously and never touches an
-        active segment.  Each source is revalidated under the DVR I/O lock
-        before FFmpeg reads it, so the model receives only immutable archive
-        footage from the exact resolved interval.
+        active segment.  Each source is revalidated under this analysis
+        window's own lock before FFmpeg reads it, so the model receives only
+        immutable archive footage from the exact resolved interval.
         """
         if until <= since:
             raise ValueError("Footage-analysis end time must be after start time.")
@@ -2109,7 +2133,7 @@ class CameraDVR:
             raise FileNotFoundError("Continuous DVR metadata is still being verified.")
         sample_times = self._footage_sample_times(since, until, count)
         self.playback_dir.mkdir(parents=True, exist_ok=True)
-        async with self._io_lock:
+        async with self._keyed_lock(f"analysis:{_utc_iso(since)}:{_utc_iso(until)}"):
             indexed: list[tuple[datetime, datetime, dict[str, Any], Path]] = []
             for row in segments:
                 source = self._segment_path(row["filename"], require_file=True)

@@ -158,7 +158,7 @@ test("continuous timeline seeks by absolute time and hands off across segment bo
   assert.match(source, /function beginAdvancing\(\)/);
   assert.match(source, /videoPlayer\.addEventListener\("error", \(\) => \{[\s\S]*state\.player\.advancing = false/);
   // Required visible playback controls (spec: 10s/30s skip, prev/next event,
-  // 0.5x-8x speed, fullscreen) -- keyboard shortcuts only supplement these.
+  // 0.5x-20x speed, fullscreen) -- keyboard shortcuts only supplement these.
   for (const id of [
     "playPauseButton", "back10Button", "forward10Button", "back30Button",
     "forward30Button", "prevEventButton", "nextEventButton", "speedSelect",
@@ -166,7 +166,7 @@ test("continuous timeline seeks by absolute time and hands off across segment bo
   ]) {
     assert.match(source, new RegExp(`\\$\\("#${id}"\\)`), `${id} must be wired`);
   }
-  for (const speed of ["0.5", "1", "2", "4", "8"]) {
+  for (const speed of ["0.5", "1", "2", "4", "8", "10", "15", "20"]) {
     const html = await dvrSource("index.html");
     assert.match(html, new RegExp(`<option value="${speed}"`));
   }

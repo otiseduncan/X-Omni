@@ -509,6 +509,100 @@ async def test_completed_segment_probe_corrects_advertised_codec_and_rebuilds_st
 
 
 @pytest.mark.asyncio
+async def test_concurrent_playback_requests_for_the_same_segment_dedupe_ffmpeg_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Real hardware: the timeline's next-segment prefetch can race the
+    # actual auto-advance request for that same segment. A single shared
+    # lock used to serialize *every* prep request regardless of target,
+    # slowing unrelated segments down together; a per-target lock lets
+    # different segments prepare concurrently while a second request for
+    # the *same* target waits for, then reuses, the first one's result
+    # instead of running its own redundant (and CPU-competing) transcode.
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    source = dvr.recordings_dir / "20260829-120000.mkv"
+    source.write_bytes(b"h264-source")
+    monkeypatch.setattr(dvr, "_probe_segment_sync", lambda _path: ("H264", 1920, 1080))
+    await dvr._index_segments(force=True)
+    segment = (await dvr.list_segments(limit=1))[0]
+
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_rebuild(target_path, _args, *, artifact_kind=None, source_key=None):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        target_path.write_bytes(b"rebuilt")
+        # A faithful stand-in for the real function's own cache registration
+        # -- without it, the second call's cache-tracked check would always
+        # miss and this test could never tell dedup from a coincidence.
+        if artifact_kind and source_key:
+            async with dvr._db_lock:
+                await asyncio.to_thread(
+                    dvr._register_artifact_sync, target_path.name, artifact_kind, source_key
+                )
+        return target_path
+
+    monkeypatch.setattr(dvr, "_write_playback_target", slow_rebuild)
+
+    first = asyncio.create_task(dvr.segment_playback(segment["id"]))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    second = asyncio.create_task(dvr.segment_playback(segment["id"]))
+    await asyncio.sleep(0.05)  # let the second call block on the keyed lock
+    release.set()
+    first_result, second_result = await asyncio.wait_for(
+        asyncio.gather(first, second), timeout=2
+    )
+
+    assert calls == 1
+    assert first_result == second_result == dvr.playback_dir / f"segment-{segment['id']}.mp4"
+
+
+@pytest.mark.asyncio
+async def test_prune_fast_path_never_blocks_concurrent_playback_prep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The common case (plenty of free space) must never make a human
+    # watching the DVR wait on retention's periodic maintenance cycle.
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    source = dvr.recordings_dir / "20260829-120000.mkv"
+    source.write_bytes(b"h264-source")
+    monkeypatch.setattr(dvr, "_probe_segment_sync", lambda _path: ("H264", 1920, 1080))
+    await dvr._index_segments(force=True)
+    segment = (await dvr.list_segments(limit=1))[0]
+    dvr._disk_usage_sync = lambda: SimpleNamespace(total=10**13, used=0, free=10**12)
+
+    async def instant_rebuild(target_path, _args, **_kwargs):
+        target_path.write_bytes(b"rebuilt")
+        return target_path
+
+    monkeypatch.setattr(dvr, "_write_playback_target", instant_rebuild)
+
+    prune_started = asyncio.Event()
+    prune_may_finish = asyncio.Event()
+
+    async def slow_cache_cleanup():
+        prune_started.set()
+        await prune_may_finish.wait()
+
+    monkeypatch.setattr(dvr, "_prune_old_playback_cache", slow_cache_cleanup)
+
+    prune_task = asyncio.create_task(dvr._prune())
+    await asyncio.wait_for(prune_started.wait(), timeout=2)
+
+    result = await asyncio.wait_for(dvr.segment_playback(segment["id"]), timeout=2)
+    assert result.is_file()
+
+    prune_may_finish.set()
+    await asyncio.wait_for(prune_task, timeout=2)
+
+
+@pytest.mark.asyncio
 async def test_segment_playback_reindexes_changed_source_before_cache_reuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
