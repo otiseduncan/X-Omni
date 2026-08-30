@@ -8,14 +8,7 @@ motion-subscription health used by its own retention/status reporting, the
 E:\\XOmni-DVR archive, and the standalone DVR operator GUI/API. It is
 deliberately independent of X Omni Core: starting, stopping, or restarting
 Core (or its model worker) never starts, stops, or restarts this process,
-and closing the DVR GUI in a browser never touches recording either. Core
-talks to this service as a client (see
-`core.services.camera_dvr_client.DVRServiceClient`); it does not run any of
-this itself.
-
-Binds loopback only, exactly like Core -- remote reach, if wanted, is
-Tailscale's job (see scripts/tailscale-serve.ps1), not this process binding
-wider than 127.0.0.1.
+and closing the DVR GUI in a browser never touches recording either.
 """
 
 from __future__ import annotations
@@ -23,12 +16,13 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from .api import auth as auth_api
@@ -51,25 +45,10 @@ def build_app(settings: Settings) -> FastAPI:
     store = Store(settings.db_path)
     exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
     camera_dvr = camera_security_svc.XiongmaiDVR(exterior_camera)
-    # auth_api's Host/Origin checks are keyed off settings.port -- this
-    # process serves its own origin (dvr_port), not Core's, so give the
-    # shared session-cookie logic a settings view with that port swapped in.
-    # Everything else (session_secret, public_origin, auth_enabled, ...)
-    # stays identical to Core's real settings; only local-origin acceptance
-    # changes, so the same Owner cookie set by Core's login validates here.
     dvr_auth_settings = dataclasses.replace(settings, port=settings.dvr_port)
     require_session = auth_api.make_require_session(dvr_auth_settings, store)
 
     async def _track_motion_health() -> None:
-        """Keep status()'s onvif_motion_events/last_motion_at honest here too.
-
-        Recording never needs this (motion_states() only touches ONVIF
-        subscription state, never E:\\XOmni-DVR -- see camera_dvr.py's module
-        docstring). This exists solely so the standalone GUI's own status
-        reads true camera-event-subscription health directly, without
-        depending on X Omni Core (which independently runs the real
-        motion-triggered capture/captioning pipeline via OnvifCameraMonitor).
-        """
         while not camera_dvr._stopped:
             try:
                 async for _active in camera_dvr.motion_states():
@@ -130,10 +109,6 @@ def build_app(settings: Settings) -> FastAPI:
             response.headers["Cache-Control"] = "no-store"
         return response
 
-    # Continuous human playback is registered before the legacy per-segment
-    # DVR router. The archive still consists of resilient five-minute MKVs,
-    # but the operator's <video> element gets one fragmented MP4 stream that
-    # crosses those boundaries without replacing its source every five minutes.
     app.include_router(
         continuous_playback_svc.create_router(require_session, camera_dvr)
     )
@@ -142,17 +117,55 @@ def build_app(settings: Settings) -> FastAPI:
 
     @app.get("/dvr/continuous-playback.js")
     async def dvr_continuous_js():
-        # Authentication is still enforced by the actual playback API. This
-        # static script contains no DVR data or credentials and matches the
-        # existing no-store static UI behavior.
         path = ui_root / "continuous-playback.js"
         if not path.is_file():
-            return JSONResponse({"detail": "DVR playback adapter is not installed."}, status_code=404)
+            return JSONResponse(
+                {"detail": "DVR playback adapter is not installed."},
+                status_code=404,
+            )
         return FileResponse(
             path,
             media_type="text/javascript",
             headers={"Cache-Control": "no-store"},
         )
+
+    async def _require_owner(session: dict = Depends(require_session)) -> dict:
+        if session.get("role") != "owner":
+            raise HTTPException(403, "Owner authorization is required.")
+        return session
+
+    def _owner_session_id(session: dict) -> str:
+        token_hash = str(session.get("token_hash") or "").strip()
+        if token_hash:
+            return f"session:{token_hash}"
+        return f"local:{session.get('google_sub') or 'local-dev'}"
+
+    @app.delete("/dvr/api/live/reset")
+    async def reset_owner_live_session(session: dict = Depends(_require_owner)):
+        """Clear an orphaned standalone Live View session for this Owner.
+
+        A browser reload can lose the opaque live session id before its
+        keepalive DELETE reaches the service. Without this bounded reset the
+        invisible pending session blocks Start Live until its five-minute TTL.
+        It never touches the continuous recorder or historical playback.
+        """
+        owner_id = _owner_session_id(session)
+        async with exterior_camera._lock:
+            await exterior_camera._expire_locked()
+            current = exterior_camera._session
+            if current is None:
+                return {"ok": True, "stopped": False}
+            if not secrets.compare_digest(current.owner_id, owner_id):
+                raise HTTPException(403, "The active camera session belongs to another Owner.")
+            live_session_id = current.session_id
+        try:
+            await exterior_camera.delete_session(
+                session_id=live_session_id,
+                owner_id=owner_id,
+            )
+        except exterior_camera_svc.ExteriorCameraSessionNotFound:
+            return {"ok": True, "stopped": False}
+        return {"ok": True, "stopped": True}
 
     app.include_router(
         camera_dvr_svc.create_router(
