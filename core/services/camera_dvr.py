@@ -1755,7 +1755,18 @@ class CameraDVR:
         # Refresh and, when needed, bitstream-probe the immutable source before
         # taking the playback/retention lock. A cache key is only authoritative
         # when the indexed size and mtime still match the local archive file.
-        await self._index_segments(force=True)
+        #
+        # Unforced: run_forever() already forces a full reindex on its own
+        # ~30s maintenance cycle, which is the only place archive-wide
+        # freshness actually needs to be authoritative. Forcing another full
+        # glob-and-probe of the whole archive here on every single playback
+        # click became real, growing latency as the archive fills across a
+        # day (measured: felt like a hang once the index had a few hundred
+        # rows and this queued behind the recorder's own reindex on the same
+        # lock). The explicit bytes/mtime check below already fails safely
+        # ("changed; retry") if this segment's row is stale, so skipping the
+        # forced whole-archive rescan costs nothing but that rare retry.
+        await self._index_segments()
         self.playback_dir.mkdir(parents=True, exist_ok=True)
         target = self.playback_dir / f"segment-{segment_id}.mp4"
         async with self._keyed_lock(target.name):
@@ -1807,7 +1818,8 @@ class CameraDVR:
         until = until.replace(tzinfo=timezone.utc) if until.tzinfo is None else until.astimezone(timezone.utc)
         if (until - since).total_seconds() > MAX_PLAYBACK_DURATION_SECONDS:
             raise ValueError("Continuous playback clips are limited to 30 minutes.")
-        await self._index_segments(force=True)
+        # Unforced -- see segment_playback()'s comment on the same call.
+        await self._index_segments()
         segments = await self.list_segments(
             since=_utc_iso(since),
             until=_utc_iso(until),
@@ -2116,7 +2128,8 @@ class CameraDVR:
             max(int(sample_count), MIN_FOOTAGE_ANALYSIS_SAMPLES),
             MAX_FOOTAGE_ANALYSIS_SAMPLES,
         )
-        await self._index_segments(force=True)
+        # Unforced -- see segment_playback()'s comment on the same call.
+        await self._index_segments()
         segments = await self.list_segments(
             since=_utc_iso(since),
             until=_utc_iso(until),

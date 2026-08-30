@@ -633,12 +633,39 @@ async def test_segment_playback_reindexes_changed_source_before_cache_reuse(
         return target_path
 
     monkeypatch.setattr(dvr, "_write_playback_target", rebuild)
+    # segment_playback() itself no longer forces a full archive reindex on
+    # every call (see its docstring comment) -- run_forever()'s own ~30s
+    # maintenance cycle is what keeps the index fresh in production; a test
+    # of "a changed source gets picked up, not served stale" stands in for
+    # that cycle explicitly rather than relying on segment_playback to do it.
+    await dvr._index_segments(force=True)
     result = await dvr.segment_playback(original["id"])
 
     refreshed = await dvr.get_segment(original["id"])
     assert refreshed is not None and refreshed["codec"] == "HEVC"
     assert result.read_bytes() == b"rebuilt-h264"
     assert "libx264" in observed["args"]
+
+
+@pytest.mark.asyncio
+async def test_segment_playback_fails_safe_on_a_change_with_no_intervening_reindex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The other half of the same contract: without a reindex in between (the
+    # throttled, unforced call inside segment_playback won't have picked up
+    # a change made only moments ago), a changed source must never be served
+    # from a now-stale cache -- it must fail cleanly and ask for a retry.
+    dvr = _dvr(tmp_path)
+    dvr.recordings_dir.mkdir(parents=True)
+    source = dvr.recordings_dir / "20260829-120000.mkv"
+    source.write_bytes(b"original-h264")
+    monkeypatch.setattr(dvr, "_probe_segment_sync", lambda _path: ("H264", 1920, 1080))
+    await dvr._index_segments(force=True)
+    original = (await dvr.list_segments(limit=1))[0]
+
+    source.write_bytes(b"replacement-with-a-different-size")
+    with pytest.raises(FileNotFoundError, match="changed; retry"):
+        await dvr.segment_playback(original["id"])
 
 
 @pytest.mark.asyncio
@@ -674,6 +701,9 @@ async def test_range_playback_reindexes_changed_source_before_cache_reuse(
         return target_path
 
     monkeypatch.setattr(dvr, "_write_playback_target", rebuild)
+    # range_clip() no longer forces a full archive reindex on every call
+    # either -- see the matching segment_playback() test/comment.
+    await dvr._index_segments(force=True)
     result = await dvr.range_clip(since, until, cache_name="range-test")
 
     refreshed = (await dvr.list_segments(limit=1))[0]
