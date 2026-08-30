@@ -1,15 +1,10 @@
 /*
  * Continuous X DVR playback adapter.
  *
- * app.js owns the operator UI.  This small layer changes only the timeline
- * media transport: selecting a time starts one fragmented-MP4 stream at that
- * absolute instant.  The DVR backend walks the underlying five-minute MKVs.
- * Consequently five-minute archive boundaries never replace <video>.src and
- * cannot reset, rewind, or strand the browser's auto-advance state.
- *
- * app.js is deliberately loaded as a classic script before this file so its
- * global lexical state/functions are shared here. Saved clips and Live View
- * keep their original direct-source behavior.
+ * app.js owns the operator UI. This layer changes only the timeline media
+ * transport: selecting a time starts one fragmented-MP4 stream at that absolute
+ * instant. The DVR backend walks the underlying five-minute MKVs, so physical
+ * archive boundaries never replace <video>.src during ordinary playback.
  */
 
 function continuousCoveringSegment(target) {
@@ -22,16 +17,11 @@ function continuousCoveringSegment(target) {
 async function continuousSeekAbsolute(target, { autoplay = true } = {}) {
   if (!(target instanceof Date) || Number.isNaN(target.getTime())) return;
 
-  // Deliberate operator navigation always wins over any stale transition state
-  // left by the legacy segment handoff machinery.
   state.player.advancing = false;
   clearAdvanceWatchdog();
 
   let segment = continuousCoveringSegment(target);
   if (!segment) {
-    // Preserve the existing convenient behavior for clicks immediately before
-    // recorded coverage: move to the next completed recording, but never hide
-    // a gap while continuous playback is already underway.
     const after = state.segments
       .filter((row) => row.complete && row.startedAt > target)
       .sort((a, b) => a.startedAt - b.startedAt)[0];
@@ -46,12 +36,15 @@ async function continuousSeekAbsolute(target, { autoplay = true } = {}) {
   const clamped = target < segment.startedAt ? segment.startedAt : target;
   setMode("playback");
   setPlayerEmpty(null);
-  playerLoading.hidden = false;
+
+  // Normal DVR playback should look like a DVR, not a file-preparation tool.
+  // Keep the legacy diagnostic badge available to old direct-file paths, but
+  // never flash "Loading next recording" for the continuous transport. The
+  // video simply remains on its current/black frame until metadata is ready.
+  playerLoading.hidden = true;
 
   state.player.directSource = false;
   state.player.currentSegmentId = segment.id;
-  // The continuous endpoint starts its output exactly at `clamped`, so video
-  // time zero maps directly to this absolute wall-clock instant.
   state.player.anchorAbsolute = clamped;
   state.player.pendingOffset = 0;
   state.player.autoplayAfterLoad = autoplay;
@@ -61,30 +54,25 @@ async function continuousSeekAbsolute(target, { autoplay = true } = {}) {
   updatePlayerTimeUI(clamped);
 
   const params = new URLSearchParams({ start: clamped.toISOString() });
-  // A fresh URL also guarantees a cancelled/previous streaming response can
-  // never be reused as the source for a new human seek.
   params.set("request", String(Date.now()));
   videoPlayer.src = `/dvr/api/playback/continuous.mp4?${params.toString()}`;
   videoPlayer.load();
 }
 
-// Rebind the function used by timeline clicks, recording rows, event jumps,
-// skip controls, and keyboard navigation. User-directed seeking starts a new
-// continuous stream; ordinary playback never changes source at archive edges.
 seekAbsolute = continuousSeekAbsolute;
 
 advanceToNextSegment = function continuousAdvanceBookkeeping(_segment, currentAbs) {
   if (state.player.directSource || !(currentAbs instanceof Date)) return;
   const covering = continuousCoveringSegment(currentAbs);
-  if (covering) {
-    state.player.currentSegmentId = covering.id;
-  }
-  // Intentionally no source replacement. The fragmented MP4 already contains
-  // the following physical recording. If there is a real archive gap, FFmpeg
-  // ends this response and the normal `ended` state is truthful.
+  if (covering) state.player.currentSegmentId = covering.id;
+  // No source replacement. FFmpeg already carries the physical next segment
+  // inside this one browser response.
 };
 
-// Per-file prefetching was required only by the old source-swap architecture.
-// Keep the binding harmless because app.js may still call it from code paths
-// that are retained for historical/saved media compatibility.
 prefetchSegment = function continuousPrefetchNoop() {};
+
+// Defense in depth: app.js retains the old loading element for historical
+// direct-file playback. Continuous timeline playback never needs it.
+videoPlayer.addEventListener("loadstart", () => {
+  if (!state.player.directSource) playerLoading.hidden = true;
+});
