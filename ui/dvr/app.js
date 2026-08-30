@@ -576,22 +576,32 @@ videoPlayer.addEventListener("timeupdate", () => {
   const segment = state.segments.find((row) => row.id === state.player.currentSegmentId);
   if (!segment || state.player.advancing || videoPlayer.paused) return;
   if (abs >= new Date(segment.endedAt.getTime() - 250)) {
-    const next = nextSegmentAfter(segment);
-    if (next) {
-      beginAdvancing();
-      seekAbsolute(next.startedAt, { autoplay: true });
-    }
+    advanceToNextSegment(segment, abs);
   }
 });
 videoPlayer.addEventListener("ended", () => {
   const segment = state.segments.find((row) => row.id === state.player.currentSegmentId);
   if (!segment || state.player.advancing) return;
-  const next = nextSegmentAfter(segment);
-  if (next) {
-    beginAdvancing();
-    seekAbsolute(next.startedAt, { autoplay: true });
-  }
+  advanceToNextSegment(segment, currentAbsoluteTime());
 });
+
+function advanceTarget(nextStartedAt, currentAbs) {
+  // Consecutive segments can overlap by a second or two (see
+  // findSegmentForTime); seeking to nextStartedAt unconditionally would
+  // visibly rewind into content already shown whenever that overlap exists.
+  // Continuing from wherever playback actually was (never earlier than the
+  // next segment's start, so a real gap still jumps forward correctly) keeps
+  // the boundary seamless either way.
+  return currentAbs && currentAbs.getTime() > nextStartedAt.getTime() ? currentAbs : nextStartedAt;
+}
+
+function advanceToNextSegment(segment, currentAbs) {
+  const next = nextSegmentAfter(segment);
+  if (!next) return;
+  const target = advanceTarget(next.startedAt, currentAbs);
+  beginAdvancing();
+  seekAbsolute(target, { autoplay: true });
+}
 
 function updatePlayPauseUI() {
   const button = $("#playPauseButton");

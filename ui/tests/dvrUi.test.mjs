@@ -81,6 +81,38 @@ test("an overlapping segment boundary resolves forward, not back into the segmen
   assert.equal(sandbox.findSegmentForTime(new Date("2026-08-30T06:50:00Z")).id, incoming.id);
 });
 
+async function advanceTargetFn() {
+  const source = await dvrSource("app.js");
+  const start = source.indexOf("function advanceTarget");
+  const end = source.indexOf("\n}\n\nfunction advanceToNextSegment", start);
+  assert.ok(start >= 0 && end > start, "advance-target picker must remain independently testable");
+  const sandbox = {};
+  vm.runInNewContext(source.slice(start, end + 2), sandbox, { filename: "dvr-advance-target.js" });
+  return sandbox.advanceTarget;
+}
+
+test("auto-advance across an overlap continues from where playback was, not a visible rewind", async () => {
+  // Reproduced live: it cleared the first (freeze) boundary, ran on at
+  // speed, then visibly jumped backward at the *next* boundary -- landing
+  // on the next segment's nominal start even though playback, at speed,
+  // had already reached a moment at or after that start (the two segments
+  // overlap there too). The seek target must never be earlier than where
+  // playback actually already was.
+  const advanceTarget = await advanceTargetFn();
+  const nextStartedAt = new Date("2026-08-30T06:52:57Z");
+
+  // Overlap: current position is already past the next segment's start.
+  const pastStart = new Date("2026-08-30T06:52:58Z");
+  assert.equal(advanceTarget(nextStartedAt, pastStart).getTime(), pastStart.getTime());
+
+  // Gap: current position has not yet reached the next segment's start.
+  const beforeStart = new Date("2026-08-30T06:52:55Z");
+  assert.equal(advanceTarget(nextStartedAt, beforeStart).getTime(), nextStartedAt.getTime());
+
+  // No known current position (e.g. a direct-source clip was playing).
+  assert.equal(advanceTarget(nextStartedAt, null).getTime(), nextStartedAt.getTime());
+});
+
 test("DVR media URLs are same-origin and constrained to owned route families", async () => {
   const validate = await mediaUrlValidator();
   const snapshots = ["/api/camera-snapshots/"];
