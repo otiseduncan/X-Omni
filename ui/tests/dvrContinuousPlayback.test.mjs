@@ -54,3 +54,19 @@ test("a prolonged media stall releases playback without reloading the DVR page",
   assert.match(js, /Playback stalled near/);
   assert.doesNotMatch(js, /window\.location\.reload/);
 });
+
+test("Live View hard-stops historical playback before opening the camera", async () => {
+  const js = await source("continuous-playback.js");
+  assert.match(js, /\/dvr\/api\/playback\/active/);
+  assert.match(js, /method: "DELETE"/);
+  assert.match(js, /mode === "live"[\s\S]*stopHistoricalPlaybackOnServer/);
+  assert.match(js, /removeEventListener\("click", baseStartLiveWatch\)/);
+  assert.match(js, /await stopHistoricalPlaybackOnServer\(\)/);
+});
+
+test("Live View clears an orphaned server camera session before a fresh start", async () => {
+  const js = await source("continuous-playback.js");
+  assert.match(js, /function resetOrphanedLiveSession\(\)/);
+  assert.match(js, /\/dvr\/api\/live\/reset/);
+  assert.match(js, /await resetOrphanedLiveSession\(\)[\s\S]*return baseStartLiveWatch\(\)/);
+});
