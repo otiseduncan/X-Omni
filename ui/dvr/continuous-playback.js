@@ -1,10 +1,11 @@
 /*
  * Continuous X DVR playback adapter.
  *
- * app.js owns the operator UI. This layer changes only the timeline media
- * transport: selecting a time starts one fragmented-MP4 stream at that absolute
- * instant. The DVR backend walks the underlying five-minute MKVs, so physical
- * archive boundaries never replace <video>.src during ordinary playback.
+ * app.js owns the operator UI. This layer changes only timeline-media
+ * transport and, critically, keeps historical playback isolated from Live
+ * View. Switching to Live tears down the browser media request AND asks the
+ * DVR service to terminate its archive-playback FFmpeg worker before opening
+ * another RTSP camera session.
  */
 
 const CONTINUOUS_STALL_RECOVERY_MS = 15000;
@@ -28,13 +29,36 @@ function clearContinuousStallTimer() {
 function cancelContinuousMediaRequest() {
   clearContinuousStallTimer();
   continuousRequestGeneration += 1;
-  // Merely assigning a new src does not guarantee Chrome immediately closes
-  // the old streaming HTTP response. Pause, detach, and load the empty element
-  // first so the DVR service sees a real disconnect and can retire its FFmpeg
-  // worker before a new seek starts.
   videoPlayer.pause();
   videoPlayer.removeAttribute("src");
   videoPlayer.load();
+}
+
+async function stopHistoricalPlaybackOnServer() {
+  try {
+    await fetch("/dvr/api/playback/active", {
+      method: "DELETE",
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } catch (_error) {
+    // Browser teardown still closes the HTTP response. The backend also has a
+    // no-progress watchdog, so a failed best-effort control request must never
+    // prevent the operator from attempting Live View.
+  }
+}
+
+function resetHistoricalPlayerState() {
+  state.player.advancing = false;
+  clearAdvanceWatchdog();
+  state.player.currentSegmentId = null;
+  state.player.anchorAbsolute = null;
+  state.player.pendingOffset = null;
+  state.player.autoplayAfterLoad = false;
+  state.player.prefetchedSegmentId = null;
+  timelinePlayheadEl.hidden = true;
+  playerLoading.hidden = true;
+  updatePlayPauseUI();
 }
 
 function armContinuousStallRecovery() {
@@ -45,18 +69,13 @@ function armContinuousStallRecovery() {
     if (generation !== continuousRequestGeneration || state.player.directSource) return;
     const when = currentAbsoluteTime();
     cancelContinuousMediaRequest();
-    state.player.currentSegmentId = null;
-    state.player.anchorAbsolute = null;
-    state.player.pendingOffset = null;
-    state.player.autoplayAfterLoad = false;
-    timelinePlayheadEl.hidden = true;
-    playerLoading.hidden = true;
+    void stopHistoricalPlaybackOnServer();
+    resetHistoricalPlayerState();
     setPlayerEmpty(
       when
         ? `Playback stalled near ${formatClock(when)}. Pick another point on the timeline to continue.`
         : "Playback stalled. Pick another point on the timeline to continue."
     );
-    updatePlayPauseUI();
   }, CONTINUOUS_STALL_RECOVERY_MS);
 }
 
@@ -84,9 +103,9 @@ async function continuousSeekAbsolute(target, { autoplay = true } = {}) {
   setPlayerEmpty(null);
   playerLoading.hidden = true;
 
-  // Explicitly close the prior HTTP media request before opening another one.
-  // This prevents stale FFmpeg workers from piling up when an operator scrubs
-  // or seeks away from a damaged segment.
+  // Do not stack historical transcodes while scrubbing. Shut the browser side
+  // immediately; the new backend playback request itself also supersedes any
+  // older server worker through the single-owner playback guard.
   cancelContinuousMediaRequest();
 
   state.player.directSource = false;
@@ -116,9 +135,32 @@ advanceToNextSegment = function continuousAdvanceBookkeeping(_segment, currentAb
 
 prefetchSegment = function continuousPrefetchNoop() {};
 
-// Normal buffering should be invisible. A prolonged stall, however, must
-// release the media request so the entire DVR console cannot become hostage to
-// one bad recording.
+// setMode's Live tab is an immediate media-lifecycle boundary. The base UI only
+// paused the hidden <video>, which left its HTTP/FFmpeg playback request alive.
+const baseSetMode = setMode;
+setMode = function isolatedDvrMode(mode) {
+  if (mode === "live" && !state.player.directSource) {
+    cancelContinuousMediaRequest();
+    resetHistoricalPlayerState();
+    void stopHistoricalPlaybackOnServer();
+  }
+  return baseSetMode(mode);
+};
+
+// app.js registered the original startLiveWatch function object directly as
+// the button listener before this adapter loaded. Remove that exact reference
+// and replace it with a guarded start that waits for archive playback teardown.
+const baseStartLiveWatch = startLiveWatch;
+const startLiveButton = $("#startLiveButton");
+startLiveButton.removeEventListener("click", baseStartLiveWatch);
+async function startLiveAfterPlaybackStops() {
+  cancelContinuousMediaRequest();
+  resetHistoricalPlayerState();
+  await stopHistoricalPlaybackOnServer();
+  return baseStartLiveWatch();
+}
+startLiveButton.addEventListener("click", startLiveAfterPlaybackStops);
+
 videoPlayer.addEventListener("loadstart", () => {
   if (!state.player.directSource) playerLoading.hidden = true;
 });
@@ -132,4 +174,7 @@ for (const eventName of ["playing", "canplay", "progress", "timeupdate", "loaded
 videoPlayer.addEventListener("error", () => {
   if (!state.player.directSource) clearContinuousStallTimer();
 });
-window.addEventListener("beforeunload", cancelContinuousMediaRequest);
+window.addEventListener("beforeunload", () => {
+  cancelContinuousMediaRequest();
+  void stopHistoricalPlaybackOnServer();
+});
