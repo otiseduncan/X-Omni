@@ -65,8 +65,11 @@ def test_adas_profile_prompt_and_catalog_budget_is_reviewable_and_bounded() -> N
     assert metrics["base_system"]["tokens"] <= 1_800
     assert metrics["advertised_tools"]["catalog_chars"] <= 42_800
     assert metrics["advertised_tools"]["catalog_tokens"] <= 12_300
-    assert metrics["total_input_used_tokens"] <= 13_800
-    assert metrics["remaining_normal_turn_tokens"] >= 17_400
+    # camera_footage's system-prompt guidance grew slightly (range_narrowed
+    # coverage-honesty rule, see camera_security.camera_footage_analyze);
+    # these ceilings/floors moved with it, not toward zero headroom.
+    assert metrics["total_input_used_tokens"] <= 13_900
+    assert metrics["remaining_normal_turn_tokens"] >= 17_300
 
 
 def test_adas_profile_contains_field_surface_not_experimental_catalog_noise() -> None:
@@ -165,9 +168,11 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     # rounding can move the combined estimate by a token.
     assert abs(metrics["fixed_prompt"]["tokens"] - summed_sections) <= 2
     # The camera_footage system-prompt guidance grew to require analysis:
-    # true for temporal/action questions (see camera_dvr.footage_analysis_
-    # samples); this floor moved down with it, not toward zero headroom.
-    assert metrics["remaining_normal_turn_tokens"] >= 15_150
+    # true for temporal/action questions, and to require surfacing a
+    # range_narrowed result honestly (see camera_security.
+    # camera_footage_analyze); this floor moved down with it, not toward
+    # zero headroom.
+    assert metrics["remaining_normal_turn_tokens"] >= 15_100
 
 
 def test_budget_metrics_match_actual_generated_system_prompt() -> None:

@@ -1534,6 +1534,14 @@ function CameraFootageAnalysisCard({ data }) {
             No absence-of-action conclusion is drawn from insufficient DVR samples.
           </p>
         )}
+        {data.range_narrowed && (
+          <p className="card-note" role="alert">
+            {displayText(
+              data.coverage_note,
+              "Only part of the requested time range was examined; missed camera motion is not proof nothing else happened.",
+            )}
+          </p>
+        )}
         {data.playback_error && <p className="card-note" role="alert">{displayText(data.playback_error)}</p>}
       </figcaption>
     </figure>

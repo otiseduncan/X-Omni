@@ -269,7 +269,9 @@ def test_settings_can_select_an_explicit_maintenance_profile(monkeypatch) -> Non
 def test_normal_prompt_is_concise_and_free_of_capability_micro_routing() -> None:
     prompt = system_prompt(_omni_router())
 
-    assert len(prompt) < 5_600
+    # camera_footage's range_narrowed coverage-honesty rule grew this
+    # slightly; ceiling moved with it, not toward zero headroom.
+    assert len(prompt) < 5_700
     assert "model-first and tool contract" in prompt.casefold()
     assert "adas source roles" in prompt.casefold()
     assert "mutations require a direct current-turn command" in prompt.casefold()
@@ -395,8 +397,10 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
         history=history,
     )
 
-    assert metrics["base_system"]["chars"] < 5_600
-    assert metrics["base_system"]["tokens"] < 1_600
+    # camera_footage's range_narrowed coverage-honesty rule grew this
+    # slightly; ceiling moved with it, not toward zero headroom.
+    assert metrics["base_system"]["chars"] < 5_700
+    assert metrics["base_system"]["tokens"] < 1_650
     assert metrics["active_working_context"]["chars"] > 0
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
@@ -406,9 +410,9 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     assert metrics["advertised_tools"]["catalog_tokens"] < 12_300
     # Visibility ceiling with regression headroom; the independent remaining
     # context floor below is the authoritative 32K safety contract.
-    assert metrics["total_input_used_tokens"] < 14_200
+    assert metrics["total_input_used_tokens"] < 14_250
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
-    assert metrics["remaining_normal_turn_tokens"] > 15_300
+    assert metrics["remaining_normal_turn_tokens"] > 15_250
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

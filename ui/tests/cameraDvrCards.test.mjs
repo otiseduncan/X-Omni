@@ -83,4 +83,6 @@ test("temporal DVR analysis card preserves observed versus unresolved evidence",
   assert.match(card, /not observed in sampled frames/);
   assert.match(card, /No absence-of-action conclusion is drawn from insufficient DVR samples/);
   assert.match(card, /<video[\s\S]*?src=\{data\.clip_url\}[\s\S]*?controls[\s\S]*?playsInline/);
+  assert.match(card, /data\.range_narrowed/);
+  assert.match(card, /data\.coverage_note/);
 });

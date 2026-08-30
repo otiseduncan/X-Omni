@@ -805,6 +805,12 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
         )
 
     selected_events: list[dict[str, Any]] = []
+    # True only when a broad requested range got narrowed to one motion
+    # event's bounded window -- the result must say so, not present that
+    # narrow slice as if it covered the whole request. A camera can miss real
+    # activity (no ONVIF motion trigger fired), so "no motion found" is never
+    # grounds to imply nothing happened in the unexamined remainder.
+    range_narrowed = False
     if event is not None:
         try:
             since, until, selected_events = _temporal_event_window(store, event)
@@ -816,11 +822,15 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
             event = _motion_event_in_range(store, since, until)
             if event is None:
                 return _temporal_error(
-                    "A temporal DVR analysis needs a three-minute interval or a motion event within the requested range.",
+                    "No motion event was detected anywhere in that range, and it is too long to "
+                    "examine directly. The camera's motion detector can miss real activity, so "
+                    "this does not mean nothing happened -- ask about a specific few-minute window "
+                    "and the continuous recording can be checked directly, motion event or not.",
                     status="range_too_broad",
                     since=since,
                     until=until,
                 )
+            range_narrowed = True
             try:
                 since, until, selected_events = _temporal_event_window(store, event)
             except ValueError as exc:
@@ -981,6 +991,22 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
         result["burst_id"] = event.get("burst_id")
     if selected_events:
         result["event_frame_count"] = len(selected_events)
+    if range_narrowed and requested_since is not None and requested_until is not None:
+        requested_since_local = requested_since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+        requested_until_local = requested_until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+        result["range_narrowed"] = True
+        result["requested_started_at"] = _dvr_iso(requested_since)
+        result["requested_ended_at"] = _dvr_iso(requested_until)
+        result["requested_started_at_local"] = requested_since_local
+        result["requested_ended_at_local"] = requested_until_local
+        result["coverage_note"] = (
+            f"This only examined the motion event at {result['started_at_local']}"
+            f"–{result['ended_at_local']}; the rest of the requested "
+            f"{requested_since_local}–{requested_until_local} range was not checked "
+            "because no other motion was detected there. The camera's motion detector can "
+            "miss real activity, so that is not proof nothing else happened -- ask about a "
+            "specific time in that range to check the continuous recording directly."
+        )
     return result
 
 

@@ -663,3 +663,65 @@ async def test_broad_playback_selects_its_motion_window_instead_of_transcoding_t
     assert result["selected_motion_event_id"] == 51
     assert result["clip_url"] == "/dvr/api/clips/motion-9.mp4"
     dvr.event_clip.assert_awaited_once_with(store, 9)
+
+
+@pytest.mark.asyncio
+async def test_temporal_footage_analysis_narrowed_from_a_broad_range_says_so_honestly(
+    monkeypatch,
+):
+    # A broad "what happened this morning" request that narrows to one
+    # motion event's bounded window must say so -- silently analyzing only
+    # that slice and going quiet about the rest let a real return trip with
+    # no motion trigger go unexamined and unmentioned.
+    store = FakeStore()
+    event = {
+        "id": 51,
+        "burst_id": 9,
+        "captured_at": "2026-08-30 06:43:20",
+        "trigger": "motion",
+    }
+    store.range_rows = [event]
+    store.burst_rows[9] = [event]
+    dvr = _FootageAnalysisDVR()
+    monkeypatch.setattr(
+        camera_security.camera_svc,
+        "caption_frame",
+        AsyncMock(return_value=_temporal_caption(
+            person="yes", vehicle="yes", movement="observed", interaction="observed",
+        )),
+    )
+
+    result = await camera_security.camera_footage_analyze(
+        store,
+        FakeRouter(),
+        {"since": "2026-08-30T06:00:00Z", "until": "2026-08-30T08:00:00Z"},
+        dvr=dvr,
+    )
+
+    assert result["ok"] is True
+    assert result["range_narrowed"] is True
+    assert result["requested_started_at"] == "2026-08-30T06:00:00Z"
+    assert result["requested_ended_at"] == "2026-08-30T08:00:00Z"
+    assert "requested_started_at_local" in result
+    assert result["coverage_note"]
+    assert "motion detector can miss" in result["coverage_note"]
+
+
+@pytest.mark.asyncio
+async def test_temporal_footage_analysis_range_too_broad_suggests_a_specific_window():
+    store = FakeStore()
+    store.range_rows = []  # no motion event anywhere in the requested range
+    dvr = _FootageAnalysisDVR()
+
+    result = await camera_security.camera_footage_analyze(
+        store,
+        FakeRouter(),
+        {"since": "2026-08-30T06:00:00Z", "until": "2026-08-30T08:00:00Z"},
+        dvr=dvr,
+    )
+
+    assert result["ok"] is False
+    assert result["analysis_status"] == "range_too_broad"
+    assert "can miss real activity" in result["error"]
+    assert "specific" in result["error"]
+    assert not dvr.sample_calls
