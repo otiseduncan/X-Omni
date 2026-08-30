@@ -27,7 +27,6 @@ test("continuous adapter replaces five-minute source swapping", async () => {
   assert.match(js, /seekAbsolute = continuousSeekAbsolute/);
   assert.match(js, /\/dvr\/api\/playback\/continuous\.mp4/);
   assert.match(js, /advanceToNextSegment = function continuousAdvanceBookkeeping/);
-  assert.match(js, /No source replacement/);
   assert.match(js, /prefetchSegment = function continuousPrefetchNoop/);
 });
 
@@ -35,4 +34,23 @@ test("continuous playback does not flash segment-loading UI", async () => {
   const js = await source("continuous-playback.js");
   assert.match(js, /playerLoading\.hidden = true/);
   assert.doesNotMatch(js, /playerLoading\.hidden = false/);
+});
+
+test("a new DVR seek explicitly tears down the prior media request", async () => {
+  const js = await source("continuous-playback.js");
+  assert.match(js, /function cancelContinuousMediaRequest\(\)/);
+  assert.match(js, /videoPlayer\.pause\(\)/);
+  assert.match(js, /videoPlayer\.removeAttribute\("src"\)/);
+  assert.match(js, /videoPlayer\.load\(\)/);
+  assert.match(js, /cancelContinuousMediaRequest\(\)[\s\S]*videoPlayer\.src = `\/dvr\/api\/playback\/continuous\.mp4/);
+});
+
+test("a prolonged media stall releases playback without reloading the DVR page", async () => {
+  const js = await source("continuous-playback.js");
+  assert.match(js, /CONTINUOUS_STALL_RECOVERY_MS = 15000/);
+  assert.match(js, /function armContinuousStallRecovery\(\)/);
+  assert.match(js, /addEventListener\("waiting", armContinuousStallRecovery\)/);
+  assert.match(js, /addEventListener\("stalled", armContinuousStallRecovery\)/);
+  assert.match(js, /Playback stalled near/);
+  assert.doesNotMatch(js, /window\.location\.reload/);
 });
