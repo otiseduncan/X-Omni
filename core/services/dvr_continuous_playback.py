@@ -31,6 +31,9 @@ MAX_STREAM_SEGMENTS = camera_dvr_svc.MAX_UI_SEGMENTS
 LEGACY_INDEX_JITTER_SECONDS = 10.0
 CROSS_SESSION_GAP_SECONDS = 2.0
 STREAM_NO_PROGRESS_SECONDS = 12.0
+PLAYBACK_TERMINATE_TIMEOUT_SECONDS = 5.0
+PLAYBACK_READRATE = 24.0
+PLAYBACK_THREADS = 4
 
 # Single-owner DVR: at most one historical playback worker. Crucially this map
 # contains *only* archive playback workers -- never the recorder and never the
@@ -159,18 +162,41 @@ async def _continuous_parts(dvr, start: datetime) -> list[PlaybackPart]:
     return parts
 
 
-async def cancel_active_playback(dvr) -> bool:
-    """Terminate only the active historical playback worker, if any.
+async def _bounded_terminate(dvr, proc: Any) -> None:
+    """Terminate playback without ever making the DVR web server wait forever."""
+    if proc is None or getattr(proc, "returncode", None) is not None:
+        return
+    try:
+        await asyncio.wait_for(
+            dvr._terminate_process(proc), timeout=PLAYBACK_TERMINATE_TIMEOUT_SECONDS
+        )
+        return
+    except asyncio.TimeoutError:
+        pass
+    except Exception:
+        return
 
-    This is safe to call before Live View: recorder FFmpeg and camera-preview
-    FFmpeg are separately owned and are never present in _ACTIVE_PLAYBACK.
-    """
+    # Last-resort fallback for an FFmpeg child that ignored normal DVR cleanup.
+    # This process object belongs only to historical playback; never the recorder
+    # and never Live View.
+    try:
+        proc.kill()
+    except Exception:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2.0)
+    except Exception:
+        pass
+
+
+async def cancel_active_playback(dvr) -> bool:
+    """Terminate only the active historical playback worker, if any."""
     key = id(dvr)
     async with _ACTIVE_PLAYBACK_LOCK:
         proc = _ACTIVE_PLAYBACK.pop(key, None)
     if proc is None or getattr(proc, "returncode", None) is not None:
         return False
-    await dvr._terminate_process(proc)
+    await _bounded_terminate(dvr, proc)
     return True
 
 
@@ -184,7 +210,7 @@ async def _claim_active_playback(dvr, proc: Any) -> None:
         and previous is not proc
         and getattr(previous, "returncode", None) is None
     ):
-        await dvr._terminate_process(previous)
+        await _bounded_terminate(dvr, previous)
 
 
 async def _release_active_playback(dvr, proc: Any) -> None:
@@ -211,15 +237,19 @@ async def continuous_stream(
     manifest.write_text(_ffconcat_text(parts), encoding="utf-8")
 
     ffmpeg = dvr.camera._require_ffmpeg()
-    creationflags = 0x08000000 if os.name == "nt" else 0
+    # CREATE_NO_WINDOW + BELOW_NORMAL_PRIORITY_CLASS on Windows. Historical
+    # playback is important, but it must never starve the DVR API or Live View.
+    creationflags = 0x08004000 if os.name == "nt" else 0
     proc = await dvr._process_factory(
         str(ffmpeg),
         "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
         "-fflags", "+genpts",
+        "-readrate", f"{PLAYBACK_READRATE:g}",
         "-f", "concat", "-safe", "0", "-i", str(manifest),
         "-map", "0:v:0", "-an",
         "-vf", "scale=1280:-2",
         "-c:v", "libx264", "-preset", "superfast", "-crf", "23",
+        "-threads", str(PLAYBACK_THREADS),
         "-pix_fmt", "yuv420p",
         "-avoid_negative_ts", "make_zero",
         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
@@ -230,7 +260,7 @@ async def continuous_stream(
     )
     if proc.stdout is None or proc.stderr is None:
         manifest.unlink(missing_ok=True)
-        await dvr._terminate_process(proc)
+        await _bounded_terminate(dvr, proc)
         raise RuntimeError("DVR playback worker did not expose its media pipes.")
 
     await _claim_active_playback(dvr, proc)
@@ -247,7 +277,7 @@ async def continuous_stream(
                         timeout=STREAM_NO_PROGRESS_SECONDS,
                     )
                 except asyncio.TimeoutError:
-                    await dvr._terminate_process(proc)
+                    await _bounded_terminate(dvr, proc)
                     break
                 if not chunk:
                     break
@@ -256,13 +286,13 @@ async def continuous_stream(
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
                 except asyncio.TimeoutError:
-                    await dvr._terminate_process(proc)
+                    await _bounded_terminate(dvr, proc)
         except (asyncio.CancelledError, GeneratorExit):
-            await dvr._terminate_process(proc)
+            await _bounded_terminate(dvr, proc)
             raise
         finally:
             if getattr(proc, "returncode", None) is None:
-                await dvr._terminate_process(proc)
+                await _bounded_terminate(dvr, proc)
             await _release_active_playback(dvr, proc)
             dvr._playback_processes.pop(key, None)
             stderr_task.cancel()
@@ -292,7 +322,13 @@ def create_router(require_session, dvr) -> APIRouter:
 
     @router.delete("/api/playback/active")
     async def stop_active_playback(_session: dict = Depends(require_owner)):
-        stopped = await cancel_active_playback(dvr)
+        try:
+            stopped = await asyncio.wait_for(
+                cancel_active_playback(dvr),
+                timeout=PLAYBACK_TERMINATE_TIMEOUT_SECONDS + 1.0,
+            )
+        except asyncio.TimeoutError:
+            stopped = False
         return {"ok": True, "stopped": stopped}
 
     @router.get("/api/playback/continuous.mp4")
