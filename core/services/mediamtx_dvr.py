@@ -38,6 +38,7 @@ MAX_PLAYBACK_SEGMENTS = 8
 MAX_TOOL_PLAYBACK_DURATION_SECONDS = 300
 MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS = 180
 MAX_PLAYBACK_DURATION_SECONDS = 30 * 60
+FOOTAGE_ANALYSIS_TAIL_PADDING_SECONDS = 20.0
 
 
 class PlaybackPreparationError(RuntimeError):
@@ -262,9 +263,27 @@ class MediaMTXDVR:
         if duration > MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
             raise ValueError("The selected window is too long for bounded DVR analysis.")
         try:
-            clip_bytes = await self.client.fetch_clip_bytes(self.path, since, duration)
-        except MediaMTXNotFound as exc:
-            raise FileNotFoundError(str(exc)) from exc
+            # MediaMTX's stitched Playback API response can fail to decode a
+            # still frame from roughly its last ~10s (an artifact of how the
+            # final source part is muxed at the tail, confirmed empirically
+            # against live recordings) -- fetching a few extra seconds past
+            # `until` keeps that unreliable tail out of the sampled range
+            # without changing what gets analyzed or shown as evidence.
+            clip_bytes = await self.client.fetch_clip_bytes(
+                self.path, since, duration + FOOTAGE_ANALYSIS_TAIL_PADDING_SECONDS
+            )
+        except MediaMTXNotFound:
+            # The padding itself may reach past the newest available
+            # recording (e.g. analyzing footage from moments ago) -- fall
+            # back to exactly the requested span rather than failing outright.
+            try:
+                clip_bytes = await self.client.fetch_clip_bytes(self.path, since, duration)
+            except MediaMTXNotFound as exc:
+                raise FileNotFoundError(str(exc)) from exc
+            except MediaMTXUnavailable as exc:
+                raise PlaybackPreparationError(str(exc)) from exc
+            except MediaMTXInvalidRequest as exc:
+                raise ValueError(str(exc)) from exc
         except MediaMTXUnavailable as exc:
             raise PlaybackPreparationError(str(exc)) from exc
         except MediaMTXInvalidRequest as exc:

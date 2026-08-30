@@ -63,6 +63,25 @@ async def _run_ffmpeg(ffmpeg_path: Path, args: list[str], *, timeout_seconds: fl
     return int(proc.returncode or 0), stderr_data or b""
 
 
+_BACKOFF_SECONDS = (0.0, 1.5, 3.0)
+
+
+async def _extract_one_frame(
+    clip_path: Path, frame_path: Path, offset: float, *, ffmpeg_path: Path,
+) -> bool:
+    rc, _stderr = await _run_ffmpeg(
+        ffmpeg_path,
+        [
+            "-y", "-ss", f"{offset:.3f}", "-i", str(clip_path),
+            "-map", "0:v:0", "-frames:v", "1",
+            "-vf", f"scale={FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease",
+            "-strict", "unofficial", "-q:v", "4", str(frame_path),
+        ],
+        timeout_seconds=FRAME_TIMEOUT_SECONDS,
+    )
+    return rc == 0 and frame_path.is_file() and frame_path.stat().st_size > 0
+
+
 async def extract_frames(
     clip_path: Path,
     clip_started_at: datetime,
@@ -70,27 +89,26 @@ async def extract_frames(
     *,
     ffmpeg_path: Path,
 ) -> list[tuple[datetime, bytes]]:
-    """Extract one still JPEG per requested time from a local clip file."""
+    """Extract one still JPEG per requested time from a local clip file.
+
+    A requested offset landing exactly on (or near) a server-side segment
+    stitch boundary can occasionally fail to decode even though the
+    surrounding footage is fine -- nudging a few seconds earlier before
+    giving up on that one sample keeps a transient stitch artifact from
+    silently costing the "after" evidence frame the analysis prompt
+    depends on.
+    """
     extracted: list[tuple[datetime, bytes]] = []
     with tempfile.TemporaryDirectory(prefix=".xomni-footage-frames-") as temp:
         temp_dir = Path(temp)
         for index, captured_at in enumerate(times):
-            offset = max(0.0, (captured_at - clip_started_at).total_seconds())
-            frame_path = temp_dir / f"frame-{index:02d}-{uuid.uuid4().hex[:6]}.jpg"
-            rc, stderr = await _run_ffmpeg(
-                ffmpeg_path,
-                [
-                    "-y", "-ss", f"{offset:.3f}", "-i", str(clip_path),
-                    "-map", "0:v:0", "-frames:v", "1",
-                    "-vf", f"scale={FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease",
-                    "-q:v", "4", str(frame_path),
-                ],
-                timeout_seconds=FRAME_TIMEOUT_SECONDS,
-            )
-            if rc != 0 or not frame_path.is_file() or frame_path.stat().st_size <= 0:
-                detail = stderr.decode("utf-8", "replace")[-500:]
-                raise FrameExtractionError(detail or "DVR frame extraction failed.")
-            extracted.append((captured_at, frame_path.read_bytes()))
+            base_offset = max(0.0, (captured_at - clip_started_at).total_seconds())
+            for backoff in _BACKOFF_SECONDS:
+                offset = max(0.0, base_offset - backoff)
+                frame_path = temp_dir / f"frame-{index:02d}-{uuid.uuid4().hex[:6]}.jpg"
+                if await _extract_one_frame(clip_path, frame_path, offset, ffmpeg_path=ffmpeg_path):
+                    extracted.append((captured_at, frame_path.read_bytes()))
+                    break
     if len(extracted) < MIN_SAMPLES:
         raise FrameExtractionError("Insufficient DVR frames were extracted for temporal analysis.")
     return extracted
