@@ -74,17 +74,24 @@ try {
         throw "MediaMTX camera path sync failed (exit $LASTEXITCODE). See $syncScript output above."
     }
 
-    $existing = Get-Process mediamtx -ErrorAction SilentlyContinue
+    # Get-Process's Name/Path shape doesn't match Test-MediaMTXProcess's
+    # Win32_Process-style check (Name lacks ".exe", there is no
+    # ExecutablePath) -- that mismatch previously made verification always
+    # fail whenever MediaMTX was already running, rejecting even the exact
+    # correct process. Win32_Process throughout keeps the shapes consistent.
+    $existing = Get-CimInstance Win32_Process -Filter "Name='mediamtx.exe'" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if ($existing -and -not (Test-MediaMTXProcess -Process $existing)) {
         throw "A process named mediamtx.exe is already running from an unexpected location. X Omni will not replace it."
     }
     if ($existing) {
-        Write-LauncherLog "Stopping existing verified MediaMTX PID $($existing.Id) for a fresh restart."
-        Stop-Process -Id $existing.Id -Force -ErrorAction Stop
+        Write-LauncherLog "Stopping existing verified MediaMTX PID $($existing.ProcessId) for a fresh restart."
+        Stop-Process -Id ([int]$existing.ProcessId) -Force -ErrorAction Stop
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
         do {
             Start-Sleep -Milliseconds 200
-            $remaining = Get-Process mediamtx -ErrorAction SilentlyContinue
+            $remaining = Get-CimInstance Win32_Process -Filter "Name='mediamtx.exe'" -ErrorAction SilentlyContinue |
+                Select-Object -First 1
         } while ($remaining -and [DateTime]::UtcNow -lt $deadline)
         if ($remaining) { throw 'MediaMTX did not stop within the expected time.' }
     }

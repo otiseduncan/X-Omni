@@ -1,5 +1,9 @@
+import base64
+import os
 from pathlib import Path
 import shutil
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +62,88 @@ def test_mediamtx_launcher_verifies_before_replacing_and_regenerates_paths() -> 
     sync_index = script.index("sync-mediamtx-config.py")
     start_index = script.index("Start-Process -FilePath $mediamtxExe")
     assert sync_index < start_index
+
+    # Regression guard for a real bug: Get-Process's Name (no ".exe") and
+    # missing ExecutablePath property silently made Test-MediaMTXProcess
+    # reject the launcher's own already-running, exactly-correct process
+    # every time -- Get-CimInstance Win32_Process must be used consistently
+    # wherever a process gets checked against that function.
+    for forbidden in ("Get-Process mediamtx", "$existing.Id", "$remaining.Id"):
+        assert forbidden not in script, f"launch-mediamtx.ps1 must not reference {forbidden!r}"
+    assert script.count("Get-CimInstance Win32_Process -Filter \"Name='mediamtx.exe'\"") >= 2
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or POWERSHELL is None,
+    reason="Test-MediaMTXProcess is only invokable on Windows",
+)
+def test_mediamtx_process_predicate_accepts_the_real_win32_process_shape() -> None:
+    # The concrete regression: verify Test-MediaMTXProcess against an object
+    # shaped exactly like what Get-CimInstance Win32_Process actually
+    # returns (Name carries ".exe", ExecutablePath is a real property) --
+    # not a hand-picked shape that happens to satisfy the function.
+    import subprocess
+
+    script_path = str(ROOT / "scripts" / "launch-mediamtx.ps1").replace("'", "''")
+    powershell = rf"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{script_path}', [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) {{ throw ($errors | ForEach-Object {{ $_.ToString() }} | Out-String) }}
+$node = $ast.Find({{
+    param($candidate)
+    $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $candidate.Name -eq 'Test-MediaMTXProcess'
+}}, $true)
+if (-not $node) {{ throw 'Missing launcher function Test-MediaMTXProcess' }}
+Invoke-Expression $node.Extent.Text
+$mediamtxExe = 'X:\MediaMTX\mediamtx.exe'
+
+# Shaped exactly like a real Get-CimInstance Win32_Process result (Name
+# carries ".exe", ExecutablePath is a real property) -- the shape the
+# launcher actually feeds this function with today.
+$matching = [pscustomobject]@{{
+    Name = 'mediamtx.exe'
+    ProcessId = 1234
+    ExecutablePath = $mediamtxExe
+    CommandLine = "`"$mediamtxExe`" `"X:\MediaMTX\mediamtx.yml`""
+}}
+$mismatchedPath = [pscustomobject]@{{
+    Name = 'mediamtx.exe'
+    ProcessId = 5678
+    ExecutablePath = 'C:\Other\mediamtx.exe'
+    CommandLine = 'C:\Other\mediamtx.exe'
+}}
+# Shaped like a bare Get-Process result: Name has no extension and there is
+# no ExecutablePath property at all -- this must never be mistaken for a
+# match, since Get-Process's Name/ExecutablePath never look like this.
+$bareGetProcessShape = [pscustomobject]@{{
+    Name = 'mediamtx'
+    Id = 1234
+}}
+[pscustomobject]@{{
+    accepts_the_verified_shape = [bool](Test-MediaMTXProcess -Process $matching)
+    rejects_an_unverified_path = -not [bool](Test-MediaMTXProcess -Process $mismatchedPath)
+    rejects_the_bare_get_process_shape = -not [bool](Test-MediaMTXProcess -Process $bareGetProcessShape)
+}} | ConvertTo-Json -Compress
+"""
+    encoded = base64.b64encode(powershell.encode("utf-16-le")).decode("ascii")
+    completed = subprocess.run(
+        [POWERSHELL, "-NoLogo", "-NoProfile", "-EncodedCommand", encoded],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    import json
+
+    result = json.loads(completed.stdout)
+    assert result == {
+        "accepts_the_verified_shape": True,
+        "rejects_an_unverified_path": True,
+        "rejects_the_bare_get_process_shape": True,
+    }
 
 
 def test_mediamtx_startup_installer_creates_a_hidden_logon_shortcut() -> None:
