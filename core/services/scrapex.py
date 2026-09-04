@@ -67,6 +67,29 @@ ADAS_MAP_ACTIONS = frozenset(
 )
 SOURCE_SCOPES = frozenset({"active", "all", "terminal"})
 
+# --- ScrapeX Navigator: bounded browser observation/action turns -----------
+#
+# Unlike ADAS Map (one deterministic worker call per action), a Navigator
+# task is driven turn-by-turn by this process's own model loop, one browser
+# action per model turn, against ScrapeX's session/graph/action-budget/
+# verification machinery. This client never authors a CSS selector or role
+# guess -- every click/fill/press targets an opaque ``ref`` copied verbatim
+# from the most recent observation's element list, exactly like batch_id
+# for ADAS Map. Staged behind Settings.alldata_navigator_enabled; see the
+# ScrapeX Navigator architecture plan.
+NAVIGATOR_PROVIDERS = frozenset({"alldata"})
+NAVIGATOR_META_ACTIONS = frozenset({"create_task", "observe", "verify", "get_evidence"})
+NAVIGATOR_ACT_KINDS = frozenset({"click", "fill", "press", "back", "open", "extract", "done"})
+NAVIGATOR_ACTIONS = NAVIGATOR_META_ACTIONS | NAVIGATOR_ACT_KINDS
+MAX_TASK_ID_CHARS = 80
+MAX_TOPIC_CHARS = 400
+MAX_TARGET_FIELD_CHARS = 120
+MAX_VIN_CHARS = 32
+MAX_REF_CHARS = 40
+MAX_FILL_TEXT_CHARS = 400
+MAX_KEY_CHARS = 40
+MAX_NAV_URL_CHARS = 2048
+
 
 SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
     "description": (
@@ -325,11 +348,206 @@ SCRAPEX_START_NATIVE_SCHEMA: dict[str, Any] = {
     },
 }
 
+_NAVIGATOR_TARGET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "description": (
+        "The vehicle/subject this task must stay bound to. Every verification "
+        "check re-derives its own proof from the live page; nothing here is "
+        "trusted as already selected."
+    ),
+    "properties": {
+        "year": {"type": "integer", "minimum": 1900, "maximum": 2100},
+        "make": {"type": "string", "maxLength": MAX_TARGET_FIELD_CHARS},
+        "model": {"type": "string", "maxLength": MAX_TARGET_FIELD_CHARS},
+        "trim": {"type": "string", "maxLength": MAX_TARGET_FIELD_CHARS},
+        "vin": {"type": "string", "maxLength": MAX_VIN_CHARS},
+    },
+}
+_NAVIGATOR_TASK_ID_PROPERTY: dict[str, Any] = {
+    "type": "string",
+    "maxLength": MAX_TASK_ID_CHARS,
+    "description": (
+        "Exact opaque id copied verbatim from a verified same-turn "
+        "scrapex_navigator create_task or observe/act result; never guess."
+    ),
+}
+_NAVIGATOR_REF_PROPERTY: dict[str, Any] = {
+    "type": "string",
+    "maxLength": MAX_REF_CHARS,
+    "description": (
+        "Exact opaque element ref copied verbatim from the most recent "
+        "observe/act result's elements list -- never a role, name, or CSS "
+        "selector the model authors itself. A ref from an older observation "
+        "may no longer resolve; re-observe if so."
+    ),
+}
+
+SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
+    "description": (
+        "Drive one bounded ScrapeX Navigator browser turn for dynamic "
+        "service-information sites (e.g. ALLDATA) whose procedure content is "
+        "many clicks deep and varies by vehicle. create_task starts a new "
+        "session-scoped task; every other action requires its exact task_id. "
+        "observe/act both return the current page's element list -- always "
+        "act using a ref from the most recent one, never an older observation. "
+        "click/fill/press/back/open/extract are ordinary navigation steps; "
+        "done ends the task and verify computes the deterministic proof of "
+        "whether real, on-topic procedure content was actually reached and "
+        "extracted for the requested target. A page changing after an action "
+        "is expected -- always re-observe before acting again."
+    ),
+    "parameters": {
+        "type": "object",
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {"type": "string", "const": "create_task"},
+                    "provider": {
+                        "type": "string",
+                        "enum": sorted(NAVIGATOR_PROVIDERS),
+                    },
+                    "target": _NAVIGATOR_TARGET_SCHEMA,
+                    "topic": {
+                        "type": "string",
+                        "maxLength": MAX_TOPIC_CHARS,
+                        "description": "The calibration/procedure topic being researched.",
+                    },
+                    "action_budget": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 80,
+                        "description": "Optional cap on browser actions for this task; ScrapeX defaults it.",
+                    },
+                },
+                "required": ["action", "provider", "target", "topic"],
+            },
+            *[
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "action": {"type": "string", "const": meta_action},
+                        "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    },
+                    "required": ["action", "task_id"],
+                }
+                for meta_action in ("observe", "verify", "get_evidence")
+            ],
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "click",
+                        "description": "Click one element by its observed ref.",
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "ref": _NAVIGATOR_REF_PROPERTY,
+                },
+                "required": ["action", "task_id", "ref"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "fill",
+                        "description": "Type text into one observed field by its ref.",
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "ref": _NAVIGATOR_REF_PROPERTY,
+                    "text": {"type": "string", "maxLength": MAX_FILL_TEXT_CHARS},
+                },
+                "required": ["action", "task_id", "ref", "text"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "press",
+                        "description": "Press one key while one observed element by its ref is focused.",
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "ref": _NAVIGATOR_REF_PROPERTY,
+                    "key": {"type": "string", "maxLength": MAX_KEY_CHARS},
+                },
+                "required": ["action", "task_id", "ref", "key"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "back",
+                        "description": "Navigate back one page.",
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                },
+                "required": ["action", "task_id"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "open",
+                        "description": "Navigate directly to a URL within this provider's own domain.",
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "url": {"type": "string", "maxLength": MAX_NAV_URL_CHARS},
+                },
+                "required": ["action", "task_id", "url"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "extract",
+                        "description": (
+                            "Mark the current page as the procedure leaf whose content "
+                            "should be captured as evidence. Only call this once the "
+                            "actual procedure content -- not a menu or search-results "
+                            "listing -- is on screen."
+                        ),
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                },
+                "required": ["action", "task_id"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "done",
+                        "description": "End this task's browser turns before calling verify.",
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                },
+                "required": ["action", "task_id"],
+            },
+        ],
+    },
+}
+
 SCRAPEX_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "scrapex_status": SCRAPEX_STATUS_SCHEMA,
     "scrapex_read": SCRAPEX_READ_SCHEMA,
     "scrapex_adas_map": SCRAPEX_ADAS_MAP_SCHEMA,
     "scrapex_start_native": SCRAPEX_START_NATIVE_SCHEMA,
+    "scrapex_navigator": SCRAPEX_NAVIGATOR_SCHEMA,
 }
 
 
@@ -1221,6 +1439,163 @@ def _validate_pause_contract(payload: Any, *, expected_batch_id: str) -> dict[st
     return result
 
 
+def _navigator_target(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ScrapeXInput("target must be an object.")
+    allowed = {"year", "make", "model", "trim", "vin"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ScrapeXInput(f"Unsupported target field(s): {', '.join(unknown)}.")
+    target: dict[str, Any] = {}
+    year = value.get("year")
+    if year is not None:
+        if isinstance(year, bool) or not isinstance(year, int) or not 1900 <= year <= 2100:
+            raise ScrapeXInput("target.year must be an integer year.")
+        target["year"] = year
+    for field, maximum in (
+        ("make", MAX_TARGET_FIELD_CHARS),
+        ("model", MAX_TARGET_FIELD_CHARS),
+        ("trim", MAX_TARGET_FIELD_CHARS),
+        ("vin", MAX_VIN_CHARS),
+    ):
+        raw = value.get(field)
+        if raw is not None:
+            target[field] = _text(raw, f"target.{field}", maximum=maximum)
+    return target
+
+
+def _navigator_task_id(args: dict[str, Any]) -> str:
+    value = _text(args.get("task_id"), "task_id", maximum=MAX_TASK_ID_CHARS)
+    assert value is not None
+    if not _RESOURCE_ID_RE.fullmatch(value):
+        raise ScrapeXInput("task_id must be a bounded ScrapeX identifier.")
+    return value
+
+
+def _navigator_ref(value: Any) -> str:
+    result = _text(value, "ref", maximum=MAX_REF_CHARS)
+    assert result is not None
+    return result
+
+
+def _validate_navigator_task_contract(
+    payload: Any,
+    *,
+    expected_provider: str | None = None,
+    expected_target: dict[str, Any] | None = None,
+    expected_topic: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    task = _contract_mapping(payload, "navigator task")
+    task_id = _contract_identifier(task.get("id") or task.get("task_id"), "task.id")
+    if expected_provider is not None and task.get("provider") != expected_provider:
+        raise ScrapeXContract(
+            "navigator_provider_mismatch",
+            "ScrapeX returned a navigator task for a different provider.",
+        )
+    if expected_target is not None and task.get("target") != expected_target:
+        raise ScrapeXContract(
+            "navigator_target_mismatch",
+            "ScrapeX did not echo the exact requested navigator target.",
+        )
+    if expected_topic is not None and task.get("topic") != expected_topic:
+        raise ScrapeXContract(
+            "navigator_topic_mismatch",
+            "ScrapeX did not echo the exact requested navigator topic.",
+        )
+    return task, task_id
+
+
+def _validate_navigator_observation_contract(payload: Any) -> dict[str, Any]:
+    observation = _contract_mapping(payload, "navigator observation")
+    if not isinstance(observation.get("url"), str):
+        raise ScrapeXContract(
+            "navigator_observation_malformed", "ScrapeX omitted the observation URL."
+        )
+    elements = observation.get("elements")
+    if not isinstance(elements, list):
+        raise ScrapeXContract(
+            "navigator_observation_malformed",
+            "ScrapeX omitted the observation element list.",
+        )
+    for raw_element in elements:
+        element = _contract_mapping(raw_element, "observation element")
+        if not isinstance(element.get("ref"), str) or not element["ref"]:
+            raise ScrapeXContract(
+                "navigator_observation_malformed",
+                "An observation element is missing its ref.",
+            )
+        if not isinstance(element.get("role"), str) or not isinstance(
+            element.get("name"), str
+        ):
+            raise ScrapeXContract(
+                "navigator_observation_malformed",
+                "An observation element is missing its role or name.",
+            )
+    return observation
+
+
+def _validate_navigator_verification_contract(payload: Any) -> dict[str, Any]:
+    proof = _contract_mapping(payload, "navigator verification")
+    for key in (
+        "vehicle_verified",
+        "subject_verified",
+        "procedure_leaf_verified",
+        "content_extracted",
+        "verified",
+    ):
+        if type(proof.get(key)) is not bool:
+            raise ScrapeXContract(
+                "navigator_verification_malformed",
+                f"ScrapeX omitted the {key} verification gate.",
+            )
+    if proof.get("provider") is not None and not isinstance(proof.get("provider"), str):
+        raise ScrapeXContract(
+            "navigator_verification_malformed",
+            "ScrapeX returned a malformed verification provider.",
+        )
+    return proof
+
+
+def _validate_navigator_page_signals_contract(
+    payload: Any, *, expected_provider: str
+) -> dict[str, Any]:
+    status_payload = _contract_mapping(payload, "navigator page signals")
+    if status_payload.get("provider") != expected_provider:
+        raise ScrapeXContract(
+            "navigator_provider_mismatch",
+            "ScrapeX returned page signals for a different provider.",
+        )
+    if type(status_payload.get("authenticated")) is not bool:
+        raise ScrapeXContract(
+            "navigator_authentication_state_missing",
+            "ScrapeX omitted the Navigator authentication state.",
+        )
+    signals = status_payload.get("signals")
+    if not isinstance(signals, list) or not all(isinstance(item, str) for item in signals):
+        raise ScrapeXContract(
+            "navigator_signals_malformed",
+            "ScrapeX returned a malformed page-signals list.",
+        )
+    return status_payload
+
+
+def _validate_navigator_evidence_contract(
+    payload: Any, *, expected_task_id: str
+) -> dict[str, Any]:
+    evidence = _contract_mapping(payload, "navigator evidence")
+    if evidence.get("task_id") != expected_task_id:
+        raise ScrapeXContract(
+            "navigator_task_mismatch",
+            "ScrapeX returned navigator evidence for a different task.",
+        )
+    if type(evidence.get("verified")) is not bool:
+        raise ScrapeXContract(
+            "navigator_verification_malformed",
+            "ScrapeX omitted the evidence verified state.",
+        )
+    return evidence
+
+
 async def status(settings: Any, args: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return service/dependency state without launching a browser or work."""
     try:
@@ -1708,3 +2083,205 @@ async def adas_map(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
         return _transport_failure(action, exc)
     except ScrapeXContract as exc:
         return _contract_failure(action, exc, may_mutate=True)
+
+
+async def navigator_current_page_signals(settings: Any, provider: str) -> dict[str, Any]:
+    """Bounded, generic "what's currently on screen" read -- no task, no
+    model turns, no specific candidate vehicle. For the small number of
+    non-agentic callers (Calibration IQ work-prep matching) that need to
+    check many candidate rows against whatever vehicle is currently
+    selected in an already-authenticated Navigator session.
+    """
+    action = "current_page_signals"
+    try:
+        provider_value = _text(provider, "provider", maximum=40)
+        assert provider_value is not None
+        if provider_value not in NAVIGATOR_PROVIDERS:
+            raise ScrapeXInput(f"Unsupported navigator provider: {provider_value}.")
+        data = await _request(
+            settings,
+            "GET",
+            f"/api/navigator/providers/{quote(provider_value, safe='')}/current-page-signals",
+            timeout=READ_TIMEOUT,
+            may_mutate=False,
+        )
+        status_payload = _validate_navigator_page_signals_contract(
+            data, expected_provider=provider_value
+        )
+        return _success(action, status_payload, status="read", verified=True)
+    except ScrapeXInput as exc:
+        return _input_failure(action, exc)
+    except ScrapeXConfiguration as exc:
+        return _configuration_failure(action, exc)
+    except ScrapeXRemote as exc:
+        return _remote_failure(action, exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure(action, exc)
+    except ScrapeXContract as exc:
+        return _contract_failure(action, exc, may_mutate=False)
+
+
+_NAVIGATOR_ALLOWED_KEYS: dict[str, set[str]] = {
+    "create_task": {"action", "provider", "target", "topic", "action_budget"},
+    "observe": {"action", "task_id"},
+    "verify": {"action", "task_id"},
+    "get_evidence": {"action", "task_id"},
+    "back": {"action", "task_id"},
+    "extract": {"action", "task_id"},
+    "done": {"action", "task_id"},
+    "click": {"action", "task_id", "ref"},
+    "fill": {"action", "task_id", "ref", "text"},
+    "press": {"action", "task_id", "ref", "key"},
+    "open": {"action", "task_id", "url"},
+}
+
+
+async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """Drive one bounded ScrapeX Navigator browser turn per model call.
+
+    ``create_task`` is id-free. Every other action requires an exact
+    ``task_id`` copied verbatim from a verified same-turn result -- the
+    caller's registry-level evidence gate enforces that binding before this
+    function is ever invoked; this function's own contract validation only
+    proves that ScrapeX's response is well-formed, never that the id was
+    legitimately obtained.
+    """
+    action = "navigator"
+    try:
+        clean = _clean_args(args)
+        action_value = _text(clean.get("action"), "action", maximum=40)
+        assert action_value is not None
+        action = action_value
+        if action not in NAVIGATOR_ACTIONS:
+            raise ScrapeXInput(f"Unsupported ScrapeX navigator action: {action}.")
+        _expect_keys(clean, _NAVIGATOR_ALLOWED_KEYS[action])
+
+        if action == "create_task":
+            provider = _text(clean.get("provider"), "provider", maximum=40)
+            assert provider is not None
+            if provider not in NAVIGATOR_PROVIDERS:
+                raise ScrapeXInput(f"Unsupported navigator provider: {provider}.")
+            target = _navigator_target(clean.get("target"))
+            topic = _text(clean.get("topic"), "topic", maximum=MAX_TOPIC_CHARS)
+            assert topic is not None
+            action_budget = clean.get("action_budget")
+            if action_budget is not None and (
+                isinstance(action_budget, bool)
+                or not isinstance(action_budget, int)
+                or not 1 <= action_budget <= 80
+            ):
+                raise ScrapeXInput("action_budget must be an integer from 1 to 80.")
+            body: dict[str, Any] = {"provider": provider, "target": target, "topic": topic}
+            if action_budget is not None:
+                body["action_budget"] = action_budget
+            data = await _request(
+                settings,
+                "POST",
+                "/api/navigator/tasks",
+                body=body,
+                timeout=OPERATOR_TIMEOUT,
+                may_mutate=True,
+            )
+            task, _task_id = _validate_navigator_task_contract(
+                data,
+                expected_provider=provider,
+                expected_target=target,
+                expected_topic=topic,
+            )
+            return _success(action, task, status="created", work_complete=False)
+
+        task_id = _navigator_task_id(clean)
+        encoded_task = quote(task_id, safe="")
+
+        if action == "observe":
+            data = await _request(
+                settings,
+                "POST",
+                f"/api/navigator/tasks/{encoded_task}/observe",
+                body={},
+                timeout=OPERATOR_TIMEOUT,
+                may_mutate=True,
+            )
+            observation = _validate_navigator_observation_contract(data)
+            return _success(action, observation, status="observed")
+
+        if action == "verify":
+            data = await _request(
+                settings,
+                "POST",
+                f"/api/navigator/tasks/{encoded_task}/verify",
+                body={},
+                timeout=OPERATOR_TIMEOUT,
+                may_mutate=False,
+            )
+            proof = _validate_navigator_verification_contract(data)
+            verified = proof["verified"]
+            return _success(
+                action,
+                proof,
+                status="verified" if verified else "unverified",
+                verified=verified,
+                work_complete=verified,
+                success=verified,
+            )
+
+        if action == "get_evidence":
+            data = await _request(
+                settings,
+                "GET",
+                f"/api/navigator/tasks/{encoded_task}/evidence",
+                timeout=READ_TIMEOUT,
+                may_mutate=False,
+            )
+            evidence = _validate_navigator_evidence_contract(
+                data, expected_task_id=task_id
+            )
+            return _success(action, evidence, status="read", verified=True)
+
+        # click/fill/press/back/open/extract/done all drive the same bounded
+        # /act endpoint; ScrapeX's own executor is the sole authority on
+        # whether the ref/url is valid and the action kind is legal.
+        body = {"action": action}
+        if action == "click":
+            body["ref"] = _navigator_ref(clean.get("ref"))
+        elif action == "fill":
+            body["ref"] = _navigator_ref(clean.get("ref"))
+            text = _text(clean.get("text"), "text", maximum=MAX_FILL_TEXT_CHARS)
+            assert text is not None
+            body["text"] = text
+        elif action == "press":
+            body["ref"] = _navigator_ref(clean.get("ref"))
+            key = _text(clean.get("key"), "key", maximum=MAX_KEY_CHARS)
+            assert key is not None
+            body["key"] = key
+        elif action == "open":
+            url = _text(clean.get("url"), "url", maximum=MAX_NAV_URL_CHARS)
+            assert url is not None
+            body["url"] = url
+        data = await _request(
+            settings,
+            "POST",
+            f"/api/navigator/tasks/{encoded_task}/act",
+            body=body,
+            timeout=OPERATOR_TIMEOUT,
+            may_mutate=True,
+        )
+        observation = _validate_navigator_observation_contract(data)
+        return _success(
+            action,
+            observation,
+            status="acted",
+            work_complete=(action == "done"),
+        )
+    except ScrapeXInput as exc:
+        return _input_failure(action, exc)
+    except ScrapeXConfiguration as exc:
+        return _configuration_failure(action, exc)
+    except ScrapeXRemote as exc:
+        return _remote_failure(action, exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure(action, exc)
+    except ScrapeXContract as exc:
+        return _contract_failure(
+            action, exc, may_mutate=(action not in {"verify", "get_evidence"})
+        )

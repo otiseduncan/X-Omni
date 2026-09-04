@@ -89,6 +89,10 @@ CALIBRATION_IQ_ROUTINE_OPERATIONS = (
     "reject_prerequisite",
     "reopen_prerequisite",
     "update_research",
+    "mark_repair_scope_reviewed",
+    "record_repair_trigger_justification",
+    "create_missing_si_record",
+    "resolve_missing_si_record",
     "research_ro",
     "ensure_case_workspace",
     "create_folder",
@@ -132,6 +136,7 @@ _CALIBRATION_IQ_DESTRUCTIVE_TARGET_KINDS = {
 _CALIBRATION_IQ_TARGET_OPERATION_KINDS = {
     "update_note": "note",
     "update_calibration": "calibration",
+    "record_repair_trigger_justification": "calibration",
     "complete_calibration": "calibration",
     "reopen_calibration": "calibration",
     "update_blocker": "blocker",
@@ -174,6 +179,9 @@ CALIBRATION_IQ_RO_REQUIRED_OPERATIONS = (
     "add_blocker",
     "add_prerequisite",
     "update_research",
+    "mark_repair_scope_reviewed",
+    "create_missing_si_record",
+    "resolve_missing_si_record",
     "research_ro",
     "ensure_case_workspace",
     "create_folder",
@@ -191,6 +199,7 @@ CALIBRATION_IQ_RO_REQUIRED_OPERATIONS = (
 CALIBRATION_IQ_TARGET_REQUIRED_OPERATIONS = (
     "update_note",
     "update_calibration",
+    "record_repair_trigger_justification",
     "complete_calibration",
     "reopen_calibration",
     "update_blocker",
@@ -237,6 +246,8 @@ CALIBRATION_IQ_VERSION_REQUIRED_OPERATIONS = (
     "reject_prerequisite",
     "reopen_prerequisite",
     "update_research",
+    "mark_repair_scope_reviewed",
+    "record_repair_trigger_justification",
     "update_document",
     "link_document",
     "unlink_document",
@@ -585,6 +596,275 @@ def scrapex_evidence_from_result(
         batch_ids=tuple(sorted(batch_ids)),
         quarantined_batch_ids=tuple(sorted(quarantined)),
     )
+
+
+NAVIGATOR_ID_BOUND_ACTIONS = frozenset(
+    {"observe", "verify", "get_evidence", "click", "fill", "press", "back", "open", "extract", "done"}
+)
+_NAVIGATOR_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+
+@dataclass(frozen=True)
+class NavigatorTurnEvidence:
+    """Opaque Navigator task identities proved by prior results in one turn.
+
+    A sibling of :class:`ScrapeXTurnEvidence`, not a reuse of it -- ADAS Map
+    batch ids and Navigator task ids are different resource spaces on
+    different ScrapeX endpoints, and must never cross-pollinate in the same
+    verified set.
+    """
+
+    conversation_id: int
+    message_id: int
+    source_tool_call_ids: tuple[str, ...]
+    task_ids: tuple[str, ...] = ()
+    quarantined_task_ids: tuple[str, ...] = ()
+
+    @property
+    def verified(self) -> bool:
+        return bool(set(self.task_ids).difference(self.quarantined_task_ids))
+
+
+def _navigator_task_identifier(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or value != value.strip():
+        return None
+    return value if _NAVIGATOR_TASK_ID_RE.fullmatch(value) else None
+
+
+def _navigator_action(args: Any) -> str:
+    if not isinstance(args, dict) or not isinstance(args.get("action"), str):
+        return ""
+    return args["action"].strip()
+
+
+def _navigator_same_turn_previous(
+    previous: Optional[NavigatorTurnEvidence],
+    *,
+    conversation_id: int,
+    message_id: int,
+) -> Optional[NavigatorTurnEvidence]:
+    if (
+        previous is not None
+        and previous.conversation_id == conversation_id
+        and previous.message_id == message_id
+    ):
+        return previous
+    return None
+
+
+def navigator_evidence_from_result(
+    tool_name: str,
+    tool_args: Any,
+    result: Any,
+    *,
+    conversation_id: int,
+    message_id: int,
+    source_tool_call_id: str,
+    previous: Optional[NavigatorTurnEvidence] = None,
+) -> Optional[NavigatorTurnEvidence]:
+    """Merge only structurally verified Navigator task ids from this turn."""
+
+    same_turn_previous = _navigator_same_turn_previous(
+        previous,
+        conversation_id=conversation_id,
+        message_id=message_id,
+    )
+    if (
+        tool_name != "scrapex_navigator"
+        or not isinstance(result, dict)
+        or result.get("service") != "ScrapeX"
+    ):
+        return same_turn_previous
+    action = _navigator_action(tool_args)
+    if not action or result.get("action") != action:
+        return same_turn_previous
+    if (
+        isinstance(conversation_id, bool)
+        or not isinstance(conversation_id, int)
+        or conversation_id <= 0
+        or isinstance(message_id, bool)
+        or not isinstance(message_id, int)
+        or message_id <= 0
+        or not isinstance(source_tool_call_id, str)
+        or not source_tool_call_id.strip()
+    ):
+        return same_turn_previous
+
+    # An indeterminate id-bound action (ScrapeX transport/contract failure
+    # after a mutation request) can never be safely retried automatically --
+    # quarantine that task id immediately, mirroring ScrapeX batch handling.
+    ambiguous_id_mutation = (
+        action in NAVIGATOR_ID_BOUND_ACTIONS
+        and (
+            result.get("may_have_executed") is True
+            or result.get("indeterminate") is True
+            or result.get("status") == "indeterminate"
+        )
+    )
+    if ambiguous_id_mutation:
+        task_id = _navigator_task_identifier(
+            tool_args.get("task_id") if isinstance(tool_args, dict) else None
+        )
+        if (
+            task_id is None
+            or same_turn_previous is None
+            or task_id not in same_turn_previous.task_ids
+        ):
+            return same_turn_previous
+        remaining = set(same_turn_previous.task_ids)
+        remaining.discard(task_id)
+        quarantined = set(same_turn_previous.quarantined_task_ids)
+        quarantined.add(task_id)
+        source_ids = set(same_turn_previous.source_tool_call_ids)
+        source_ids.add(source_tool_call_id.strip())
+        return NavigatorTurnEvidence(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            source_tool_call_ids=tuple(sorted(source_ids)),
+            task_ids=tuple(sorted(remaining)),
+            quarantined_task_ids=tuple(sorted(quarantined)),
+        )
+
+    if (
+        result.get("success") is not True
+        or result.get("executed") is not True
+        or result.get("verified") is not True
+        or result.get("authentication_required") is True
+        or result.get("may_have_executed") is True
+        or result.get("indeterminate") is True
+        or result.get("status") == "indeterminate"
+    ):
+        return same_turn_previous
+
+    observed: set[str] = set()
+    data = result.get("data")
+    if action == "create_task":
+        if not isinstance(data, dict):
+            return same_turn_previous
+        task_id = _navigator_task_identifier(data.get("id"))
+        if task_id is None:
+            return same_turn_previous
+        observed.add(task_id)
+    elif action in NAVIGATOR_ID_BOUND_ACTIONS:
+        # Bound observe/act/verify/evidence calls preserve an already-proved
+        # opaque id; they can never mint a new identity from their own args.
+        task_id = _navigator_task_identifier(
+            tool_args.get("task_id") if isinstance(tool_args, dict) else None
+        )
+        if (
+            task_id is None
+            or same_turn_previous is None
+            or task_id not in same_turn_previous.task_ids
+        ):
+            return same_turn_previous
+        observed.add(task_id)
+    else:
+        return same_turn_previous
+
+    if not observed:
+        return same_turn_previous
+    quarantined = set(
+        same_turn_previous.quarantined_task_ids if same_turn_previous else ()
+    )
+    observed.difference_update(quarantined)
+    if not observed:
+        return same_turn_previous
+    task_ids = set(same_turn_previous.task_ids if same_turn_previous else ())
+    task_ids.update(observed)
+    source_ids = set(
+        same_turn_previous.source_tool_call_ids if same_turn_previous else ()
+    )
+    source_ids.add(source_tool_call_id.strip())
+    return NavigatorTurnEvidence(
+        conversation_id=conversation_id,
+        message_id=message_id,
+        source_tool_call_ids=tuple(sorted(source_ids)),
+        task_ids=tuple(sorted(task_ids)),
+        quarantined_task_ids=tuple(sorted(quarantined)),
+    )
+
+
+def navigator_apply_new_quarantine(
+    round_evidence: Optional[NavigatorTurnEvidence],
+    observed_evidence: Optional[NavigatorTurnEvidence],
+) -> Optional[NavigatorTurnEvidence]:
+    """Revoke ambiguous task ids for later calls in one authored batch.
+
+    Mirrors :func:`scrapex_apply_new_quarantine` for Navigator task ids.
+    """
+
+    if not isinstance(round_evidence, NavigatorTurnEvidence):
+        return round_evidence
+    if (
+        not isinstance(observed_evidence, NavigatorTurnEvidence)
+        or observed_evidence.conversation_id != round_evidence.conversation_id
+        or observed_evidence.message_id != round_evidence.message_id
+    ):
+        return round_evidence
+    newly_quarantined = set(observed_evidence.quarantined_task_ids).difference(
+        round_evidence.quarantined_task_ids
+    )
+    if not newly_quarantined:
+        return round_evidence
+    remaining_ids = set(round_evidence.task_ids).difference(newly_quarantined)
+    quarantined_ids = set(round_evidence.quarantined_task_ids)
+    quarantined_ids.update(newly_quarantined)
+    source_ids = set(round_evidence.source_tool_call_ids)
+    source_ids.update(observed_evidence.source_tool_call_ids)
+    return NavigatorTurnEvidence(
+        conversation_id=round_evidence.conversation_id,
+        message_id=round_evidence.message_id,
+        source_tool_call_ids=tuple(sorted(source_ids)),
+        task_ids=tuple(sorted(remaining_ids)),
+        quarantined_task_ids=tuple(sorted(quarantined_ids)),
+    )
+
+
+def validate_navigator_task_binding(
+    name: str,
+    args: Any,
+    evidence: Optional[NavigatorTurnEvidence],
+    *,
+    conversation_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+) -> None:
+    """Reject an opaque Navigator task id not proved earlier in this turn."""
+
+    if name != "scrapex_navigator":
+        return
+    action = _navigator_action(args)
+    if action not in NAVIGATOR_ID_BOUND_ACTIONS:
+        return
+    if not isinstance(evidence, NavigatorTurnEvidence) or not evidence.verified:
+        raise ToolBlocked(
+            "ScrapeX Navigator task-id actions require a verified same-turn "
+            "create_task or bound result before the opaque id can be used. "
+            "Nothing was run."
+        )
+    if (
+        conversation_id is None
+        or message_id is None
+        or evidence.conversation_id != conversation_id
+        or evidence.message_id != message_id
+    ):
+        raise ToolBlocked(
+            "ScrapeX Navigator task-id evidence belongs to a different "
+            "conversation turn. Nothing was run."
+        )
+    task_id = _navigator_task_identifier(
+        args.get("task_id") if isinstance(args, dict) else None
+    )
+    if task_id in evidence.quarantined_task_ids:
+        raise ToolBlocked(
+            "ScrapeX reported an indeterminate prior attempt for this "
+            "Navigator task in the current turn, so an automatic retry is "
+            "forbidden. Nothing was run."
+        )
+    if task_id is None or task_id not in evidence.task_ids:
+        raise ToolBlocked(
+            "ScrapeX Navigator task_id was not copied verbatim from a "
+            "verified same-turn scrapex_navigator result. Nothing was run."
+        )
 
 
 def scrapex_apply_new_quarantine(
@@ -2179,7 +2459,27 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "repair_order_id": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Exact displayed RO number or authoritative internal id.",
+                    "description": (
+                        "Exact displayed RO number or authoritative internal id, taken "
+                        "only from what Otis said in his current message -- never copied "
+                        "from an Active conversation subject block, even for a question "
+                        "that reads like a repeat of an earlier one. Otis often speaks "
+                        "only the last 5 digits (the shop-specific first 5 digits "
+                        "omitted) -- pass exactly what he said here and always supply "
+                        "`shop` alongside it in that case, e.g. repair_order_id \"11774\" "
+                        "+ shop \"Warner Robins\" for \"eleven seven seven four in Warner "
+                        "Robins\"."
+                    ),
+                },
+                "shop": {
+                    "type": "string",
+                    "description": (
+                        "Required whenever repair_order_id is a bare 5-digit short form "
+                        "instead of the full 10-digit RO number -- e.g. Macon, Perry, "
+                        "Warner Robins. Not needed when the full RO number was given. "
+                        "Take this only from Otis's current message; never reuse a prior "
+                        "subject's shop for a newly-spoken RO number."
+                    ),
                 },
             },
             "required": ["repair_order_id"],
@@ -2352,6 +2652,39 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                 },
                             ),
                             _calibration_iq_action_branch(
+                                ("create_missing_si_record", "resolve_missing_si_record"),
+                                ("repair_order_id", "arguments"),
+                                "Track or clear a durable ADAS SI gap for one calibration.",
+                                operation_description=(
+                                    "create_missing_si_record when ADAS SI has no applicable "
+                                    "procedure for this calibration yet; resolve_missing_si_record "
+                                    "once it does, or the gap no longer applies. Calibration IQ is "
+                                    "the durable, cross-conversation record of this fact."
+                                ),
+                                arguments_schema=_calibration_iq_arguments_schema(
+                                    {
+                                        "calibration_item_id": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                        },
+                                        "missing_document_type": {
+                                            "type": "string",
+                                            "enum": [
+                                                "ADAS_MAP_REPORT",
+                                                "OEM_PROCEDURE",
+                                                "SUPPORTING_SERVICE_INFO",
+                                                "UNCLASSIFIED",
+                                            ],
+                                        },
+                                        "search_query": {"type": "string"},
+                                        "search_details": {"type": "object"},
+                                        "resolved_document_id": {"type": "string"},
+                                        "reason": {"type": "string"},
+                                    },
+                                    required=("calibration_item_id",),
+                                ),
+                            ),
+                            _calibration_iq_action_branch(
                                 ("ensure_case_workspace",),
                                 ("repair_order_id",),
                                 "Ensure the RO research workspace exists.",
@@ -2447,6 +2780,15 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                             "minLength": 1,
                                             "maxLength": 80,
                                         },
+                                        "semantic_type": {
+                                            "type": "string",
+                                            "enum": [
+                                                "ADAS_MAP_REPORT",
+                                                "OEM_PROCEDURE",
+                                                "SUPPORTING_SERVICE_INFO",
+                                                "UNCLASSIFIED",
+                                            ],
+                                        },
                                         "title": {
                                             "type": "string",
                                             "minLength": 1,
@@ -2474,6 +2816,15 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                         "calibration_item_ids": {
                                             "type": "array",
                                             "items": {"type": "string", "minLength": 1},
+                                        },
+                                        "evidence_role": {
+                                            "type": "string",
+                                            "enum": ["JUSTIFICATION", "PROCEDURE", "SUPPORTING"],
+                                            "description": (
+                                                "Why calibration_item_ids is linked: JUSTIFICATION "
+                                                "proves the calibration is required, PROCEDURE says "
+                                                "how to perform it."
+                                            ),
                                         },
                                     },
                                     required=("source_path",),
@@ -3620,6 +3971,21 @@ class Registry:
             args = dict(args)
             args.pop(_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY, None)
         tier = self.tier(name)
+
+        if name == "calibration_iq_update" and not self.profile_allows_tool(name):
+            # Legacy write path: /ros/{id}/mutations, only 4 operations, no
+            # verified-evidence binding (see CALIBRATION_IQ_STAGED_WRITE_TOOLS
+            # above). Exclusion from the active profile's catalog is
+            # advertisement-only -- profiles never gate invoke() by design
+            # for every other tool -- so this legacy name gets its own
+            # narrowly-scoped execution-level guard instead of a blanket
+            # profile check that would also block intentionally-unlisted
+            # tools in other profiles.
+            if self.store:
+                self.store.audit(
+                    "tool_blocked", {"tool": name, "reason": "retired_from_active_profile"}
+                )
+            raise ToolBlocked(f"'{name}' is retired from the active tool profile.")
 
         if self.store and conversation_id is not None:
             conversation_user = self.store.conversation_user_id(conversation_id)

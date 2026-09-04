@@ -739,6 +739,132 @@ async def test_week_readiness_capacity_fails_before_snapshot_or_reconciliation(m
     assert calls == {"snapshot": 0, "reconcile": 0, "save": 0}
 
 
+def test_build_missing_si_actions_maps_missing_and_covered_states():
+    snapshot = {
+        "repair_order": {"id": "ro-si-actions", "ro_number": "RO-SI-ACTIONS"},
+        "calibrations": [
+            {
+                "id": "cal-missing",
+                "calibration_type": "Front long-range radar",
+                "determination": "REQUIRED",
+            },
+            {
+                "id": "cal-covered",
+                "calibration_type": "Rear corner radar - Left",
+                "determination": "REQUIRED",
+            },
+            {
+                "id": "cal-unverified",
+                "calibration_type": "Blind spot / corner radar - Right",
+                "determination": "REQUIRED",
+            },
+        ],
+    }
+    coverage = [
+        {
+            "calibration": "Front long-range radar",
+            "state": prep.adas_artifact_catalog.MISSING,
+            "reason": "No supporting document found.",
+        },
+        {"calibration": "Rear corner radar - Left", "state": prep.adas_artifact_catalog.COVERED},
+        {
+            "calibration": "Blind spot / corner radar - Right",
+            "state": prep.adas_artifact_catalog.UNVERIFIED,
+        },
+    ]
+
+    actions = prep.build_missing_si_actions(snapshot, coverage, "ro-si-actions")
+
+    assert len(actions) == 2
+    create_action = next(a for a in actions if a["operation"] == "create_missing_si_record")
+    assert create_action["repair_order_id"] == "ro-si-actions"
+    assert create_action["arguments"]["calibration_item_id"] == "cal-missing"
+    assert create_action["arguments"]["search_details"] == {
+        "reason": "No supporting document found."
+    }
+    resolve_action = next(a for a in actions if a["operation"] == "resolve_missing_si_record")
+    assert resolve_action["arguments"]["calibration_item_id"] == "cal-covered"
+
+
+@pytest.mark.asyncio
+async def test_week_readiness_dispatches_missing_si_actions_when_context_is_present(
+    monkeypatch,
+):
+    row = {
+        "id": "ro-si-dispatch",
+        "ro_number": "RO-SI-DISPATCH",
+        "phase": "5",
+        "source_presence": {"active_on_source": True},
+    }
+    snapshot = {
+        "repair_order": {"id": "ro-si-dispatch", "ro_number": "RO-SI-DISPATCH"},
+        "calibrations": [
+            {
+                "id": "cal-si-dispatch",
+                "calibration_type": "Front long-range radar",
+                "determination": "REQUIRED",
+            }
+        ],
+    }
+
+    async def query_repair_orders(_settings, _args):
+        return {"status": "verified", "items": [row]}
+
+    async def load_snapshot(_settings, _identifier):
+        return {"status": "verified", "snapshot": snapshot}
+
+    async def discover_map(_catalog, _snapshot):
+        return {
+            "status": "verified",
+            "requirements": [{"label": "Front long-range radar", "method": "STATIC"}],
+        }
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [], None
+
+    async def catalog_coverage(_catalog, _snapshot, _map_info):
+        return [
+            {"calibration": "Front long-range radar", "state": prep.adas_artifact_catalog.MISSING}
+        ]
+
+    dispatched_batches: list[dict] = []
+
+    async def operator_execute(_settings, _adas, payload):
+        dispatched_batches.append(payload)
+        return {
+            "success": True,
+            "receipts": [{"success": True} for _ in payload["actions"]],
+        }
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_coverage", catalog_coverage)
+    monkeypatch.setattr(prep.calibration_iq, "operator_execute", operator_execute)
+
+    result = await prep._week_readiness(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {
+            "phase": "5",
+            prep._CONTEXT_KEY: {  # noqa: SLF001
+                "conversation_id": 1,
+                "message_id": 1,
+                "tool_call_id": "test-missing-si-dispatch",
+            },
+        },
+    )
+
+    assert len(dispatched_batches) == 1
+    dispatched_actions = dispatched_batches[0]["actions"]
+    assert len(dispatched_actions) == 1
+    assert dispatched_actions[0]["operation"] == "create_missing_si_record"
+    assert dispatched_actions[0]["arguments"]["calibration_item_id"] == "cal-si-dispatch"
+    assert result["missing_si_records_dispatched"] == 1
+    assert result["missing_si_records_dispatch_errors"] == 0
+
+
 @pytest.mark.asyncio
 async def test_week_readiness_preserves_requested_indeterminate_mutation_truth(
     monkeypatch,
@@ -972,6 +1098,68 @@ async def test_resolve_queue_next_reports_stale_queue(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolve_selected_alldata_to_ciq_reads_through_navigator_when_flagged_on(
+    tmp_path, monkeypatch
+):
+    # Behind the flag, this must read through ScrapeX's Navigator session
+    # instead of X Omni's in-process ALLDATA browser -- a pure call-site
+    # swap; the CIQ-row matching logic is exactly the same either way.
+    settings = SimpleNamespace(root=tmp_path, alldata_navigator_enabled=True)
+
+    def get_browser(*_a, **_k):
+        raise AssertionError("must not use the in-process browser when the Navigator flag is on")
+
+    monkeypatch.setattr(prep.research_operator, "get_browser", get_browser)
+
+    async def navigator_current_page_signals(_settings, provider):
+        assert provider == "alldata"
+        return {
+            "success": True,
+            "data": {
+                "authenticated": True,
+                "signals": ["Vehicle Information - 2023 Acura TLX Type S - ALLDATA Collision"],
+            },
+        }
+
+    monkeypatch.setattr(
+        prep.scrapex_svc, "navigator_current_page_signals", navigator_current_page_signals
+    )
+
+    async def query_repair_orders(_settings, _args):
+        return {
+            "status": "verified",
+            "items": [
+                {"id": "ro-1", "ro_number": "RO1", "vehicle": {"year": 2023, "make": "Acura", "model": "TLX"}},
+            ],
+        }
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+
+    result = await prep.resolve_selected_alldata_to_ciq(settings, SimpleNamespace())
+    assert result["status"] == "verified"
+    assert result["verified"] is True
+    assert result["ro_number"] == "RO1"
+
+
+@pytest.mark.asyncio
+async def test_resolve_selected_alldata_to_ciq_requires_navigator_authentication_when_flagged_on(
+    tmp_path, monkeypatch
+):
+    settings = SimpleNamespace(root=tmp_path, alldata_navigator_enabled=True)
+
+    async def navigator_current_page_signals(_settings, _provider):
+        return {"success": True, "data": {"authenticated": False, "signals": []}}
+
+    monkeypatch.setattr(
+        prep.scrapex_svc, "navigator_current_page_signals", navigator_current_page_signals
+    )
+
+    result = await prep.resolve_selected_alldata_to_ciq(settings, SimpleNamespace())
+    assert result["status"] == "human_action_required"
+    assert result["verified"] is False
+
+
+@pytest.mark.asyncio
 async def test_resolve_queue_next_selected_vehicle_not_in_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(weekly_queue, "_STORE", None)
     settings = SimpleNamespace(root=tmp_path)
@@ -997,6 +1185,47 @@ async def test_resolve_queue_next_selected_vehicle_not_in_queue(tmp_path, monkey
 
     result = await prep.resolve_queue_next(settings, SimpleNamespace(), 8)
     assert result["status"] == "not_in_queue"
+
+
+@pytest.mark.asyncio
+async def test_resolve_queue_next_reads_through_navigator_when_flagged_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(weekly_queue, "_STORE", None)
+    settings = SimpleNamespace(root=tmp_path, alldata_navigator_enabled=True)
+    store = weekly_queue.get_store(tmp_path)
+    item = weekly_queue.WeeklyQueueItem(
+        repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Acura TLX",
+        vehicle_year="2023", vehicle_make="Acura", vehicle_model_trim="TLX",
+    )
+    store.save(weekly_queue.WeeklyQueue(conversation_id="11", items=[item]))
+
+    def get_browser(*_a, **_k):
+        raise AssertionError("must not use the in-process browser when the Navigator flag is on")
+
+    monkeypatch.setattr(prep.research_operator, "get_browser", get_browser)
+
+    async def navigator_current_page_signals(_settings, provider):
+        assert provider == "alldata"
+        return {
+            "success": True,
+            "data": {
+                "authenticated": True,
+                "signals": ["Vehicle Information - 2023 Acura TLX Type S - ALLDATA Collision"],
+            },
+        }
+
+    monkeypatch.setattr(
+        prep.scrapex_svc, "navigator_current_page_signals", navigator_current_page_signals
+    )
+
+    async def collect(_settings, _adas, args):
+        assert args["repair_order_id"] == "ro-1"
+        return {"status": "success", "success": True, "verified": True, "vehicle": "2023 Acura TLX"}
+
+    monkeypatch.setattr(prep.quick, "collect_for_calibration_iq_ro", collect)
+
+    result = await prep.resolve_queue_next(settings, SimpleNamespace(), 11)
+    assert result["status"] == "success"
+    assert result["repair_order_id"] == "ro-1"
 
 
 @pytest.mark.asyncio

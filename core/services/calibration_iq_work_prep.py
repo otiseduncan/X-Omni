@@ -30,6 +30,7 @@ from . import calibration_iq_weekly_queue as weekly_queue
 from . import research_alldata_navigation as nav
 from . import research_alldata_quick_reference as quick
 from . import research_operator
+from . import scrapex as scrapex_svc
 
 TOOL_NAME = "calibration_iq_work_prep"
 _CONTEXT_KEY = "__xomni_work_prep_context"
@@ -352,6 +353,64 @@ def build_reconciliation_actions(
     return actions
 
 
+def build_missing_si_actions(
+    snapshot: dict[str, Any], coverage: list[dict[str, Any]], ro_id: str
+) -> list[dict[str, Any]]:
+    """Turn ADAS SI coverage results into Calibration IQ's durable missing-SI record.
+
+    Calibration IQ's `missing_si_records` table is the cross-conversation
+    system-of-record for "service information isn't in ADAS SI yet" -- the
+    local weekly queue (calibration_iq_weekly_queue.py) still drives the
+    ALLDATA-walk ordering for `queue_next`/`queue_list`, but only this table
+    is visible to a later conversation, to the human dashboard, and to
+    anyone reading the RO's `vetting` snapshot. MISSING coverage opens a
+    record; COVERED coverage resolves one unconditionally -- Calibration IQ
+    itself no-ops the resolve when nothing is open, so it is always safe to
+    send on every readiness pass.
+    """
+
+    by_key: dict[str, str] = {}
+    for item in _active_ciq_requirements(snapshot):
+        key = _calibration_key(item.get("calibration_type"))
+        item_id = str(item.get("id") or "").strip()
+        if key and item_id:
+            by_key[key] = item_id
+
+    actions: list[dict[str, Any]] = []
+    for item in coverage:
+        calibration_item_id = by_key.get(_calibration_key(item.get("calibration")))
+        if not calibration_item_id:
+            continue
+        state = item.get("state")
+        if state == adas_artifact_catalog.MISSING:
+            actions.append(
+                {
+                    "operation": "create_missing_si_record",
+                    "repair_order_id": ro_id,
+                    "arguments": {
+                        "calibration_item_id": calibration_item_id,
+                        "missing_document_type": "OEM_PROCEDURE",
+                        "search_query": str(item.get("calibration") or ""),
+                        "search_details": (
+                            {"reason": str(item["reason"])} if item.get("reason") else {}
+                        ),
+                    },
+                }
+            )
+        elif state == adas_artifact_catalog.COVERED:
+            actions.append(
+                {
+                    "operation": "resolve_missing_si_record",
+                    "repair_order_id": ro_id,
+                    "arguments": {
+                        "calibration_item_id": calibration_item_id,
+                        "reason": "ADAS SI coverage confirmed by X's readiness scan.",
+                    },
+                }
+            )
+    return actions
+
+
 def _reconciliation_issues(
     snapshot: dict[str, Any], map_info: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -397,21 +456,16 @@ def _reconciliation_issues(
         if map_method != "UNKNOWN" and _method(matches[0].get("method")) != map_method:
             issues.append({"code": "method_mismatch", "calibration": label})
 
-    for item in existing:
-        if str(item.get("determination") or "").upper() not in _ACTIVE_DETERMINATIONS:
-            continue
-        label = _requirement_label(item)
-        key = _calibration_key(label)
-        if not key:
-            issues.append(
-                {
-                    "code": "extra_active_item",
-                    "calibration": label,
-                    "reason": "active CIQ label could not be normalized",
-                }
-            )
-        elif key not in governing_keys:
-            issues.append({"code": "extra_active_item", "calibration": label})
+    # Deliberately no "CIQ has an active item this ADAS Map pull didn't
+    # mention" check here. One ADAS Map read only proves what it covers, not
+    # a closed world -- a technician-added item, a structural calibration
+    # outside this inspection's scope, or a different/earlier ADAS Map read
+    # can all put a legitimate active item in CIQ that this particular
+    # governing_keys set doesn't know about. Treating that as a reconciliation
+    # failure blocked nearly every RO from ever reaching "ready" with no
+    # action able to resolve it (build_reconciliation_actions never touches
+    # extras). Mirrors ScrapeX's own reconcile_requirements: absence from one
+    # ADAS Map result never deletes or disqualifies a CIQ row.
     return issues
 
 
@@ -1866,6 +1920,8 @@ async def _week_readiness(
     verified_receipt_total = 0
     indeterminate_reconciliation_total = 0
     may_have_executed_reconciliation_total = 0
+    missing_si_dispatched_total = 0
+    missing_si_dispatch_error_total = 0
     for row, envelope in loaded:
         if envelope.get("status") != "verified":
             results.append(
@@ -1938,6 +1994,38 @@ async def _week_readiness(
         ]
         vehicle = _vehicle_label(snapshot, calibration_iq._vehicle_label(row))  # noqa: SLF001
         coverage = await _catalog_coverage(catalog, snapshot, map_info)
+        row_ro_id = str(calibration_iq._authoritative_repair_order_id(snapshot) or "")  # noqa: SLF001
+        if context is not None and row_ro_id:
+            missing_si_actions = build_missing_si_actions(snapshot, coverage, row_ro_id)
+            if missing_si_actions:
+                try:
+                    missing_si_result = await calibration_iq.operator_execute(
+                        settings,
+                        adas,
+                        {
+                            "actions": missing_si_actions,
+                            "continue_on_error": True,
+                            calibration_iq._INVOCATION_CONTEXT_KEY: {  # noqa: SLF001
+                                **context,
+                                "tool_call_id": f"{context['tool_call_id']}-missing-si-{row_ro_id[:12]}",
+                            },
+                        },
+                    )
+                    if isinstance(missing_si_result, dict):
+                        missing_si_dispatched_total += sum(
+                            1
+                            for receipt in (missing_si_result.get("receipts") or [])
+                            if isinstance(receipt, dict) and receipt.get("success") is True
+                        )
+                        missing_si_dispatch_error_total += sum(
+                            1
+                            for receipt in (missing_si_result.get("receipts") or [])
+                            if isinstance(receipt, dict) and receipt.get("success") is not True
+                        )
+                    else:
+                        missing_si_dispatch_error_total += len(missing_si_actions)
+                except Exception:  # noqa: BLE001 - best-effort bookkeeping, never fails the scan
+                    missing_si_dispatch_error_total += len(missing_si_actions)
         missing_si = [
             item
             for item in coverage
@@ -2106,6 +2194,8 @@ async def _week_readiness(
         "needs_si_count": si_missing_count,
         "si_missing_count": si_missing_count,
         "si_unverified_count": si_unverified_count,
+        "missing_si_records_dispatched": missing_si_dispatched_total,
+        "missing_si_records_dispatch_errors": missing_si_dispatch_error_total,
         "adas_map_verified_count": adas_map_verified_count,
         "adas_map_missing_count": adas_map_missing_count,
         "adas_map_unverified_count": adas_map_unverified_count,
@@ -2447,12 +2537,33 @@ def _row_matches_signals(row: dict[str, Any], signals: list[str]) -> bool:
     return any(quick._identity_matches_text(signal, vehicle) for signal in signals)  # noqa: SLF001
 
 
-async def resolve_selected_alldata_to_ciq(settings: Any, adas: Any) -> dict[str, Any]:
+async def _current_alldata_signals(settings: Any, adas: Any) -> tuple[bool, list[str]]:
+    """Return (authenticated_and_ready, bounded vehicle-ish text signals).
+
+    Behind Settings.alldata_navigator_enabled, this reads through ScrapeX's
+    Navigator session instead of X Omni's own in-process ALLDATA browser --
+    a pure call-site swap; the signal-matching logic downstream is
+    unchanged either way. Off by default: the live technician's actual
+    authenticated ALLDATA session lives in the in-process browser until the
+    Navigator path has been proven end-to-end and the flag is flipped.
+    """
+    if getattr(settings, "alldata_navigator_enabled", False):
+        page_signals = await scrapex_svc.navigator_current_page_signals(settings, "alldata")
+        data = page_signals.get("data") if isinstance(page_signals.get("data"), dict) else {}
+        if not (page_signals.get("success") and data.get("authenticated")):
+            return False, []
+        return True, list(data.get("signals") or [])
     browser = research_operator.get_browser(Path(settings.root), adas=adas)
     state = await browser.start(auto_login=False)
     if not state.get("authenticated") or browser._page is None:  # noqa: SLF001
+        return False, []
+    return True, await _bounded_selected_vehicle_signals(browser._page)  # noqa: SLF001
+
+
+async def resolve_selected_alldata_to_ciq(settings: Any, adas: Any) -> dict[str, Any]:
+    ready, signals = await _current_alldata_signals(settings, adas)
+    if not ready:
         return {"status": "human_action_required", "verified": False, "message": "Open/resume the ALLDATA browser and sign in first."}
-    signals = await _bounded_selected_vehicle_signals(browser._page)  # noqa: SLF001
     if not signals:
         return {"status": "vehicle_selection_required", "verified": False, "message": "X could not read a bounded selected-vehicle signal from ALLDATA. Select the CIQ vehicle first."}
     queue = await calibration_iq.query_repair_orders(settings, {"include_completed": False})
@@ -2591,9 +2702,8 @@ async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> 
             "message": "The weekly readiness queue is complete -- every RO that needed ADAS SI has been collected.",
         }
 
-    browser = research_operator.get_browser(Path(settings.root), adas=adas)
-    state = await browser.start(auto_login=False)
-    if not state.get("authenticated") or browser._page is None:  # noqa: SLF001
+    ready, signals = await _current_alldata_signals(settings, adas)
+    if not ready:
         return {
             "status": "authentication_required",
             "success": False,
@@ -2602,7 +2712,6 @@ async def resolve_queue_next(settings: Any, adas: Any, conversation_id: int) -> 
             "items": [item.to_dict() for item in queue.unresolved()],
             "message": "Open/resume the ALLDATA browser and sign in first.",
         }
-    signals = await _bounded_selected_vehicle_signals(browser._page)  # noqa: SLF001
     if not signals:
         remaining = "; ".join(f"RO {item.ro_number} — {item.vehicle_label}" for item in pending[:3])
         return {
@@ -3063,7 +3172,7 @@ def install() -> None:
                     from ..config import Settings
                     from . import adas_si as adas_si_mod
                     settings = Settings.load()
-                    adas = adas_si_mod.AdasSI(
+                    adas = adas_si_mod.get_shared_instance(
                         settings.adas_si_root,
                         settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite",
                     )
