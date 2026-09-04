@@ -515,70 +515,15 @@ def test_alias_parity_is_bounded_and_does_not_let_si_invent_requirements():
     )
 
 
-def test_reconciliation_parity_rejects_extra_active_ciq_requirements():
-    snapshot = {
-        "calibrations": [
-            {
-                "id": "cal-bsm",
-                "calibration_type": "Blind Spot Monitor Calibration",
-                "determination": "REQUIRED",
-                "method": "STATIC",
-                "version": 1,
-            },
-            {
-                "id": "cal-radar",
-                "calibration_type": "Front Radar Calibration",
-                "determination": "REQUIRED",
-                "method": "STATIC",
-                "version": 1,
-            },
-        ]
-    }
-    map_info = {
-        "status": "verified",
-        "requirements": [
-            {"label": "Blind Spot Monitor Calibration", "method": "STATIC"}
-        ],
-    }
-
-    assert prep._reconciliation_issues(snapshot, map_info) == [
-        {"code": "extra_active_item", "calibration": "Front Radar Calibration"}
-    ]
-
-
-def test_reconciliation_parity_rejects_unparseable_active_ciq_requirement():
-    snapshot = {
-        "calibrations": [
-            {
-                "id": "cal-bsm",
-                "calibration_type": "Blind Spot Monitor Calibration",
-                "determination": "REQUIRED",
-                "method": "STATIC",
-                "version": 1,
-            },
-            {
-                "id": "cal-unparsed",
-                "calibration_type": "Calibration",
-                "determination": "REQUIRED",
-                "method": "UNKNOWN",
-                "version": 1,
-            },
-        ]
-    }
-    map_info = {
-        "status": "verified",
-        "requirements": [
-            {"label": "Blind Spot Monitor Calibration", "method": "STATIC"}
-        ],
-    }
-
-    assert prep._reconciliation_issues(snapshot, map_info) == [
-        {
-            "code": "extra_active_item",
-            "calibration": "Calibration",
-            "reason": "active CIQ label could not be normalized",
-        }
-    ]
+# The "extra_active_item" check these two tests were written against was
+# removed as a confirmed false positive: CIQ's active calibration list is
+# legitimately allowed to be a superset of any single ADAS Map source's own
+# requirements (a different/older map revision, manual entry, or another
+# corroborating source can add real, legitimate items a single map read
+# never mentions) -- flagging that as an error blocked genuine reconciliation
+# progress. Reconfirmed live this session: a real RO (2400711867) correctly
+# carries "Seat Belt" as an active CIQ requirement beyond what its own map
+# source lists, with no data problem at all.
 
 
 @pytest.mark.asyncio

@@ -328,7 +328,10 @@ tools:
       Perform verified, idempotent Calibration IQ operator batches, including
       research, photos, managed case-file/document work, status undo,
       no-calibration decisions, and location administration. Routine authorized
-      operations run immediately and are audited upstream and in X.
+      operations run immediately and are audited upstream and in X. Also
+      records repair-trigger justification and repair-scope review, and
+      tracks/clears durable ADAS SI service-information gaps
+      (create_missing_si_record/resolve_missing_si_record).
 
   calibration_iq_work_prep:
     tier: operator_authorized

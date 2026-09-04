@@ -42,9 +42,13 @@ Vehicle-specific calibration requirements, triggers, procedures, prerequisites, 
 WORKING_CONTEXT = """## Current work context
 Trusted active-subject and artifact context comes from prior authoritative results. Use it for follow-ups; a clearly selected new RO or vehicle replaces the prior subject. Collection reads answer set/list questions and discover identities. Even an exact-number list match is a thin row, not detail; use the exact-resource read for one identified RO.
 
+Any RO number Otis names this turn -- full or the shop-relative short form -- is a fresh identification, never a follow-up on the active subject, even if the question's wording matches an earlier turn almost exactly ("what calibrations do I have on ___"). Different digits or a different shop name than the current subject both independently mean a different RO: call `calibration_iq_ro` again with the new number and shop and answer from that fresh result, not from what an earlier turn already returned. Reusing a prior answer for a differently-named RO is always wrong, no matter how similar the two questions read.
+
 If active context says `current_calibration_detail_included=false` or exposes only identity/workflow scope, it is not evidence of current saved calibrations; refresh `calibration_iq_ro` before a current-calibration or detail-dependent answer.
 
 Identity may persist, but mutable state and versions become stale. Before any schema-versioned write, refresh that exact RO in the same turn and copy the required RO or child id and current version from its authoritative detail. A board row or stale context is not write proof and never proves an OEM requirement.
+
+Speak RO numbers back in whatever form Otis used to name the subject this turn, not Calibration IQ's full 10-digit number: he usually says only the shop-specific last 5 digits plus the shop name (e.g. "11774 in Warner Robins"), so say it that way too -- "RO 11774 in Warner Robins," never "RO 2400711774." The full number is what `calibration_iq_ro`/`repair_order_id` needs internally, not what belongs in the sentence back to him. If he names the full number himself, mirror that instead.
 """
 
 ADAS_SOURCE_ROLES = """## ADAS source roles
@@ -53,6 +57,7 @@ ADAS_SOURCE_ROLES = """## ADAS source roles
 - ADAS SI holds local OEM procedures, triggers, prerequisites, specifications, target setup, and page provenance. It does not establish current CIQ assignments.
 - Automotive Knowledge is reusable structured knowledge bounded by lifecycle and provenance.
 - Licensed-provider and public-OEM research acquire evidence not yet established locally; authentication remains human.
+- Repair-trigger justification, repair-scope review, and per-calibration SI presence/missing come only from Calibration IQ's `vetting` snapshot block; report unverified/missing rather than inferring from automotive knowledge.
 
 Choose among these sources from the actual question and returned evidence. This role map is not a mandatory fixed chain.
 """
@@ -401,6 +406,10 @@ def _active_subject_context(active_subject: Optional[dict], max_chars: int) -> s
         "exact id before answering. Do not summarize status/phase or merely offer to "
         "retrieve it: call that available tool now. The latest explicit user request "
         "overrides it; do not rewrite the user's message.\n"
+        "Never copy this JSON's resource_id/repair_order_id/ro_number/shop into a new "
+        "calibration_iq_ro call -- those describe the PRIOR subject. Any RO number or "
+        "shop Otis names this turn, however short, is this call's only source for those "
+        "arguments, even if the question echoes an earlier one.\n"
         "<active_subject_json>"
     )
     suffix = "</active_subject_json>"

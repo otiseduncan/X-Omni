@@ -215,7 +215,7 @@ def build_app(settings: Settings) -> FastAPI:
     # --- field tools: ADAS SI + Calibration IQ ---
     # Both degrade to an honest "unavailable" rather than failing to start,
     # so Core still boots when the library or the service is offline.
-    adas = adas_si_svc.AdasSI(
+    adas = adas_si_svc.get_shared_instance(
         settings.adas_si_root,
         settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite",
     )

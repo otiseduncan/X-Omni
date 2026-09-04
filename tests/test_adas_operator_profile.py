@@ -16,7 +16,9 @@ from core.tools.registry import (
     CALIBRATION_IQ_RESEARCH_RO_OPERATIONS,
     CALIBRATION_IQ_STAGED_WRITE_TOOLS,
     CALIBRATION_IQ_WORKSPACE_DOCUMENT_RO_OPERATIONS,
+    NeedsApproval,
     Registry,
+    ToolBlocked,
     calibration_iq_evidence_from_result,
     scrapex_evidence_from_result,
 )
@@ -165,6 +167,38 @@ def test_profile_filters_advertising_without_changing_gateway_policy() -> None:
     assert registry.tier("calibration_iq_destructive") == "confirm_required"
 
 
+async def test_calibration_iq_update_is_blocked_under_the_default_profile() -> None:
+    """Advertising exclusion alone is not execution-level quarantine.
+
+    profile_allows_tool only gates profile_catalog/model_tools advertising --
+    invoke() previously never consulted it, so a caller that named the
+    legacy 'calibration_iq_update' tool directly would still reach its
+    handler (and skip the verified-evidence binding that
+    calibration_iq_operator/_destructive require) even though the default
+    'adas_operator' profile doesn't advertise it.
+    """
+
+    registry = Registry(POLICY_PATH, profile="adas_operator")
+    registry.register("calibration_iq_update", lambda _args: {"success": True})
+    assert registry.profile_allows_tool("calibration_iq_update") is False
+
+    with pytest.raises(ToolBlocked):
+        await registry.invoke("calibration_iq_update", {})
+
+
+async def test_calibration_iq_update_reaches_its_normal_gate_under_the_full_profile() -> None:
+    # The full maintenance profile still advertises this legacy tool, so the
+    # quarantine guard must not fire there -- it should reach the tool's own
+    # ordinary confirm_required approval gate instead of being blocked as
+    # "retired".
+    registry = Registry(POLICY_PATH, profile="full")
+    registry.register("calibration_iq_update", lambda _args: {"success": True})
+    assert registry.profile_allows_tool("calibration_iq_update") is True
+
+    with pytest.raises(NeedsApproval):
+        await registry.invoke("calibration_iq_update", {})
+
+
 def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> None:
     configured_profile_catalog(_settings())
     registry = Registry(POLICY_PATH, profile="adas_operator")
@@ -270,8 +304,12 @@ def test_normal_prompt_is_concise_and_free_of_capability_micro_routing() -> None
     prompt = system_prompt(_omni_router())
 
     # camera_footage's range_narrowed coverage-honesty rule grew this
-    # slightly; ceiling moved with it, not toward zero headroom.
-    assert len(prompt) < 5_800
+    # slightly; the ADAS_SOURCE_ROLES vetting-snapshot bullet grew it again;
+    # the WORKING_CONTEXT short-RO-number speaking rule grew it once more;
+    # the WORKING_CONTEXT new-subject-always-refetches rule (fixing X
+    # repeating stale RO context across a shop/number change) grew it once
+    # more. Ceiling moved with it, not toward zero headroom.
+    assert len(prompt) < 7_300
     assert "model-first and tool contract" in prompt.casefold()
     assert "adas source roles" in prompt.casefold()
     assert "mutations require a direct current-turn command" in prompt.casefold()
@@ -332,6 +370,7 @@ def test_production_profile_catalog_exposes_disjoint_unversioned_action_families
     research = operations_for(set(CALIBRATION_IQ_RESEARCH_RO_OPERATIONS))
     add = operations_for(set(CALIBRATION_IQ_ADD_CALIBRATION_OPERATIONS))
     exact_groups = (
+        {"create_missing_si_record", "resolve_missing_si_record"},
         {"ensure_case_workspace"},
         {"create_folder", "archive_entry"},
         {"rename_entry"},
@@ -398,21 +437,34 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     )
 
     # camera_footage's range_narrowed coverage-honesty rule grew this
-    # slightly; ceiling moved with it, not toward zero headroom.
-    assert metrics["base_system"]["chars"] < 5_800
-    assert metrics["base_system"]["tokens"] < 1_650
+    # slightly; the ADAS_SOURCE_ROLES vetting-snapshot bullet grew it again;
+    # the WORKING_CONTEXT short-RO-number speaking rule grew it once more;
+    # the WORKING_CONTEXT new-subject-always-refetches rule grew it once
+    # more. Ceilings moved with it, not toward zero headroom.
+    assert metrics["base_system"]["chars"] < 7_300
+    assert metrics["base_system"]["tokens"] < 2_100
     assert metrics["active_working_context"]["chars"] > 0
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
     assert metrics["stored_artifact_context"]["chars"] <= 8_000
     assert metrics["advertised_tools"]["count"] == 35
-    assert metrics["advertised_tools"]["catalog_chars"] < 42_800
-    assert metrics["advertised_tools"]["catalog_tokens"] < 12_300
+    # The vetting-contract operations (mark_repair_scope_reviewed,
+    # record_repair_trigger_justification, create_missing_si_record,
+    # resolve_missing_si_record) grew calibration_iq_operator's schema; the
+    # calibration_iq_ro `shop` parameter (short-RO-number resolution) grew
+    # it again, and the anti-copy warnings on `repair_order_id`/`shop`
+    # (never copy an identifier from the Active conversation subject block
+    # into a fresh call) grew it once more. Ceilings moved with them, not
+    # toward zero headroom.
+    assert metrics["advertised_tools"]["catalog_chars"] < 45_500
+    assert metrics["advertised_tools"]["catalog_tokens"] < 13_100
     # Visibility ceiling with regression headroom; the independent remaining
-    # context floor below is the authoritative 32K safety contract.
-    assert metrics["total_input_used_tokens"] < 14_300
+    # context floor below is the authoritative 32K safety contract. The
+    # new-subject-always-refetches WORKING_CONTEXT rule and the active-
+    # subject/tool-schema anti-copy warnings moved this floor down once more.
+    assert metrics["total_input_used_tokens"] < 15_500
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
-    assert metrics["remaining_normal_turn_tokens"] > 15_200
+    assert metrics["remaining_normal_turn_tokens"] > 13_900
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

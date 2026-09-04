@@ -1303,6 +1303,25 @@ async def test_research_destination_folder_normalizes_and_appends_each_source_fi
     ]
     assert len(report["documents_prepared"]) == 2
 
+    # Two distinct documents both matched the one calibration in this RO --
+    # neither may be auto-linked to it. Both are still imported (so nothing
+    # found is lost), and the ambiguity is reported for a human/model
+    # decision instead of being silently resolved by picking one.
+    assert all(item["arguments"]["calibration_item_ids"] == [] for item in imports)
+    assert report["ambiguous_calibrations"] == [{
+        "calibration_id": "cal-bsm",
+        "calibration": "blind spot monitor",
+        "candidates": [
+            {"title": source.stem, "relative_path": source.name, "pages": [index + 2]}
+            for index, source in enumerate(sources)
+        ],
+        "message": (
+            "Multiple distinct ADAS SI documents matched this calibration; "
+            "none were auto-linked. A human or a follow-up model turn must "
+            "choose the correct one."
+        ),
+    }]
+
     invalid_action = {
         **action,
         "arguments": {"destination_path": "calibration-procedures/BSM/procedure.pdf"},
@@ -1496,6 +1515,7 @@ async def test_repeat_research_updates_existing_document_with_snapshot_version_a
             "ADAS SI queries: 2023 Toyota Camry front camera"
         ),
         "calibration_item_ids": ["cal-1", "cal-old"],
+        "evidence_role": "PROCEDURE",
     }
     assert "changes" not in update["arguments"]
     canonical_update = {
@@ -1591,7 +1611,10 @@ async def test_repeat_research_links_existing_document_with_snapshot_version_onl
     link = posted[0]["actions"][1]
     assert link["target_id"] == "doc-existing"
     assert link["expected_version"] == 7
-    assert link["arguments"] == {"calibration_item_ids": ["cal-1"]}
+    assert link["arguments"] == {
+        "calibration_item_ids": ["cal-1"],
+        "evidence_role": "PROCEDURE",
+    }
     assert all(action["operation"] != "import_document" for action in posted[0]["actions"])
     report = result["research"][0]
     assert report["documents_prepared"] == []

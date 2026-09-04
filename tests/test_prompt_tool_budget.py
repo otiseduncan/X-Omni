@@ -61,15 +61,32 @@ def test_adas_profile_prompt_and_catalog_budget_is_reviewable_and_bounded() -> N
     }
     assert metrics["advertised_tools"]["count"] == _configured_profile_tool_count()
     assert metrics["advertised_tools"]["count"] <= 35
-    assert metrics["base_system"]["chars"] <= 6_000
-    assert metrics["base_system"]["tokens"] <= 1_800
-    assert metrics["advertised_tools"]["catalog_chars"] <= 42_800
-    assert metrics["advertised_tools"]["catalog_tokens"] <= 12_300
+    # WORKING_CONTEXT's short-RO-number speaking rule grew base_system, and
+    # the new-subject-always-refetches rule (fixing X repeating stale RO
+    # context across a shop/number change) grew it again; ceiling moved
+    # with it, not toward zero headroom.
+    assert metrics["base_system"]["chars"] <= 7_300
+    assert metrics["base_system"]["tokens"] <= 2_100
+    # The vetting-contract operations (mark_repair_scope_reviewed,
+    # record_repair_trigger_justification, create_missing_si_record,
+    # resolve_missing_si_record) grew calibration_iq_operator's schema; the
+    # calibration_iq_ro `shop` parameter (short-RO-number resolution) grew
+    # it again, and the anti-copy warnings on `repair_order_id`/`shop`
+    # (never copy an identifier from the Active conversation subject block
+    # into a fresh call) grew it once more. Ceilings moved with them, not
+    # toward zero headroom.
+    assert metrics["advertised_tools"]["catalog_chars"] <= 45_500
+    assert metrics["advertised_tools"]["catalog_tokens"] <= 13_100
     # camera_footage's system-prompt guidance grew slightly (range_narrowed
     # coverage-honesty rule, see camera_security.camera_footage_analyze);
-    # these ceilings/floors moved with it, not toward zero headroom.
-    assert metrics["total_input_used_tokens"] <= 13_900
-    assert metrics["remaining_normal_turn_tokens"] >= 17_300
+    # these ceilings/floors moved with it, not toward zero headroom. The
+    # vetting-contract operations then moved them again, and the
+    # short-RO-number resolution work (WORKING_CONTEXT rule +
+    # calibration_iq_ro `shop` parameter) moved them once more. The
+    # new-subject-always-refetches WORKING_CONTEXT rule and the active-
+    # subject/tool-schema anti-copy warnings moved them once more still.
+    assert metrics["total_input_used_tokens"] <= 15_400
+    assert metrics["remaining_normal_turn_tokens"] >= 15_800
 
 
 def test_adas_profile_contains_field_surface_not_experimental_catalog_noise() -> None:
@@ -171,8 +188,13 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     # true for temporal/action questions, and to require surfacing a
     # range_narrowed result honestly (see camera_security.
     # camera_footage_analyze); this floor moved down with it, not toward
-    # zero headroom.
-    assert metrics["remaining_normal_turn_tokens"] >= 15_100
+    # zero headroom. The vetting-contract operations then grew
+    # calibration_iq_operator's schema and moved it down again. The
+    # WORKING_CONTEXT short-RO-number speaking rule moved it down once more,
+    # and the new-subject-always-refetches WORKING_CONTEXT rule plus the
+    # active-subject/tool-schema anti-copy warnings moved it down once more
+    # still.
+    assert metrics["remaining_normal_turn_tokens"] >= 13_600
 
 
 def test_budget_metrics_match_actual_generated_system_prompt() -> None:

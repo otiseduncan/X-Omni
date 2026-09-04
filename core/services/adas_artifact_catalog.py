@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - normalized as an unreadable artifact
     pdfium = None
 
 
-CATALOG_SCHEMA_VERSION = "5"
+CATALOG_SCHEMA_VERSION = "6"  # ligature-artifact normalization fix -- forces a full re-scan
 SCRAPEX_DB_ENV = "XOMNI_SCRAPEX_DB_PATH"
 DEFAULT_SCRAPEX_DB = Path(r"X:\ScrapeX\data\scrapex.sqlite3")
 
@@ -133,6 +133,41 @@ _ALIAS_FAMILIES: dict[str, tuple[str, ...]] = {
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_LIGATURE_REPLACEMENTS = {
+    # "ti" has no ToUnicode mapping at all in these reports' embedded font:
+    # pypdf renders the glyph as a literal NUL, pypdfium2 (the fallback
+    # path) renders the same glyph as U+FFFE. Either way "Estimate" comes
+    # out "Es<gap>mate", "Identified" comes out "Iden<gap>fied", "Static
+    # Calibration" comes out "Sta<gap>c Calibra<gap>on" -- confirmed live
+    # against a real report, and it silently broke every downstream regex
+    # expecting those exact words, so a real, confirmed-correct-vehicle
+    # report parsed to zero requirements even though the calibration was
+    # genuinely printed on the page.
+    "\x00": "ti",
+    "￾": "ti",
+    # These, by contrast, resolve correctly to real Unicode ligature code
+    # points (also confirmed live in the same document -- "Identified"
+    # came through as "Iden" + U+FB01 + "ed") -- just not to the plain
+    # ASCII letter pairs the parser's regexes are written against.
+    "ﬀ": "ff",
+    "ﬁ": "fi",
+    "ﬂ": "fl",
+    "ﬃ": "ffi",
+    "ﬄ": "ffl",
+    "ﬅ": "ft",
+    "ﬆ": "st",
+}
+
+
+def _normalize_ligature_artifacts(text: str) -> str:
+    """Undo font-decoding gaps observed live in real ADAS Map PDFs where a
+    ligature glyph (only ever "ti"/"fi" confirmed so far) doesn't come
+    through as its plain letter pair -- see _LIGATURE_REPLACEMENTS."""
+    for artifact, letters in _LIGATURE_REPLACEMENTS.items():
+        text = text.replace(artifact, letters)
+    return text
 
 
 def _fold(value: object) -> str:
@@ -344,8 +379,29 @@ def _families_in(text: str) -> list[str]:
 def _requirements_from_section(text: str) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen: set[str] = set()
-    for raw in re.findall(r"(?m)^\s*[•●▪*-]\s*(?P<label>[^\r\n]{2,160})", text):
+    # U+FFFD (the generic Unicode replacement character): confirmed live --
+    # this document's actual bullet glyph has no ToUnicode mapping either,
+    # so it comes through as the same "unknown character" placeholder every
+    # PDF text extractor falls back to, not one of the literal bullet
+    # characters below. Without it, the requirement line under this bullet
+    # (a genuinely required calibration, printed on the page) silently
+    # never matched at all.
+    # The PDF report's own bullet phrasing is "ADAS L3: Static Calibration -
+    # A of ICC / Distance Sensor" -- the method/tier description prefixed
+    # onto the actual component name with " of ", not the bare component
+    # name the live ADAS Map modal itself shows. Confirmed live: without
+    # stripping this prefix, _safe_requirement's own colon-rejecting filter
+    # (correctly strict against section-header-looking text) discarded the
+    # entire line, silently losing a real, genuinely-required calibration.
+    _method_prefix_re = re.compile(
+        r"(?i)^adas\s+l\d+\s*:\s*.+?\bof\s+(?P<component>.+)$"
+    )
+
+    for raw in re.findall(r"(?m)^\s*[•●▪*�-]\s*(?P<label>[^\r\n]{2,160})", text):
         label = re.sub(r"(?i)\s+estimate\s+lines?.*$", "", raw).strip(" .;:-")
+        prefix_match = _method_prefix_re.match(label)
+        if prefix_match:
+            label = prefix_match.group("component").strip(" .;:-")
         safe = _safe_requirement(label)
         if not safe:
             continue
@@ -692,7 +748,7 @@ class AdasArtifactCatalog:
             raise RuntimeError(
                 "Neither pypdf nor pypdfium2 is installed; cannot read ADAS SI PDFs."
             )
-        return pages
+        return [(number, _normalize_ligature_artifacts(text)) for number, text in pages]
 
     @staticmethod
     def _cached_pages(
@@ -706,7 +762,13 @@ class AdasArtifactCatalog:
             return []
         pages = [(int(row[0]), str(row[1] or "")) for row in rows]
         if any(text.strip() for _, text in pages):
-            return pages
+            # Cached rows were written by whatever extraction ran when they
+            # were first scanned -- confirmed live: 2,607 pages already
+            # cached from before the ligature-artifact fix existed, so
+            # reading them back verbatim would keep serving the same
+            # corrupted text forever regardless of the fix. Normalize on
+            # every read instead of requiring a full cache invalidation.
+            return [(number, _normalize_ligature_artifacts(text)) for number, text in pages]
         # Existing OCR is part of the same cache.  Reuse it when native page
         # rows are present but empty; never initialize or run OCR implicitly.
         has_ocr = db.execute(
@@ -724,7 +786,9 @@ class AdasArtifactCatalog:
         ).fetchall()
         ocr = {int(row[0]): str(row[1] or "") for row in ocr_rows}
         merged = [(page, ocr.get(page) or text) for page, text in pages]
-        return merged if any(text.strip() for _, text in merged) else []
+        if not any(text.strip() for _, text in merged):
+            return []
+        return [(number, _normalize_ligature_artifacts(text)) for number, text in merged]
 
     @staticmethod
     def _sidecar(path: Path, digest: str) -> tuple[dict[str, Any], bool, Optional[str]]:
@@ -1116,7 +1180,8 @@ class AdasArtifactCatalog:
                        adas_map_source_url,adas_map_requirements_json,
                        adas_map_requirements_proven,adas_map_raw_result_json,
                        ciq_reconciliation_state,
-                       ciq_reconciliation_json
+                       ciq_reconciliation_json,
+                       adas_map_checked_at
                        FROM items"""
                 ).fetchall()
             ]
@@ -1312,6 +1377,16 @@ class AdasArtifactCatalog:
                     "explicit_no_calibration": explicit_none,
                     "verified": not errors,
                     "errors": errors,
+                    "checked_at": str(row.get("adas_map_checked_at") or ""),
+                    # Family-only, deliberately excluding source_context_runtime_id:
+                    # that id is a per-scrape-session anti-spoofing nonce (proves
+                    # every requirement in *this* record came from one live DOM
+                    # modal), not a stable identity -- it differs on every session
+                    # by design, so it cannot be used to compare records from
+                    # different scrape sessions against each other.
+                    "requirement_key_set": frozenset(
+                        value["family"] for value in requirements
+                    ),
                     "sources": [
                         {
                             "kind": "scrapex_canonical_v1",
@@ -1521,14 +1596,57 @@ class AdasArtifactCatalog:
         canonical, scrapex_error = self._canonical_candidates(query)
 
         if len(canonical) > 1:
-            return {
-                "status": DISCOVERY_AMBIGUOUS,
-                "query": query.__dict__,
-                "record": None,
-                "match_count": len(canonical),
-                "index": index,
-                "reason": "Multiple canonical ScrapeX v1 rows match the exact identity.",
-            }
+            # Repeat successful scrapes of the same RO (ScrapeX re-verifies on
+            # its own schedule) legitimately produce more than one fully
+            # proven canonical row. That is corroborating evidence, not a
+            # conflict -- only disagreement in substance (a different VIN or
+            # a different requirement set) is a real identity conflict.
+            # Unverified rows never resolve the pick; they just don't count.
+            #
+            # Requiring every verified row ever taken to agree is too strict:
+            # ADAS Map genuinely adds requirements over time (a later scrape
+            # legitimately finds more than an earlier one did), so an old,
+            # now-superseded row would permanently block an otherwise-settled
+            # RO. The safe resolution is corroboration, not unanimity: trust
+            # the most recent verified signature only if some OTHER verified
+            # row -- taken at a different time -- independently produced the
+            # exact same signature. A lone, uncorroborated latest read stays
+            # ambiguous rather than being trusted on its own.
+            verified_candidates = [c for c in canonical if c.get("verified") is True]
+
+            def _signature(c: dict[str, Any]) -> tuple[Any, Any, Any]:
+                return (c.get("vin"), c.get("explicit_no_calibration"), c.get("requirement_key_set"))
+
+            resolved: Optional[dict[str, Any]] = None
+            if verified_candidates:
+                by_recency = sorted(
+                    verified_candidates, key=lambda c: c.get("checked_at") or "", reverse=True
+                )
+                latest = by_recency[0]
+                latest_signature = _signature(latest)
+                corroborated = any(
+                    c is not latest and _signature(c) == latest_signature
+                    for c in verified_candidates
+                )
+                if corroborated:
+                    resolved = latest
+            if resolved is not None:
+                canonical = [resolved]
+            else:
+                return {
+                    "status": DISCOVERY_AMBIGUOUS,
+                    "query": query.__dict__,
+                    "record": None,
+                    "match_count": len(canonical),
+                    "index": index,
+                    "reason": (
+                        "Multiple canonical ScrapeX v1 rows match the exact identity "
+                        "and disagree on vehicle identity or requirements."
+                        if verified_candidates
+                        else "Multiple canonical ScrapeX v1 rows match the exact identity, "
+                        "but none passed full provenance verification."
+                    ),
+                }
 
         if canonical:
             record = canonical[0]

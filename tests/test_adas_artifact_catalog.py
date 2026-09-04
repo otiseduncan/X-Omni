@@ -255,7 +255,8 @@ def _create_scrapex(path: Path, rows: list[dict]) -> None:
                adas_map_state TEXT, adas_map_inspection_id TEXT,
                adas_map_source_url TEXT, adas_map_requirements_json TEXT,
                adas_map_requirements_proven INTEGER, adas_map_raw_result_json TEXT,
-               ciq_reconciliation_state TEXT, ciq_reconciliation_json TEXT)"""
+               ciq_reconciliation_state TEXT, ciq_reconciliation_json TEXT,
+               adas_map_checked_at TEXT)"""
         )
         for row in rows:
             columns = list(row)
@@ -335,6 +336,7 @@ def _canonical_row(
         "adas_map_raw_result_json": json.dumps(raw_result),
         "ciq_reconciliation_state": ciq_state,
         "ciq_reconciliation_json": json.dumps(reconciliation),
+        "adas_map_checked_at": "2026-01-01T00:00:00+00:00",
     }
 
 

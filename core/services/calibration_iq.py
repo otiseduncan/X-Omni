@@ -109,6 +109,10 @@ ROUTINE_OPERATOR_OPERATIONS = frozenset({
     "reject_prerequisite",
     "reopen_prerequisite",
     "update_research",
+    "mark_repair_scope_reviewed",
+    "record_repair_trigger_justification",
+    "create_missing_si_record",
+    "resolve_missing_si_record",
     "research_ro",
     "ensure_case_workspace",
     "create_folder",
@@ -973,6 +977,7 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
     ident = str(args.get("repair_order_id") or args.get("ro_number") or "").strip()
     if not ident:
         raise ValueError("repair_order_id (or ro_number) is required")
+    shop_hint = str(args.get("shop") or "").strip()
 
     item: Optional[dict] = None
     raw_detail: Optional[dict] = None
@@ -981,6 +986,57 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=READ_TIMEOUT, trust_env=False) as client:
+
+            # Otis's own shorthand: he speaks only the last 5 digits of an RO
+            # number plus the shop ("11774 in Warner Robins") rather than the
+            # full 10-digit number -- the first 5 digits are a shop-specific
+            # prefix (confirmed live: 24006=Perry, 24007=Warner Robins,
+            # 24009=Macon, consistent across every RO sampled), the last 5
+            # are what's specific to the car. Rather than hardcode that
+            # prefix table (a new shop would silently break it), resolve the
+            # short form the same way the existing collection search below
+            # already resolves a full RO number -- q + shop narrows it to
+            # one exact row without needing to know the prefix at all.
+            if re.fullmatch(r"\d{5}", ident) and shop_hint:
+                short_url = f"{base}/collection/ros"
+                tried.append(f"{short_url}?q={ident}&shop={shop_hint}")
+                try:
+                    short_resp = await client.get(
+                        short_url,
+                        params={"q": ident, "shop": shop_hint, "limit": 5},
+                        headers=_auth(token),
+                    )
+                except httpx.HTTPError:
+                    short_resp = None
+                if short_resp is not None and short_resp.status_code == 200:
+                    try:
+                        short_found = list(short_resp.json().get("items") or [])
+                    except ValueError:
+                        short_found = []
+                    short_exact = [
+                        row
+                        for row in short_found
+                        if str(
+                            _dig(row, "ro_number", "roNumber", "number", default="")
+                        ).strip().endswith(ident)
+                    ]
+                    if len(short_exact) == 1:
+                        resolved_number = str(
+                            _dig(
+                                short_exact[0], "ro_number", "roNumber", "number", default=""
+                            )
+                        ).strip()
+                        if resolved_number:
+                            ident = resolved_number
+                    elif len(short_exact) > 1:
+                        resolution_conflict = (
+                            f"More than one repair order in {shop_hint!r} ends in "
+                            f"'{ident}'."
+                        )
+                    else:
+                        resolution_conflict = (
+                            f"No repair order in {shop_hint!r} ends in '{ident}'."
+                        )
 
             async def _try_snapshot(candidate: str) -> bool:
                 nonlocal item, raw_detail
@@ -1016,10 +1072,11 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
                 raw_detail = detail
                 return True
 
-            await _try_snapshot(ident)
+            if resolution_conflict is None:
+                await _try_snapshot(ident)
 
             url = f"{base}/ros/{ident}"
-            if item is None:
+            if item is None and resolution_conflict is None:
                 tried.append(url)
                 resp = await client.get(url, headers=_auth(token))
                 if resp.status_code == 200:
@@ -1039,7 +1096,7 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
                     except (AttributeError, ValueError):
                         item = None
 
-            if item is None:
+            if item is None and resolution_conflict is None:
                 # Neither identifier-shaped route recognized `ident` -- it is
                 # most likely the human RO number. Resolve it via search, then
                 # retry the rich snapshot with the id search proves is the
@@ -2238,6 +2295,44 @@ async def _expand_research_action(
             ),
         })
 
+    # A calibration is ambiguous when more than one distinct source document
+    # was found to support it. Silently picking one and linking it would be
+    # exactly the "uncertain candidate" failure the ADAS SI missing-SI
+    # workflow must not commit. Every found document is still imported (so
+    # nothing discovered is lost) -- only the contested calibration link is
+    # withheld from all of them, and reported for a human/model decision.
+    calibration_to_paths: dict[str, set[str]] = {}
+    for relative, record in documents.items():
+        for calibration_id in record["calibration_item_ids"]:
+            calibration_to_paths.setdefault(calibration_id, set()).add(relative)
+    ambiguous_calibration_ids = {
+        calibration_id for calibration_id, paths in calibration_to_paths.items() if len(paths) > 1
+    }
+    ambiguous_calibrations: list[dict[str, Any]] = []
+    if ambiguous_calibration_ids:
+        label_by_id = {spec["id"]: spec.get("label") for spec in specs if spec.get("id")}
+        for calibration_id in sorted(ambiguous_calibration_ids):
+            candidates = []
+            for relative, record in documents.items():
+                if calibration_id not in record["calibration_item_ids"]:
+                    continue
+                candidates.append({
+                    "title": record["title"],
+                    "relative_path": relative,
+                    "pages": sorted(record["pages"]),
+                })
+                record["calibration_item_ids"].discard(calibration_id)
+            ambiguous_calibrations.append({
+                "calibration_id": calibration_id,
+                "calibration": label_by_id.get(calibration_id),
+                "candidates": candidates,
+                "message": (
+                    "Multiple distinct ADAS SI documents matched this calibration; "
+                    "none were auto-linked. A human or a follow-up model turn must "
+                    "choose the correct one."
+                ),
+            })
+
     expanded: list[dict[str, Any]] = [{
         "operation": "ensure_case_workspace",
         "repair_order_id": ro_id,
@@ -2266,9 +2361,12 @@ async def _expand_research_action(
         calibration_ids = sorted(record["calibration_item_ids"])
         canonical_source_uri = f"adas-si:///{quote(record['relative_path'])}"
         default_document_type = "adas_map_report" if record.get("is_adas_map") else "oem_procedure"
+        evidence_role = "JUSTIFICATION" if record.get("is_adas_map") else "PROCEDURE"
         import_arguments: dict[str, Any] = {
             "source_path": record["source_path"],
             "document_type": str(arguments.get("document_type") or default_document_type),
+            "semantic_type": "ADAS_MAP_REPORT" if record.get("is_adas_map") else "OEM_PROCEDURE",
+            "evidence_role": evidence_role,
             "title": record["title"],
             "source_uri": canonical_source_uri,
             "source_name": record["source_name"],
@@ -2328,6 +2426,7 @@ async def _expand_research_action(
                     changes["calibration_item_ids"] = sorted(
                         existing_ids | set(calibration_ids)
                     )
+                    changes["evidence_role"] = evidence_role
                 expanded.append({
                     "operation": "update_document",
                     "target_id": document_id,
@@ -2343,7 +2442,10 @@ async def _expand_research_action(
                     "expected_version": _existing_document_version(
                         existing, operation="link_document"
                     ),
-                    "arguments": {"calibration_item_ids": missing_ids},
+                    "arguments": {
+                        "calibration_item_ids": missing_ids,
+                        "evidence_role": evidence_role,
+                    },
                 })
             already_present.append({
                 "document_id": document_id or None,
@@ -2453,6 +2555,7 @@ async def _expand_research_action(
         "documents_prepared": imported,
         "already_present": already_present,
         "missing_documents": missing,
+        "ambiguous_calibrations": ambiguous_calibrations,
         "research_complete_requested": requested_complete,
         "research_complete_eligible": eligible_complete,
         "research_complete_action_added": requested_complete and eligible_complete and not already_complete,

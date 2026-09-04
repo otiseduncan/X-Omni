@@ -377,6 +377,28 @@ class SourceInventory:
 # page text cache + search
 # ==========================================================================
 
+_shared_instances: dict[tuple[str, str], "AdasSI"] = {}
+_shared_instances_lock = threading.Lock()
+
+
+def get_shared_instance(source_root: Path, cache_path: Path) -> "AdasSI":
+    """Return one memoized `AdasSI` per (source_root, cache_path) pair.
+
+    Building an `AdasSI` walks the entire source tree and opens a schema
+    check against the cache. Callers that would otherwise construct a fresh
+    instance per tool invocation (rather than once at process startup)
+    should go through this factory instead, so the walk only happens once.
+    """
+
+    key = (str(Path(source_root).resolve()), str(Path(cache_path).resolve()))
+    with _shared_instances_lock:
+        instance = _shared_instances.get(key)
+        if instance is None:
+            instance = AdasSI(source_root, cache_path)
+            _shared_instances[key] = instance
+        return instance
+
+
 class AdasSI:
     def __init__(self, source_root: Path, cache_path: Path):
         self.source_root = Path(source_root).resolve()
