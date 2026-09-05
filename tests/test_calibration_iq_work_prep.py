@@ -54,13 +54,16 @@ def test_adas_map_nested_payload_extracts_governing_requirements_and_source():
 
 @pytest.mark.asyncio
 async def test_discover_adas_map_drops_non_calibration_canonical_labels():
-    """ADAS Map's required-procedures list includes SRS/inspection items (seat
-    belt pretensioner checks, etc.) alongside real ADAS calibrations. Those
-    items have no CIQ calibration_type to reconcile against, so treating them
-    as required calibrations means the weekly-readiness queue reports the RO
-    as permanently missing coverage no matter how many times reconciliation
-    runs. The canonical (ScrapeX-sourced) requirements list must be filtered
-    the same way extract_adas_map already filters its own snapshot path."""
+    """The canonical requirements list keeps real requirements and drops noise.
+
+    Seat belt was previously excluded here as an SRS/inspection item on the
+    grounds that it had no CIQ calibration_type to reconcile against. That is
+    no longer true -- Calibration IQ carries Seat Belt as a REQUIRED
+    calibration -- and excluding it meant it silently vanished from every
+    requirement set, so its service information was never gathered and an RO
+    whose only requirement was a seat belt reported zero requirements and
+    could never verify. Rows that are not calibrations at all are still
+    filtered, the same way extract_adas_map filters its own snapshot path."""
 
     class FakeCatalog:
         @staticmethod
@@ -72,6 +75,8 @@ async def test_discover_adas_map_drops_non_calibration_canonical_labels():
                         {"label": "Occupant Classification System"},
                         {"label": "Passenger Seat Weight Sensor"},
                         {"label": "Seat Belt"},
+                        {"label": "Notes"},
+                        {"label": "n/a"},
                     ],
                     "explicit_no_calibration": False,
                 },
@@ -81,8 +86,12 @@ async def test_discover_adas_map_drops_non_calibration_canonical_labels():
 
     assert result["status"] == "verified"
     labels = {item["label"] for item in result["requirements"]}
-    assert labels == {"Occupant Classification System", "Passenger Seat Weight Sensor"}
-    assert "Seat Belt" not in labels
+    assert labels == {
+        "Occupant Classification System",
+        "Passenger Seat Weight Sensor",
+        "Seat Belt",
+    }
+    assert "Notes" not in labels and "n/a" not in labels
 
 
 def test_requirement_identity_collapses_common_oem_label_variants():
@@ -1782,3 +1791,69 @@ def test_truncated_ciq_model_does_not_contradict_the_full_adas_map_model():
     # genuinely disagrees is still a conflict.
     assert conflicts("Explorer Active RWD", "Explorer Active AWD") == ["model"]
     assert conflicts("Explorer Activ...", "Escape Titanium") == ["model"]
+
+
+def test_seat_belt_is_a_calibration_requirement():
+    """The label gate must admit everything the family vocabulary knows.
+
+    _looks_like_calibration_label runs before _calibration_key, so anything it
+    rejects never reaches the family logic. "Seat Belt" already had a seatbelt
+    family yet was rejected here, so it vanished from every requirement set and
+    an RO whose only requirement was a seat belt reported zero requirements and
+    could never verify.
+    """
+    for label in (
+        "Seat Belt",
+        "Seat Belt Inspection",
+        "Passenger Seat Weight Sensor",
+        "Occupant Classification System",
+        "Front Camera",
+        "Blind Spot Monitor",
+        "Steering Angle Sensor",
+        "Surround View Camera",
+        "Millimeter Wave Radar Sensor",
+    ):
+        assert prep._looks_like_calibration_label(label), label  # noqa: SLF001
+        assert prep._calibration_key(label), label  # noqa: SLF001
+
+    for junk in ("hello there", "n/a", ""):
+        assert not prep._looks_like_calibration_label(junk)  # noqa: SLF001
+
+
+def test_configuration_compares_the_bare_value_not_the_combined_one():
+    """CIQ stores both the bare and the model-prefixed configuration.
+
+    Reading the combined "Mustang Premium Fastback w/EcoBoost" and comparing it
+    against ADAS Map's bare "Premium Fastback w/EcoBoost" reported a
+    contradiction for a vehicle that matches exactly, parking a freshly
+    acquired map as ambiguous.
+    """
+    def conflicts(expected_config, observed_config):
+        return prep._artifact_identity_conflicts(  # noqa: SLF001
+            {
+                "repair_order": {"id": "ro-1"},
+                "vehicle": {
+                    "year": 2016,
+                    "make": "Ford",
+                    "model": "Mustang",
+                    "configuration": expected_config,
+                },
+            },
+            {
+                "ciq_ro_id": "ro-1",
+                "vehicle": {
+                    "year": 2016,
+                    "make": "Ford",
+                    "model": "Mustang",
+                    "configuration": observed_config,
+                },
+            },
+        )
+
+    combined = {
+        "adas_map_configuration": "Premium Fastback w/EcoBoost",
+        "adas_map_model_configuration": "Mustang Premium Fastback w/EcoBoost",
+    }
+    assert conflicts(combined, "Premium Fastback w/EcoBoost") == []
+    # A configuration that genuinely differs is still a conflict.
+    assert conflicts(combined, "GT Convertible") == ["configuration"]

@@ -46,8 +46,14 @@ _REQUIREMENT_KEY_RE = re.compile(
     r"calibrat|requirement|required|system|service|operation|procedure|aim|align|reset|relearn|initial",
     re.IGNORECASE,
 )
+# This gate runs before _calibration_key, so anything it rejects never reaches
+# the family vocabulary at all. It must therefore admit everything that
+# vocabulary recognises -- "Seat Belt" is a real, common ADAS Map requirement
+# that was being dropped here, which left an RO whose only requirement was a
+# seat belt reporting zero requirements and never verifying.
 _CALIBRATION_LABEL_RE = re.compile(
-    r"\b(?:camera|radar|blind\s*spot|\bbsm\b|\bbsd\b|steering\s*angle|occupant|ocs|"
+    r"\b(?:camera|radar|blind\s*spot|\bbsm\b|\bbsd\b|\bsodcm\b|steering\s*angle|\bsas\b|"
+    r"occupant|ocs|seat\s*belt|pretensioner|restraint|seat[-\s]*weight|\bipma\b|\bccm\b|"
     r"parking|park\s*assist|ultrasonic|sonar|lane|collision|cruise|sensor|around\s*view|"
     r"surround\s*view|360)\b",
     re.IGNORECASE,
@@ -698,9 +704,10 @@ def _artifact_identity(
     return query
 
 
-def _identity_text(value: object) -> str:
+def _identity_text(value: object, *, prefer: tuple[str, ...] = ()) -> str:
     if isinstance(value, dict):
         for key in (
+            *prefer,
             "adas_map_model_configuration",
             "model_configuration",
             "configuration",
@@ -712,6 +719,15 @@ def _identity_text(value: object) -> str:
                 return candidate
         return ""
     return " ".join(str(value or "").split()).casefold()
+
+
+# CIQ stores the vehicle configuration as a mapping that carries both the bare
+# configuration and the combined model+configuration. Reading the combined value
+# and comparing it against ADAS Map's bare configuration -- "Mustang Premium
+# Fastback w/EcoBoost" against "Premium Fastback w/EcoBoost" -- reported a
+# contradiction for a vehicle that matches exactly, so read the bare value first
+# when the configuration itself is what is being compared.
+_CONFIGURATION_IDENTITY_KEYS = ("adas_map_configuration", "configuration")
 
 
 def _truncated_identity_prefix(text: str) -> Optional[str]:
@@ -771,8 +787,11 @@ def _artifact_identity_conflicts(
         elif field == "vin":
             matches = str(expected).strip().upper() == str(observed).strip().upper()
         else:
-            expected_text = _identity_text(expected)
-            observed_text = _identity_text(observed)
+            prefer = (
+                _CONFIGURATION_IDENTITY_KEYS if field == "configuration" else ()
+            )
+            expected_text = _identity_text(expected, prefer=prefer)
+            observed_text = _identity_text(observed, prefer=prefer)
             prefix = _truncated_identity_prefix(expected_text)
             if prefix is not None:
                 # Only the part CIQ actually kept can be compared; the rest was
