@@ -1262,10 +1262,10 @@ def _validate_completed_provenance(
     expected_ro_number: str,
 ) -> dict[str, Any]:
     provenance = _provenance(item)
-    if provenance.get("contract_version") != 1:
+    if provenance.get("contract_version") != 3:
         raise ScrapeXContract(
             "provenance_contract_mismatch",
-            "Completed ADAS Map work did not return canonical contract version 1.",
+            "Completed ADAS Map work did not return canonical contract version 3.",
         )
     if provenance.get("state") != "adas_map_complete":
         raise ScrapeXContract(
@@ -1298,6 +1298,18 @@ def _validate_completed_provenance(
         raise ScrapeXContract(
             "ciq_reconciliation_unverified",
             "Calibration IQ reconciliation was not authoritatively verified.",
+        )
+    attachment = reconciliation.get("adas_map_attachment")
+    if not (
+        isinstance(attachment, dict)
+        and attachment.get("attached") is True
+        and str(attachment.get("semantic_type") or "").strip().casefold()
+        == "adas_map_report"
+        and attachment.get("document_id")
+    ):
+        raise ScrapeXContract(
+            "ciq_adas_map_attachment_unverified",
+            "Completed ADAS Map work did not prove the managed CIQ ADAS Map attachment.",
         )
     raw_result = _contract_mapping(provenance.get("raw_result"), "raw_result")
     if not (
