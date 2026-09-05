@@ -341,6 +341,7 @@ SCRAPEX_ID_BOUND_READ_ACTIONS = frozenset({
 })
 SCRAPEX_ID_FREE_ADAS_MAP_ACTIONS = frozenset({
     "open_authentication",
+    "acquire_exact",
     "create_exact_batch",
     "create_phase_batch",
 })

@@ -5,9 +5,10 @@ is the governing calibration-requirement source. ADAS SI owns procedure
 availability. This module joins those existing contracts without creating a
 second queue or teaching the model to guess at job scope.
 
-The model selects this capability and supplies its structured mode and filters.
-This module validates and executes those fields; it does not infer them from the
-user's conversational wording.
+The model selects this capability and supplies its structured mode, filters, and
+whether missing evidence should actually be acquired. This module validates and
+executes those structured decisions; it does not infer them from the user's
+conversational wording.
 
 Requirement reconciliation is routine operator work. If a machine-readable
 ADAS Map on an RO contains a calibration missing from CIQ, X uses CIQ's own
@@ -29,6 +30,7 @@ from . import calibration_iq
 from . import calibration_iq_weekly_queue as weekly_queue
 from . import research_alldata_navigation as nav
 from . import research_alldata_quick_reference as quick
+from . import research_navigator_agent
 from . import research_operator
 from . import scrapex as scrapex_svc
 
@@ -256,6 +258,152 @@ def extract_adas_map(snapshot: Any) -> dict[str, Any]:
 def _ciq_calibrations(snapshot: Any) -> list[dict[str, Any]]:
     raw = snapshot.get("calibrations") if isinstance(snapshot, dict) else []
     return [dict(item) for item in (raw or []) if isinstance(item, dict)]
+
+
+def _navigator_target(snapshot: dict[str, Any]) -> Optional[dict[str, Any]]:
+    vehicle = (
+        snapshot.get("vehicle")
+        if isinstance(snapshot.get("vehicle"), dict)
+        else {}
+    )
+    target = {
+        "year": vehicle.get("year"),
+        "make": vehicle.get("make"),
+        "model": vehicle.get("model"),
+        "trim": vehicle.get("trim"),
+        "vin": vehicle.get("vin"),
+    }
+    if not (target["year"] and target["make"] and target["model"]):
+        return None
+    return {
+        key: value
+        for key, value in target.items()
+        if value not in (None, "")
+    }
+
+
+async def _acquire_adas_map_gap(
+    settings: Any,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    ro_number = _ro_number(snapshot)
+    if not ro_number:
+        return {
+            "status": "invalid_identity",
+            "success": False,
+            "verified": False,
+            "work_complete": False,
+            "message": "The Calibration IQ snapshot has no exact RO number.",
+        }
+    return await scrapex_svc.adas_map(
+        settings,
+        {
+            "action": "acquire_exact",
+            "ro_number": ro_number,
+            "source_scope": "active",
+        },
+    )
+
+
+async def _acquire_si_gaps(
+    settings: Any,
+    adas: Any,
+    snapshot: dict[str, Any],
+    coverage: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Research confirmed SI gaps through the same active X model.
+
+    The model decides the live browser steps. ScrapeX owns the isolated
+    ALLDATA profile, deterministic page verification, and canonical capture.
+    """
+    missing = [
+        item
+        for item in coverage
+        if isinstance(item, dict)
+        and item.get("state") == adas_artifact_catalog.MISSING
+        and str(item.get("calibration") or "").strip()
+    ]
+    if not missing:
+        return []
+
+    target = _navigator_target(snapshot)
+    if target is None:
+        return [
+            {
+                "status": "invalid_vehicle_identity",
+                "verified": False,
+                "captured": False,
+                "topic": str(item.get("calibration") or ""),
+                "message": (
+                    "Exact year, make, and model are required for SI acquisition."
+                ),
+            }
+            for item in missing
+        ]
+
+    client = research_navigator_agent.current_model_client()
+    if client is None:
+        return [
+            {
+                "status": "model_context_unavailable",
+                "verified": False,
+                "captured": False,
+                "topic": str(item.get("calibration") or ""),
+                "message": (
+                    "The active X model was unavailable to the Navigator subtask; "
+                    "the retired scripted ALLDATA fallback was not run."
+                ),
+            }
+            for item in missing
+        ]
+
+    results: list[dict[str, Any]] = []
+    for item in missing:
+        topic = str(item.get("calibration") or "").strip()
+        result = await research_navigator_agent.run_navigator_search(
+            client=client,
+            settings=settings,
+            provider="alldata",
+            target=target,
+            topic=topic,
+        )
+        results.append({"topic": topic, **result})
+
+    if any(item.get("captured") is True for item in results):
+        inventory = getattr(adas, "inventory", None)
+        if inventory is not None and hasattr(inventory, "_cache"):
+            inventory._cache = None  # noqa: SLF001 - source files changed externally
+    return results
+
+
+async def _link_ro_research_evidence(
+    settings: Any,
+    adas: Any,
+    repair_order_id: str,
+    context: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if context is None or not repair_order_id:
+        return None
+    return await calibration_iq.operator_execute(
+        settings,
+        adas,
+        {
+            "actions": [
+                {
+                    "operation": "research_ro",
+                    "repair_order_id": repair_order_id,
+                    "arguments": {"complete_research": False},
+                }
+            ],
+            "continue_on_error": True,
+            calibration_iq._INVOCATION_CONTEXT_KEY: {  # noqa: SLF001
+                **context,
+                "tool_call_id": (
+                    f"{context['tool_call_id']}-evidence-{repair_order_id[:12]}"
+                ),
+            },
+        },
+    )
 
 
 def _active_ciq_requirements(snapshot: Any) -> list[dict[str, Any]]:
@@ -1829,6 +1977,7 @@ async def _week_readiness(
     # their SI coverage now would be noise. An explicit phase in the request
     # overrides this default instead of being narrowed further by it.
     explicit_phase = bool(args.get("phase"))
+    execute_missing = args.get("execute_missing") is True
     # The upstream collection's default scope is Calibration IQ Active Work,
     # which deliberately includes terminal-status ROs still marked
     # active_on_source.  Keep those rows instead of locally dropping them by
@@ -1854,7 +2003,7 @@ async def _week_readiness(
         for item in (queue.get("items") or [])
         if isinstance(item, dict) and _row_is_source_active(item)
     ]
-    if not explicit_phase:
+    if not explicit_phase and not execute_missing:
         rows = [
             row for row in rows if _row_phase_token(row) in _WEEK_READY_DEFAULT_PHASES
         ]
@@ -1866,6 +2015,8 @@ async def _week_readiness(
         phase_scope = (
             [str(args["phase"])]
             if explicit_phase
+            else ["active"]
+            if execute_missing
             else sorted(_WEEK_READY_DEFAULT_PHASES, key=int)
         )
         return {
@@ -1922,6 +2073,12 @@ async def _week_readiness(
     may_have_executed_reconciliation_total = 0
     missing_si_dispatched_total = 0
     missing_si_dispatch_error_total = 0
+    adas_map_acquisition_attempted = 0
+    adas_map_acquired_count = 0
+    si_acquisition_attempted = 0
+    si_acquired_count = 0
+    evidence_link_attempted = 0
+    evidence_link_verified = 0
     for row, envelope in loaded:
         if envelope.get("status") != "verified":
             results.append(
@@ -1945,6 +2102,20 @@ async def _week_readiness(
             continue
         snapshot = dict(envelope["snapshot"])
         map_info = await _discover_adas_map(catalog, snapshot)
+        map_acquisition: Optional[dict[str, Any]] = None
+        if execute_missing and map_info.get("status") == "not_found":
+            adas_map_acquisition_attempted += 1
+            map_acquisition = await _acquire_adas_map_gap(settings, snapshot)
+            if (
+                map_acquisition.get("success") is True
+                and map_acquisition.get("verified") is True
+                and map_acquisition.get("work_complete") is True
+            ):
+                adas_map_acquired_count += 1
+                executed_any = True
+                catalog = _catalog_for(adas)
+                map_info = await _discover_adas_map(catalog, snapshot)
+
         snapshot, planned, reconciliation = await _reconcile_one(
             settings, adas, snapshot, map_info, context
         )
@@ -1994,7 +2165,41 @@ async def _week_readiness(
         ]
         vehicle = _vehicle_label(snapshot, calibration_iq._vehicle_label(row))  # noqa: SLF001
         coverage = await _catalog_coverage(catalog, snapshot, map_info)
+
+        si_acquisitions: list[dict[str, Any]] = []
+        if execute_missing and map_info.get("status") == "verified":
+            si_acquisitions = await _acquire_si_gaps(
+                settings, adas, snapshot, coverage
+            )
+            si_acquisition_attempted += len(si_acquisitions)
+            acquired_now = sum(
+                1
+                for item in si_acquisitions
+                if item.get("captured") is True
+            )
+            si_acquired_count += acquired_now
+            if si_acquisitions:
+                executed_any = True
+            if acquired_now:
+                catalog = _catalog_for(adas)
+                coverage = await _catalog_coverage(catalog, snapshot, map_info)
+
         row_ro_id = str(calibration_iq._authoritative_repair_order_id(snapshot) or "")  # noqa: SLF001
+        research_link: Optional[dict[str, Any]] = None
+        if execute_missing and map_info.get("status") == "verified" and row_ro_id:
+            evidence_link_attempted += 1
+            research_link = await _link_ro_research_evidence(
+                settings, adas, row_ro_id, context
+            )
+            if isinstance(research_link, dict):
+                if research_link.get("executed") is True:
+                    executed_any = True
+                if (
+                    research_link.get("success") is True
+                    and research_link.get("verified") is True
+                ):
+                    evidence_link_verified += 1
+
         if context is not None and row_ro_id:
             missing_si_actions = build_missing_si_actions(snapshot, coverage, row_ro_id)
             if missing_si_actions:
@@ -2061,8 +2266,19 @@ async def _week_readiness(
             coverage_status = adas_artifact_catalog.UNVERIFIED
         else:
             coverage_status = adas_artifact_catalog.COVERED
+        evidence_link_ok = bool(
+            not execute_missing
+            or (
+                isinstance(research_link, dict)
+                and research_link.get("success") is True
+                and research_link.get("verified") is True
+            )
+        )
         ready = bool(
-            map_ok and reconcile_ok and coverage_status == adas_artifact_catalog.COVERED
+            map_ok
+            and reconcile_ok
+            and coverage_status == adas_artifact_catalog.COVERED
+            and evidence_link_ok
         )
         if ready:
             status = "ready"
@@ -2072,6 +2288,8 @@ async def _week_readiness(
             status = "reconciliation_failed"
         elif coverage_status == adas_artifact_catalog.MISSING:
             status = "si_missing"
+        elif not evidence_link_ok:
+            status = "research_link_failed"
         else:
             status = "si_unverified"
         results.append(
@@ -2092,6 +2310,9 @@ async def _week_readiness(
                 "status": status,
                 "ready": ready,
                 "adas_map": map_info,
+                "adas_map_acquisition": map_acquisition,
+                "si_acquisitions": si_acquisitions,
+                "research_link": research_link,
                 "calibration_requirements": [
                     _requirement_label(item) for item in requirements
                 ],
@@ -2187,6 +2408,7 @@ async def _week_readiness(
         # or more ROs need attention. A verified queue-persistence failure is
         # reported separately and makes the end-to-end operation unsuccessful.
         "readiness_complete": exception_count == 0,
+        "execute_missing": execute_missing,
         "exception_count": exception_count,
         "queue_count": len(results),
         "ready_count": ready_count,
@@ -2196,6 +2418,12 @@ async def _week_readiness(
         "si_unverified_count": si_unverified_count,
         "missing_si_records_dispatched": missing_si_dispatched_total,
         "missing_si_records_dispatch_errors": missing_si_dispatch_error_total,
+        "adas_map_acquisition_attempted": adas_map_acquisition_attempted,
+        "adas_map_acquired_count": adas_map_acquired_count,
+        "si_acquisition_attempted": si_acquisition_attempted,
+        "si_acquired_count": si_acquired_count,
+        "evidence_link_attempted": evidence_link_attempted,
+        "evidence_link_verified": evidence_link_verified,
         "adas_map_verified_count": adas_map_verified_count,
         "adas_map_missing_count": adas_map_missing_count,
         "adas_map_unverified_count": adas_map_unverified_count,
@@ -2210,8 +2438,11 @@ async def _week_readiness(
         "acquisition_status": (
             "queue_persistence_error"
             if queue_persistence_failed
-            else
-            "queued"
+            else "completed"
+            if execute_missing and exception_count == 0
+            else "partial"
+            if execute_missing
+            else "queued"
             if context is not None and queue_candidates
             else "not_needed"
             if not queue_candidates
@@ -2259,6 +2490,8 @@ async def _week_readiness(
         "filters": filters,
         "phase_scope": [str(args["phase"])]
         if explicit_phase
+        else ["active"]
+        if execute_missing
         else sorted(_WEEK_READY_DEFAULT_PHASES, key=int),
         **public_result_meta,
         "repair_orders": public_results,
@@ -2890,6 +3123,8 @@ def _readiness_summary(mode: str, data: dict[str, Any]) -> str:
             else _summary_value((data.get("filters") or {}).get("phase"), limit=20)
         )
         scope = f"in Phase {phase}" if phase else "in the requested phase"
+    elif phase_scope == ["active"]:
+        scope = "in active C1/Calibration IQ work"
     elif len(phase_scope) > 1:
         scope = f"in weekly phases {phase_scope[0]}–{phase_scope[-1]}"
     elif phase_scope:
@@ -2987,6 +3222,16 @@ def _readiness_summary(mode: str, data: dict[str, Any]) -> str:
         ),
         f"ALLDATA: {int(data.get('alldata_queued_count') or 0)} vehicle(s) queued.",
     ]
+    if data.get("execute_missing") is True:
+        lines.append(
+            "Preparation execution: "
+            f"ADAS Map {int(data.get('adas_map_acquired_count') or 0)}/"
+            f"{int(data.get('adas_map_acquisition_attempted') or 0)} acquired; "
+            f"SI {int(data.get('si_acquired_count') or 0)}/"
+            f"{int(data.get('si_acquisition_attempted') or 0)} captured; "
+            f"CIQ evidence links {int(data.get('evidence_link_verified') or 0)}/"
+            f"{int(data.get('evidence_link_attempted') or 0)} verified."
+        )
     for item in exceptions[:_SUMMARY_EXCEPTION_LIMIT]:
         lines.append(_readiness_exception_line(item, map_focus=map_focus))
     omitted = max(0, exception_count - min(len(exceptions), _SUMMARY_EXCEPTION_LIMIT))
