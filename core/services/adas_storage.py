@@ -324,15 +324,24 @@ def migrate_library(
 
         destination = _unique_target(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if not source.is_file():
+            # ScrapeX may have migrated the same shared-root report first.
+            continue
         old_abs = str(source.resolve())
         old_parent = source.parent
-        shutil.move(str(source), str(destination))
+        try:
+            shutil.move(str(source), str(destination))
+        except FileNotFoundError:
+            continue
         moved[old_abs] = str(destination.resolve())
 
         source_sidecar = _sidecar_path(source)
         if source_sidecar.is_file():
             destination_sidecar = _unique_target(_sidecar_path(destination))
-            shutil.move(str(source_sidecar), str(destination_sidecar))
+            try:
+                shutil.move(str(source_sidecar), str(destination_sidecar))
+            except FileNotFoundError:
+                pass
 
         manifest = old_parent / "quick-reference-manifest.json"
         if manifest.is_file():
