@@ -417,10 +417,19 @@ class AdasSI:
     def __init__(self, source_root: Path, cache_path: Path):
         self.source_root = Path(source_root).resolve()
         self.cache_path = Path(cache_path).resolve()
-        self.storage_migration = adas_storage.migrate_library_once(
-            self.source_root,
-            self.cache_path,
-            describe_document,
+        self.storage_migration = (
+            adas_storage.migrate_library_once(
+                self.source_root,
+                self.cache_path,
+                describe_document,
+            )
+            if adas_storage.is_authoritative_runtime_root(self.source_root)
+            else {
+                "moved": 0,
+                "unresolved": [],
+                "paths": {},
+                "skipped_non_authoritative_root": True,
+            }
         )
         self.managed_root = self.source_root / MANAGED_DIRNAME
         self.inventory = SourceInventory(self.source_root)

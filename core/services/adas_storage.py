@@ -13,6 +13,7 @@ Anything unresolved is left in place and reported rather than guessed.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -353,12 +354,37 @@ def migrate_library(
     }
 
 
+def is_authoritative_runtime_root(source_root: Path) -> bool:
+    """True only for the configured live ADAS SI library.
+
+    Unit tests and ad-hoc scratch libraries frequently instantiate AdasSI with
+    temporary roots. They must not be physically reorganized merely because
+    the search/index object was opened.
+    """
+    configured = Path(os.getenv("XOMNI_ADAS_SI_ROOT", r"X:\ADAS SI"))
+    try:
+        actual = Path(source_root).resolve()
+        expected = configured.resolve()
+    except OSError:
+        actual = Path(source_root).absolute()
+        expected = configured.absolute()
+    return os.path.normcase(str(actual)) == os.path.normcase(str(expected))
+
+
 def migrate_library_once(
     source_root: Path,
     cache_path: Path,
     descriptor_resolver: Callable[[Path, Path], dict[str, Any]],
 ) -> dict[str, Any]:
-    key = str(Path(source_root).resolve()).casefold()
+    root = Path(source_root).resolve()
+    if not root.is_dir():
+        return {
+            "moved": 0,
+            "unresolved": [],
+            "paths": {},
+            "source_unavailable": True,
+        }
+    key = str(root).casefold()
     with _STORAGE_LOCK:
         if key in _MIGRATED_ROOTS:
             return {
@@ -367,6 +393,6 @@ def migrate_library_once(
                 "paths": {},
                 "already_checked": True,
             }
-        result = migrate_library(source_root, cache_path, descriptor_resolver)
+        result = migrate_library(root, cache_path, descriptor_resolver)
         _MIGRATED_ROOTS.add(key)
         return result

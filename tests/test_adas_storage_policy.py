@@ -138,3 +138,17 @@ def test_adas_map_inside_old_vehicle_tree_is_still_moved_by_ro(tmp_path: Path):
     assert result["moved"] == 1
     assert expected.is_file()
     assert not pdf.exists()
+
+
+def test_runtime_auto_migration_is_scoped_to_configured_authoritative_root(
+    tmp_path: Path,
+    monkeypatch,
+):
+    live = tmp_path / "Live ADAS SI"
+    scratch = tmp_path / "Scratch ADAS SI"
+    live.mkdir()
+    scratch.mkdir()
+    monkeypatch.setenv("XOMNI_ADAS_SI_ROOT", str(live))
+
+    assert adas_storage.is_authoritative_runtime_root(live) is True
+    assert adas_storage.is_authoritative_runtime_root(scratch) is False
