@@ -2275,6 +2275,7 @@ async def _expand_research_action(
     ])
 
     documents: dict[str, dict[str, Any]] = {}
+    sha_to_relative: dict[str, str] = {}
     findings: list[dict[str, Any]] = []
     for spec, search in zip(queries, search_results):
         search = search if isinstance(search, dict) else {}
@@ -2302,18 +2303,27 @@ async def _expand_research_action(
                 continue
             document_supported = bool(exact_source_matched and doc_hits)
             supported = supported or document_supported
-            record = documents.setdefault(relative, {
-                "relative_path": relative,
-                "source_path": str(source_path),
-                "source_name": source_path.name,
-                "sha256": source_sha256,
-                "title": str(matched.get("title") or source_path.stem),
-                "pages": set(),
-                "calibration_item_ids": set(),
-                "queries": set(),
-                "validated": False,
-                "is_adas_map": False,
-            })
+
+            canonical_relative = sha_to_relative.get(source_sha256)
+            if canonical_relative is None:
+                sha_to_relative[source_sha256] = relative
+                record = documents.setdefault(relative, {
+                    "relative_path": relative,
+                    "source_path": str(source_path),
+                    "source_name": source_path.name,
+                    "sha256": source_sha256,
+                    "title": str(matched.get("title") or source_path.stem),
+                    "pages": set(),
+                    "calibration_item_ids": set(),
+                    "queries": set(),
+                    "validated": False,
+                    "is_adas_map": False,
+                })
+            else:
+                # The source library can legitimately retain duplicate legacy
+                # copies after migration. Identical bytes are one evidence
+                # source for CIQ linking, not competing calibration candidates.
+                record = documents[canonical_relative]
             record["pages"].update(int(hit["page"]) for hit in doc_hits)
             record["queries"].add(spec["query"])
             if spec.get("label") == "ADAS Map":
@@ -2322,12 +2332,16 @@ async def _expand_research_action(
                 record["validated"] = True
                 if spec.get("id"):
                     record["calibration_item_ids"].add(spec["id"])
-            finding_docs.append({
-                "title": record["title"],
-                "source": record["source_name"],
-                "relative_path": relative,
-                "pages": sorted(int(hit["page"]) for hit in doc_hits),
-            })
+            if not any(
+                item.get("relative_path") == record["relative_path"]
+                for item in finding_docs
+            ):
+                finding_docs.append({
+                    "title": record["title"],
+                    "source": record["source_name"],
+                    "relative_path": record["relative_path"],
+                    "pages": sorted(int(hit["page"]) for hit in doc_hits),
+                })
         findings.append({
             "calibration_id": spec.get("id") or None,
             "calibration": spec.get("label"),

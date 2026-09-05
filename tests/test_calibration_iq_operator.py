@@ -3342,3 +3342,70 @@ async def test_research_ro_reuses_pre_migration_ciq_document_by_sha_and_rewrites
         "adas-si:///2023/Toyota/Camry/ALLDATA/Camera%20Procedure.pdf"
     )
     assert report["already_present"][0]["sha256"] == digest
+
+
+@pytest.mark.asyncio
+async def test_research_ro_collapses_identical_migrated_source_copies_before_ciq_linking(
+    tmp_path: Path,
+):
+    source = tmp_path / "Camera Procedure.pdf"
+    source.write_bytes(b"%PDF-1.4\nidentical procedure\n")
+    relatives = [
+        "2023/Toyota/Camry/ALLDATA/Camera Procedure.pdf",
+        "2023/Toyota/Camry/ALLDATA/Camera Procedure (2).pdf",
+    ]
+
+    class DuplicateAdas:
+        def resolve_relative(self, relative: str) -> Path:
+            assert relative in relatives
+            return source
+
+        def search(self, args: dict[str, Any]) -> dict[str, Any]:
+            assert args.get("search_mode") == "calibration_requirements"
+            return {
+                "status": "success",
+                "exact_source_matched": True,
+                "results": [
+                    {
+                        "source": Path(relative).name,
+                        "title": Path(relative).stem,
+                        "relative_path": relative,
+                        "page": 7,
+                        "excerpt": "Perform the forward recognition camera calibration.",
+                        "source_match_score": 18,
+                    }
+                    for relative in relatives
+                ],
+                "matched_documents": [
+                    {
+                        "source": Path(relative).name,
+                        "title": Path(relative).stem,
+                        "relative_path": relative,
+                        "source_match_score": 18,
+                    }
+                    for relative in relatives
+                ],
+            }
+
+    snapshot = {
+        "id": "ro-dedup",
+        "vehicle": {"year": 2023, "make": "Toyota", "model": "Camry"},
+        "calibration_items": [{"id": "cal-1", "name": "front camera"}],
+        "research": {"state": "research_in_progress", "version": 1},
+        "documents": [],
+    }
+    expanded, report = await ciq._expand_research_action(
+        DuplicateAdas(),
+        {
+            "operation": "research_ro",
+            "repair_order_id": "ro-dedup",
+            "arguments": {},
+        },
+        snapshot,
+    )
+
+    imports = [item for item in expanded if item["operation"] == "import_document"]
+    assert len(imports) == 1
+    assert imports[0]["arguments"]["calibration_item_ids"] == ["cal-1"]
+    assert report["ambiguous_calibrations"] == []
+    assert len(report["documents_prepared"]) == 1
