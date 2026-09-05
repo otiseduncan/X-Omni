@@ -350,7 +350,7 @@ async def _acquire_si_gaps(
                 "topic": str(item.get("calibration") or ""),
                 "message": (
                     "The active X model was unavailable to the Navigator subtask; "
-                    "the retired scripted ALLDATA fallback was not run."
+                    "no substitute navigation path was run."
                 ),
             }
             for item in missing
