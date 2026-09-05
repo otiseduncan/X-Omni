@@ -314,7 +314,7 @@ async def _acquire_si_gaps(
     """Research confirmed SI gaps through the same active X model.
 
     The model decides the live browser steps. ScrapeX owns the isolated
-    ALLDATA profile, deterministic page verification, and canonical capture.
+    ALLDATA profile, page verification, and canonical capture.
     """
     missing = [
         item
@@ -366,6 +366,7 @@ async def _acquire_si_gaps(
             provider="alldata",
             target=target,
             topic=topic,
+            capture=True,
         )
         results.append({"topic": topic, **result})
 

@@ -1,8 +1,8 @@
 """Bounded, loopback-only client for the local ScrapeX ADAS Map worker.
 
 The model chooses these operations through structured tool arguments.  This
-module deliberately contains no language/keyword router and accepts neither a
-URL nor credentials from tool input.  ScrapeX remains the owner of browser
+module accepts only structured tool arguments and accepts neither a URL nor
+credentials from tool input.  ScrapeX remains the owner of browser
 state and CIQ reconciliation; X Omni only invokes its published loopback API
 and reports the returned state without turning "started" into "completed".
 """
@@ -70,7 +70,7 @@ SOURCE_SCOPES = frozenset({"active", "all", "terminal"})
 
 # --- ScrapeX Navigator: bounded browser observation/action turns -----------
 #
-# Unlike ADAS Map (one deterministic worker call per action), a Navigator
+# Unlike ADAS Map (one worker call per action), a Navigator
 # task is driven turn-by-turn by this process's own model loop, one browser
 # action per model turn, against ScrapeX's session/graph/action-budget/
 # verification machinery. This client never authors a CSS selector or role
@@ -417,7 +417,7 @@ SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
         "observe/act both return the current page's element list -- always "
         "act using a ref from the most recent one, never an older observation. "
         "click/fill/press/back/open/extract are ordinary navigation steps; "
-        "done ends the task and verify computes the deterministic proof of "
+        "done ends the task and verify computes the verification proof of "
         "whether real, on-topic procedure content was actually reached and "
         "extracted for the requested target. A page changing after an action "
         "is expected -- always re-observe before acting again."
@@ -2315,7 +2315,7 @@ async def navigator_capture(settings: Any, task_id: str) -> dict[str, Any]:
 
     This is intentionally an internal composite helper rather than a model-
     advertised browser action. The model chooses navigation; ScrapeX's
-    deterministic verification proof is what authorizes persistence.
+    verification proof is what authorizes persistence.
     """
     action = "capture"
     try:

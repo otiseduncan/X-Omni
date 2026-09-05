@@ -565,16 +565,13 @@ class LicensedBrowser:
                 provider="alldata",
                 target=target,
                 topic=topic,
+                capture=args.get("preserve") is True,
             )
             result["action"] = action
             result["status"] = (
-                "success"
-                if result.get("verified") is True and result.get("captured") is True
-                else "unverified"
+                "success" if result.get("verified") is True else "unverified"
             )
-            result["success"] = bool(
-                result.get("verified") is True and result.get("captured") is True
-            )
+            result["success"] = result.get("verified") is True
             return result
         if action == "capture_to_adas":
             return await self._capture_to_adas(args)
@@ -616,7 +613,7 @@ class LicensedBrowser:
         # Acquisition into ADAS SI is the highest-consequence step in this whole
         # pipeline -- it becomes the answer for every future query about this
         # vehicle. Whatever upstream navigation path produced this page
-        # (deterministic search or the model-driven agent loop), independently
+        # (regardless of the navigation path), independently
         # re-confirm the claimed vehicle here, against the live page, through the
         # same bounded signal research_verification relies on elsewhere. Never
         # trust the caller-supplied vehicle label on its own.
@@ -1001,6 +998,14 @@ def install() -> None:
                         "vehicle_model": {"type": "string"},
                         "vehicle_trim": {"type": "string"},
                         "topic": {"type": "string"},
+                        "preserve": {
+                            "type": "boolean",
+                            "description": (
+                                "For alldata_vehicle_research only: preserve a verified "
+                                "procedure into canonical ADAS SI storage. Omit or false "
+                                "for read-only research."
+                            ),
+                        },
                         "source_depth": {
                             "type": "string",
                             "enum": [

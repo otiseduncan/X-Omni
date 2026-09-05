@@ -10,16 +10,15 @@ Playwright page driven directly by this process. ScrapeX owns browser
 mechanics; this loop remains the only reasoning layer, exactly as it was
 for the old path -- only where the "browser" lives has changed.
 
-Feature-flagged off by default via Settings.alldata_navigator_enabled; the
-old research_alldata_agent.py stays the default path until this one has
-proven itself against a real ALLDATA acceptance case. See the ScrapeX
-Navigator architecture plan.
+ScrapeX Navigator is the production ALLDATA browser path. The model owns
+perception and navigation; ScrapeX owns the isolated provider session,
+bounded action execution, and verification.
 
 Truthfulness never depends on the model's own narration of what it did.
 After the loop ends (the model stops calling tools, sends "done", or the
-turn budget runs out), a deterministic epilogue calls ScrapeX's own verify
-action -- the single authority on evaluate_navigation_claim -- so "verified"
-means the same thing regardless of how many turns the model actually used.
+turn budget runs out), ScrapeX's verify action is the single authority on
+evaluate_navigation_claim, so "verified" means the same thing regardless
+of how many turns the model actually used.
 This loop never recomputes browser semantics itself; it only checks the
 *shape* of what ScrapeX's contract-validated client returns.
 """
@@ -38,8 +37,8 @@ log = logging.getLogger("xomni.research_navigator_agent")
 
 # The active X model is bound only for the duration of one Registry handler
 # invocation. This lets a composite operator capability delegate a bounded
-# browser-navigation subtask back to the same model without global state,
-# keyword routing, or a second model process.
+# browser-navigation subtask back to the same model without global state
+# or a second model process.
 _ACTIVE_MODEL_CLIENT: ContextVar[Any | None] = ContextVar(
     "xomni_active_navigator_model_client",
     default=None,
@@ -133,8 +132,8 @@ def _system_prompt(target: dict[str, Any], topic: str) -> str:
         f"Find the exact OEM procedure for:\nVehicle: {label}\nTopic: {topic}\n\n"
         "Do not substitute a different model, trim, or year, and do not answer from general "
         "knowledge -- only from what you actually observe. You are the navigation reasoner: "
-        "choose the next browser action from the live page state instead of following a fixed "
-        "menu script or keyword router. A task-bound annotated screenshot accompanies each "
+        "choose the next browser action from the live page state and reassess after every turn. "
+        "A task-bound annotated screenshot accompanies each "
         "observation when available; labels such as [e12] on the image are the same exact refs "
         "listed in the structured observation. Use pixels to understand layout, grouping, "
         "selected state, menus, and drill-down context, but act only by an observed ref. The "
@@ -250,6 +249,7 @@ async def run_navigator_search(
     topic: str,
     max_turns: int = MAX_MODEL_TURNS,
     action_budget: Optional[int] = None,
+    capture: bool = False,
 ) -> dict[str, Any]:
     create_body: dict[str, Any] = {
         "action": "create_task",
@@ -443,9 +443,9 @@ async def run_navigator_search(
     else:
         stopped_reason = "turn_budget_exhausted"
 
-    # Deterministic epilogue -- ScrapeX's own verify action is the single
-    # authority on evaluate_navigation_claim; this loop never recomputes
-    # browser semantics or text-matching itself.
+    # ScrapeX's own verify action is the single authority on
+    # evaluate_navigation_claim; this loop never recomputes browser semantics
+    # or text-matching itself.
     verification = await scrapex_svc.navigator(settings, {"action": "verify", "task_id": task_id})
     proof = verification.get("data") if isinstance(verification.get("data"), dict) else {}
     verified = bool(proof.get("verified"))
@@ -461,10 +461,10 @@ async def run_navigator_search(
 
     capture_result: dict[str, Any] | None = None
     captured = False
-    if verified:
-        # ScrapeX owns the provider browser and therefore owns the final
-        # verified-page capture. X never re-opens the page in another profile
-        # and never reconstructs the path from model narration.
+    if verified and capture:
+        # Persistence is a separate structured choice from research. ScrapeX
+        # owns the provider browser and therefore owns the final verified-page
+        # capture when the calling workflow explicitly requests preservation.
         capture_result = await scrapex_svc.navigator_capture(settings, task_id)
         captured = bool(
             capture_result.get("success") is True
