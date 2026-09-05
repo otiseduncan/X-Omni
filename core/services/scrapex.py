@@ -1893,8 +1893,14 @@ async def start_native(settings: Any) -> dict[str, Any]:
 
 
 async def read(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
-    """Read bounded ScrapeX state selected entirely by structured arguments."""
+    """Read bounded ScrapeX state from the current runtime revision."""
     action = "read"
+    startup = await start_native(settings)
+    if startup.get("success") is not True:
+        return {
+            **startup,
+            "action": action,
+        }
     try:
         clean = _clean_args(args)
         action_value = _text(clean.get("action"), "action", maximum=40)
@@ -2028,6 +2034,13 @@ async def adas_map(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
         if action not in ADAS_MAP_ACTIONS:
             raise ScrapeXInput(f"Unsupported ScrapeX ADAS Map action: {action}.")
 
+        startup = await start_native(settings)
+        if startup.get("success") is not True:
+            return {
+                **startup,
+                "action": action,
+            }
+
         if action == "open_authentication":
             _expect_keys(clean, {"action"})
             data = await _request(
@@ -2046,14 +2059,6 @@ async def adas_map(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
         if action == "acquire_exact":
             _expect_keys(clean, {"action", "ro_number", "source_scope"})
             ro_number = _ro_number(clean.get("ro_number"))
-            startup = await start_native(settings)
-            if startup.get("success") is not True:
-                return {
-                    **startup,
-                    "action": action,
-                    "requested_ro_number": ro_number,
-                }
-
             created = await adas_map(
                 settings,
                 {
