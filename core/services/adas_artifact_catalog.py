@@ -40,7 +40,8 @@ except ImportError:  # pragma: no cover - normalized as an unreadable artifact
     pdfium = None
 
 
-CATALOG_SCHEMA_VERSION = "6"  # ligature-artifact normalization fix -- forces a full re-scan
+CATALOG_SCHEMA_VERSION = "7"  # ScrapeX ADAS Map contract v3 -- forces a full re-scan
+SCRAPEX_ADAS_MAP_CONTRACT_VERSION = 3
 SCRAPEX_DB_ENV = "XOMNI_SCRAPEX_DB_PATH"
 DEFAULT_SCRAPEX_DB = Path(r"X:\ScrapeX\data\scrapex.sqlite3")
 
@@ -1221,7 +1222,10 @@ class AdasArtifactCatalog:
         candidates: list[dict[str, Any]] = []
         for row in rows:
             # Poisoned legacy rows are not candidates for governing truth.
-            if int(row.get("adas_map_contract_version") or 0) != 1:
+            if (
+                int(row.get("adas_map_contract_version") or 0)
+                != SCRAPEX_ADAS_MAP_CONTRACT_VERSION
+            ):
                 continue
             record = {
                 "item_id": str(row.get("id") or ""),
@@ -1366,11 +1370,23 @@ class AdasArtifactCatalog:
             if raw_trim and stored_trim and raw_trim != stored_trim:
                 errors.append("vehicle_trim_mismatch")
             record["vehicle"]["configuration"] = raw_configuration
+            attachment = (
+                reconciliation.get("adas_map_attachment")
+                if isinstance(reconciliation, dict)
+                else None
+            )
             ciq_verified = bool(
                 isinstance(reconciliation, dict)
                 and reconciliation.get("verified") is True
                 and reconciliation.get("snapshot_verified") is True
+                and isinstance(attachment, dict)
+                and attachment.get("attached") is True
+                and str(attachment.get("semantic_type") or "").strip().casefold()
+                == "adas_map_report"
+                and attachment.get("document_id")
             )
+            if not ciq_verified:
+                errors.append("ciq_adas_map_attachment_unverified")
             record.update(
                 {
                     "requirements": requirements,
@@ -1389,7 +1405,7 @@ class AdasArtifactCatalog:
                     ),
                     "sources": [
                         {
-                            "kind": "scrapex_canonical_v1",
+                            "kind": "scrapex_canonical_v3",
                             "item_id": record["item_id"],
                             "inspection_id": record["inspection_id"],
                             "source_url": source_url or None,
