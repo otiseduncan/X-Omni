@@ -1,21 +1,15 @@
 """Verified composite post-collision research for X Omni.
 
 For a post-collision technical research request, X must prove which information
-sources were actually queried. This module runs one sequence: ADAS SI ->
-authenticated ALLDATA -> public OEM/manufacturer web. It returns a source
-ledger so model prose cannot substitute for tool execution.
-
-The ALLDATA step is model-driven when a live model client is available (see
-_ACTIVE_RESEARCH_CLIENT below and research_alldata_agent.run_agent_search),
-falling back to a fixed vehicle-first navigation sequence otherwise. Either
-way, "verified" is decided once, centrally, by research_verification -- never
-by which navigation path happened to run.
+sources were actually queried. Licensed ALLDATA work uses ScrapeX's isolated
+Navigator profile with the active X model. X owns interpretation and navigation;
+ScrapeX owns browser-session execution and objective verification. Persistence
+remains an explicit structured choice.
 """
+
 
 from __future__ import annotations
 
-import asyncio
-import contextvars
 import json
 import logging
 import re
@@ -24,20 +18,13 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 from . import research_capture
+from . import research_navigator_agent
 from . import research_operator as ro
-from . import research_verification
 
 log = logging.getLogger("xomni.research_workflow")
 
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
-
-# Optional execution context for callers that already own a live model client.
-# Ordinary conversation reaches this workflow only through a structured
-# collision_research tool call and never patches the orchestrator turn loop.
-_ACTIVE_RESEARCH_CLIENT: "contextvars.ContextVar[Optional[Any]]" = contextvars.ContextVar(
-    "_xomni_active_research_client", default=None
-)
 
 _STOPWORDS = {
     "about", "after", "alldata", "and", "any", "check", "collision", "documentation",
@@ -67,115 +54,6 @@ def requested_make(query: str, adas_mod: Any) -> Optional[str]:
         if re.search(rf"(?<![a-z0-9]){re.escape(value.casefold())}(?![a-z0-9])", folded):
             return value
     return None
-
-
-def _tokens(query: str) -> list[str]:
-    return [t for t in re.findall(r"[a-z0-9-]+", query.casefold()) if len(t) >= 3 and t not in _STOPWORDS][:24]
-
-
-def _compact_adas(result: dict[str, Any], make: Optional[str]) -> dict[str, Any]:
-    hits: list[dict[str, Any]] = []
-    for item in (result.get("results") or [])[:6]:
-        if not isinstance(item, dict):
-            continue
-        hits.append({
-            "title": item.get("title") or item.get("source"),
-            "page": item.get("page"),
-            "excerpt": str(item.get("excerpt") or "")[:2200],
-            "url": item.get("url"),
-            "vehicle": item.get("vehicle") if isinstance(item.get("vehicle"), dict) else {},
-            "text_extraction": item.get("text_extraction"),
-        })
-    return {"status": result.get("status"), "requested_make": make, "result_count": len(hits), "hits": hits}
-
-
-async def _search_input(page: Any) -> Any | None:
-    selectors = (
-        "input[type='search']", "input[placeholder*='search' i]", "input[aria-label*='search' i]",
-        "input[name*='search' i]", "input[id*='search' i]", "input[placeholder*='keyword' i]",
-        "input[aria-label*='keyword' i]",
-    )
-    frames = [page, *list(getattr(page, "frames", []) or [])]
-    seen: set[int] = set()
-    for frame in frames:
-        if id(frame) in seen:
-            continue
-        seen.add(id(frame))
-        for selector in selectors:
-            try:
-                loc = frame.locator(selector).first
-                if await loc.is_visible(timeout=350):
-                    return loc
-            except Exception:  # noqa: BLE001
-                continue
-    return None
-
-
-async def search_alldata(browser: Any, query: str) -> dict[str, Any]:
-    state = await browser.start(auto_login=True)
-    page = browser._page  # noqa: SLF001 - provider automation owned by this service
-    if page is None:
-        return {"attempted": True, "searched": False, "verified": False, "reason": "No active ALLDATA page."}
-    if not state.get("authenticated"):
-        return {
-            "attempted": True, "searched": False, "verified": False,
-            "human_action_required": True,
-            "reason": "ALLDATA requires a human authentication step before search can continue.",
-            "status": state,
-        }
-
-    box = await _search_input(page)
-    if box is None:
-        for label in ("Search", "Keyword Search", "Find"):
-            try:
-                nav = page.get_by_text(label, exact=False).first
-                if await nav.is_visible(timeout=400):
-                    await nav.click(timeout=3_000)
-                    await asyncio.sleep(0.5)
-                    box = await _search_input(page)
-                    if box is not None:
-                        break
-            except Exception:  # noqa: BLE001
-                continue
-    if box is None:
-        return {
-            "attempted": True, "searched": False, "verified": False,
-            "reason": "No searchable ALLDATA field was found in the authenticated provider UI.",
-            "url": str(page.url)[: ro.MAX_URL_CHARS], "title": (await page.title())[:300],
-        }
-
-    try:
-        await box.fill(query)
-        await box.press("Enter")
-        try:
-            await page.wait_for_load_state("domcontentloaded", timeout=12_000)
-        except Exception:  # noqa: BLE001 - SPA search may not navigate
-            await asyncio.sleep(1)
-        body = str(await page.locator("body").inner_text(timeout=10_000) or "")
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "attempted": True, "searched": False, "verified": False,
-            "reason": f"ALLDATA search interaction failed: {type(exc).__name__}.",
-            "url": str(page.url)[: ro.MAX_URL_CHARS],
-        }
-    matched = [token for token in _tokens(query) if token in body.casefold()]
-    # This generic keyword search never selects a vehicle -- it has no concept
-    # of vehicle-scoped results at all -- so it can never truthfully claim
-    # "verified" regardless of what the URL says. research_alldata_navigation's
-    # vehicle-first search is what supplies real vehicle-selection evidence;
-    # this path only exists as a last-resort fallback when that flow can't
-    # even find a search field to try.
-    claim = research_verification.unselected_source_claim(
-        "This search never confirmed a vehicle selection; it only reached a generic keyword search field."
-    )
-    return {
-        "attempted": True, "searched": True, "verified": claim["verified"],
-        "verification_reason": claim["reason"],
-        "query_submitted": True, "query": query, "url": str(page.url)[: ro.MAX_URL_CHARS],
-        "title": (await page.title())[:300], "matched_terms": matched[:12],
-        "relevance_score": len(matched), "page_text": body[:12_000],
-        "provenance": {"provider": ro.PROVIDER_LABEL, "licensed_session": True, "query_submitted": True},
-    }
 
 
 def _source_score(source: dict[str, Any], make: Optional[str]) -> int:
@@ -240,29 +118,62 @@ async def search_public_oem(
     }
 
 
-async def _search_alldata_best_available(browser: Any, query: str) -> dict[str, Any]:
-    """Prefer model-driven ALLDATA navigation; fall back to the fixed sequence.
+async def _search_alldata_best_available(
+    browser: Any,
+    query: str,
+    *,
+    capture: bool = False,
+) -> dict[str, Any]:
+    """Use the isolated ScrapeX Navigator for licensed ALLDATA research.
 
-    A live client may be supplied by an execution caller that already owns the
-    app's running model worker. Ordinary structured tool calls leave it unset
-    and use the bounded vehicle-first execution path.
+    browser stays in the signature only for compatibility with direct callers
+    of this legacy composite helper. It is never used for ALLDATA navigation
+    or persistence.
     """
-    client = _ACTIVE_RESEARCH_CLIENT.get()
-    if client is not None:
-        try:
-            from . import research_alldata_agent
-            from . import research_alldata_navigation as nav
+    del browser
+    from ..config import Settings
+    from . import research_alldata_navigation as nav
 
-            vehicle = nav.vehicle_from_query(query)
-            if vehicle.get("label"):
-                topic = nav.topic_from_query(query, vehicle)
-                return await research_alldata_agent.run_agent_search(
-                    client=client, browser=browser, vehicle=vehicle, topic=topic,
-                )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("ALLDATA agent navigation failed; falling back to deterministic search: %s", exc)
-    return await search_alldata(browser, query)
+    vehicle = nav.vehicle_from_query(query)
+    target = {
+        "year": vehicle.get("year"),
+        "make": vehicle.get("make"),
+        "model": vehicle.get("model_trim"),
+    }
+    if not (target["year"] and target["make"] and target["model"]):
+        return {
+            "attempted": False,
+            "searched": False,
+            "verified": False,
+            "captured": False,
+            "reason": (
+                "Exact year, make, and model are required for licensed "
+                "ALLDATA Navigator research."
+            ),
+        }
 
+    client = research_navigator_agent.current_model_client()
+    if client is None:
+        return {
+            "attempted": False,
+            "searched": False,
+            "verified": False,
+            "captured": False,
+            "reason": (
+                "The active X model is unavailable to the ALLDATA Navigator; "
+                "no substitute navigation path was run."
+            ),
+        }
+
+    topic = nav.topic_from_query(query, vehicle)
+    return await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=Settings.load(),
+        provider="alldata",
+        target=target,
+        topic=topic,
+        capture=capture,
+    )
 
 async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dict[str, Any]:
     from . import adas_si as adas_mod
@@ -294,13 +205,20 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
     }
 
     try:
-        alldata = await _search_alldata_best_available(browser, query)
+        alldata = await _search_alldata_best_available(
+            browser, query, capture=preserve
+        )
     except Exception as exc:  # noqa: BLE001
         alldata = {"attempted": True, "searched": False, "verified": False, "reason": f"ALLDATA provider error: {type(exc).__name__}: {exc}"}
     alldata_ledger = {
         "source": "ALLDATA", "attempted": bool(alldata.get("attempted", True)),
         "searched": bool(alldata.get("searched")), "verified": bool(alldata.get("verified")),
-        "query_submitted": bool(alldata.get("query_submitted")), "url": alldata.get("url"),
+        "captured": bool(alldata.get("captured")),
+        "query_submitted": bool(
+            alldata.get("query_submitted")
+            or (alldata.get("verification") or {}).get("query_submitted")
+        ),
+        "url": alldata.get("source_url") or alldata.get("url"),
         # An early-exit failure (couldn't authenticate, couldn't find the
         # vehicle box) sets "reason"; a run that got as far as a result but
         # failed the evaluate_alldata_claim() checks only sets
@@ -327,24 +245,20 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
 
     captures: list[dict[str, Any]] = []
     if preserve:
-        if alldata.get("verified") and alldata.get("query_submitted") and int(alldata.get("relevance_score") or 0) >= 2:
-            try:
-                captures.append({
+        if alldata.get("captured") is True and isinstance(alldata.get("capture"), dict):
+            captures.append({"source": "ALLDATA", **alldata["capture"]})
+        elif alldata.get("verified") is True:
+            captures.append(
+                {
                     "source": "ALLDATA",
-                    **(
-                        await browser._capture_to_adas(  # noqa: SLF001
-                            {
-                                "vehicle": storage_vehicle.get("label") or "",
-                                "vehicle_year": storage_vehicle.get("year"),
-                                "vehicle_make": storage_vehicle.get("make"),
-                                "vehicle_model": storage_vehicle.get("model_trim"),
-                                "topic": query[:120],
-                            }
-                        )
+                    "status": "not_captured",
+                    "verified": False,
+                    "message": (
+                        "ALLDATA research verified, but ScrapeX did not verify the "
+                        "requested persistence operation."
                     ),
-                })
-            except Exception as exc:  # noqa: BLE001
-                captures.append({"source": "ALLDATA", "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+                }
+            )
         for source in (public.get("sources") or [])[:4]:
             if not isinstance(source, dict) or _source_score(source, make or None) < 8:
                 continue
@@ -480,8 +394,8 @@ def install() -> None:
 
     The base collision_research actions remain model-selectable. The legacy
     full_research helper stays directly testable, but production registration
-    must not collapse source selection and escalation into one deterministic
-    composite action.
+    must not collapse source selection and escalation into a fixed composite
+    action.
     """
 
     global _INSTALLED
