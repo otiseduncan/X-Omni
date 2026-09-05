@@ -1754,3 +1754,31 @@ async def test_week_readiness_leaves_an_ambiguous_map_for_an_operator(monkeypatc
         SimpleNamespace(), SimpleNamespace(), {"phase": "1", "execute_missing": True}
     )
     assert result["adas_map_acquisition_attempted"] == 0
+
+
+def test_truncated_ciq_model_does_not_contradict_the_full_adas_map_model():
+    """Schedule imports store the model cut short; that is not a conflict.
+
+    Calibration IQ held "Explorer Activ..." while ADAS Map carried the full
+    "Explorer Active RWD". Comparing them verbatim reported an identity
+    contradiction for vehicles that plainly match, parking the artifact as
+    ambiguous so readiness never acquired SI for those repair orders.
+    """
+    def conflicts(ciq_model: str, adas_model: str) -> list[str]:
+        return prep._artifact_identity_conflicts(  # noqa: SLF001
+            {
+                "repair_order": {"id": "ro-1"},
+                "vehicle": {"year": 2025, "make": "Ford", "model": ciq_model},
+            },
+            {
+                "ciq_ro_id": "ro-1",
+                "vehicle": {"year": 2025, "make": "Ford", "model": adas_model},
+            },
+        )
+
+    assert conflicts("Explorer Activ...", "Explorer Active RWD") == []
+    assert conflicts("Santa Fe Limit…", "Santa Fe Limited AWD w/6-Passenger") == []
+    # A complete value still has to match exactly, and a truncated prefix that
+    # genuinely disagrees is still a conflict.
+    assert conflicts("Explorer Active RWD", "Explorer Active AWD") == ["model"]
+    assert conflicts("Explorer Activ...", "Escape Titanium") == ["model"]

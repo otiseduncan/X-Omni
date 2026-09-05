@@ -714,6 +714,22 @@ def _identity_text(value: object) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
+def _truncated_identity_prefix(text: str) -> Optional[str]:
+    """Return the readable part of a CIQ identity value that was cut short.
+
+    Schedule imports store a shortened model string ending in an ellipsis --
+    "Explorer Activ...", "Santa Fe Limit..." -- while ADAS Map carries the
+    full "Explorer Active RWD". Comparing those verbatim reported an identity
+    contradiction for vehicles that plainly match, which parked the artifact
+    as ambiguous and stopped the whole readiness workflow for that RO.
+    """
+    for suffix in ("...", "…"):
+        if text.endswith(suffix):
+            prefix = text[: -len(suffix)].strip()
+            return prefix or None
+    return None
+
+
 def _artifact_identity_conflicts(
     snapshot: dict[str, Any], record: dict[str, Any]
 ) -> list[str]:
@@ -755,7 +771,15 @@ def _artifact_identity_conflicts(
         elif field == "vin":
             matches = str(expected).strip().upper() == str(observed).strip().upper()
         else:
-            matches = _identity_text(expected) == _identity_text(observed)
+            expected_text = _identity_text(expected)
+            observed_text = _identity_text(observed)
+            prefix = _truncated_identity_prefix(expected_text)
+            if prefix is not None:
+                # Only the part CIQ actually kept can be compared; the rest was
+                # never stored. A full value still has to match exactly.
+                matches = observed_text.startswith(prefix)
+            else:
+                matches = expected_text == observed_text
         if not matches:
             conflicts.append(field)
     return conflicts
