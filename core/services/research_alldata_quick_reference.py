@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+from . import adas_storage
 from . import calibration_iq
 from . import research_alldata_navigation as nav
 from . import research_operator as ro
@@ -456,17 +457,21 @@ async def _enumerate_quick_reference_links(page: Any, limit: int) -> list[dict[s
 
 
 def _capture_folder(source_root: Path, vehicle: dict[str, Any]) -> Path:
-    make = _safe_filename(vehicle.get("make") or "Unknown Make", "Unknown Make")
-    vehicle_name = _safe_filename(
-        vehicle.get("label")
-        or " ".join(
-            str(vehicle.get(key) or "")
-            for key in ("year", "make", "model_trim")
-            if vehicle.get(key)
-        ),
-        "Vehicle",
+    identity = adas_storage.normalize_vehicle_identity(
+        {
+            "year": vehicle.get("year"),
+            "make": vehicle.get("make"),
+            "model": vehicle.get("model") or vehicle.get("model_trim"),
+        }
     )
-    return source_root / "Acquired" / "ALLDATA" / make / vehicle_name / "ADAS Quick Reference"
+    if identity is None:
+        raise ValueError("ADAS Quick Reference storage requires exact year, make, and model.")
+    return adas_storage.service_information_directory(
+        source_root,
+        identity,
+        "ALLDATA",
+        "ADAS Quick Reference",
+    )
 
 
 def _save_manifest(folder: Path, payload: dict[str, Any]) -> None:
@@ -621,7 +626,13 @@ async def _capture_one(
         "alldata_article_id": article,
         "quick_reference_url": _canonical_alldata_url(quick_reference_url),
         "retrieved_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
-        "vehicle": vehicle.get("label"),
+        "vehicle": {
+            "year": vehicle.get("year"),
+            "make": vehicle.get("make"),
+            "model": vehicle.get("model") or vehicle.get("model_trim"),
+            "label": vehicle.get("label"),
+        },
+        "storage_policy": "year/make/model",
         "title": source_title,
         "page_title": title,
         "saved_pdf_sha256": digest,
@@ -1039,7 +1050,24 @@ async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str
     if not vehicle_label:
         vehicle_label = calibration_iq._research_vehicle_label(ro_result.get("repair_order") or {})  # noqa: SLF001
     vehicle = nav.vehicle_from_query(vehicle_label)
-    if not vehicle.get("year") or not vehicle.get("make") or not vehicle.get("model_trim"):
+    exact_vehicle = calibration_iq._nested(  # noqa: SLF001
+        snapshot,
+        "vehicle",
+        "repair_order.vehicle",
+        "ro.vehicle",
+        default={},
+    )
+    if isinstance(exact_vehicle, dict):
+        exact_model = calibration_iq._nested(  # noqa: SLF001
+            exact_vehicle,
+            "model",
+            default=calibration_iq._nested(snapshot, "model", "vehicle_model"),
+        )
+        if exact_model not in (None, ""):
+            vehicle["model"] = str(exact_model).strip()
+    if not vehicle.get("year") or not vehicle.get("make") or not (
+        vehicle.get("model") or vehicle.get("model_trim")
+    ):
         return {
             "status": "vehicle_identity_missing",
             "success": False,

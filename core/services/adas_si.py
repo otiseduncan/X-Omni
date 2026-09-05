@@ -45,6 +45,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
+from . import adas_storage
+
 log = logging.getLogger("xomni.adas_si")
 
 try:
@@ -73,7 +75,7 @@ MAX_RESULTS = 8
 MAX_MATCHED_DOCS = 5
 EXCERPT_LEAD = 350
 EXCERPT_LEN = 1800
-CACHE_SCHEMA_VERSION = "2"
+CACHE_SCHEMA_VERSION = "3"
 
 IGNORE_TOKENS = {
     "the", "for", "show", "find", "display", "procedure", "calibration",
@@ -206,10 +208,22 @@ def describe_document(source_root: Path, path: Path) -> dict[str, Any]:
         "platform_code": None, "topic": None,
         "application_parsed": False, "parse_confidence": "none",
     }
+    path_identity = adas_storage.canonical_vehicle_identity(source_root, path)
+
+    def _finish() -> dict[str, Any]:
+        # The Year/Make/Model directory is the canonical identity contract for
+        # newly captured SI. Filenames remain useful for topic parsing only.
+        if path_identity is not None:
+            descriptor["year"] = path_identity["year"]
+            descriptor["make"] = path_identity["make"]
+            descriptor["model"] = path_identity["model"]
+            descriptor["application_parsed"] = True
+            descriptor["parse_confidence"] = "path"
+        return descriptor
 
     match = YEAR_RE.match(title)
     if not match:
-        return descriptor
+        return _finish()
     descriptor["year"] = int(match.group(1))
     body = match.group(2).strip()
 
@@ -217,7 +231,7 @@ def describe_document(source_root: Path, path: Path) -> dict[str, Any]:
     descriptor["make"] = make
     if not make or not remainder:
         descriptor["parse_confidence"] = "low"
-        return descriptor
+        return _finish()
 
     words = remainder.split()
     while words and words[0].casefold() in BODY_PREFIXES:
@@ -247,7 +261,7 @@ def describe_document(source_root: Path, path: Path) -> dict[str, Any]:
         )
     else:
         descriptor["parse_confidence"] = "low"
-    return descriptor
+    return _finish()
 
 
 class SourceInventory:
@@ -403,6 +417,11 @@ class AdasSI:
     def __init__(self, source_root: Path, cache_path: Path):
         self.source_root = Path(source_root).resolve()
         self.cache_path = Path(cache_path).resolve()
+        self.storage_migration = adas_storage.migrate_library_once(
+            self.source_root,
+            self.cache_path,
+            describe_document,
+        )
         self.managed_root = self.source_root / MANAGED_DIRNAME
         self.inventory = SourceInventory(self.source_root)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)

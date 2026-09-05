@@ -606,9 +606,30 @@ class LicensedBrowser:
                         "signal. Select the exact vehicle before capturing."
                     )
 
+        from . import adas_storage
+        from . import research_alldata_navigation as nav
+
+        parsed_storage_vehicle = nav.vehicle_from_query(
+            str(args.get("vehicle") or "")
+        )
+        storage_vehicle = adas_storage.normalize_vehicle_identity(
+            {
+                "year": args.get("vehicle_year") or parsed_storage_vehicle.get("year"),
+                "make": args.get("vehicle_make") or parsed_storage_vehicle.get("make"),
+                "model": args.get("vehicle_model") or parsed_storage_vehicle.get("model_trim"),
+            }
+        )
+        if storage_vehicle is None:
+            raise ValueError(
+                "Saving ALLDATA material into ADAS SI requires exact year, make, and model."
+            )
         vehicle = _safe_filename(args.get("vehicle") or "Vehicle")
         topic = _safe_filename(args.get("topic") or self._page.title() or "Research")
-        folder = self.adas.source_root / "Acquired" / "ALLDATA"
+        folder = adas_storage.service_information_directory(
+            self.adas.source_root,
+            storage_vehicle,
+            "ALLDATA",
+        )
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         base = _safe_filename(f"{vehicle} {topic} ALLDATA {stamp}")
@@ -625,6 +646,8 @@ class LicensedBrowser:
             "retrieved_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
             "licensed_access": True,
             "targeted_research": True,
+            "storage_policy": "year/make/model",
+            "vehicle": storage_vehicle,
             "original_web_source_retained_as": "print_snapshot_pdf",
             "credential_secret_stored_in_document": False,
         }

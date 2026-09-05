@@ -26,6 +26,7 @@ from urllib.parse import urljoin
 
 import httpx
 
+from . import adas_storage
 from . import research_operator as ro
 
 MAX_CAPTURE_BYTES = 32 * 1024 * 1024
@@ -134,7 +135,33 @@ async def public_capture(args: dict[str, Any], adas: Any) -> dict[str, Any]:
     if not url:
         raise ValueError("url is required")
     manufacturer = _safe_filename(args.get("manufacturer") or "OEM", "OEM")
-    vehicle = _safe_filename(args.get("vehicle") or "", "")
+    vehicle_label = _safe_filename(args.get("vehicle") or "", "")
+    vehicle_identity = adas_storage.normalize_vehicle_identity(
+        {
+            "year": args.get("vehicle_year"),
+            "make": args.get("vehicle_make"),
+            "model": args.get("vehicle_model"),
+        }
+    )
+    if vehicle_identity is None:
+        # Preserve only vehicle-specific SI. The public_capture action shares
+        # the collision_research schema, so callers can always provide the
+        # explicit structured vehicle fields when the display label is not
+        # sufficient to distinguish model from trim.
+        from . import research_alldata_navigation as nav
+
+        parsed = nav.vehicle_from_query(vehicle_label)
+        vehicle_identity = adas_storage.normalize_vehicle_identity(
+            {
+                "year": parsed.get("year"),
+                "make": parsed.get("make"),
+                "model": parsed.get("model_trim"),
+            }
+        )
+    if vehicle_identity is None:
+        raise ValueError(
+            "Saving public OEM material into ADAS SI requires exact year, make, and model."
+        )
     topic_hint = _safe_filename(args.get("topic") or "Research", "Research")
 
     final_url, raw, content_type = await _bounded_public_fetch(url)
@@ -162,9 +189,17 @@ async def public_capture(args: dict[str, Any], adas: Any) -> dict[str, Any]:
         artifact_kind = "rendered_text_snapshot_pdf"
         authoritative_artifact = False
 
-    folder = Path(adas.source_root) / "Acquired" / "Public OEM" / manufacturer
+    folder = adas_storage.service_information_directory(
+        Path(adas.source_root),
+        vehicle_identity,
+        "Public OEM",
+        manufacturer,
+    )
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    vehicle = " ".join(
+        str(vehicle_identity[key]) for key in ("year", "make", "model")
+    )
     base_parts = [part for part in (vehicle, manufacturer, title, stamp) if part]
     base = _safe_filename(" ".join(base_parts), f"{manufacturer} OEM research {stamp}")
     pdf_path = folder / f"{base}.pdf"
@@ -182,6 +217,8 @@ async def public_capture(args: dict[str, Any], adas: Any) -> dict[str, Any]:
         "authoritative_artifact": authoritative_artifact,
         "source_url_is_authority": True,
         "targeted_research": True,
+        "storage_policy": "year/make/model",
+        "vehicle": vehicle_identity,
         "credential_secret_stored_in_document": False,
     }
     sidecar.write_text(json.dumps(provenance, indent=2), encoding="utf-8")

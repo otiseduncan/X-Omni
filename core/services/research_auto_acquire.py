@@ -15,7 +15,7 @@ def _existing_capture(folder: Path, url: str) -> dict[str, Any] | None:
     if not folder.is_dir() or not url:
         return None
     canonical = url.strip()
-    for sidecar in folder.glob("*.source.json"):
+    for sidecar in folder.rglob("*.source.json"):
         try:
             payload = json.loads(sidecar.read_text(encoding="utf-8"))
         except Exception:
@@ -39,7 +39,7 @@ async def deduplicating_capture(self: Any, args: dict[str, Any]) -> dict[str, An
     if page is None:
         raise ValueError("No active ALLDATA page is available to capture.")
     current_url = str(page.url or "")[: ro.MAX_URL_CHARS]
-    folder = Path(self.adas.source_root) / "Acquired" / "ALLDATA" if self.adas is not None else Path()
+    folder = Path(self.adas.source_root) if self.adas is not None else Path()
     existing = _existing_capture(folder, current_url) if self.adas is not None else None
     if existing is not None:
         pdf = existing.get("pdf")
