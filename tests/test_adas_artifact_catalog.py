@@ -863,3 +863,46 @@ def test_new_sidecar_reindexes_an_unchanged_pdf(tmp_path: Path):
     assert result["index"]["updated"] == 1
     assert result["status"] == DISCOVERY_VERIFIED
     assert result["record"]["sources"][0]["sidecar_verified"] is True
+
+
+def test_adas_map_settles_restraint_items_but_not_real_calibrations():
+    """The map establishes requirements; it cannot satisfy the procedural ones.
+
+    Letting the ADAS Map report satisfy any family it mentions marked every
+    requirement COVERED the moment the map attached, so SI acquisition saw no
+    gaps and never ran -- RO 2400612502's 360-degree camera and front parking
+    sensor both read COVERED with no OEM procedure anywhere.
+
+    Seat belt and occupant classification stay settled on purpose: they are
+    inspection and verification steps carried by the map's own OE section with
+    no separate OEM calibration procedure to find, and holding them open would
+    stall the queue on evidence that does not exist.
+    """
+    row = {
+        "readable": True,
+        "artifact_kind": "adas_map_report",
+        "oe_requirement_families": [
+            "seat_belt",
+            "occupant_classification",
+            "surround_camera",
+            "parking_assist",
+            "front_radar",
+            "steering_angle",
+        ],
+        "oe_section_text": "Seatbelts must be inspected after a collision.",
+    }
+    supports = catalog_mod.AdasArtifactCatalog._procedure_supports  # noqa: SLF001
+
+    assert supports(row, "Seat Belt")
+    assert supports(row, "Occupant Classification System")
+    assert supports(row, "Passenger Seat Weight Sensor")
+
+    for calibration in (
+        "360 Degree View Cameras",
+        "Parking Aid Sensor - Front",
+        "Front Radar",
+        "Steering Angle Sensor",
+        "Blind Spot Monitor",
+        "Windshield Camera",
+    ):
+        assert not supports(row, calibration), calibration

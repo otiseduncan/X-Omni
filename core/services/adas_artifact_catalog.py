@@ -88,6 +88,17 @@ _FAMILY_LABELS = {
     "parking_assist": "Parking Assist Sensor",
 }
 
+# The ADAS Map is the document that establishes what a vehicle requires; on its
+# own it cannot be the service information that satisfies a requirement, or
+# every item is covered the moment the map attaches and SI is never gathered.
+# The exception is the restraint work its own OE section actually carries:
+# seat belt and occupant classification are inspection and verification steps
+# with no separate OEM calibration procedure to find, and treating them as
+# outstanding would stall the queue on evidence that does not exist. A camera,
+# radar, steering angle, or parking sensor calibration is real procedural work
+# and still needs its own OEM document.
+_ADAS_MAP_SETTLED_FAMILIES = frozenset({"seat_belt", "occupant_classification"})
+
 # These are intentionally bounded.  In particular, short acronyms are matched
 # as complete normalized tokens, never as substrings of unrelated words.
 _ALIAS_FAMILIES: dict[str, tuple[str, ...]] = {
@@ -1827,6 +1838,8 @@ class AdasArtifactCatalog:
             return False
         if row.get("artifact_kind") == "adas_map_report":
             family = _requirement_family(requirement)
+            if family not in _ADAS_MAP_SETTLED_FAMILIES:
+                return False
             if family in set(row.get("oe_requirement_families") or []):
                 return True
             oe_text = str(row.get("oe_section_text") or "")
