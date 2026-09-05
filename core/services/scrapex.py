@@ -2453,16 +2453,17 @@ async def adas_map_with_ciq_attachment(
     adas: Any,
     args: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run the explicit ADAS Map action and finish its document workflow.
+    """Acquire an ADAS Map through ScrapeX and verify CIQ's resulting truth.
 
-    Only acquire_exact has this additional side effect. The caller has already
-    selected that structured business operation; this helper does not
-    interpret conversational language.
+    ScrapeX contract v3 owns the mutation: canonical PDF capture, Calibration IQ
+    document attachment, semantic classification, and research-state handoff.
+    X Omni does not perform a second attachment. It only rereads CIQ and refuses
+    to report completion unless the same state is visible there.
     """
     from . import calibration_iq
 
     payload = dict(args)
-    context = payload.pop(_INVOCATION_CONTEXT_KEY, None)
+    payload.pop(_INVOCATION_CONTEXT_KEY, None)
     result = await adas_map(settings, payload)
     if str(payload.get("action") or "") != "acquire_exact":
         return result
@@ -2485,26 +2486,8 @@ async def adas_map_with_ciq_attachment(
             "verified": False,
             "work_complete": False,
             "message": (
-                "ScrapeX completed the portal lookup, but X could not verify the "
-                "canonical ADAS Map PDF on disk, so the RO was not reported ready."
-            ),
-        }
-
-    if (
-        not isinstance(context, dict)
-        or not context.get("conversation_id")
-        or not context.get("message_id")
-        or not context.get("tool_call_id")
-    ):
-        return {
-            **result,
-            "status": "attachment_failed",
-            "success": False,
-            "verified": False,
-            "work_complete": False,
-            "message": (
-                "The ADAS Map PDF was saved, but the X invocation identity needed "
-                "to attach it to Calibration IQ was unavailable."
+                "ScrapeX reported completion, but X could not verify the canonical "
+                "ADAS Map PDF on disk."
             ),
         }
 
@@ -2513,7 +2496,8 @@ async def adas_map_with_ciq_attachment(
     )
     ro = ro_read.get("repair_order") if isinstance(ro_read, dict) else None
     ro_id = str((ro or {}).get("id") or "").strip()
-    if ro_read.get("status") != "verified" or not ro_id:
+    snapshot = ro_read.get("raw") if isinstance(ro_read, dict) else None
+    if ro_read.get("status") != "verified" or not ro_id or not isinstance(snapshot, dict):
         return {
             **result,
             "status": "attachment_failed",
@@ -2525,47 +2509,33 @@ async def adas_map_with_ciq_attachment(
                 "attached": False,
                 "message": str(
                     ro_read.get("message")
-                    or "Calibration IQ did not resolve one exact RO."
+                    or "Calibration IQ did not return one authoritative RO snapshot."
                 ),
             },
             "message": (
-                "The ADAS Map PDF was saved, but X could not verify the matching "
-                "Calibration IQ RO for document attachment."
+                "ScrapeX completed acquisition, but X could not verify the matching "
+                "Calibration IQ RO state."
             ),
         }
 
     relative = str(local["relative_path"])
     source_uri = f"adas-si:///{quote(relative)}"
-    attachment_result = await calibration_iq.operator_execute(
-        settings,
-        adas,
-        {
-            "actions": [
-                {
-                    "operation": "research_ro",
-                    "repair_order_id": ro_id,
-                    "arguments": {
-                        "queries": [
-                            {
-                                "query": f"{ro_number} ADAS Map",
-                                "label": "ADAS Map",
-                            }
-                        ],
-                        "complete_research": False,
-                    },
-                }
-            ],
-            "continue_on_error": False,
-            calibration_iq._INVOCATION_CONTEXT_KEY: {  # noqa: SLF001
-                **context,
-                "tool_call_id": f"{context['tool_call_id']}-adas-map-attach",
-            },
-        },
-    )
-    if not (
-        attachment_result.get("success") is True
-        and attachment_result.get("verified") is True
-    ):
+    documents = calibration_iq._existing_research_documents(snapshot)  # noqa: SLF001
+    matches = [
+        document
+        for document in documents
+        if (
+            str(document.get("source_uri") or "").strip().casefold()
+            == source_uri.casefold()
+            or (
+                str(document.get("source_name") or "").strip().casefold()
+                == f"{ro_number} adas map.pdf".casefold()
+                and str(document.get("semantic_type") or "").strip().casefold()
+                == "adas_map_report"
+            )
+        )
+    ]
+    if len(matches) != 1:
         return {
             **result,
             "status": "attachment_failed",
@@ -2576,32 +2546,76 @@ async def adas_map_with_ciq_attachment(
                 "status": "not_verified",
                 "attached": False,
                 "repair_order_id": ro_id,
-                "message": str(
-                    attachment_result.get("message")
-                    or "Calibration IQ did not verify the ADAS Map attachment."
+                "message": (
+                    "Calibration IQ did not expose one exact managed ADAS Map "
+                    "document after ScrapeX reconciliation."
                 ),
             },
             "message": (
-                "The ADAS Map PDF was saved, but Calibration IQ did not verify "
-                "that it was attached to the RO."
+                "The ADAS Map PDF exists, but its Calibration IQ attachment is not "
+                "authoritatively visible."
             ),
         }
 
-    attachment = _ciq_attachment_from_result(
-        attachment_result,
-        ro_id=ro_id,
-        source_uri=source_uri,
-    )
-    if attachment.get("attached") is not True:
+    document = matches[0]
+    if (
+        str(document.get("semantic_type") or "").strip().casefold()
+        != "adas_map_report"
+        or str(document.get("document_type") or "").strip().casefold()
+        != "adas_map_report"
+    ):
         return {
             **result,
             "status": "attachment_failed",
             "success": False,
             "verified": False,
             "work_complete": False,
-            "ciq_attachment": attachment,
-            "message": attachment.get("message"),
+            "message": (
+                "Calibration IQ has the file, but it is not classified as an ADAS Map."
+            ),
         }
+
+    research = snapshot.get("research")
+    research_state = (
+        str(research.get("state") or "").strip().casefold()
+        if isinstance(research, dict)
+        else ""
+    )
+    if research_state not in {"research_in_progress", "research_complete"}:
+        return {
+            **result,
+            "status": "attachment_failed",
+            "success": False,
+            "verified": False,
+            "work_complete": False,
+            "message": (
+                "Calibration IQ still reports research required after the ADAS Map "
+                "attachment."
+            ),
+        }
+
+    document_id = str(
+        document.get("id") or document.get("document_id") or ""
+    ).strip()
+    attachment = {
+        "status": "verified",
+        "attached": True,
+        "repair_order_id": ro_id,
+        "document_id": document_id or None,
+        "title": document.get("title") or document.get("source_name") or "ADAS Map",
+        "source_uri": source_uri,
+        "storage_relative_path": document.get("storage_relative_path"),
+        "semantic_type": document.get("semantic_type"),
+        "research_state": research_state,
+        "download_url": (
+            document.get("download_url")
+            or (
+                calibration_iq._document_proxy_url(document_id)  # noqa: SLF001
+                if document_id
+                else None
+            )
+        ),
+    }
 
     return {
         **result,
@@ -2612,8 +2626,8 @@ async def adas_map_with_ciq_attachment(
         "chat_document": local.get("chat_document"),
         "ciq_attachment": attachment,
         "message": (
-            f"ADAS Map for RO {ro_number} was saved to the canonical ADAS Map "
-            "library and attached to the Calibration IQ repair order."
+            f"ADAS Map for RO {ro_number} is attached in Calibration IQ and "
+            f"research is {research_state.replace('_', ' ')}."
         ),
     }
 
