@@ -1040,7 +1040,8 @@ export function ScrapeXCard({ data }) {
         </div>
       )}
 
-      {authenticationRequired && (        <p className="card-note ciq-incomplete" style={{ marginTop: 9 }}>
+      {authenticationRequired && (
+        <p className="card-note ciq-incomplete" style={{ marginTop: 9 }}>
           Interactive ADAS Map sign-in is required in ScrapeX&apos;s managed work browser.
           Credentials never pass through chat or the model.
         </p>
