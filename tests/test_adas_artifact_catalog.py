@@ -299,6 +299,15 @@ def _canonical_row(
         "inspection_id": inspection,
         "receipt_count": 1 if ciq_verified else 0,
         "explicit_no_calibration": explicit_no_calibration,
+        "adas_map_attachment": (
+            {
+                "attached": True,
+                "document_id": "doc-adas-map",
+                "semantic_type": "ADAS_MAP_REPORT",
+            }
+            if ciq_verified
+            else None
+        ),
     }
     raw_result = {
         "success": True,
@@ -327,7 +336,7 @@ def _canonical_row(
         "make": "Toyota",
         "model": "Camry",
         "trim": "LE",
-        "adas_map_contract_version": 1,
+        "adas_map_contract_version": 3,
         "adas_map_state": map_state,
         "adas_map_inspection_id": inspection,
         "adas_map_source_url": "https://adas-map.invalid/exact-inspection",
@@ -353,7 +362,7 @@ def _catalog(tmp_path: Path, *, rows: list[dict] | None = None, texts=None):
     )
 
 
-def test_canonical_v1_provenance_wins_and_legacy_strings_are_ignored(tmp_path: Path):
+def test_canonical_v3_provenance_wins_and_legacy_strings_are_ignored(tmp_path: Path):
     canonical = _canonical_row()
     legacy = {
         **canonical,
@@ -377,7 +386,7 @@ def test_canonical_v1_provenance_wins_and_legacy_strings_are_ignored(tmp_path: P
     ]
     assert result["record"]["sources"] == [
         {
-            "kind": "scrapex_canonical_v1",
+            "kind": "scrapex_canonical_v3",
             "item_id": "canonical-1",
             "inspection_id": "5949644",
             "source_url": "https://adas-map.invalid/exact-inspection",
