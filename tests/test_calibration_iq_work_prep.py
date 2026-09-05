@@ -1098,18 +1098,10 @@ async def test_resolve_queue_next_reports_stale_queue(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_selected_alldata_to_ciq_reads_through_navigator_when_flagged_on(
+async def test_resolve_selected_alldata_to_ciq_reads_through_navigator(
     tmp_path, monkeypatch
 ):
-    # Behind the flag, this must read through ScrapeX's Navigator session
-    # instead of X Omni's in-process ALLDATA browser -- a pure call-site
-    # swap; the CIQ-row matching logic is exactly the same either way.
-    settings = SimpleNamespace(root=tmp_path, alldata_navigator_enabled=True)
-
-    def get_browser(*_a, **_k):
-        raise AssertionError("must not use the in-process browser when the Navigator flag is on")
-
-    monkeypatch.setattr(prep.research_operator, "get_browser", get_browser)
+    settings = SimpleNamespace(root=tmp_path)
 
     async def navigator_current_page_signals(_settings, provider):
         assert provider == "alldata"
@@ -1142,10 +1134,10 @@ async def test_resolve_selected_alldata_to_ciq_reads_through_navigator_when_flag
 
 
 @pytest.mark.asyncio
-async def test_resolve_selected_alldata_to_ciq_requires_navigator_authentication_when_flagged_on(
+async def test_resolve_selected_alldata_to_ciq_requires_navigator_authentication(
     tmp_path, monkeypatch
 ):
-    settings = SimpleNamespace(root=tmp_path, alldata_navigator_enabled=True)
+    settings = SimpleNamespace(root=tmp_path)
 
     async def navigator_current_page_signals(_settings, _provider):
         return {"success": True, "data": {"authenticated": False, "signals": []}}
@@ -1170,38 +1162,38 @@ async def test_resolve_queue_next_selected_vehicle_not_in_queue(tmp_path, monkey
     )
     store.save(weekly_queue.WeeklyQueue(conversation_id="8", items=[item]))
 
-    class Browser:
-        _page = object()
+    async def navigator_current_page_signals(_settings, provider):
+        assert provider == "alldata"
+        return {
+            "success": True,
+            "data": {
+                "authenticated": True,
+                "signals": [
+                    "Vehicle Information - 2019 Toyota Camry LE - ALLDATA Collision"
+                ],
+            },
+        }
 
-        async def start(self, auto_login=False):  # noqa: ARG002
-            return {"authenticated": True}
-
-    monkeypatch.setattr(prep.research_operator, "get_browser", lambda *_a, **_k: Browser())
-
-    async def signals(_page):
-        return ["Vehicle Information - 2019 Toyota Camry LE - ALLDATA Collision"]
-
-    monkeypatch.setattr(prep, "_bounded_selected_vehicle_signals", signals)
+    monkeypatch.setattr(
+        prep.scrapex_svc,
+        "navigator_current_page_signals",
+        navigator_current_page_signals,
+    )
 
     result = await prep.resolve_queue_next(settings, SimpleNamespace(), 8)
     assert result["status"] == "not_in_queue"
 
 
 @pytest.mark.asyncio
-async def test_resolve_queue_next_reads_through_navigator_when_flagged_on(tmp_path, monkeypatch):
+async def test_resolve_queue_next_reads_through_navigator(tmp_path, monkeypatch):
     monkeypatch.setattr(weekly_queue, "_STORE", None)
-    settings = SimpleNamespace(root=tmp_path, alldata_navigator_enabled=True)
+    settings = SimpleNamespace(root=tmp_path)
     store = weekly_queue.get_store(tmp_path)
     item = weekly_queue.WeeklyQueueItem(
         repair_order_id="ro-1", ro_number="RO1", vehicle_label="2023 Acura TLX",
         vehicle_year="2023", vehicle_make="Acura", vehicle_model_trim="TLX",
     )
     store.save(weekly_queue.WeeklyQueue(conversation_id="11", items=[item]))
-
-    def get_browser(*_a, **_k):
-        raise AssertionError("must not use the in-process browser when the Navigator flag is on")
-
-    monkeypatch.setattr(prep.research_operator, "get_browser", get_browser)
 
     async def navigator_current_page_signals(_settings, provider):
         assert provider == "alldata"
@@ -1244,18 +1236,23 @@ async def test_resolve_queue_next_fails_closed_on_ambiguous_match(tmp_path, monk
     )
     store.save(weekly_queue.WeeklyQueue(conversation_id="10", items=[first, second]))
 
-    class Browser:
-        _page = object()
+    async def navigator_current_page_signals(_settings, provider):
+        assert provider == "alldata"
+        return {
+            "success": True,
+            "data": {
+                "authenticated": True,
+                "signals": [
+                    "Vehicle Information - 2023 Ford F-150 4WD - ALLDATA Collision"
+                ],
+            },
+        }
 
-        async def start(self, auto_login=False):  # noqa: ARG002
-            return {"authenticated": True}
-
-    monkeypatch.setattr(prep.research_operator, "get_browser", lambda *_a, **_k: Browser())
-
-    async def signals(_page):
-        return ["Vehicle Information - 2023 Ford F-150 4WD - ALLDATA Collision"]
-
-    monkeypatch.setattr(prep, "_bounded_selected_vehicle_signals", signals)
+    monkeypatch.setattr(
+        prep.scrapex_svc,
+        "navigator_current_page_signals",
+        navigator_current_page_signals,
+    )
 
     collected = False
 
@@ -1290,18 +1287,23 @@ async def test_resolve_queue_next_collects_marks_complete_and_names_the_next_veh
     )
     store.save(weekly_queue.WeeklyQueue(conversation_id="9", items=[first, second]))
 
-    class Browser:
-        _page = object()
+    async def navigator_current_page_signals(_settings, provider):
+        assert provider == "alldata"
+        return {
+            "success": True,
+            "data": {
+                "authenticated": True,
+                "signals": [
+                    "Vehicle Information - 2023 Acura TLX Type S - ALLDATA Collision"
+                ],
+            },
+        }
 
-        async def start(self, auto_login=False):  # noqa: ARG002
-            return {"authenticated": True}
-
-    monkeypatch.setattr(prep.research_operator, "get_browser", lambda *_a, **_k: Browser())
-
-    async def signals(_page):
-        return ["Vehicle Information - 2023 Acura TLX Type S - ALLDATA Collision"]
-
-    monkeypatch.setattr(prep, "_bounded_selected_vehicle_signals", signals)
+    monkeypatch.setattr(
+        prep.scrapex_svc,
+        "navigator_current_page_signals",
+        navigator_current_page_signals,
+    )
 
     async def collect(_settings, _adas, args):
         assert args["repair_order_id"] == "ro-1"
@@ -1405,18 +1407,23 @@ async def test_queue_next_persists_running_attempt_then_retryable_failure(tmp_pa
     )
     store.save(weekly_queue.WeeklyQueue(conversation_id="93", items=[item]))
 
-    class Browser:
-        _page = object()
+    async def navigator_current_page_signals(_settings, provider):
+        assert provider == "alldata"
+        return {
+            "success": True,
+            "data": {
+                "authenticated": True,
+                "signals": [
+                    "Vehicle Information - 2023 Acura TLX Type S - ALLDATA Collision"
+                ],
+            },
+        }
 
-        async def start(self, auto_login=False):  # noqa: ARG002
-            return {"authenticated": True}
-
-    monkeypatch.setattr(prep.research_operator, "get_browser", lambda *_a, **_k: Browser())
-
-    async def signals(_page):
-        return ["Vehicle Information - 2023 Acura TLX Type S - ALLDATA Collision"]
-
-    monkeypatch.setattr(prep, "_bounded_selected_vehicle_signals", signals)
+    monkeypatch.setattr(
+        prep.scrapex_svc,
+        "navigator_current_page_signals",
+        navigator_current_page_signals,
+    )
 
     async def collect(_settings, _adas, _args):
         in_flight = store.get("93").items[0]
