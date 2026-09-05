@@ -223,6 +223,7 @@ def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> Non
     }
     assert action_branches(initial, "scrapex_adas_map") == {
         "open_authentication",
+        "acquire_exact",
         "create_exact_batch",
         "create_phase_batch",
     }
@@ -261,6 +262,7 @@ def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> Non
     }
     assert action_branches(unlocked, "scrapex_adas_map") == {
         "open_authentication",
+        "acquire_exact",
         "create_exact_batch",
         "create_phase_batch",
         "process_one",
@@ -454,17 +456,21 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # calibration_iq_ro `shop` parameter (short-RO-number resolution) grew
     # it again, and the anti-copy warnings on `repair_order_id`/`shop`
     # (never copy an identifier from the Active conversation subject block
-    # into a fresh call) grew it once more. Ceilings moved with them, not
+    # into a fresh call) grew it once more. The single-owner ScrapeX v3
+    # handoff descriptions and the scrapex_adas_map auth-before-batch
+    # guidance grew the catalog again. Ceilings moved with them, not
     # toward zero headroom.
-    assert metrics["advertised_tools"]["catalog_chars"] < 45_500
-    assert metrics["advertised_tools"]["catalog_tokens"] < 13_100
+    assert metrics["advertised_tools"]["catalog_chars"] < 47_200
+    assert metrics["advertised_tools"]["catalog_tokens"] < 13_600
     # Visibility ceiling with regression headroom; the independent remaining
     # context floor below is the authoritative 32K safety contract. The
     # new-subject-always-refetches WORKING_CONTEXT rule and the active-
-    # subject/tool-schema anti-copy warnings moved this floor down once more.
-    assert metrics["total_input_used_tokens"] < 15_500
+    # subject/tool-schema anti-copy warnings moved this floor down once more,
+    # and the ScrapeX v3 single-owner handoff plus auth-before-batch guidance
+    # moved it once more still.
+    assert metrics["total_input_used_tokens"] < 16_000
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
-    assert metrics["remaining_normal_turn_tokens"] > 13_900
+    assert metrics["remaining_normal_turn_tokens"] > 13_400
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

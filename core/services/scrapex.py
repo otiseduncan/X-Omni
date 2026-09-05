@@ -220,15 +220,19 @@ SCRAPEX_READ_SCHEMA: dict[str, Any] = {
 SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
     "description": (
         "Run bounded ScrapeX ADAS Map actions. For one exact RO that the user wants "
-        "acquired now, prefer acquire_exact: it starts ScrapeX if needed, creates the "
-        "exact one-RO batch, processes that RO synchronously, verifies the canonical "
-        "ADAS Map PDF, and attaches that document to the matching Calibration IQ RO "
-        "before the X-facing workflow reports completion. process_one requires an "
-        "observed exact batch_id. After create_exact_batch or create_phase_batch, copy "
-        "result.data.id exactly; never copy evidence_id. open_authentication is a "
-        "parameterless browser-opening human/provider handoff used after status reports "
-        "authentication_required or when the user explicitly requests provider setup. "
-        "Queued or started is not completed."
+        "acquired now, prefer acquire_exact: it starts ScrapeX if needed, verifies "
+        "managed-browser sign-in before any batch exists, creates the exact one-RO "
+        "batch, processes that RO synchronously, verifies the canonical ADAS Map PDF, "
+        "and attaches that document to the matching Calibration IQ RO before the "
+        "X-facing workflow reports completion. If sign-in is needed, acquire_exact "
+        "opens the managed sign-in window itself and returns authentication_required "
+        "with no batch created; report that and repeat the same acquire_exact after "
+        "the operator signs in, instead of manual create/start/process/pause steps. "
+        "process_one requires an observed exact batch_id. After create_exact_batch or "
+        "create_phase_batch, copy result.data.id exactly; never copy evidence_id. "
+        "open_authentication is a parameterless browser-opening human/provider handoff "
+        "used after status reports authentication_required or when the user explicitly "
+        "requests provider setup. Queued or started is not completed."
     ),
     "parameters": {
         "type": "object",
@@ -2079,15 +2083,31 @@ async def adas_map(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
         if action == "acquire_exact":
             _expect_keys(clean, {"action", "ro_number", "source_scope"})
             ro_number = _ro_number(clean.get("ro_number"))
-            created = await adas_map(
-                settings,
-                {
-                    "action": "create_exact_batch",
-                    "name": f"RO {ro_number} ADAS Map",
-                    "ro_numbers": [ro_number],
-                    "source_scope": _source_scope(clean, "all"),
-                },
-            )
+            create_args = {
+                "action": "create_exact_batch",
+                "name": f"RO {ro_number} ADAS Map",
+                "ro_numbers": [ro_number],
+                "source_scope": _source_scope(clean, "all"),
+            }
+            created = await adas_map(settings, create_args)
+            if created.get("status") == "authentication_required":
+                # Sign-in comes before any batch mutation. Open/focus the
+                # managed sign-in window once, and only continue when that
+                # open proves the session is already authenticated; otherwise
+                # return one authentication_required state with no batch
+                # created, so the same request can simply be repeated after
+                # the operator signs in.
+                opened = await adas_map(settings, {"action": "open_authentication"})
+                if not (
+                    opened.get("success") is True
+                    and opened.get("verified") is True
+                ):
+                    return {
+                        **opened,
+                        "action": action,
+                        "requested_ro_number": ro_number,
+                    }
+                created = await adas_map(settings, create_args)
             if not (
                 created.get("success") is True
                 and created.get("verified") is True
@@ -2163,6 +2183,12 @@ async def adas_map(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
                 "ro_numbers": ro_numbers,
                 "source_scope": _source_scope(clean, "all"),
             }
+            # Authentication is verified before the work batch exists at all:
+            # an unauthenticated request must not leave a queued exact batch
+            # behind as a side effect.
+            authentication = await _authentication_status(settings, action)
+            if authentication is not None:
+                return authentication
             data = await _request(
                 settings,
                 "POST",

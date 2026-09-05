@@ -31,6 +31,9 @@ from core.tools.registry import (
 @dataclass
 class FakeSettings:
     scrapex_base_url: str = "http://127.0.0.1:8125"
+    # Point away from any real local ScrapeX checkout so revision-aware
+    # native startup is inert and tests stay hermetic on developer machines.
+    scrapex_project_path: str = r"C:\xomni-tests\nonexistent-scrapex"
 
 
 def _install_transport(monkeypatch, handler) -> None:
@@ -749,6 +752,8 @@ async def test_open_authentication_is_a_parameterless_provider_setup_handoff(
 @pytest.mark.asyncio
 async def test_create_exact_batch_uses_only_bounded_structured_fields(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": True, "authenticated": True})
         assert request.method == "POST"
         assert request.url.path == "/api/batches/from-ciq/exact"
         assert "authorization" not in request.headers
@@ -871,10 +876,171 @@ async def test_acquire_exact_runs_one_ro_through_terminal_processing(monkeypatch
     assert result["exact_batch_id"] == "batch-9701"
     assert result["requested_ro_number"] == "9701"
     assert requests == [
+        ("GET", "/api/adas-map/status"),
         ("POST", "/api/batches/from-ciq/exact"),
         ("GET", "/api/adas-map/status"),
         ("POST", "/api/batches/batch-9701/adas-map/process-one/9701"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_acquire_exact_opens_sign_in_without_creating_any_batch(monkeypatch):
+    requests: list[tuple[str, str]] = []
+
+    async def start_native(_settings):
+        return {
+            "status": "ready",
+            "success": True,
+            "executed": False,
+            "verified": True,
+        }
+
+    monkeypatch.setattr(scrapex, "start_native", start_native)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": False, "authenticated": False})
+        if request.url.path == "/api/adas-map/open":
+            return httpx.Response(
+                200,
+                json={
+                    "active": True,
+                    "authenticated": False,
+                    "title": "Login | ADAS Map",
+                    "opened": True,
+                    "focused": True,
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.adas_map(
+        FakeSettings(),
+        {"action": "acquire_exact", "ro_number": "9801"},
+    )
+
+    # One clear authentication_required state: the sign-in window was opened,
+    # no batch was created, started, processed, or paused.
+    assert result["status"] == "authentication_required"
+    assert result["action"] == "acquire_exact"
+    assert result["requested_ro_number"] == "9801"
+    assert result["requires_human"] is True
+    assert result["work_complete"] is False
+    assert requests == [
+        ("GET", "/api/adas-map/status"),
+        ("POST", "/api/adas-map/open"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acquire_exact_resumes_when_open_proves_authentication(monkeypatch):
+    requests: list[tuple[str, str]] = []
+    authenticated = {"value": False}
+
+    async def start_native(_settings):
+        return {
+            "status": "ready",
+            "success": True,
+            "executed": False,
+            "verified": True,
+        }
+
+    monkeypatch.setattr(scrapex, "start_native", start_native)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(
+                200,
+                json={
+                    "active": authenticated["value"],
+                    "authenticated": authenticated["value"],
+                },
+            )
+        if request.url.path == "/api/adas-map/open":
+            # Focusing found an already-signed-in managed window.
+            authenticated["value"] = True
+            return httpx.Response(200, json={"active": True, "authenticated": True})
+        if request.url.path == "/api/batches/from-ciq/exact":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "batch-9802",
+                    "state": "pending",
+                    "requested_ro_numbers": ["9802"],
+                    "source_scope": "all",
+                    "items": [
+                        {
+                            "id": "item-9802",
+                            "batch_id": "batch-9802",
+                            "ro_number": "9802",
+                        }
+                    ],
+                    "readiness": {
+                        "ready": False,
+                        "total": 1,
+                        "adas_map_unresolved": 1,
+                    },
+                },
+            )
+        if request.url.path == "/api/batches/batch-9802/adas-map/process-one/9802":
+            return httpx.Response(
+                200,
+                json={
+                    "attempted": True,
+                    "completed": True,
+                    "status": "completed",
+                    "batch_id": "batch-9802",
+                    "ro_number": "9802",
+                    "item": _completed_item("batch-9802", "9802"),
+                    "readiness": {"ready": True},
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.adas_map(
+        FakeSettings(),
+        {"action": "acquire_exact", "ro_number": "9802"},
+    )
+
+    assert result["status"] == "completed"
+    assert result["success"] is True
+    assert result["exact_batch_id"] == "batch-9802"
+    assert requests == [
+        ("GET", "/api/adas-map/status"),
+        ("POST", "/api/adas-map/open"),
+        ("GET", "/api/adas-map/status"),
+        ("POST", "/api/batches/from-ciq/exact"),
+        ("GET", "/api/adas-map/status"),
+        ("POST", "/api/batches/batch-9802/adas-map/process-one/9802"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_exact_batch_requires_authentication_before_any_mutation(
+    monkeypatch,
+):
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": True, "authenticated": False})
+        raise AssertionError(request.url.path)
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.adas_map(
+        FakeSettings(),
+        {"action": "create_exact_batch", "ro_numbers": ["9803"]},
+    )
+
+    assert result["status"] == "authentication_required"
+    assert result["success"] is False
+    assert result["executed"] is False
+    assert result["work_complete"] is False
+    assert requests == [("GET", "/api/adas-map/status")]
 
 
 @pytest.mark.asyncio
@@ -942,6 +1108,7 @@ async def test_process_one_copies_the_exact_created_batch_data_id(monkeypatch):
     assert processed["status"] == "completed"
     assert processed["data"]["batch_id"] == authoritative_batch_id
     assert requests == [
+        ("GET", "/api/adas-map/status"),
         ("POST", "/api/batches/from-ciq/exact"),
         ("GET", "/api/adas-map/status"),
         ("POST", "/api/batches/batch-resource-42/adas-map/process-one/9601"),
@@ -976,7 +1143,9 @@ async def test_create_exact_2xx_requires_exact_batch_and_ro_contract(
     else:
         payload["requested_ro_numbers"] = ["stale-ro"]
 
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": True, "authenticated": True})
         return httpx.Response(200, json=payload)
 
     _install_transport(monkeypatch, handler)
@@ -1286,6 +1455,8 @@ async def test_mutation_timeout_is_indeterminate_and_not_reported_as_success(mon
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": True, "authenticated": True})
         nonlocal calls
         calls += 1
         raise httpx.ReadTimeout("simulated timeout", request=request)
@@ -1311,6 +1482,8 @@ async def test_mutation_remote_5xx_is_indeterminate_and_never_retry_safe(monkeyp
     calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": True, "authenticated": True})
         nonlocal calls
         calls += 1
         return httpx.Response(503, json={"detail": "worker response was lost"})
@@ -1334,7 +1507,9 @@ async def test_mutation_remote_5xx_is_indeterminate_and_never_retry_safe(monkeyp
 
 @pytest.mark.asyncio
 async def test_mutating_invalid_json_2xx_propagates_commit_ambiguity(monkeypatch):
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": True, "authenticated": True})
         return httpx.Response(200, content=b"not-json")
 
     _install_transport(monkeypatch, handler)
@@ -1364,9 +1539,13 @@ async def test_read_invalid_json_2xx_remains_definitive_invalid_response(monkeyp
 
 @pytest.mark.asyncio
 async def test_mutating_oversized_2xx_propagates_commit_ambiguity(monkeypatch):
-    monkeypatch.setattr(scrapex, "MAX_RESPONSE_BYTES", 32)
+    # Large enough for the small authentication-status read, small enough
+    # that the mutating create response overflows it.
+    monkeypatch.setattr(scrapex, "MAX_RESPONSE_BYTES", 64)
 
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(200, json={"active": True, "authenticated": True})
         return httpx.Response(200, json={"id": "batch-big", "padding": "x" * 128})
 
     _install_transport(monkeypatch, handler)
@@ -1755,6 +1934,12 @@ async def test_registry_blocks_unbound_or_stale_batch_ids_before_handler() -> No
         return {"status": "sentinel"}
 
     async def map_handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        # The registry owns the reserved invocation-context field; strip it so
+        # the assertions below compare only the model-visible arguments.
+        arguments = dict(arguments)
+        context = arguments.pop(scrapex._INVOCATION_CONTEXT_KEY, None)
+        assert context is not None
+        assert context["tool_call_id"] == "create-call"
         calls.append(("scrapex_adas_map", arguments))
         return {"status": "sentinel"}
 
@@ -1824,6 +2009,7 @@ async def test_registry_blocks_unbound_or_stale_batch_ids_before_handler() -> No
         {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
         conversation_id=11,
         message_id=22,
+        tool_call_id="create-call",
     )
     assert calls == [
         (
@@ -1968,10 +2154,24 @@ async def test_loop_revokes_indeterminate_batch_before_later_sibling_call(
 
     assert client.round == 3
     assert read_calls == [{"action": "list_batches"}]
-    assert map_calls == [
+    # The registry injects its reserved invocation-context field; compare the
+    # model-visible arguments and check the context identity separately.
+    assert [
+        {
+            key: value
+            for key, value in call.items()
+            if key != scrapex._INVOCATION_CONTEXT_KEY
+        }
+        for call in map_calls
+    ] == [
         {"action": "start_batch", "batch_id": "batch-risk"},
         {"action": "start_batch", "batch_id": "batch-safe"},
     ]
+    for call in map_calls:
+        context = call.get(scrapex._INVOCATION_CONTEXT_KEY)
+        assert context is not None
+        assert context["conversation_id"] == conversation_id
+        assert context["message_id"] == message_id
     map_results = [
         event["result"]
         for event in events

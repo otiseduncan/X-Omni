@@ -73,10 +73,12 @@ def test_adas_profile_prompt_and_catalog_budget_is_reviewable_and_bounded() -> N
     # calibration_iq_ro `shop` parameter (short-RO-number resolution) grew
     # it again, and the anti-copy warnings on `repair_order_id`/`shop`
     # (never copy an identifier from the Active conversation subject block
-    # into a fresh call) grew it once more. Ceilings moved with them, not
+    # into a fresh call) grew it once more. The single-owner ScrapeX v3
+    # handoff descriptions and the scrapex_adas_map auth-before-batch
+    # guidance grew the catalog again. Ceilings moved with them, not
     # toward zero headroom.
-    assert metrics["advertised_tools"]["catalog_chars"] <= 45_500
-    assert metrics["advertised_tools"]["catalog_tokens"] <= 13_100
+    assert metrics["advertised_tools"]["catalog_chars"] <= 47_200
+    assert metrics["advertised_tools"]["catalog_tokens"] <= 13_600
     # camera_footage's system-prompt guidance grew slightly (range_narrowed
     # coverage-honesty rule, see camera_security.camera_footage_analyze);
     # these ceilings/floors moved with it, not toward zero headroom. The
@@ -193,8 +195,11 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     # WORKING_CONTEXT short-RO-number speaking rule moved it down once more,
     # and the new-subject-always-refetches WORKING_CONTEXT rule plus the
     # active-subject/tool-schema anti-copy warnings moved it down once more
-    # still.
-    assert metrics["remaining_normal_turn_tokens"] >= 13_600
+    # still. The scrapex_adas_map auth-before-batch guidance (sign-in is
+    # verified before any exact batch exists, and acquire_exact returns one
+    # authentication_required state instead of ad-hoc create/start/process/
+    # pause steps) moved it down again.
+    assert metrics["remaining_normal_turn_tokens"] >= 13_450
 
 
 def test_budget_metrics_match_actual_generated_system_prompt() -> None:

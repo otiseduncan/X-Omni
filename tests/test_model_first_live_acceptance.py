@@ -7496,6 +7496,9 @@ async def test_scrapex_preview_omitted_scope_defaults_to_active_only(
         }
 
     monkeypatch.setattr(scrapex, "_request", capture_request)
+    # Keep the read hermetic: without this, a developer machine with a real
+    # local ScrapeX checkout would trigger revision-aware native startup.
+    monkeypatch.setattr(scrapex, "_project_revision", lambda _project: None)
     omitted_scope = {
         "action": "preview_ciq_queue",
         "phases": ["6"],
@@ -7526,9 +7529,12 @@ async def test_scrapex_preview_omitted_scope_defaults_to_active_only(
 
 
 @pytest.mark.asyncio
-async def test_scrapex_preview_with_ro_number_cannot_replace_batch_discovery() -> None:
+async def test_scrapex_preview_with_ro_number_cannot_replace_batch_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from core.services import scrapex
 
+    monkeypatch.setattr(scrapex, "_project_revision", lambda _project: None)
     result = await scrapex.read(
         SimpleNamespace(),
         {
@@ -8972,6 +8978,7 @@ def test_scrapex_read_schemas_require_observed_verbatim_batch_ids() -> None:
     }
     assert set(acquisition_variants) == {
         "open_authentication",
+        "acquire_exact",
         "create_exact_batch",
         "create_phase_batch",
         "process_one",
@@ -9008,6 +9015,7 @@ def test_scrapex_initial_catalog_has_no_id_bound_fixture_path() -> None:
     }
     assert actions_for("scrapex_adas_map") == {
         "open_authentication",
+        "acquire_exact",
         "create_exact_batch",
         "create_phase_batch",
     }
@@ -9026,6 +9034,7 @@ def test_scrapex_initial_catalog_has_no_id_bound_fixture_path() -> None:
         "list_batches",
         "preview_ciq_queue",
         "open_authentication",
+        "acquire_exact",
         "create_exact_batch",
         "create_phase_batch",
     }
