@@ -481,3 +481,45 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
         "active_worker",
         "current_time",
     }
+
+
+def test_research_attach_cannot_request_a_file_and_a_folder_at_once() -> None:
+    """destination_path and destination_folder are mutually exclusive.
+
+    Sending both is rejected downstream, which costs a whole operator turn
+    and leaves the RO reporting an unverified outcome. Keep it impossible to
+    express rather than only caught after dispatch.
+    """
+    from jsonschema import Draft202012Validator
+
+    from core.tools.registry import TOOL_SCHEMAS
+
+    schema = TOOL_SCHEMAS["calibration_iq_operator"]["parameters"]
+    Draft202012Validator.check_schema(schema)
+
+    matches = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if (
+                isinstance(properties, dict)
+                and "destination_path" in properties
+                and "destination_folder" in properties
+            ):
+                matches.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(schema)
+    assert len(matches) == 1
+    validator = Draft202012Validator(matches[0])
+
+    assert validator.is_valid({"query": "camera", "destination_path": "a/b.pdf"})
+    assert validator.is_valid({"query": "camera", "destination_folder": "a"})
+    assert not validator.is_valid(
+        {"query": "camera", "destination_path": "a/b.pdf", "destination_folder": "a"}
+    )

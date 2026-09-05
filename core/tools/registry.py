@@ -2606,6 +2606,15 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                         "summary": {"type": "string"},
                                         "reason": {"type": "string"},
                                     },
+                                    # One exact file or one folder, never both: sending
+                                    # both is rejected downstream and wastes an operator
+                                    # turn, so make it unrepresentable in the call.
+                                    "not": {
+                                        "required": [
+                                            "destination_path",
+                                            "destination_folder",
+                                        ]
+                                    },
                                 },
                             ),
                             _calibration_iq_action_branch(
