@@ -343,3 +343,34 @@ async def test_malformed_no_tool_review_fails_closed_instead_of_leaking_draft(
     assert final_text == NO_TOOL_SELF_CHECK_FALLBACK
     assert "Unsupported current-state claim" not in final_text
     store.close()
+
+
+def test_no_tool_review_forbids_accepting_a_draft_that_reports_work_as_done() -> None:
+    """A zero-tool turn cannot have performed anything.
+
+    Seen live on RO 2400911779: with no active subject the review was not
+    forced to pick a tool, and the model accepted its own draft claiming the
+    ADAS Map had been acquired and attached, inventing three calibration
+    requirements. ScrapeX had no batch, no PDF was written, and Calibration IQ
+    still read research_required with zero documents. The review instruction
+    has to state that a draft reporting completed work is unsupported when
+    nothing executed, so accepting it is never the right call.
+    """
+    message = NO_TOOL_SELF_CHECK_MESSAGE.casefold()
+
+    assert "nothing has executed in this turn" in message
+    # The claim classes that made the fabricated answer read as authoritative.
+    for claim in ("acquired", "attached", "reconciled", "complete"):
+        assert claim in message
+    # Findings credited to work that never ran are unsupported too, not just
+    # the completion sentence itself.
+    assert "unsupported" in message
+    # It must send the model to the tool rather than to the accept marker.
+    accept_index = message.index(NO_TOOL_SELF_CHECK_ACCEPT.casefold())
+    executed_index = message.index("nothing has executed in this turn")
+    assert executed_index < accept_index
+
+    # The forced-review variant already refuses the draft outright, so it must
+    # keep saying so rather than deferring to the model's own judgement.
+    required = NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE.casefold()
+    assert "do not accept or repeat the withheld draft" in required
