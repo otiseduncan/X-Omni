@@ -473,6 +473,168 @@ def test_adas_map_schema_uses_complete_action_specific_branches() -> None:
 
 
 @pytest.mark.asyncio
+async def test_acquire_exact_composite_saves_attaches_and_returns_chat_document(
+    tmp_path, monkeypatch
+):
+    ro_number = "2400911578"
+    pdf = tmp_path / "ADAS Map" / ro_number / f"{ro_number} ADAS Map.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4\n" + (b"0" * 512))
+
+    async def base_map(_settings, args):
+        assert args == {
+            "action": "acquire_exact",
+            "ro_number": ro_number,
+            "source_scope": "active",
+        }
+        return {
+            "service": "ScrapeX",
+            "action": "acquire_exact",
+            "status": "completed",
+            "success": True,
+            "executed": True,
+            "verified": True,
+            "work_complete": True,
+            "data": {"readiness": {"ready": True}},
+        }
+
+    class Adas:
+        def page_count(self, path):
+            assert path == pdf
+            return 3
+
+    from core.services import calibration_iq as ciq
+
+    async def ro_read(_settings, args):
+        assert args == {"ro_number": ro_number}
+        return {
+            "status": "verified",
+            "repair_order": {"id": "ro-internal-1", "RO": ro_number},
+        }
+
+    captured = {}
+
+    async def operator_execute(_settings, adas, args, **_kwargs):
+        captured["adas"] = adas
+        captured["args"] = args
+        source_uri = (
+            "adas-si:///ADAS%20Map/2400911578/"
+            "2400911578%20ADAS%20Map.pdf"
+        )
+        return {
+            "status": "success",
+            "success": True,
+            "verified": True,
+            "final_snapshots": {
+                "ro-internal-1": {
+                    "status": "verified",
+                    "snapshot": {
+                        "documents": [
+                            {
+                                "id": "doc-1",
+                                "title": "2400911578 ADAS Map",
+                                "source_name": "2400911578 ADAS Map.pdf",
+                                "source_uri": source_uri,
+                                "download_url": (
+                                    "/api/calibration-iq/documents/"
+                                    "doc-1/download"
+                                ),
+                            }
+                        ]
+                    },
+                }
+            },
+        }
+
+    monkeypatch.setattr(scrapex, "adas_map", base_map)
+    monkeypatch.setattr(ciq, "get_repair_order", ro_read)
+    monkeypatch.setattr(ciq, "operator_execute", operator_execute)
+
+    adas = Adas()
+    settings = SimpleNamespace(adas_si_root=tmp_path)
+    result = await scrapex.adas_map_with_ciq_attachment(
+        settings,
+        adas,
+        {
+            "action": "acquire_exact",
+            "ro_number": ro_number,
+            "source_scope": "active",
+            scrapex._INVOCATION_CONTEXT_KEY: {
+                "conversation_id": 12,
+                "message_id": 34,
+                "tool_call_id": "map-call",
+                "user_id": "owner",
+                "role": "owner",
+            },
+        },
+    )
+
+    assert result["status"] == "completed"
+    assert result["success"] is True
+    assert result["work_complete"] is True
+    assert result["local_report"]["verified"] is True
+    assert result["chat_document"]["pages_total"] == 3
+    assert result["ciq_attachment"]["attached"] is True
+    assert result["ciq_attachment"]["document_id"] == "doc-1"
+    action = captured["args"]["actions"][0]
+    assert action["operation"] == "research_ro"
+    assert action["repair_order_id"] == "ro-internal-1"
+    assert action["arguments"]["queries"] == [
+        {"query": f"{ro_number} ADAS Map", "label": "ADAS Map"}
+    ]
+    assert action["arguments"]["complete_research"] is False
+
+
+@pytest.mark.asyncio
+async def test_acquire_exact_composite_refuses_ready_when_pdf_is_not_on_disk(
+    tmp_path, monkeypatch
+):
+    ro_number = "2400911578"
+
+    async def base_map(_settings, _args):
+        return {
+            "service": "ScrapeX",
+            "action": "acquire_exact",
+            "status": "completed",
+            "success": True,
+            "executed": True,
+            "verified": True,
+            "work_complete": True,
+            "data": {},
+        }
+
+    from core.services import calibration_iq as ciq
+
+    async def should_not_resolve(*_args, **_kwargs):
+        raise AssertionError(
+            "CIQ attachment must not run without the canonical PDF"
+        )
+
+    monkeypatch.setattr(scrapex, "adas_map", base_map)
+    monkeypatch.setattr(ciq, "get_repair_order", should_not_resolve)
+
+    result = await scrapex.adas_map_with_ciq_attachment(
+        SimpleNamespace(adas_si_root=tmp_path),
+        SimpleNamespace(),
+        {
+            "action": "acquire_exact",
+            "ro_number": ro_number,
+            scrapex._INVOCATION_CONTEXT_KEY: {
+                "conversation_id": 12,
+                "message_id": 34,
+                "tool_call_id": "map-call",
+            },
+        },
+    )
+
+    assert result["status"] == "attachment_failed"
+    assert result["success"] is False
+    assert result["verified"] is False
+    assert result["work_complete"] is False
+    assert result["local_report"]["verified"] is False
+
+
+@pytest.mark.asyncio
 async def test_start_batch_stops_truthfully_when_authentication_is_required(monkeypatch):
     requests: list[tuple[str, str]] = []
 
