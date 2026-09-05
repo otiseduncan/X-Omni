@@ -202,7 +202,7 @@ def _scrapex_result() -> dict:
                 "adas_map_state": "adas_map_complete",
             },
             "provenance": {
-                "contract_version": 1,
+                "contract_version": 3,
                 "state": "adas_map_complete",
                 "requirements_proven": True,
                 "inspection_id": "inspection-9",
