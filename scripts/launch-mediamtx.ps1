@@ -21,6 +21,7 @@ $venvPython = Join-Path $root '.venv\Scripts\python.exe'
 $syncScript = Join-Path $root 'scripts\sync-mediamtx-config.py'
 $logDirectory = Join-Path $root 'logs\launcher'
 $controlOrigin = 'http://127.0.0.1:9997'
+$playerOrigin = 'http://127.0.0.1:8889'
 $mutex = New-Object System.Threading.Mutex($false, 'Local\XOmniMediaMTXLauncher')
 $hasMutex = $false
 
@@ -150,7 +151,12 @@ try {
             $apiUp = $true
             if (Test-MediaMTXPathsReady -ExpectedPaths $expectedPaths) {
                 Write-LauncherLog "MediaMTX ready; $($expectedPaths.Count) configured path(s) online: $($expectedPaths -join ', ')."
-                if (-not $NoOpen) { Start-Process "$controlOrigin/v3/paths/list" }
+                if (-not $NoOpen -and $expectedPaths.Count -gt 0) {
+                    # MediaMTX serves an actual interactive WebRTC viewer page
+                    # at <path>/ on its WebRTC port -- not the raw JSON at
+                    # /v3/paths/list, which is an API response, not a player.
+                    Start-Process "$playerOrigin/$($expectedPaths[0])/"
+                }
                 return
             }
         }
