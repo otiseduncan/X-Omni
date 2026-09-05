@@ -88,7 +88,10 @@ async def test_full_workflow_emits_three_lane_source_ledger(monkeypatch):
                 ],
             }
 
-    async def fake_alldata(_browser, query):
+    # The legacy generic search_alldata fallback is gone; licensed ALLDATA
+    # research now runs only through the Navigator seam below.
+    async def fake_alldata(_browser, query, *, capture=False):
+        assert capture is False
         return {
             "attempted": True,
             "searched": True,
@@ -111,7 +114,9 @@ async def test_full_workflow_emits_three_lane_source_ledger(monkeypatch):
             "result_count": 1,
         }
 
-    monkeypatch.setattr(research_workflow, "search_alldata", fake_alldata)
+    monkeypatch.setattr(
+        research_workflow, "_search_alldata_best_available", fake_alldata
+    )
     monkeypatch.setattr(research_workflow, "search_public_oem", fake_public)
     result = await research_workflow.full_research(
         {"query": "Research whether Toyota permits a recycled blind spot monitor module.", "preserve": False},
@@ -137,7 +142,7 @@ async def test_ledger_surfaces_verification_reason_when_a_result_was_found_but_n
         def search(self, args):  # noqa: ARG002
             return {"status": "no_result", "results": []}
 
-    async def fake_alldata(_browser, _query):
+    async def fake_alldata(_browser, _query, *, capture=False):
         return {
             "attempted": True,
             "searched": True,
@@ -150,7 +155,9 @@ async def test_ledger_surfaces_verification_reason_when_a_result_was_found_but_n
     async def fake_public(_query, _make, **_kwargs):
         return {"searched": False, "verified": False, "sources": [], "read_results": [], "result_count": 0}
 
-    monkeypatch.setattr(research_workflow, "search_alldata", fake_alldata)
+    monkeypatch.setattr(
+        research_workflow, "_search_alldata_best_available", fake_alldata
+    )
     monkeypatch.setattr(research_workflow, "search_public_oem", fake_public)
     result = await research_workflow.full_research(
         {"query": "2019 Ford F-150 360 camera calibration procedure", "preserve": False},

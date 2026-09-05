@@ -690,7 +690,10 @@ def install() -> None:
     with _INSTALL_LOCK:
         if _INSTALLED:
             return
-        previous = research_workflow.search_alldata
+        # The legacy generic search_alldata fallback was removed from
+        # research_workflow; the attribute now exists only after installers
+        # publish the vehicle-first implementation, so read it tolerantly.
+        previous = getattr(research_workflow, "search_alldata", None)
         if not getattr(previous, "_xomni_alldata_vehicle_first", False):
             search_alldata_vehicle_first._xomni_alldata_vehicle_first = True  # type: ignore[attr-defined]
             research_workflow.search_alldata = search_alldata_vehicle_first

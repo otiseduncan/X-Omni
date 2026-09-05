@@ -56,6 +56,22 @@ def requested_make(query: str, adas_mod: Any) -> Optional[str]:
     return None
 
 
+def _compact_adas(result: dict[str, Any], make: Optional[str]) -> dict[str, Any]:
+    hits: list[dict[str, Any]] = []
+    for item in (result.get("results") or [])[:6]:
+        if not isinstance(item, dict):
+            continue
+        hits.append({
+            "title": item.get("title") or item.get("source"),
+            "page": item.get("page"),
+            "excerpt": str(item.get("excerpt") or "")[:2200],
+            "url": item.get("url"),
+            "vehicle": item.get("vehicle") if isinstance(item.get("vehicle"), dict) else {},
+            "text_extraction": item.get("text_extraction"),
+        })
+    return {"status": result.get("status"), "requested_make": make, "result_count": len(hits), "hits": hits}
+
+
 def _source_score(source: dict[str, Any], make: Optional[str]) -> int:
     url = str(source.get("url") or "")
     host = (urlparse(url).hostname or "").casefold()
