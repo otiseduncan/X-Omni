@@ -36,6 +36,13 @@ log = logging.getLogger("xomni.research_navigator_agent")
 
 MAX_MODEL_TURNS = 18
 _NAV_ACTIONS = ("observe", "click", "fill", "press", "back", "open", "extract", "done")
+# Bounded at the element level, not by an outer character truncation --
+# confirmed live against real ALLDATA search results (500+ entries): a flat
+# json.dumps(...)[:N] cap cut the elements array off mid-object, so the
+# model picked a ref from an incomplete list and selected the wrong
+# vehicle. Capping the list itself keeps the fed-back JSON always complete.
+MAX_ELEMENTS_FOR_MODEL = 120
+_TOOL_RESULT_CHAR_BACKSTOP = 24_000
 
 NAVIGATOR_AGENT_TOOL_SCHEMA = {
     "type": "function",
@@ -147,14 +154,25 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
     data = navigator_result.get("data") if isinstance(navigator_result, dict) else None
     if not isinstance(data, dict):
         return {"error": (navigator_result or {}).get("error") if isinstance(navigator_result, dict) else "no_data"}
-    return {
+    elements = data.get("elements")
+    elements = elements[:MAX_ELEMENTS_FOR_MODEL] if isinstance(elements, list) else elements
+    truncated = isinstance(data.get("elements"), list) and len(data["elements"]) > MAX_ELEMENTS_FOR_MODEL
+    summary: dict[str, Any] = {
         "url": data.get("url"),
         "title": data.get("title"),
-        "elements": data.get("elements"),
+        "elements": elements,
         "loop_warning": data.get("loop_warning"),
         "backtrack_available": data.get("backtrack_available"),
         "repeated_action_warning": data.get("repeated_action_warning"),
     }
+    if truncated:
+        summary["elements_truncated"] = (
+            f"Only the first {MAX_ELEMENTS_FOR_MODEL} of "
+            f"{len(data['elements'])} elements are shown. If what you need "
+            "isn't here, narrow the search (e.g. add the trim) rather than "
+            "guessing a ref that isn't in this list."
+        )
+    return summary
 
 
 async def run_navigator_search(
@@ -210,7 +228,7 @@ async def run_navigator_search(
             "role": "user",
             "content": (
                 f"Find the ALLDATA procedure for {_target_label(target)}: {topic}.\n\n"
-                f"Initial observation: {json.dumps(_observation_summary(initial_observation), default=str)[:4_000]}"
+                f"Initial observation: {json.dumps(_observation_summary(initial_observation), default=str)[:_TOOL_RESULT_CHAR_BACKSTOP]}"
             ),
         },
     ]
@@ -318,7 +336,7 @@ async def run_navigator_search(
             messages.append({
                 "role": "tool",
                 "tool_call_id": wire_call["id"],
-                "content": json.dumps(result, default=str)[:6_000],
+                "content": json.dumps(result, default=str)[:_TOOL_RESULT_CHAR_BACKSTOP],
             })
 
         if model_called_done:
