@@ -76,9 +76,10 @@ async def test_successful_start_verifies_via_fresh_health(settings, monkeypatch)
     health_calls = {"n": 0}
 
     async def fake_health(_settings):
+        # start_native always delegates to the revision-aware launcher, so the
+        # only health read is the post-start verification.
         health_calls["n"] += 1
-        # First call (pre-check): offline. Second call (post-start verify): available.
-        return _health("offline") if health_calls["n"] == 1 else _health("available")
+        return _health("available")
 
     def fake_run(_project_path):
         return subprocess.CompletedProcess(args=[], returncode=0, stdout="healthy\n", stderr="")
@@ -92,7 +93,7 @@ async def test_successful_start_verifies_via_fresh_health(settings, monkeypatch)
     assert result["executed"] is True
     assert result["verified"] is True
     assert result["exit_code"] == 0
-    assert health_calls["n"] == 2
+    assert health_calls["n"] == 1
 
 
 @pytest.mark.asyncio
@@ -120,11 +121,8 @@ async def test_nonzero_exit_and_still_unhealthy_is_reported_as_failed(settings, 
 async def test_a_nonzero_exit_that_actually_recovers_is_not_reported_as_failed(settings, monkeypatch):
     """The script's exit code is never trusted alone -- only the fresh health
     recheck decides success, in either direction."""
-    health_calls = {"n": 0}
-
     async def fake_health(_settings):
-        health_calls["n"] += 1
-        return _health("offline") if health_calls["n"] == 1 else _health("available")
+        return _health("available")
 
     def fake_run(_project_path):
         return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="warning\n")

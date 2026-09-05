@@ -724,7 +724,9 @@ async def test_week_readiness_execute_missing_runs_full_active_evidence_flow(mon
         }
 
     async def acquire_map(_settings, current_snapshot):
-        assert current_snapshot is snapshot
+        # _week_readiness defensively copies the loaded snapshot, so compare
+        # the authoritative content rather than object identity.
+        assert current_snapshot == snapshot
         return {
             "status": "completed",
             "success": True,
@@ -733,7 +735,18 @@ async def test_week_readiness_execute_missing_runs_full_active_evidence_flow(mon
         }
 
     async def reconcile(_settings, _adas, current, _map_info, _context):
-        return current, [], None
+        # The real reconciler leaves CIQ holding exactly the ADAS Map's
+        # authoritative requirement set; readiness then proves that set is
+        # present, so the returned snapshot must reflect it.
+        reconciled = dict(current)
+        reconciled["calibrations"] = [
+            {
+                "calibration_type": "Front camera calibration",
+                "determination": "REQUIRED",
+                "method": "STATIC",
+            }
+        ]
+        return reconciled, [], None
 
     coverage_calls = 0
 
@@ -748,7 +761,9 @@ async def test_week_readiness_execute_missing_runs_full_active_evidence_flow(mon
         return [{"calibration": "Front camera calibration", "state": state}]
 
     async def acquire_si(_settings, _adas, current_snapshot, coverage):
-        assert current_snapshot is snapshot
+        # SI acquisition runs after reconciliation, so it sees the reconciled
+        # snapshot for the same authoritative RO rather than the loaded one.
+        assert current_snapshot["repair_order"] == snapshot["repair_order"]
         assert coverage[0]["state"] == prep.adas_artifact_catalog.MISSING
         return [
             {

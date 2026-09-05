@@ -65,6 +65,9 @@ async def test_already_healthy_short_circuits_without_spawning(settings, monkeyp
         return httpx.Response(200, json={"ok": True}, request=request)
 
     _install_transport(monkeypatch, handler)
+    # The tmp project is not a git checkout; revision probing itself would
+    # otherwise reach subprocess and trip the no-spawn trap below.
+    monkeypatch.setattr(scrapex, "_project_revision", lambda _project: None)
 
     def fake_popen(*args, **kwargs):
         raise AssertionError("should not spawn ScrapeX when already healthy")
@@ -136,6 +139,7 @@ async def test_becomes_healthy_after_spawning(settings, monkeypatch):
         return httpx.Response(200, json={"ok": True}, request=request)
 
     _install_transport(monkeypatch, handler)
+    monkeypatch.setattr(scrapex, "_project_revision", lambda _project: None)
 
     def fake_popen(cmd, *, cwd, stdout, stderr, creationflags):
         state["up"] = True  # the "server" is now serving
@@ -156,6 +160,7 @@ async def test_process_exiting_early_fails_fast_with_log_tail(settings, monkeypa
         raise httpx.ConnectError("Connection refused", request=request)
 
     _install_transport(monkeypatch, handler)
+    monkeypatch.setattr(scrapex, "_project_revision", lambda _project: None)
 
     def fake_popen(cmd, *, cwd, stdout, stderr, creationflags):
         stdout.write("Run .\\scripts\\install.ps1 first.\n")
@@ -178,6 +183,7 @@ async def test_polling_timeout_fails_without_a_process_exit(settings, monkeypatc
         raise httpx.ConnectError("Connection refused", request=request)
 
     _install_transport(monkeypatch, handler)
+    monkeypatch.setattr(scrapex, "_project_revision", lambda _project: None)
 
     def fake_popen(cmd, *, cwd, stdout, stderr, creationflags):
         return FakeProcess(returncode=None)  # keeps "running" but never answers
@@ -206,6 +212,8 @@ async def test_missing_launcher_script_fails_without_spawning(tmp_path: Path, mo
         scrapex_project_path=empty_project,
         root=tmp_path / "x-omni-root",
     )
+
+    monkeypatch.setattr(scrapex, "_project_revision", lambda _project: None)
 
     def fake_popen(*args, **kwargs):
         raise AssertionError("should not spawn a launcher that does not exist")
