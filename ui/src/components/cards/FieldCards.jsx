@@ -460,6 +460,27 @@ export function CalibrationSummaryCard({ data }) {
 
 /* ---------------- Calibration IQ: one repair order ---------------- */
 
+function calibrationRoDocuments(data) {
+  const raw = data?.raw || {};
+  const candidates = [
+    ...(Array.isArray(raw?.documents) ? raw.documents : []),
+    ...(Array.isArray(raw?.research?.documents) ? raw.research.documents : []),
+    ...(Array.isArray(raw?.research_case?.documents) ? raw.research_case.documents : []),
+  ];
+  const seen = new Set();
+  return candidates.filter((doc) => {
+    if (!doc || doc.archived_at) return false;
+    const key = String(doc.id || doc.document_id || doc.source_uri || doc.source_name || "");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function ciqDocumentDownloadUrl(doc) {
+  const value = String(doc?.download_url || "");
+  return value.startsWith("/api/calibration-iq/documents/") ? value : null;
+}
 export function CalibrationRoCard({ data }) {
   const ro = data?.repair_order;
   if (!ro) {
@@ -471,6 +492,7 @@ export function CalibrationRoCard({ data }) {
   }
   const blockers = Array.isArray(ro.blockers) ? ro.blockers : [];
   const reqs = Array.isArray(ro.requirements) ? ro.requirements : [];
+  const documents = calibrationRoDocuments(data);
   const humanize = (v) =>
     String(v || "").toLowerCase().replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
   const label = (x) => {
@@ -521,6 +543,28 @@ export function CalibrationRoCard({ data }) {
         </>
       )}
 
+      {documents.length > 0 && (
+        <>
+          <p className="rail-sub" style={{ marginTop: 10 }}>Attached documents</p>
+          {documents.map((doc, i) => {
+            const href = ciqDocumentDownloadUrl(doc);
+            const title = doc.title || doc.source_name || ("Document " + (i + 1));
+            return (
+              <div className="field-row" key={doc.id || doc.document_id || doc.source_uri || i}>
+                <FileText size={13} />
+                {href ? (
+                  <a href={href} target="_blank" rel="noreferrer" className="field-link">
+                    {title}
+                  </a>
+                ) : (
+                  <span>{title}</span>
+                )}
+                {doc.semantic_type && <span className="ro-pill">{humanize(doc.semantic_type)}</span>}
+              </div>
+            );
+          })}
+        </>
+      )}
       {ro.notes && <p className="card-note" style={{ marginTop: 10 }}>{ro.notes}</p>}
     </Card>
   );
