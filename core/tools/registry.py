@@ -57,6 +57,7 @@ VALID_POLICY_TIERS = frozenset({
 })
 
 _CALIBRATION_IQ_CONTEXT_KEY = "__xomni_invocation"
+_SCRAPEX_CONTEXT_KEY = "__xomni_invocation"
 _CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY = "__xomni_work_prep_context"
 _CALIBRATION_IQ_APPROVAL_BINDING_KEY = "__xomni_write_binding"
 _AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY = "__xomni_actor"
@@ -4091,6 +4092,15 @@ class Registry:
         if name == "automotive_knowledge_capture":
             handler_args = dict(args)
             handler_args[_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY] = user_id or "local-dev"
+        if name == "scrapex_adas_map":
+            handler_args = dict(args)
+            handler_args[_SCRAPEX_CONTEXT_KEY] = self._calibration_iq_invocation_context(
+                conversation_id=conversation_id,
+                tool_call_id=tool_call_id,
+                message_id=message_id,
+                user_id=user_id,
+                role=role,
+            )
         if name in {"calibration_iq_operator", "calibration_iq_destructive"}:
             handler_args = dict(args)
             # Overwrite (never merge) the reserved field. The model cannot

@@ -170,7 +170,6 @@ def build_app(settings: Settings) -> FastAPI:
     registry.register("scrapex_status", lambda a: scrapex_svc.status(settings, a))
     registry.register("scrapex_start_native", lambda a: scrapex_svc.start_native(settings))
     registry.register("scrapex_read", lambda a: scrapex_svc.read(settings, a))
-    registry.register("scrapex_adas_map", lambda a: scrapex_svc.adas_map(settings, a))
     registry.register(
         "website_preview_generate",
         website_svc.make_website_preview(client, store),
@@ -246,6 +245,11 @@ def build_app(settings: Settings) -> FastAPI:
     registry.register("adas_si_file_write", lambda a: adas.file_write(a))
     registry.register("adas_si_record_write", lambda a: adas.record_write(a))
     registry.register("adas_si_record_modify", lambda a: adas.record_modify(a))
+
+    registry.register(
+        "scrapex_adas_map",
+        lambda a: scrapex_svc.adas_map_with_ciq_attachment(settings, adas, a),
+    )
 
     registry.register("automotive_knowledge_search", automotive_knowledge.search)
     registry.register("automotive_knowledge_read", automotive_knowledge.read)
