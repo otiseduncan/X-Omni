@@ -135,11 +135,9 @@ class Settings:
     scrapex_project_path: Path = Path(r"X:\ScrapeX")
     automotive_knowledge_db: Path | None = None
     tool_profile: str = "adas_operator"
-    # Off by default: the ScrapeX Navigator replacement for the in-process
-    # 7-turn ALLDATA browser loop is still staged behind this flag until it
-    # has proven itself against a real ALLDATA acceptance case. See the
-    # ScrapeX Navigator architecture plan.
-    alldata_navigator_enabled: bool = False
+    # ScrapeX Navigator is the production ALLDATA path. The provider browser
+    # remains isolated from the ADAS Map work-profile session.
+    alldata_navigator_enabled: bool = True
 
     # Web Push
     vapid_public_key: str = ""
@@ -246,7 +244,7 @@ class Settings:
                 os.getenv("XOMNI_SCRAPEX_PROJECT_PATH", r"X:\ScrapeX")
             ),
             alldata_navigator_enabled=os.getenv(
-                "XOMNI_ALLDATA_NAVIGATOR_ENABLED", "0"
+                "XOMNI_ALLDATA_NAVIGATOR_ENABLED", "1"
             ).strip().casefold() in {"1", "true", "yes", "on"},
             automotive_knowledge_db=Path(
                 os.getenv(

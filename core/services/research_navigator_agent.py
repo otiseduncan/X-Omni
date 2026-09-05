@@ -29,11 +29,34 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from contextvars import ContextVar
 from typing import Any, Optional
 
 from . import scrapex as scrapex_svc
 
 log = logging.getLogger("xomni.research_navigator_agent")
+
+# The active X model is bound only for the duration of one Registry handler
+# invocation. This lets a composite operator capability delegate a bounded
+# browser-navigation subtask back to the same model without global state,
+# keyword routing, or a second model process.
+_ACTIVE_MODEL_CLIENT: ContextVar[Any | None] = ContextVar(
+    "xomni_active_navigator_model_client",
+    default=None,
+)
+
+
+def bind_model_client(client: Any):
+    return _ACTIVE_MODEL_CLIENT.set(client)
+
+
+def reset_model_client(token: Any) -> None:
+    _ACTIVE_MODEL_CLIENT.reset(token)
+
+
+def current_model_client() -> Any | None:
+    return _ACTIVE_MODEL_CLIENT.get()
+
 
 MAX_MODEL_TURNS = 40
 _NAV_ACTIONS = ("observe", "click", "fill", "press", "back", "open", "extract", "done")
@@ -427,13 +450,34 @@ async def run_navigator_search(
     proof = verification.get("data") if isinstance(verification.get("data"), dict) else {}
     verified = bool(proof.get("verified"))
 
-    evidence_result = await scrapex_svc.navigator(settings, {"action": "get_evidence", "task_id": task_id})
-    evidence = evidence_result.get("data") if isinstance(evidence_result.get("data"), dict) else {}
+    evidence_result = await scrapex_svc.navigator(
+        settings, {"action": "get_evidence", "task_id": task_id}
+    )
+    evidence = (
+        evidence_result.get("data")
+        if isinstance(evidence_result.get("data"), dict)
+        else {}
+    )
+
+    capture_result: dict[str, Any] | None = None
+    captured = False
+    if verified:
+        # ScrapeX owns the provider browser and therefore owns the final
+        # verified-page capture. X never re-opens the page in another profile
+        # and never reconstructs the path from model narration.
+        capture_result = await scrapex_svc.navigator_capture(settings, task_id)
+        captured = bool(
+            capture_result.get("success") is True
+            and capture_result.get("verified") is True
+            and capture_result.get("work_complete") is True
+        )
 
     return {
         "attempted": True,
         "searched": len(trace) > 1,
         "verified": verified,
+        "captured": captured,
+        "capture": capture_result,
         "verification_reason": proof.get("reason"),
         "verification": proof,
         "task_id": task_id,

@@ -2538,26 +2538,23 @@ def _row_matches_signals(row: dict[str, Any], signals: list[str]) -> bool:
 
 
 async def _current_alldata_signals(settings: Any, adas: Any) -> tuple[bool, list[str]]:
-    """Return (authenticated_and_ready, bounded vehicle-ish text signals).
+    """Return the selected-vehicle signals from ScrapeX's ALLDATA profile.
 
-    Behind Settings.alldata_navigator_enabled, this reads through ScrapeX's
-    Navigator session instead of X Omni's own in-process ALLDATA browser --
-    a pure call-site swap; the signal-matching logic downstream is
-    unchanged either way. Off by default: the live technician's actual
-    authenticated ALLDATA session lives in the in-process browser until the
-    Navigator path has been proven end-to-end and the flag is flipped.
+    ADAS Map uses the managed work-profile browser; ALLDATA uses ScrapeX
+    Navigator's separate persistent provider profile. Work prep never falls
+    back to X Omni's retired in-process ALLDATA browser.
     """
-    if getattr(settings, "alldata_navigator_enabled", False):
-        page_signals = await scrapex_svc.navigator_current_page_signals(settings, "alldata")
-        data = page_signals.get("data") if isinstance(page_signals.get("data"), dict) else {}
-        if not (page_signals.get("success") and data.get("authenticated")):
-            return False, []
-        return True, list(data.get("signals") or [])
-    browser = research_operator.get_browser(Path(settings.root), adas=adas)
-    state = await browser.start(auto_login=False)
-    if not state.get("authenticated") or browser._page is None:  # noqa: SLF001
+    page_signals = await scrapex_svc.navigator_current_page_signals(
+        settings, "alldata"
+    )
+    data = (
+        page_signals.get("data")
+        if isinstance(page_signals.get("data"), dict)
+        else {}
+    )
+    if not (page_signals.get("success") and data.get("authenticated")):
         return False, []
-    return True, await _bounded_selected_vehicle_signals(browser._page)  # noqa: SLF001
+    return True, list(data.get("signals") or [])
 
 
 async def resolve_selected_alldata_to_ciq(settings: Any, adas: Any) -> dict[str, Any]:
@@ -3111,9 +3108,11 @@ def install() -> None:
                     "lists, saved one-RO requirements, and live ADAS Map requirement or "
                     "ADAS SI procedure audits. CIQ is the work queue; ADAS Map governs "
                     "calibration requirements; ADAS SI supplies procedure coverage. "
-                    "Verified gaps may add or reactivate CIQ calibrations. queue_list "
-                    "reads the saved conversation queue; statuses filters exact "
-                    "lifecycle rows."
+                    "Verified gaps may add or reactivate CIQ calibrations. When the "
+                    "user asks to actually prepare/do the missing work rather than merely "
+                    "audit it, set execute_missing=true so X acquires missing ADAS Map and "
+                    "SI evidence through their isolated ScrapeX provider sessions. queue_list "
+                    "reads the saved conversation queue; statuses filters exact lifecycle rows."
                 ),
                 "parameters": {
                     "type": "object",
@@ -3137,6 +3136,13 @@ def install() -> None:
                             ),
                         },
                         "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
+                        "execute_missing": {
+                            "type": "boolean",
+                            "description": (
+                                "For week_readiness: true when the user asked X to prepare/"
+                                "acquire the missing work now; false/omit for an audit/status check."
+                            ),
+                        },
                         "repair_order_id": {"type": "string"},
                         "phase": {"type": "string"},
                         "shop": {"type": "string"},

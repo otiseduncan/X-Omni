@@ -2294,17 +2294,25 @@ class Orchestrator:
                 return
 
         try:
-            result = await self.registry.invoke(
-                name,
-                args,
-                message_id=(approval_context or {}).get("message_id"),
-                conversation_id=conversation_id,
-                tool_call_id=call_id,
-                user_id=(approval_context or {}).get("user_id"),
-                role=(approval_context or {}).get("role"),
-                calibration_iq_evidence=calibration_iq_evidence,
-                scrapex_evidence=scrapex_evidence,
+            from ..services import research_navigator_agent
+
+            navigator_model_token = research_navigator_agent.bind_model_client(
+                self.client
             )
+            try:
+                result = await self.registry.invoke(
+                    name,
+                    args,
+                    message_id=(approval_context or {}).get("message_id"),
+                    conversation_id=conversation_id,
+                    tool_call_id=call_id,
+                    user_id=(approval_context or {}).get("user_id"),
+                    role=(approval_context or {}).get("role"),
+                    calibration_iq_evidence=calibration_iq_evidence,
+                    scrapex_evidence=scrapex_evidence,
+                )
+            finally:
+                research_navigator_agent.reset_model_client(navigator_model_token)
         except NeedsApproval as pending:
             context = approval_context or {}
             if not all(

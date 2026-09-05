@@ -58,6 +58,7 @@ READ_ACTIONS = frozenset(
 ADAS_MAP_ACTIONS = frozenset(
     {
         "open_authentication",
+        "acquire_exact",
         "create_exact_batch",
         "create_phase_batch",
         "process_one",
@@ -217,8 +218,11 @@ SCRAPEX_READ_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
     "description": (
-        "Run bounded ScrapeX ADAS Map actions. process_one requires an observed exact "
-        "batch_id. After create_exact_batch or create_phase_batch, copy "
+        "Run bounded ScrapeX ADAS Map actions. For one exact RO that the user wants "
+        "acquired now, prefer acquire_exact: it starts ScrapeX if needed, creates the "
+        "exact one-RO batch, processes that RO synchronously, and returns the terminal "
+        "result instead of merely reporting a running batch. process_one requires an "
+        "observed exact batch_id. After create_exact_batch or create_phase_batch, copy "
         "result.data.id exactly; never copy evidence_id. open_authentication is a "
         "parameterless browser-opening human/provider handoff used after status reports "
         "authentication_required or when the user explicitly requests provider setup. "
@@ -238,6 +242,26 @@ SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
                     },
                 },
                 "required": ["action"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "acquire_exact",
+                        "description": (
+                            "Acquire one exact RO now and return its terminal ADAS Map "
+                            "result. Use this for a single-RO request instead of start_batch."
+                        ),
+                    },
+                    "ro_number": {"type": "string", "maxLength": MAX_RO_CHARS},
+                    "source_scope": {
+                        "type": "string",
+                        "enum": sorted(SOURCE_SCOPES),
+                    },
+                },
+                "required": ["action", "ro_number"],
             },
             {
                 "type": "object",
@@ -1889,6 +1913,83 @@ async def adas_map(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
                 return _authentication_required(action, data, executed=True)
             return _success(action, data, status="verified", work_complete=True)
 
+        if action == "acquire_exact":
+            _expect_keys(clean, {"action", "ro_number", "source_scope"})
+            ro_number = _ro_number(clean.get("ro_number"))
+            startup = await start_native(settings)
+            if startup.get("success") is not True:
+                return {
+                    **startup,
+                    "action": action,
+                    "requested_ro_number": ro_number,
+                }
+
+            created = await adas_map(
+                settings,
+                {
+                    "action": "create_exact_batch",
+                    "name": f"RO {ro_number} ADAS Map",
+                    "ro_numbers": [ro_number],
+                    "source_scope": _source_scope(clean, "all"),
+                },
+            )
+            if not (
+                created.get("success") is True
+                and created.get("verified") is True
+                and isinstance(created.get("data"), dict)
+            ):
+                return {
+                    **created,
+                    "action": action,
+                    "requested_ro_number": ro_number,
+                }
+            batch_id = str(created["data"].get("id") or "").strip()
+            if not _RESOURCE_ID_RE.fullmatch(batch_id):
+                return _failure(
+                    action,
+                    "invalid_response",
+                    "ScrapeX did not return a valid exact-batch identifier.",
+                )
+
+            processed = await adas_map(
+                settings,
+                {
+                    "action": "process_one",
+                    "batch_id": batch_id,
+                    "ro_number": ro_number,
+                },
+            )
+            if processed.get("status") == "authentication_required":
+                opened = await adas_map(settings, {"action": "open_authentication"})
+                if not (
+                    opened.get("success") is True
+                    and opened.get("verified") is True
+                ):
+                    return {
+                        **processed,
+                        "action": action,
+                        "data": {
+                            "batch_id": batch_id,
+                            "ro_number": ro_number,
+                            "authentication": opened,
+                        },
+                    }
+                processed = await adas_map(
+                    settings,
+                    {
+                        "action": "process_one",
+                        "batch_id": batch_id,
+                        "ro_number": ro_number,
+                    },
+                )
+
+            return {
+                **processed,
+                "action": action,
+                "requested_ro_number": ro_number,
+                "exact_batch_id": batch_id,
+            }
+
         if action == "create_exact_batch":
             _expect_keys(clean, {"action", "name", "ro_numbers", "source_scope"})
             name = _text(
@@ -2207,6 +2308,70 @@ _NAVIGATOR_ALLOWED_KEYS: dict[str, set[str]] = {
     "press": {"action", "task_id", "ref", "key"},
     "open": {"action", "task_id", "url"},
 }
+
+
+async def navigator_capture(settings: Any, task_id: str) -> dict[str, Any]:
+    """Preserve one already-verified Navigator leaf in canonical ADAS SI.
+
+    This is intentionally an internal composite helper rather than a model-
+    advertised browser action. The model chooses navigation; ScrapeX's
+    deterministic verification proof is what authorizes persistence.
+    """
+    action = "capture"
+    try:
+        task_value = _text(task_id, "task_id", maximum=MAX_TASK_ID_CHARS)
+        assert task_value is not None
+        if not _RESOURCE_ID_RE.fullmatch(task_value):
+            raise ScrapeXInput("task_id must be a bounded ScrapeX identifier.")
+        data = await _request(
+            settings,
+            "POST",
+            f"/api/navigator/tasks/{quote(task_value, safe='')}/capture",
+            body={},
+            timeout=OPERATOR_TIMEOUT,
+            may_mutate=True,
+        )
+        if not isinstance(data, dict) or data.get("status") != "success":
+            raise ScrapeXContract(
+                "navigator_capture_invalid",
+                "ScrapeX did not return a successful Navigator capture contract.",
+            )
+        if str(data.get("task_id") or "") != task_value:
+            raise ScrapeXContract(
+                "navigator_task_mismatch",
+                "ScrapeX returned a capture for a different Navigator task.",
+            )
+        provider = str(data.get("provider") or "").strip()
+        relative = str(data.get("relative_path") or "").strip().replace("\\", "/")
+        if (
+            provider not in NAVIGATOR_PROVIDERS
+            or not relative
+            or relative.startswith("/")
+            or ".." in relative.split("/")
+        ):
+            raise ScrapeXContract(
+                "navigator_capture_invalid",
+                "ScrapeX returned invalid Navigator capture provenance.",
+            )
+        return _success(
+            action,
+            data,
+            status="captured" if data.get("saved") is True else "already_present",
+            executed=True,
+            verified=True,
+            work_complete=True,
+            success=True,
+        )
+    except ScrapeXInput as exc:
+        return _input_failure(action, exc)
+    except ScrapeXConfiguration as exc:
+        return _configuration_failure(action, exc)
+    except ScrapeXRemote as exc:
+        return _remote_failure(action, exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure(action, exc)
+    except ScrapeXContract as exc:
+        return _contract_failure(action, exc, may_mutate=True)
 
 
 async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:

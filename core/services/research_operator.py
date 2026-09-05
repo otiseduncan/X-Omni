@@ -524,29 +524,57 @@ class LicensedBrowser:
                 },
             }
         if action == "alldata_vehicle_research":
+            from ..config import Settings
             from . import research_alldata_navigation as navigation
+            from . import research_navigator_agent
 
             vehicle_label = " ".join(str(args.get("vehicle") or "").split()).strip()
             parsed_vehicle = (
                 navigation.vehicle_from_query(vehicle_label) if vehicle_label else {}
             )
-            result = await navigation.search_alldata_vehicle_first(
-                self,
-                vehicle={
-                    "year": args.get("vehicle_year") or parsed_vehicle.get("year"),
-                    "make": args.get("vehicle_make") or parsed_vehicle.get("make"),
-                    "model": (
-                        args.get("vehicle_model")
-                        or parsed_vehicle.get("model_trim")
+            target = {
+                "year": args.get("vehicle_year") or parsed_vehicle.get("year"),
+                "make": args.get("vehicle_make") or parsed_vehicle.get("make"),
+                "model": args.get("vehicle_model") or parsed_vehicle.get("model_trim"),
+                "trim": args.get("vehicle_trim"),
+            }
+            if not (target["year"] and target["make"] and target["model"]):
+                raise ValueError(
+                    "ALLDATA vehicle research requires exact year, make, and model."
+                )
+            topic = " ".join(str(args.get("topic") or "").split()).strip()
+            if not topic:
+                raise ValueError("ALLDATA vehicle research requires a procedure topic.")
+            client = research_navigator_agent.current_model_client()
+            if client is None:
+                return {
+                    "status": "model_context_unavailable",
+                    "action": action,
+                    "attempted": False,
+                    "searched": False,
+                    "verified": False,
+                    "captured": False,
+                    "message": (
+                        "The agentic ALLDATA Navigator requires the active X model "
+                        "execution context; the retired scripted fallback was not run."
                     ),
-                    "trim": args.get("vehicle_trim"),
-                },
-                topic=str(args.get("topic") or ""),
+                }
+            result = await research_navigator_agent.run_navigator_search(
+                client=client,
+                settings=Settings.load(),
+                provider="alldata",
+                target=target,
+                topic=topic,
             )
-            # Keep the structured business operation on the result so the
-            # chat artifact renderer can present this bounded ALLDATA lookup
-            # as research evidence instead of falling back to access setup.
             result["action"] = action
+            result["status"] = (
+                "success"
+                if result.get("verified") is True and result.get("captured") is True
+                else "unverified"
+            )
+            result["success"] = bool(
+                result.get("verified") is True and result.get("captured") is True
+            )
             return result
         if action == "capture_to_adas":
             return await self._capture_to_adas(args)
