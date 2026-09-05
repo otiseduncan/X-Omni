@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
+import psutil
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8125"
@@ -1691,24 +1692,134 @@ def _windows_powershell_exe() -> str:
     return str(exact) if exact.is_file() else "powershell"
 
 
-async def start_native(settings: Any) -> dict[str, Any]:
-    """Start ScrapeX's local server if it is not already answering
-    /api/health, then verify with a fresh probe -- the spawned process
-    merely existing is never treated as proof it is actually serving."""
+def _project_revision(project_path: Path) -> str | None:
     try:
-        await _request(
+        completed = subprocess.run(
+            ["git", "-C", str(project_path), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}", value) else None
+
+
+def _listener_pid(settings: Any) -> int | None:
+    try:
+        port = urlsplit(_base_url(settings)).port
+        if port is None:
+            return None
+        for connection in psutil.net_connections(kind="tcp"):
+            if (
+                connection.status == psutil.CONN_LISTEN
+                and connection.laddr
+                and int(connection.laddr.port) == int(port)
+                and connection.pid
+            ):
+                return int(connection.pid)
+    except (psutil.Error, OSError, ValueError):
+        return None
+    return None
+
+
+def _verified_scrapex_process(
+    settings: Any,
+    health: dict[str, Any],
+    project_path: Path,
+) -> psutil.Process:
+    raw_pid = health.get("runtime_pid")
+    try:
+        pid = int(raw_pid) if raw_pid not in (None, "") else _listener_pid(settings)
+    except (TypeError, ValueError):
+        pid = None
+    if not pid:
+        raise ScrapeXConfiguration(
+            "A stale ScrapeX runtime is answering, but X could not identify its local process."
+        )
+    try:
+        process = psutil.Process(pid)
+        cwd = Path(process.cwd()).resolve()
+        expected = project_path.resolve()
+        command = [str(value) for value in process.cmdline()]
+    except (psutil.Error, OSError) as exc:
+        raise ScrapeXConfiguration(
+            "X could not verify the stale ScrapeX process before replacing it."
+        ) from exc
+
+    module_match = any(
+        command[index] == "-m" and command[index + 1] == "scrapex"
+        for index in range(max(0, len(command) - 1))
+    )
+    if cwd != expected or not module_match:
+        raise ScrapeXConfiguration(
+            "The process answering on ScrapeX's loopback port does not match "
+            "the configured ScrapeX project, so X will not replace it."
+        )
+    return process
+
+
+def _stop_stale_scrapex(
+    settings: Any,
+    health: dict[str, Any],
+    project_path: Path,
+) -> None:
+    process = _verified_scrapex_process(settings, health, project_path)
+    try:
+        process.terminate()
+        process.wait(timeout=15)
+    except psutil.TimeoutExpired as exc:
+        raise ScrapeXConfiguration(
+            "The verified stale ScrapeX runtime did not stop within 15 seconds."
+        ) from exc
+    except psutil.Error as exc:
+        raise ScrapeXConfiguration(
+            "The verified stale ScrapeX runtime could not be stopped."
+        ) from exc
+
+
+async def start_native(settings: Any) -> dict[str, Any]:
+    """Start ScrapeX from the current local source revision.
+
+    A healthy process is reused only when it was started from the same Git
+    revision currently checked out in the configured ScrapeX repository.
+    This prevents a git pull from leaving an indefinitely stale Python
+    process serving the old ADAS Map workflow in memory.
+    """
+    project_path = Path(
+        getattr(settings, "scrapex_project_path", None) or DEFAULT_PROJECT_PATH
+    )
+    current_revision = _project_revision(project_path)
+    try:
+        health = await _request(
             settings, "GET", "/api/health", timeout=STATUS_TIMEOUT, may_mutate=False
         )
     except ScrapeXConfiguration as exc:
         return _configuration_failure("start_native", exc)
     except ScrapeXTransport:
-        pass  # not reachable yet -- fall through to actually starting it
-    else:
-        return _success("start_native", None, status="already_healthy", verified=True)
+        health = None
+    if isinstance(health, dict):
+        runtime_revision = str(health.get("runtime_revision") or "").strip()
+        if current_revision and runtime_revision != current_revision:
+            try:
+                _stop_stale_scrapex(settings, health, project_path)
+            except ScrapeXConfiguration as exc:
+                return _configuration_failure("start_native", exc)
+        else:
+            return _success(
+                "start_native",
+                {
+                    "runtime_revision": runtime_revision or None,
+                    "current_revision": current_revision,
+                },
+                status="already_healthy",
+                verified=True,
+            )
 
     try:
-        project_path = getattr(settings, "scrapex_project_path", None) or DEFAULT_PROJECT_PATH
-        script = Path(project_path) / "scripts" / "start.ps1"
+        script = project_path / "scripts" / "start.ps1"
         if not script.is_file():
             return _failure(
                 "start_native", "configuration_error",
@@ -1739,10 +1850,18 @@ async def start_native(settings: Any) -> dict[str, Any]:
             exited_early = True
             break
         try:
-            await _request(
+            observed_health = await _request(
                 settings, "GET", "/api/health", timeout=STATUS_TIMEOUT, may_mutate=False
             )
         except ScrapeXTransport:
+            await asyncio.sleep(NATIVE_START_POLL_INTERVAL_S)
+            continue
+        observed_revision = (
+            str(observed_health.get("runtime_revision") or "").strip()
+            if isinstance(observed_health, dict)
+            else ""
+        )
+        if current_revision and observed_revision != current_revision:
             await asyncio.sleep(NATIVE_START_POLL_INTERVAL_S)
             continue
         healthy = True
@@ -1761,7 +1880,16 @@ async def start_native(settings: Any) -> dict[str, Any]:
             exit_code=process.returncode if exited_early else None,
         )
 
-    return _success("start_native", None, status="healthy", executed=True, verified=True)
+    return _success(
+        "start_native",
+        {
+            "runtime_revision": current_revision,
+            "current_revision": current_revision,
+        },
+        status="healthy",
+        executed=True,
+        verified=True,
+    )
 
 
 async def read(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
