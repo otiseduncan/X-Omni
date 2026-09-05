@@ -2103,7 +2103,17 @@ async def _week_readiness(
         snapshot = dict(envelope["snapshot"])
         map_info = await _discover_adas_map(catalog, snapshot)
         map_acquisition: Optional[dict[str, Any]] = None
-        if execute_missing and map_info.get("status") == "not_found":
+        # "unverified" is a gap too, not a settled state. The artifact catalog
+        # only accepts ScrapeX provenance at the current contract version, so an
+        # ADAS Map captured before it -- or imported into Calibration IQ without
+        # ScrapeX at all -- can never verify on its own. Acquiring only on
+        # "not_found" left those repair orders reporting adas_map_unverified
+        # forever, and because SI acquisition runs only for a verified map, their
+        # service information was never gathered either. Re-acquire so the map is
+        # recaptured under the current contract; an artifact whose provenance
+        # contradicts CIQ stays "ambiguous" and is deliberately left for an
+        # operator rather than re-pulled blind.
+        if execute_missing and map_info.get("status") in {"not_found", "unverified"}:
             adas_map_acquisition_attempted += 1
             map_acquisition = await _acquire_adas_map_gap(settings, snapshot)
             if (

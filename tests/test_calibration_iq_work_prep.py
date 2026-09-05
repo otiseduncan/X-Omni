@@ -1643,3 +1643,114 @@ def test_repeated_weekly_audit_preserves_same_failure_but_requeues_changed_gap(t
     assert requeued.status == weekly_queue.STATUS_QUEUED
     assert requeued.attempts == 0
     assert requeued.last_error == ""
+
+
+@pytest.mark.asyncio
+async def test_week_readiness_reacquires_a_map_that_cannot_verify(monkeypatch):
+    """An unverified ADAS Map is a gap, not a settled state.
+
+    The artifact catalog only accepts ScrapeX provenance at the current
+    contract version, so a map captured before it -- or imported into
+    Calibration IQ without ScrapeX at all -- can never verify by itself.
+    Acquiring only on "not_found" left ten of fourteen Repair Plan ROs
+    reporting adas_map_unverified indefinitely, and since SI acquisition
+    runs only for a verified map, their service information was never
+    gathered either.
+    """
+    row = {
+        "id": "ro-stale",
+        "ro_number": "RO-STALE",
+        "phase": "1",
+        "vehicle": {"year": 2016, "make": "Lexus", "model": "ES 350"},
+    }
+
+    async def query_repair_orders(_settings, _args):
+        return {"status": "verified", "items": [row]}
+
+    async def load_snapshot(_settings, identifier):
+        return {
+            "status": "verified",
+            "snapshot": {"calibrations": [], "repair_order": {"id": identifier}},
+        }
+
+    discoveries = ["unverified", "verified"]
+
+    async def discover_map(_catalog, _snapshot):
+        status = discoveries.pop(0) if discoveries else "verified"
+        return {"status": status, "requirements": [], "requirement_count": 0}
+
+    acquired: list[str] = []
+
+    async def acquire_map(_settings, _snapshot):
+        acquired.append("called")
+        return {
+            "status": "completed",
+            "success": True,
+            "verified": True,
+            "work_complete": True,
+        }
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [], None
+
+    async def coverage(_catalog, _snapshot, _map_info):
+        return []
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_acquire_adas_map_gap", acquire_map)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_coverage", coverage)
+
+    result = await prep._week_readiness(
+        SimpleNamespace(), SimpleNamespace(), {"phase": "1", "execute_missing": True}
+    )
+
+    assert acquired == ["called"]
+    assert result["adas_map_acquisition_attempted"] == 1
+    assert result["adas_map_acquired_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_week_readiness_leaves_an_ambiguous_map_for_an_operator(monkeypatch):
+    """Provenance that contradicts CIQ identity is never re-pulled blind."""
+    row = {
+        "id": "ro-ambiguous",
+        "ro_number": "RO-AMBIG",
+        "phase": "1",
+        "vehicle": {"year": 2016, "make": "Lexus", "model": "ES 350"},
+    }
+
+    async def query_repair_orders(_settings, _args):
+        return {"status": "verified", "items": [row]}
+
+    async def load_snapshot(_settings, identifier):
+        return {
+            "status": "verified",
+            "snapshot": {"calibrations": [], "repair_order": {"id": identifier}},
+        }
+
+    async def discover_map(_catalog, _snapshot):
+        return {"status": "ambiguous", "requirements": [], "requirement_count": 0}
+
+    async def must_not_acquire(*_args, **_kwargs):
+        raise AssertionError("an ambiguous artifact must not be re-acquired blind")
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [], None
+
+    async def coverage(_catalog, _snapshot, _map_info):
+        return []
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_acquire_adas_map_gap", must_not_acquire)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_coverage", coverage)
+
+    result = await prep._week_readiness(
+        SimpleNamespace(), SimpleNamespace(), {"phase": "1", "execute_missing": True}
+    )
+    assert result["adas_map_acquisition_attempted"] == 0
