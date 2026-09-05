@@ -2201,11 +2201,21 @@ def _matching_existing_document(
             return item
 
     if re.fullmatch(r"[0-9a-f]{64}", digest):
-        hash_matches = [
-            item
-            for item in existing
-            if str(item.get("sha256") or "").strip().casefold() == digest
-        ]
+        logical_name = _logical_migration_source_name(source_name)
+        hash_matches = []
+        for item in existing:
+            if str(item.get("sha256") or "").strip().casefold() != digest:
+                continue
+            existing_name = str(item.get("source_name") or "").strip()
+            if not existing_name:
+                stored = str(
+                    item.get("storage_relative_path")
+                    or item.get("storage_key")
+                    or ""
+                ).strip().replace("\\", "/")
+                existing_name = PurePosixPath(stored).name
+            if _logical_migration_source_name(existing_name) == logical_name:
+                hash_matches.append(item)
         if len(hash_matches) == 1:
             return hash_matches[0]
         if len(hash_matches) > 1:
