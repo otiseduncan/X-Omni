@@ -51,6 +51,46 @@ function Get-MediaMTXHealth {
     }
 }
 
+function Get-MediaMTXConfiguredPaths {
+    # Read the just-synced YAML directly rather than hardcoding camera
+    # names -- sync-mediamtx-config.py regenerates this file from X Omni's
+    # own camera credential store, so the path list must stay in step with
+    # whatever cameras are actually configured, not a fixed pair.
+    param([Parameter(Mandatory)][string]$YamlPath)
+    $inPaths = $false
+    $names = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in Get-Content -LiteralPath $YamlPath) {
+        if ($line -match '^paths:\s*$') { $inPaths = $true; continue }
+        if (-not $inPaths) { continue }
+        if ($line -match '^\S') { break }
+        if ($line -match '^  ([A-Za-z0-9_]+):\s*$' -and $Matches[1] -ne 'all_others') {
+            $names.Add($Matches[1])
+        }
+    }
+    return $names
+}
+
+function Test-MediaMTXPathsReady {
+    # The control API answering only proves MediaMTX itself started -- it
+    # says nothing about whether any actual camera connected. A launcher
+    # that declares success here while every camera silently failed (bad
+    # credentials, camera offline, network issue) isn't actually verifying
+    # the thing it exists to start.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ExpectedPaths)
+    if ($ExpectedPaths.Count -eq 0) { return $true }
+    try {
+        $response = Invoke-RestMethod -Uri "$controlOrigin/v3/paths/list" -TimeoutSec 4
+    } catch {
+        return $false
+    }
+    $byName = @{}
+    foreach ($item in $response.items) { $byName[[string]$item.name] = $item }
+    foreach ($name in $ExpectedPaths) {
+        if (-not $byName.ContainsKey($name) -or -not $byName[$name].ready) { return $false }
+    }
+    return $true
+}
+
 try {
     $hasMutex = $mutex.WaitOne(0)
     if (-not $hasMutex) { return }
@@ -73,6 +113,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "MediaMTX camera path sync failed (exit $LASTEXITCODE). See $syncScript output above."
     }
+    $expectedPaths = Get-MediaMTXConfiguredPaths -YamlPath $mediamtxYaml
 
     # Get-Process's Name/Path shape doesn't match Test-MediaMTXProcess's
     # Win32_Process-style check (Name lacks ".exe", there is no
@@ -101,18 +142,25 @@ try {
     Write-LauncherLog "Started hidden MediaMTX PID $($process.Id)."
 
     $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
+    $apiUp = $false
     do {
         Start-Sleep -Milliseconds 500
         $health = Get-MediaMTXHealth
         if ($health -and $health.StatusCode -eq 200) {
-            Write-LauncherLog 'MediaMTX ready.'
-            if (-not $NoOpen) { Start-Process "$controlOrigin/v3/paths/list" }
-            return
+            $apiUp = $true
+            if (Test-MediaMTXPathsReady -ExpectedPaths $expectedPaths) {
+                Write-LauncherLog "MediaMTX ready; $($expectedPaths.Count) configured path(s) online: $($expectedPaths -join ', ')."
+                if (-not $NoOpen) { Start-Process "$controlOrigin/v3/paths/list" }
+                return
+            }
         }
         if ($process.HasExited) { break }
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    throw "MediaMTX started, but did not answer $controlOrigin/v3/info within $StartupTimeoutSeconds seconds. Check $mediamtxRoot\mediamtx.log."
+    if (-not $apiUp) {
+        throw "MediaMTX started, but did not answer $controlOrigin/v3/info within $StartupTimeoutSeconds seconds. Check $mediamtxRoot\mediamtx.log."
+    }
+    throw "MediaMTX's control API came up, but not every configured camera path came online within $StartupTimeoutSeconds seconds ($($expectedPaths -join ', ')). Check $mediamtxRoot\mediamtx.log and the camera's own connection."
 } catch {
     if (-not $script:launcherLog) {
         New-Item -ItemType Directory -Path $logDirectory -Force -ErrorAction SilentlyContinue | Out-Null
