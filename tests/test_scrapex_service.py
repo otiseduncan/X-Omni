@@ -216,7 +216,7 @@ async def test_read_batch_item_passes_through_structured_canonical_provenance(mo
                     {
                         "id": "item-9",
                         "ro_number": "9000000009",
-                        "adas_map_contract_version": 1,
+                        "adas_map_contract_version": 3,
                         "adas_map_state": "adas_map_complete",
                         "adas_map_requirements_proven": 1,
                         "adas_map_inspection_id": "inspection-9",
