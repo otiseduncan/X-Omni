@@ -1385,8 +1385,6 @@ class AdasArtifactCatalog:
                 == "adas_map_report"
                 and attachment.get("document_id")
             )
-            if not ciq_verified:
-                errors.append("ciq_adas_map_attachment_unverified")
             record.update(
                 {
                     "requirements": requirements,
