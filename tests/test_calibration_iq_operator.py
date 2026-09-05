@@ -3266,3 +3266,79 @@ async def test_output_dependent_operator_calls_share_turn_and_consume_generated_
     assert idempotency_keys[0] != idempotency_keys[1]
     assert not any(event["type"] == "approval" for event in events)
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_research_ro_reuses_pre_migration_ciq_document_by_sha_and_rewrites_source_uri(
+    tmp_path: Path,
+):
+    source = tmp_path / "Camera Procedure.pdf"
+    source.write_bytes(b"%PDF-1.4\nsame evidence after library move\n")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    canonical_relative = "2023/Toyota/Camry/ALLDATA/Camera Procedure.pdf"
+
+    class CanonicalAdas:
+        def resolve_relative(self, relative: str) -> Path:
+            assert relative == canonical_relative
+            return source
+
+        def search(self, args: dict[str, Any]) -> dict[str, Any]:
+            assert args.get("search_mode") == "calibration_requirements"
+            return {
+                "status": "success",
+                "exact_source_matched": True,
+                "results": [{
+                    "source": source.name,
+                    "title": source.stem,
+                    "relative_path": canonical_relative,
+                    "page": 7,
+                    "excerpt": "Perform the forward recognition camera calibration.",
+                    "source_match_score": 18,
+                }],
+                "matched_documents": [{
+                    "source": source.name,
+                    "title": source.stem,
+                    "relative_path": canonical_relative,
+                    "source_match_score": 18,
+                }],
+            }
+
+    existing = _persisted_evidence_document(
+        document_id="doc-existing",
+        calibration_ids=["cal-1"],
+        source_name=source.name,
+        version=4,
+    )
+    existing["sha256"] = digest
+    existing["source_uri"] = (
+        "adas-si:///Acquired/ALLDATA/Toyota/2023%20Toyota%20Camry/"
+        "Camera%20Procedure.pdf"
+    )
+    snapshot = {
+        "id": "ro-migrated",
+        "vehicle": {"year": 2023, "make": "Toyota", "model": "Camry"},
+        "calibration_items": [{"id": "cal-1", "name": "front camera"}],
+        "research": {"state": "research_in_progress", "version": 3},
+        "documents": [existing],
+    }
+
+    expanded, report = await ciq._expand_research_action(
+        CanonicalAdas(),
+        {
+            "operation": "research_ro",
+            "repair_order_id": "ro-migrated",
+            "arguments": {},
+        },
+        snapshot,
+    )
+
+    operations = [item["operation"] for item in expanded]
+    assert operations == ["ensure_case_workspace", "update_document"]
+    assert "import_document" not in operations
+    update = expanded[1]
+    assert update["target_id"] == "doc-existing"
+    assert update["expected_version"] == 4
+    assert update["arguments"]["source_uri"] == (
+        "adas-si:///2023/Toyota/Camry/ALLDATA/Camera%20Procedure.pdf"
+    )
+    assert report["already_present"][0]["sha256"] == digest

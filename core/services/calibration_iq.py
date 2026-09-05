@@ -2161,21 +2161,65 @@ def _existing_research_documents(snapshot: dict[str, Any]) -> list[dict[str, Any
     return output
 
 
+def _source_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _matching_existing_document(
-    existing: list[dict[str, Any]], *, source_uri: str, source_name: str
+    existing: list[dict[str, Any]],
+    *,
+    source_uri: str,
+    source_name: str,
+    sha256: str = "",
 ) -> Optional[dict[str, Any]]:
+    """Match CIQ evidence across ADAS SI path migrations without guessing.
+
+    The canonical source URI is the strongest identity. A unique content hash
+    is next, which lets an already-imported document survive a source-library
+    move from legacy Acquired/... to Year/Make/Model/... or ADAS Map/RO/....
+    Filename is only a last-resort compatibility fallback and is rejected when
+    both sides have conflicting hashes.
+    """
     uri_key = source_uri.strip().casefold()
     name_key = source_name.strip().casefold()
+    digest = str(sha256 or "").strip().casefold()
+
     for item in existing:
         if str(item.get("source_uri") or "").strip().casefold() == uri_key:
             return item
+
+    if re.fullmatch(r"[0-9a-f]{64}", digest):
+        hash_matches = [
+            item
+            for item in existing
+            if str(item.get("sha256") or "").strip().casefold() == digest
+        ]
+        if len(hash_matches) == 1:
+            return hash_matches[0]
+        if len(hash_matches) > 1:
+            return None
+
+    name_matches: list[dict[str, Any]] = []
     for item in existing:
         stored = str(
             item.get("storage_relative_path") or item.get("storage_key") or ""
         ).strip().replace("\\", "/").casefold()
-        if stored and PurePosixPath(stored).name.casefold() == name_key:
-            return item
-    return None
+        if not stored or PurePosixPath(stored).name.casefold() != name_key:
+            continue
+        existing_digest = str(item.get("sha256") or "").strip().casefold()
+        if (
+            digest
+            and re.fullmatch(r"[0-9a-f]{64}", digest)
+            and re.fullmatch(r"[0-9a-f]{64}", existing_digest)
+            and digest != existing_digest
+        ):
+            continue
+        name_matches.append(item)
+    return name_matches[0] if len(name_matches) == 1 else None
 
 
 def _existing_document_version(
@@ -2253,6 +2297,7 @@ async def _expand_research_action(
             doc_hits = [hit for hit in hits if str(hit.get("relative_path") or "") == relative]
             try:
                 source_path = adas.resolve_relative(relative)
+                source_sha256 = _source_file_sha256(source_path)
             except (OSError, ValueError):
                 continue
             document_supported = bool(exact_source_matched and doc_hits)
@@ -2261,6 +2306,7 @@ async def _expand_research_action(
                 "relative_path": relative,
                 "source_path": str(source_path),
                 "source_name": source_path.name,
+                "sha256": source_sha256,
                 "title": str(matched.get("title") or source_path.stem),
                 "pages": set(),
                 "calibration_item_ids": set(),
@@ -2391,6 +2437,7 @@ async def _expand_research_action(
             existing_documents,
             source_uri=canonical_source_uri,
             source_name=record["source_name"],
+            sha256=record["sha256"],
         )
         if existing is not None:
             document_id = str(existing.get("id") or existing.get("document_id") or "").strip()
@@ -2400,6 +2447,10 @@ async def _expand_research_action(
             missing_ids = sorted(set(calibration_ids) - existing_ids)
             existing_pages = {str(item) for item in (existing.get("page_references") or [])}
             desired_pages = set(import_arguments["page_references"])
+            source_identity_changed = bool(
+                str(existing.get("source_uri") or "").strip() != canonical_source_uri
+                or str(existing.get("source_name") or "").strip() != record["source_name"]
+            )
             needs_metadata_update = bool(
                 document_id
                 and (
@@ -2409,11 +2460,14 @@ async def _expand_research_action(
                         != "validated"
                     )
                     or not desired_pages.issubset(existing_pages)
+                    or source_identity_changed
                 )
             )
             if needs_metadata_update:
                 changes: dict[str, Any] = {
                     "status": import_arguments["status"],
+                    "source_uri": canonical_source_uri,
+                    "source_name": record["source_name"],
                     "page_references": sorted(existing_pages | desired_pages),
                     "citation": import_arguments["citation"],
                     "notes": import_arguments["notes"],
@@ -2452,6 +2506,7 @@ async def _expand_research_action(
                 "title": record["title"],
                 "source": record["source_name"],
                 "source_uri": canonical_source_uri,
+                "sha256": record["sha256"],
                 "calibration_item_ids": sorted(existing_ids | set(calibration_ids)),
                 "new_links_requested": missing_ids,
                 "metadata_update_requested": needs_metadata_update,
