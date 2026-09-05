@@ -314,22 +314,15 @@ def _run_start_native_script(project_path: Path) -> subprocess.CompletedProcess:
 
 
 async def start_native(settings) -> dict[str, Any]:
-    """Bring Calibration IQ's native stack (database, object storage,
-    backend, Caddy) up if it is not already healthy, then verify with a
-    fresh health() call -- the script's own exit code is never trusted on
-    its own, matching the rest of this codebase's execution-truth rule."""
-    project_path = settings.calibration_iq_project_path
-    already = await health(settings)
-    if already.get("status") == "available":
-        return {
-            "service": "Calibration IQ",
-            "action": "start_native",
-            "status": "already_healthy",
-            "executed": False,
-            "verified": True,
-            "base_url": already.get("base_url"),
-        }
+    """Bring Calibration IQ up from the current checked-out source.
 
+    The native launcher is revision-aware: it cheaply reuses a healthy stack
+    when its recorded source revision matches the repository, and refreshes
+    dependencies/frontend plus restarts when a git pull changed that revision.
+    X therefore always delegates to the launcher instead of trusting network
+    health alone as proof that the running code is current.
+    """
+    project_path = settings.calibration_iq_project_path
     script = project_path / "Start-CalibrationIQ-Native.ps1"
     if not script.is_file():
         return {
