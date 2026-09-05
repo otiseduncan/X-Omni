@@ -1857,3 +1857,76 @@ def test_configuration_compares_the_bare_value_not_the_combined_one():
     assert conflicts(combined, "Premium Fastback w/EcoBoost") == []
     # A configuration that genuinely differs is still a conflict.
     assert conflicts(combined, "GT Convertible") == ["configuration"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_is_the_map_handoff_and_does_not_wait_on_si(monkeypatch):
+    """Outstanding SI is reported, not a blocker on completed map work.
+
+    Much of it cannot be obtained at all -- seat belt and occupant
+    classification are inspection steps with no OEM calibration procedure to
+    find -- so gating readiness on coverage held finished ADAS Map work open
+    indefinitely against evidence that does not exist.
+    """
+    row = {
+        "id": "ro-si",
+        "ro_number": "RO-SI",
+        "phase": "1",
+        "vehicle": {"year": 2025, "make": "Ford", "model": "Explorer"},
+    }
+
+    async def query_repair_orders(_settings, _args):
+        return {"status": "verified", "items": [row]}
+
+    async def load_snapshot(_settings, identifier):
+        # CIQ already carries the calibration, so only the SI is outstanding.
+        return {
+            "status": "verified",
+            "snapshot": {
+                "calibrations": [
+                    {
+                        "calibration_type": "360 Degree View Cameras",
+                        "determination": "REQUIRED",
+                        "method": "STATIC",
+                    }
+                ],
+                "repair_order": {"id": identifier},
+            },
+        }
+
+    async def discover_map(_catalog, _snapshot):
+        return {
+            "status": "verified",
+            "requirements": [
+                {"label": "360 Degree View Cameras", "method": "STATIC"}
+            ],
+            "requirement_count": 1,
+        }
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [], None
+
+    async def coverage(_catalog, _snapshot, _map_info):
+        return [
+            {
+                "calibration": "360 Degree View Cameras",
+                "state": prep.adas_artifact_catalog.MISSING,
+                "available": False,
+                "documents": [],
+            }
+        ]
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_catalog_coverage", coverage)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+
+    result = await prep._week_readiness(SimpleNamespace(), SimpleNamespace(), {"phase": "1"})
+
+    assert result["ready_count"] == 1
+    assert result["repair_orders"][0]["status"] == "ready"
+    assert result["repair_orders"][0]["ready"] is True
+    # The outstanding SI is still visible for whoever chases it.
+    assert result["si_missing_count"] == 1
+    assert result["repair_orders"][0]["missing_si"]

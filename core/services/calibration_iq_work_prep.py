@@ -2327,22 +2327,26 @@ async def _week_readiness(
                 and research_link.get("verified") is True
             )
         )
-        ready = bool(
-            map_ok
-            and reconcile_ok
-            and coverage_status == adas_artifact_catalog.COVERED
-            and evidence_link_ok
-        )
+        # Readiness is the ADAS Map handoff: the governing map is verified, its
+        # requirement set reconciles against CIQ, and the research evidence link
+        # was accepted. Service information is reported alongside but no longer
+        # gates this. Much of it cannot be obtained at all -- seat belt and
+        # occupant classification are inspection steps with no OEM calibration
+        # procedure to find -- so requiring it held completed map work open
+        # indefinitely against evidence that does not exist. An RO still carries
+        # its outstanding SI in missing_si/si_missing_count for the queue that
+        # chases it.
+        ready = bool(map_ok and reconcile_ok and evidence_link_ok)
         if ready:
             status = "ready"
         elif not map_ok:
             status = "adas_map_unverified"
         elif not reconcile_ok:
             status = "reconciliation_failed"
-        elif coverage_status == adas_artifact_catalog.MISSING:
-            status = "si_missing"
         elif not evidence_link_ok:
             status = "research_link_failed"
+        elif coverage_status == adas_artifact_catalog.MISSING:
+            status = "si_missing"
         else:
             status = "si_unverified"
         results.append(

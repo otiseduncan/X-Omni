@@ -132,7 +132,11 @@ async def test_weekly_pipeline_separates_covered_missing_and_unverified_and_queu
 
     assert result["status"] == "partial_success"
     assert result["queue_count"] == 3
-    assert result["ready_count"] == 1
+    # Readiness is the ADAS Map handoff, not SI. RO 100 (covered) and RO 200
+    # (map verified, SI still outstanding) are both ready; RO 300's map never
+    # verified. The SI counters below still separate the three states and only
+    # the missing one is queued for research.
+    assert result["ready_count"] == 2
     assert result["adas_map_verified_count"] == 2
     assert result["adas_map_missing_count"] == 0
     assert result["adas_map_unverified_count"] == 1
