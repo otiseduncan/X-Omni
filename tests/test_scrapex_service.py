@@ -64,7 +64,7 @@ def _completed_item(batch_id: str, ro_number: str) -> dict[str, Any]:
         "id": "item-9900001",
         "batch_id": batch_id,
         "ro_number": ro_number,
-        "adas_map_contract_version": 1,
+        "adas_map_contract_version": 3,
         "adas_map_state": "adas_map_complete",
         "adas_map_requirements_proven": 1,
         "adas_map_inspection_id": inspection_id,
@@ -99,7 +99,16 @@ def _completed_item(batch_id: str, ro_number: str) -> dict[str, Any]:
         ),
         "ciq_reconciliation_state": "complete",
         "ciq_reconciliation_json": json.dumps(
-            {"verified": True, "snapshot_verified": True, "receipt_count": 1}
+            {
+                "verified": True,
+                "snapshot_verified": True,
+                "receipt_count": 1,
+                "adas_map_attachment": {
+                    "attached": True,
+                    "document_id": "doc-adas-map",
+                    "semantic_type": "ADAS_MAP_REPORT",
+                },
+            }
         ),
     }
 
@@ -185,6 +194,11 @@ async def test_read_batch_item_passes_through_structured_canonical_provenance(mo
         "verified": True,
         "snapshot_verified": True,
         "receipt_count": 1,
+        "adas_map_attachment": {
+            "attached": True,
+            "document_id": "doc-9",
+            "semantic_type": "ADAS_MAP_REPORT",
+        },
         "cookie": "top-secret",
     }
 
@@ -227,7 +241,7 @@ async def test_read_batch_item_passes_through_structured_canonical_provenance(mo
 
     assert result["status"] == "verified"
     provenance = result["data"]["provenance"]
-    assert provenance["contract_version"] == 1
+    assert provenance["contract_version"] == 3
     assert provenance["requirements_proven"] is True
     assert provenance["inspection_id"] == "inspection-9"
     assert provenance["source_url"] == "https://opus.adasmap.com/details/9"
@@ -507,48 +521,44 @@ async def test_acquire_exact_composite_saves_attaches_and_returns_chat_document(
 
     async def ro_read(_settings, args):
         assert args == {"ro_number": ro_number}
-        return {
-            "status": "verified",
-            "repair_order": {"id": "ro-internal-1", "RO": ro_number},
-        }
-
-    captured = {}
-
-    async def operator_execute(_settings, adas, args, **_kwargs):
-        captured["adas"] = adas
-        captured["args"] = args
         source_uri = (
             "adas-si:///ADAS%20Map/2400911578/"
             "2400911578%20ADAS%20Map.pdf"
         )
         return {
-            "status": "success",
-            "success": True,
-            "verified": True,
-            "final_snapshots": {
-                "ro-internal-1": {
-                    "status": "verified",
-                    "snapshot": {
-                        "documents": [
-                            {
-                                "id": "doc-1",
-                                "title": "2400911578 ADAS Map",
-                                "source_name": "2400911578 ADAS Map.pdf",
-                                "source_uri": source_uri,
-                                "download_url": (
-                                    "/api/calibration-iq/documents/"
-                                    "doc-1/download"
-                                ),
-                            }
-                        ]
-                    },
-                }
+            "status": "verified",
+            "repair_order": {"id": "ro-internal-1", "RO": ro_number},
+            "raw": {
+                "documents": [
+                    {
+                        "id": "doc-1",
+                        "version": 1,
+                        "title": "2400911578 ADAS Map",
+                        "document_type": "adas_map_report",
+                        "semantic_type": "ADAS_MAP_REPORT",
+                        "source_name": "2400911578 ADAS Map.pdf",
+                        "source_uri": source_uri,
+                        "download_url": (
+                            "/api/calibration-iq/documents/doc-1/download"
+                        ),
+                    }
+                ],
+                "research": {
+                    "id": "research-1",
+                    "state": "research_in_progress",
+                    "version": 4,
+                },
             },
         }
 
+    async def should_not_mutate(*_args, **_kwargs):
+        raise AssertionError(
+            "X must verify ScrapeX's CIQ handoff, not perform a second attachment"
+        )
+
     monkeypatch.setattr(scrapex, "adas_map", base_map)
     monkeypatch.setattr(ciq, "get_repair_order", ro_read)
-    monkeypatch.setattr(ciq, "operator_execute", operator_execute)
+    monkeypatch.setattr(ciq, "operator_execute", should_not_mutate)
 
     adas = Adas()
     settings = SimpleNamespace(adas_si_root=tmp_path)
@@ -576,13 +586,67 @@ async def test_acquire_exact_composite_saves_attaches_and_returns_chat_document(
     assert result["chat_document"]["pages_total"] == 3
     assert result["ciq_attachment"]["attached"] is True
     assert result["ciq_attachment"]["document_id"] == "doc-1"
-    action = captured["args"]["actions"][0]
-    assert action["operation"] == "research_ro"
-    assert action["repair_order_id"] == "ro-internal-1"
-    assert action["arguments"]["queries"] == [
-        {"query": f"{ro_number} ADAS Map", "label": "ADAS Map"}
-    ]
-    assert action["arguments"]["complete_research"] is False
+    assert result["ciq_attachment"]["semantic_type"] == "ADAS_MAP_REPORT"
+    assert result["ciq_attachment"]["research_state"] == "research_in_progress"
+
+
+@pytest.mark.asyncio
+async def test_acquire_exact_refuses_complete_when_ciq_research_is_still_required(
+    tmp_path, monkeypatch
+):
+    ro_number = "2400911578"
+    pdf = tmp_path / "ADAS Map" / ro_number / f"{ro_number} ADAS Map.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4\n" + (b"0" * 512))
+
+    async def base_map(_settings, _args):
+        return {
+            "status": "completed",
+            "success": True,
+            "verified": True,
+            "work_complete": True,
+        }
+
+    class Adas:
+        def page_count(self, _path):
+            return 1
+
+    from core.services import calibration_iq as ciq
+
+    async def ro_read(_settings, _args):
+        return {
+            "status": "verified",
+            "repair_order": {"id": "ro-internal-1"},
+            "raw": {
+                "documents": [
+                    {
+                        "id": "doc-1",
+                        "document_type": "adas_map_report",
+                        "semantic_type": "ADAS_MAP_REPORT",
+                        "source_name": f"{ro_number} ADAS Map.pdf",
+                    }
+                ],
+                "research": {
+                    "id": "research-1",
+                    "state": "research_required",
+                    "version": 2,
+                },
+            },
+        }
+
+    monkeypatch.setattr(scrapex, "adas_map", base_map)
+    monkeypatch.setattr(ciq, "get_repair_order", ro_read)
+
+    result = await scrapex.adas_map_with_ciq_attachment(
+        SimpleNamespace(adas_si_root=tmp_path),
+        Adas(),
+        {"action": "acquire_exact", "ro_number": ro_number},
+    )
+
+    assert result["status"] == "attachment_failed"
+    assert result["success"] is False
+    assert result["work_complete"] is False
+    assert "research required" in result["message"].casefold()
 
 
 @pytest.mark.asyncio
