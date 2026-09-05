@@ -140,8 +140,10 @@ class _ScriptedClient:
 
     def __init__(self, turns: list[list[tuple[str, dict]] | None]):
         self._turns = list(turns)
+        self.messages_seen: list[list[dict[str, Any]]] = []
 
     async def stream(self, messages, tools=None, max_tokens=None):  # noqa: ARG002
+        self.messages_seen.append(list(messages))
         if not self._turns:
             return
         turn = self._turns.pop(0)
@@ -306,3 +308,63 @@ async def test_unknown_action_is_reported_back_to_the_model_without_calling_scra
     assert result["attempted"] is True
     teleport_calls = [call for call in navigator.calls if call.get("action") == "teleport"]
     assert teleport_calls == []
+
+
+@pytest.mark.asyncio
+async def test_visual_observation_is_passed_to_multimodal_model_when_available(monkeypatch):
+    navigator = _FakeNavigator()
+
+    async def screenshot(settings, task_id):  # noqa: ARG001
+        assert task_id == "task-1"
+        return b"\xff\xd8\xfffake-jpeg", "image/jpeg"
+
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator, "navigator_screenshot": screenshot}),
+    )
+    client = _ScriptedClient([None])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2023, "make": "Toyota", "model": "Camry"},
+        topic="blind spot monitor calibration",
+    )
+
+    first_user = client.messages_seen[0][1]
+    assert isinstance(first_user["content"], list)
+    assert first_user["content"][0]["type"] == "text"
+    assert first_user["content"][1]["type"] == "image_url"
+    assert first_user["content"][1]["image_url"]["url"].startswith(
+        "data:image/jpeg;base64,"
+    )
+
+
+@pytest.mark.asyncio
+async def test_multiple_model_actions_do_not_run_blind_against_one_observation(monkeypatch):
+    navigator = _FakeNavigator()
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([
+        [
+            ("fill", {"ref": "e1", "text": "2023 Toyota Camry"}),
+            ("click", {"ref": "e2"}),
+        ],
+        None,
+    ])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2023, "make": "Toyota", "model": "Camry"},
+        topic="topic",
+    )
+
+    acted = [call["action"] for call in navigator.calls if call["action"] in {"fill", "click"}]
+    assert acted == ["fill"]

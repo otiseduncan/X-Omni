@@ -89,6 +89,7 @@ MAX_REF_CHARS = 40
 MAX_FILL_TEXT_CHARS = 400
 MAX_KEY_CHARS = 40
 MAX_NAV_URL_CHARS = 2048
+MAX_NAV_SCREENSHOT_BYTES = 4 * 1024 * 1024
 
 
 SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
@@ -2119,6 +2120,78 @@ async def navigator_current_page_signals(settings: Any, provider: str) -> dict[s
         return _transport_failure(action, exc)
     except ScrapeXContract as exc:
         return _contract_failure(action, exc, may_mutate=False)
+
+
+
+async def navigator_screenshot(settings: Any, task_id: str) -> tuple[bytes, str]:
+    """Fetch one task-bound Navigator still for transient multimodal reasoning.
+
+    This is intentionally not a registered model tool. Raw image bytes never
+    enter a tool result or durable conversation artifact; the caller may feed
+    the validated still directly to the active local vision worker for the
+    current browser turn only.
+    """
+    task_value = _text(task_id, "task_id", maximum=MAX_TASK_ID_CHARS)
+    assert task_value is not None
+    if not _RESOURCE_ID_RE.fullmatch(task_value):
+        raise ScrapeXInput("task_id must be a bounded ScrapeX identifier.")
+
+    base_url = _base_url(settings)
+    try:
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            timeout=READ_TIMEOUT,
+            trust_env=False,
+            follow_redirects=False,
+            headers={
+                "Accept": "image/jpeg",
+                "User-Agent": "X-Omni/ScrapeX-navigator-vision",
+            },
+        ) as client:
+            response = await client.get(
+                f"/api/navigator/tasks/{quote(task_value, safe='')}/screenshot"
+            )
+    except httpx.TimeoutException as exc:
+        raise ScrapeXTransport(
+            "timeout", "ScrapeX screenshot did not arrive before the timeout."
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise ScrapeXTransport(
+            "unavailable", "ScrapeX is unavailable on its local loopback endpoint."
+        ) from exc
+
+    if response.status_code >= 400:
+        try:
+            payload = response.json()
+            detail = payload.get("detail") if isinstance(payload, dict) else payload
+        except ValueError:
+            detail = response.text[:600]
+        raise ScrapeXRemote(response.status_code, detail, may_mutate=False)
+
+    content = response.content
+    if not content or len(content) > MAX_NAV_SCREENSHOT_BYTES:
+        raise ScrapeXContract(
+            "navigator_screenshot_invalid",
+            "ScrapeX returned an empty or oversized Navigator screenshot.",
+        )
+    media_type = (
+        str(response.headers.get("content-type") or "")
+        .partition(";")[0]
+        .strip()
+        .casefold()
+    )
+    if media_type != "image/jpeg" or not content.startswith(b"\xff\xd8\xff"):
+        raise ScrapeXContract(
+            "navigator_screenshot_invalid",
+            "ScrapeX returned a Navigator screenshot with an invalid image contract.",
+        )
+    echoed_task = str(response.headers.get("x-scrapex-task-id") or "").strip()
+    if echoed_task != task_value:
+        raise ScrapeXContract(
+            "navigator_task_mismatch",
+            "ScrapeX returned a screenshot for a different Navigator task.",
+        )
+    return content, media_type
 
 
 _NAVIGATOR_ALLOWED_KEYS: dict[str, set[str]] = {

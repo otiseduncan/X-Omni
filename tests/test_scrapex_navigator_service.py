@@ -354,3 +354,41 @@ async def test_malformed_task_id_is_rejected_before_any_request(monkeypatch):
 
     assert result["status"] == "invalid_request"
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_navigator_screenshot_is_task_bound_jpeg(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/navigator/tasks/task-1/screenshot"
+        return httpx.Response(
+            200,
+            content=b"\xff\xd8\xffjpeg",
+            headers={
+                "content-type": "image/jpeg",
+                "x-scrapex-task-id": "task-1",
+            },
+        )
+
+    _install_transport(monkeypatch, handler)
+    raw, mime = await scrapex.navigator_screenshot(FakeSettings(), "task-1")
+    assert raw.startswith(b"\xff\xd8\xff")
+    assert mime == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_navigator_screenshot_rejects_wrong_task_echo(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"\xff\xd8\xffjpeg",
+            headers={
+                "content-type": "image/jpeg",
+                "x-scrapex-task-id": "task-999",
+            },
+        )
+
+    _install_transport(monkeypatch, handler)
+    with pytest.raises(scrapex.ScrapeXContract) as exc:
+        await scrapex.navigator_screenshot(FakeSettings(), "task-1")
+    assert exc.value.code == "navigator_task_mismatch"

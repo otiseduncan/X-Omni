@@ -26,6 +26,7 @@ This loop never recomputes browser semantics itself; it only checks the
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from typing import Any, Optional
@@ -34,7 +35,7 @@ from . import scrapex as scrapex_svc
 
 log = logging.getLogger("xomni.research_navigator_agent")
 
-MAX_MODEL_TURNS = 18
+MAX_MODEL_TURNS = 40
 _NAV_ACTIONS = ("observe", "click", "fill", "press", "back", "open", "extract", "done")
 # Bounded at the element level, not by an outer character truncation --
 # confirmed live against real ALLDATA search results (500+ entries): a flat
@@ -49,21 +50,17 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
     "function": {
         "name": "navigator_browse",
         "description": (
-            "Operate a real, already-authenticated ALLDATA browser session one bounded "
-            "action at a time. observe re-reads the current page without acting -- call it "
-            "if you suspect the page changed (e.g. after a lazily-loaded menu) and want a "
-            "fresh look before deciding what to do next. Every click/fill/press targets an "
-            "element by its exact 'ref' copied verbatim from the most recent observe/action "
-            "result's elements list -- never guess a ref, and never invent a role, name, or "
-            "CSS selector; if the ref you want isn't in the latest list, call observe again. "
-            "Workflow: (1) fill the vehicle search box with the requested vehicle and click "
-            "the matching result to select it -- this is mandatory before any destination can "
-            "count as relevant to it, (2) navigate toward the requested calibration/procedure "
-            "topic, using 'back' to retreat out of any wrong branch, (3) once the actual "
-            "procedure content -- not a menu or search-results listing -- is on screen, call "
-            "extract. Call 'done' once you have extracted the relevant procedure, or once you "
-            "are confident this exact vehicle/topic is not reachable -- do not keep acting once "
-            "you already have enough information to answer."
+            "Operate the real, already-authenticated ALLDATA browser session one bounded "
+            "action at a time. Reason from the current rendered page and structured element "
+            "map; do not assume a fixed ALLDATA hierarchy or scripted drill-down sequence. "
+            "Every click/fill/press targets an exact 'ref' copied verbatim from the latest "
+            "observation -- never invent a ref, role, label, selector, or coordinate. After "
+            "each action the browser is re-observed, so choose the next action from the new "
+            "state rather than predicting what a page should contain. Maintain the exact "
+            "requested vehicle as a hard evidence requirement, explore/backtrack as needed, "
+            "and call extract only when actual procedure content is on screen rather than a "
+            "menu or results list. Call done when the requested evidence has been extracted "
+            "or when the observed site state shows the goal is not reachable."
         ),
         "parameters": {
             "type": "object",
@@ -112,12 +109,17 @@ def _system_prompt(target: dict[str, Any], topic: str) -> str:
         "answered with an initial observation of the current page -- read it before acting. "
         f"Find the exact OEM procedure for:\nVehicle: {label}\nTopic: {topic}\n\n"
         "Do not substitute a different model, trim, or year, and do not answer from general "
-        "knowledge -- only from what you actually observe in a tool result. Your final answer "
-        "is independently checked against the real page afterward, so a claim that isn't backed "
-        "by what the tools actually showed you will be discarded rather than trusted. If a tool "
-        "call returns an error, read it and change what you send -- do not repeat the exact same "
-        "call. If you cannot find this exact vehicle/topic after a reasonable number of steps, "
-        "call 'done' and say so plainly instead of guessing."
+        "knowledge -- only from what you actually observe. You are the navigation reasoner: "
+        "choose the next browser action from the live page state instead of following a fixed "
+        "menu script or keyword router. A task-bound annotated screenshot accompanies each "
+        "observation when available; labels such as [e12] on the image are the same exact refs "
+        "listed in the structured observation. Use pixels to understand layout, grouping, "
+        "selected state, menus, and drill-down context, but act only by an observed ref. The "
+        "browser will be re-observed after each executed action, so choose one action at a time "
+        "and then reassess. Your final claim is independently checked against the real page. "
+        "If a tool call returns an error, adapt to the observed state rather than repeating it. "
+        "If the exact vehicle/topic cannot be found after reasonable exploration, call 'done' "
+        "and say so plainly instead of guessing."
     )
 
 
@@ -175,6 +177,47 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+async def _task_screenshot(
+    settings: Any, task_id: str
+) -> Optional[tuple[bytes, str]]:
+    """Best-effort visual observation; pixels never become the truth gate."""
+    try:
+        return await scrapex_svc.navigator_screenshot(settings, task_id)
+    except Exception as exc:  # noqa: BLE001 - vision supplements the DOM contract
+        log.debug("Navigator screenshot unavailable for %s: %s", task_id, exc)
+        return None
+
+
+def _visual_observation_content(
+    heading: str,
+    summary: dict[str, Any],
+    screenshot: Optional[tuple[bytes, str]],
+) -> str | list[dict[str, Any]]:
+    text = (
+        f"{heading}\n\nStructured observation: "
+        f"{json.dumps(summary, default=str)[:_TOOL_RESULT_CHAR_BACKSTOP]}"
+    )
+    if screenshot is None:
+        return text
+    raw, mime = screenshot
+    encoded = base64.b64encode(raw).decode("ascii")
+    return [
+        {
+            "type": "text",
+            "text": (
+                text
+                + "\n\nThe attached image is this same task's current rendered viewport. "
+                "Its [eN] overlays correspond to the exact refs above. Use the image to "
+                "understand what a human sees, but execute browser actions only by ref."
+            ),
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{encoded}"},
+        },
+    ]
+
+
 async def run_navigator_search(
     *,
     client: Any,
@@ -222,13 +265,16 @@ async def run_navigator_search(
             ),
         }
 
+    initial_summary = _observation_summary(initial_observation)
+    initial_screenshot = await _task_screenshot(settings, task_id)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _system_prompt(target, topic)},
         {
             "role": "user",
-            "content": (
-                f"Find the ALLDATA procedure for {_target_label(target)}: {topic}.\n\n"
-                f"Initial observation: {json.dumps(_observation_summary(initial_observation), default=str)[:_TOOL_RESULT_CHAR_BACKSTOP]}"
+            "content": _visual_observation_content(
+                f"Find the ALLDATA procedure for {_target_label(target)}: {topic}.",
+                initial_summary,
+                initial_screenshot,
             ),
         },
     ]
@@ -268,7 +314,8 @@ async def run_navigator_search(
         messages.append({"role": "assistant", "content": content or None, "tool_calls": wire_calls})
 
         turn_hit_repeat_limit = False
-        for call, wire_call in zip(calls, wire_calls):
+        latest_visual_summary: Optional[dict[str, Any]] = None
+        for call_index, (call, wire_call) in enumerate(zip(calls, wire_calls)):
             try:
                 args = json.loads(call.get("arguments") or "{}")
                 if not isinstance(args, dict):
@@ -277,9 +324,17 @@ async def run_navigator_search(
                 args = {}
             action = str(args.get("action") or "").casefold()
             validation_error = _validate_args(action, args) if action in _NAV_ACTIONS else None
+            dispatched = False
 
-            if action not in _NAV_ACTIONS:
+            if call_index > 0:
                 result: dict[str, Any] = {
+                    "error": (
+                        "Only the first browser action from this model turn was executed. "
+                        "Inspect the refreshed observation before choosing another action."
+                    )
+                }
+            elif action not in _NAV_ACTIONS:
+                result = {
                     "error": f"'{action or '(missing)'}' is not a navigator action available to this loop."
                 }
             elif validation_error:
@@ -296,9 +351,12 @@ async def run_navigator_search(
                     dispatch_args["key"] = args.get("key")
                 elif action == "open":
                     dispatch_args["url"] = args.get("url")
+                dispatched = True
                 navigator_result = await scrapex_svc.navigator(settings, dispatch_args)
                 if navigator_result.get("success"):
                     result = _observation_summary(navigator_result)
+                    if action != "done":
+                        latest_visual_summary = result
                 else:
                     result = {
                         "error": (navigator_result.get("error") or {}).get("message")
@@ -317,14 +375,14 @@ async def run_navigator_search(
                     **result,
                     "error": (
                         f"REPEATED MISTAKE ({repeated_failure_count}x): you sent the exact same "
-                        f"call and got the exact same error again. Re-read the error and change "
-                        f"the arguments -- do not resend this call unchanged. {call_error}"
+                        f"call and got the exact same error again. Re-read the live state and "
+                        f"change the action or arguments. {call_error}"
                     ),
                 }
             if call_error and repeated_failure_count >= 3:
                 turn_hit_repeat_limit = True
 
-            if action == "done":
+            if action == "done" and dispatched and not call_error:
                 model_called_done = True
 
             trace.append({
@@ -338,6 +396,20 @@ async def run_navigator_search(
                 "tool_call_id": wire_call["id"],
                 "content": json.dumps(result, default=str)[:_TOOL_RESULT_CHAR_BACKSTOP],
             })
+
+        if latest_visual_summary is not None and not model_called_done:
+            current_screenshot = await _task_screenshot(settings, task_id)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _visual_observation_content(
+                        "Current rendered browser state after the executed action. "
+                        "Reason from this new state and choose the next action yourself.",
+                        latest_visual_summary,
+                        current_screenshot,
+                    ),
+                }
+            )
 
         if model_called_done:
             stopped_reason = "model_done"
