@@ -470,8 +470,13 @@ async def test_collect_general_reference_captures_and_stores_with_no_repair_orde
     assert "required_calibrations" not in result
     assert "next_action" not in result
     manifest = (
-        root / "Acquired" / "ALLDATA" / "Nissan" / "2022 Nissan Altima"
-        / "ADAS Quick Reference" / "quick-reference-manifest.json"
+        root
+        / "2022"
+        / "Nissan"
+        / "Altima"
+        / "ALLDATA"
+        / "ADAS Quick Reference"
+        / "quick-reference-manifest.json"
     )
     assert manifest.is_file()
 

@@ -93,15 +93,18 @@ async def test_capture_succeeds_when_the_page_confirms_the_claimed_vehicle(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_capture_without_a_vehicle_argument_is_not_gated(tmp_path: Path):
-    """A capture that doesn't claim to be about a specific vehicle (e.g. a
-    general policy page) isn't subject to the vehicle-identity gate at all."""
+async def test_capture_without_vehicle_identity_is_refused_by_canonical_si_policy(
+    tmp_path: Path,
+):
+    """ADAS SI has a hard Year/Make/Model storage contract."""
     page = _FakePage(
         url="https://my.alldata.com/repair/#/policy",
         title="ALLDATA Collision - Home",
     )
     browser = _browser(tmp_path, page)
 
-    result = await browser._capture_to_adas({"topic": "General collision policy"})
-
-    assert result["status"] == "success"
+    with pytest.raises(
+        ValueError,
+        match="requires exact year, make, and model",
+    ):
+        await browser._capture_to_adas({"topic": "General collision policy"})

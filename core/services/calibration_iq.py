@@ -2169,6 +2169,14 @@ def _source_file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _logical_migration_source_name(name: str) -> str:
+    """Normalize only suffixes introduced by safe duplicate preservation."""
+    stem = Path(name).stem.strip()
+    stem = re.sub(r"\s+legacy-[0-9a-f]{8,64}$", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"\s+\(\d+\)$", "", stem)
+    return stem.strip().casefold()
+
+
 def _matching_existing_document(
     existing: list[dict[str, Any]],
     *,
@@ -2275,7 +2283,7 @@ async def _expand_research_action(
     ])
 
     documents: dict[str, dict[str, Any]] = {}
-    sha_to_relative: dict[str, str] = {}
+    migration_duplicate_to_relative: dict[tuple[str, str], str] = {}
     findings: list[dict[str, Any]] = []
     for spec, search in zip(queries, search_results):
         search = search if isinstance(search, dict) else {}
@@ -2304,9 +2312,13 @@ async def _expand_research_action(
             document_supported = bool(exact_source_matched and doc_hits)
             supported = supported or document_supported
 
-            canonical_relative = sha_to_relative.get(source_sha256)
+            duplicate_key = (
+                source_sha256,
+                _logical_migration_source_name(source_path.name),
+            )
+            canonical_relative = migration_duplicate_to_relative.get(duplicate_key)
             if canonical_relative is None:
-                sha_to_relative[source_sha256] = relative
+                migration_duplicate_to_relative[duplicate_key] = relative
                 record = documents.setdefault(relative, {
                     "relative_path": relative,
                     "source_path": str(source_path),
@@ -2320,9 +2332,9 @@ async def _expand_research_action(
                     "is_adas_map": False,
                 })
             else:
-                # The source library can legitimately retain duplicate legacy
-                # copies after migration. Identical bytes are one evidence
-                # source for CIQ linking, not competing calibration candidates.
+                # Collapse only migration-generated duplicate filenames with
+                # identical bytes. Distinct logical documents remain distinct
+                # even if their content hashes happen to match.
                 record = documents[canonical_relative]
             record["pages"].update(int(hit["page"]) for hit in doc_hits)
             record["queries"].add(spec["query"])
@@ -2480,12 +2492,13 @@ async def _expand_research_action(
             if needs_metadata_update:
                 changes: dict[str, Any] = {
                     "status": import_arguments["status"],
-                    "source_uri": canonical_source_uri,
-                    "source_name": record["source_name"],
                     "page_references": sorted(existing_pages | desired_pages),
                     "citation": import_arguments["citation"],
                     "notes": import_arguments["notes"],
                 }
+                if source_identity_changed:
+                    changes["source_uri"] = canonical_source_uri
+                    changes["source_name"] = record["source_name"]
                 # A metadata refresh and missing evidence links must be one
                 # optimistic-concurrency mutation. Emitting update_document
                 # followed by link_document would require guessing the first
