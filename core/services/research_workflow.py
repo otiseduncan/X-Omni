@@ -272,6 +272,9 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
     if not query:
         raise ValueError("query is required")
     make = str(args.get("manufacturer") or "").strip() or requested_make(query, adas_mod)
+    from . import research_alldata_navigation as nav
+
+    storage_vehicle = nav.vehicle_from_query(query)
     # Persistence is an explicit structured decision made by the model. Never
     # infer it from words embedded in the research query.
     preserve = args.get("preserve") is True
@@ -326,7 +329,20 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
     if preserve:
         if alldata.get("verified") and alldata.get("query_submitted") and int(alldata.get("relevance_score") or 0) >= 2:
             try:
-                captures.append({"source": "ALLDATA", **(await browser._capture_to_adas({"vehicle": make or "Vehicle", "topic": query[:120]}))})  # noqa: SLF001
+                captures.append({
+                    "source": "ALLDATA",
+                    **(
+                        await browser._capture_to_adas(  # noqa: SLF001
+                            {
+                                "vehicle": storage_vehicle.get("label") or "",
+                                "vehicle_year": storage_vehicle.get("year"),
+                                "vehicle_make": storage_vehicle.get("make"),
+                                "vehicle_model": storage_vehicle.get("model_trim"),
+                                "topic": query[:120],
+                            }
+                        )
+                    ),
+                })
             except Exception as exc:  # noqa: BLE001
                 captures.append({"source": "ALLDATA", "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
         for source in (public.get("sources") or [])[:4]:
@@ -336,10 +352,18 @@ async def full_research(args: dict[str, Any], *, adas: Any, browser: Any) -> dic
             if not url:
                 continue
             try:
-                saved = await research_capture.public_capture({
-                    "url": url, "manufacturer": make or "OEM", "vehicle": make or "",
-                    "topic": source.get("title") or query[:120],
-                }, adas)
+                saved = await research_capture.public_capture(
+                    {
+                        "url": url,
+                        "manufacturer": make or "OEM",
+                        "vehicle": storage_vehicle.get("label") or "",
+                        "vehicle_year": storage_vehicle.get("year"),
+                        "vehicle_make": storage_vehicle.get("make"),
+                        "vehicle_model": storage_vehicle.get("model_trim"),
+                        "topic": source.get("title") or query[:120],
+                    },
+                    adas,
+                )
                 captures.append({"source": "Public OEM web", **saved})
                 break
             except Exception as exc:  # noqa: BLE001
