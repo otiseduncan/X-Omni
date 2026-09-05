@@ -78,6 +78,55 @@ async def test_already_healthy_short_circuits_without_spawning(settings, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_stale_healthy_runtime_is_replaced_after_git_pull(settings, monkeypatch):
+    revision = "a" * 40
+    state = {"stale_running": True, "new_running": False, "stopped": False}
+
+    monkeypatch.setattr(scrapex, "_project_revision", lambda _project: revision)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if state["stale_running"]:
+            return httpx.Response(
+                200,
+                json={"ok": True, "service": "ScrapeX"},
+                request=request,
+            )
+        if state["new_running"]:
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "service": "ScrapeX",
+                    "runtime_revision": revision,
+                },
+                request=request,
+            )
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    _install_transport(monkeypatch, handler)
+
+    def stop_stale(_settings, health, _project):
+        assert health["service"] == "ScrapeX"
+        state["stale_running"] = False
+        state["stopped"] = True
+
+    monkeypatch.setattr(scrapex, "_stop_stale_scrapex", stop_stale)
+
+    def fake_popen(cmd, *, cwd, stdout, stderr, creationflags):
+        state["new_running"] = True
+        return FakeProcess(returncode=None)
+
+    monkeypatch.setattr(scrapex.subprocess, "Popen", fake_popen)
+
+    result = await scrapex.start_native(settings)
+
+    assert state["stopped"] is True
+    assert result["status"] == "healthy"
+    assert result["verified"] is True
+    assert result["data"]["runtime_revision"] == revision
+
+
+@pytest.mark.asyncio
 async def test_becomes_healthy_after_spawning(settings, monkeypatch):
     state = {"up": False}
 
