@@ -681,6 +681,130 @@ async def test_week_readiness_explicit_phase_overrides_default_scope(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_week_readiness_execute_missing_runs_full_active_evidence_flow(monkeypatch):
+    row = {
+        "id": "ro-active-3",
+        "ro_number": "RO-ACTIVE-3",
+        "phase": "3",
+        "source_presence": {"active_on_source": True},
+        "vehicle": {"year": 2024, "make": "Toyota", "model": "Camry"},
+    }
+    snapshot = {
+        "repair_order": {"id": "ro-active-3", "ro_number": "RO-ACTIVE-3"},
+        "vehicle": {"year": 2024, "make": "Toyota", "model": "Camry"},
+        "calibrations": [],
+    }
+
+    async def query_repair_orders(_settings, args):
+        assert args == {"include_completed": True}
+        return {"status": "verified", "items": [row]}
+
+    async def load_snapshot(_settings, identifier):
+        assert identifier == "ro-active-3"
+        return {"status": "verified", "snapshot": snapshot}
+
+    discovery_calls = 0
+
+    async def discover_map(_catalog, _snapshot):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        if discovery_calls == 1:
+            return {
+                "status": "not_found",
+                "requirements": [],
+                "requirement_count": 0,
+            }
+        return {
+            "status": "verified",
+            "requirements": [
+                {"label": "Front camera calibration", "method": "STATIC"}
+            ],
+            "requirement_count": 1,
+        }
+
+    async def acquire_map(_settings, current_snapshot):
+        assert current_snapshot is snapshot
+        return {
+            "status": "completed",
+            "success": True,
+            "verified": True,
+            "work_complete": True,
+        }
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [], None
+
+    coverage_calls = 0
+
+    async def catalog_coverage(_catalog, _snapshot, _map_info):
+        nonlocal coverage_calls
+        coverage_calls += 1
+        state = (
+            prep.adas_artifact_catalog.MISSING
+            if coverage_calls == 1
+            else prep.adas_artifact_catalog.COVERED
+        )
+        return [{"calibration": "Front camera calibration", "state": state}]
+
+    async def acquire_si(_settings, _adas, current_snapshot, coverage):
+        assert current_snapshot is snapshot
+        assert coverage[0]["state"] == prep.adas_artifact_catalog.MISSING
+        return [
+            {
+                "topic": "Front camera calibration",
+                "verified": True,
+                "captured": True,
+            }
+        ]
+
+    async def link_evidence(_settings, _adas, repair_order_id, context):
+        assert repair_order_id == "ro-active-3"
+        assert context["conversation_id"] == 77
+        return {
+            "status": "success",
+            "success": True,
+            "verified": True,
+            "executed": True,
+        }
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", query_repair_orders)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_acquire_adas_map_gap", acquire_map)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_coverage", catalog_coverage)
+    monkeypatch.setattr(prep, "_acquire_si_gaps", acquire_si)
+    monkeypatch.setattr(prep, "_link_ro_research_evidence", link_evidence)
+
+    result = await prep._week_readiness(
+        SimpleNamespace(root=Path(".")),
+        SimpleNamespace(),
+        {
+            "execute_missing": True,
+            prep._CONTEXT_KEY: {  # noqa: SLF001
+                "conversation_id": 77,
+                "message_id": 88,
+                "tool_call_id": "prepare-active",
+            },
+        },
+    )
+
+    assert result["status"] == "success"
+    assert result["execute_missing"] is True
+    assert result["phase_scope"] == ["active"]
+    assert result["queue_count"] == 1
+    assert result["ready_count"] == 1
+    assert result["readiness_complete"] is True
+    assert result["adas_map_acquisition_attempted"] == 1
+    assert result["adas_map_acquired_count"] == 1
+    assert result["si_acquisition_attempted"] == 1
+    assert result["si_acquired_count"] == 1
+    assert result["evidence_link_attempted"] == 1
+    assert result["evidence_link_verified"] == 1
+    assert result["repair_orders"][0]["status"] == "ready"
+
+
+@pytest.mark.asyncio
 async def test_week_readiness_capacity_fails_before_snapshot_or_reconciliation(monkeypatch):
     rows = [
         {

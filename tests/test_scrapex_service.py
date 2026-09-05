@@ -566,6 +566,92 @@ async def test_create_exact_batch_uses_only_bounded_structured_fields(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_acquire_exact_runs_one_ro_through_terminal_processing(monkeypatch):
+    requests: list[tuple[str, str]] = []
+
+    async def start_native(_settings):
+        return {
+            "status": "ready",
+            "success": True,
+            "executed": False,
+            "verified": True,
+        }
+
+    monkeypatch.setattr(scrapex, "start_native", start_native)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/api/batches/from-ciq/exact":
+            assert json.loads(request.content) == {
+                "name": "RO 9701 ADAS Map",
+                "ro_numbers": ["9701"],
+                "source_scope": "active",
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "id": "batch-9701",
+                    "state": "pending",
+                    "requested_ro_numbers": ["9701"],
+                    "source_scope": "active",
+                    "items": [
+                        {
+                            "id": "item-9701",
+                            "batch_id": "batch-9701",
+                            "ro_number": "9701",
+                        }
+                    ],
+                    "readiness": {
+                        "ready": False,
+                        "total": 1,
+                        "adas_map_unresolved": 1,
+                    },
+                },
+            )
+        if request.url.path == "/api/adas-map/status":
+            return httpx.Response(
+                200,
+                json={"active": True, "authenticated": True},
+            )
+        if request.url.path == "/api/batches/batch-9701/adas-map/process-one/9701":
+            return httpx.Response(
+                200,
+                json={
+                    "attempted": True,
+                    "completed": True,
+                    "status": "completed",
+                    "batch_id": "batch-9701",
+                    "ro_number": "9701",
+                    "item": _completed_item("batch-9701", "9701"),
+                    "readiness": {"ready": True},
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.adas_map(
+        FakeSettings(),
+        {
+            "action": "acquire_exact",
+            "ro_number": "9701",
+            "source_scope": "active",
+        },
+    )
+
+    assert result["status"] == "completed"
+    assert result["success"] is True
+    assert result["verified"] is True
+    assert result["work_complete"] is True
+    assert result["exact_batch_id"] == "batch-9701"
+    assert result["requested_ro_number"] == "9701"
+    assert requests == [
+        ("POST", "/api/batches/from-ciq/exact"),
+        ("GET", "/api/adas-map/status"),
+        ("POST", "/api/batches/batch-9701/adas-map/process-one/9701"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_process_one_copies_the_exact_created_batch_data_id(monkeypatch):
     requests: list[tuple[str, str]] = []
 
