@@ -1013,10 +1013,34 @@ export function ScrapeXCard({ data }) {
         {readinessRows.map((row) => (
           <div key={row.key}><span>{row.label}</span><strong>{row.value}</strong></div>
         ))}
+        {data?.local_report?.verified === true && (
+          <div><span>PDF saved</span><strong>yes</strong></div>
+        )}
+        {data?.ciq_attachment?.attached === true && (
+          <div><span>Attached to RO</span><strong>yes</strong></div>
+        )}
       </div>
 
-      {authenticationRequired && (
-        <p className="card-note ciq-incomplete" style={{ marginTop: 9 }}>
+      {data?.chat_document && data?.ciq_attachment?.attached === true && (
+        <div style={{ marginTop: 10 }}>
+          <DocumentViewer doc={data.chat_document} compact />
+        </div>
+      )}
+
+      {data?.ciq_attachment?.download_url && (
+        <div className="field-actions" style={{ marginTop: 8 }}>
+          <a
+            href={data.ciq_attachment.download_url}
+            target="_blank"
+            rel="noreferrer"
+            className="field-link"
+          >
+            <ExternalLink size={12} /> Open attached ADAS Map
+          </a>
+        </div>
+      )}
+
+      {authenticationRequired && (        <p className="card-note ciq-incomplete" style={{ marginTop: 9 }}>
           Interactive ADAS Map sign-in is required in ScrapeX&apos;s managed work browser.
           Credentials never pass through chat or the model.
         </p>
