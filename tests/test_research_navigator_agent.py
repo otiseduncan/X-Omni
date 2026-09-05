@@ -2,8 +2,8 @@
 
 These exercise the control flow (task creation, tool dispatch, turn budget,
 repeated-failure detection) and, most importantly, that verification always
-comes from ScrapeX's own deterministic verify action -- never from the
-model's own narration -- by driving a fake scrapex.navigator() rather than a
+comes from ScrapeX's own verify action -- never from the model's own narration --
+by driving a fake scrapex.navigator() rather than a
 real ScrapeX service.
 """
 
@@ -182,6 +182,7 @@ async def test_happy_path_reaches_verified_via_scrapex_verify_not_model_narratio
 
     assert result["attempted"] is True
     assert result["verified"] is True
+    assert result["captured"] is False
     assert result["agent_stopped_reason"] == "model_done"
     assert result["task_id"] == "task-1"
     assert result["source_url"] == "https://my.alldata.com/leaf"
@@ -195,6 +196,48 @@ async def test_happy_path_reaches_verified_via_scrapex_verify_not_model_narratio
     # Model never spends its own turn budget re-deriving verification --
     # verify/get_evidence happen only in the epilogue, after the loop ends.
     assert actions_called.index("verify") > actions_called.index("done")
+
+
+@pytest.mark.asyncio
+async def test_verified_navigation_captures_only_when_explicitly_requested(monkeypatch):
+    navigator = _FakeNavigator()
+    navigator.verified_after_extract = True
+    captured_tasks: list[str] = []
+
+    async def capture(_settings, task_id):
+        captured_tasks.append(task_id)
+        return {
+            "success": True,
+            "verified": True,
+            "work_complete": True,
+            "data": {
+                "task_id": task_id,
+                "relative_path": "2023/Toyota/Camry/ALLDATA/Procedure.pdf",
+            },
+        }
+
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator, "navigator_capture": capture}),
+    )
+    client = _ScriptedClient([
+        [("extract", {})],
+        [("done", {})],
+    ])
+
+    result = await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2023, "make": "Toyota", "model": "Camry"},
+        topic="blind spot monitor calibration",
+        capture=True,
+    )
+
+    assert result["verified"] is True
+    assert result["captured"] is True
+    assert captured_tasks == ["task-1"]
 
 
 @pytest.mark.asyncio

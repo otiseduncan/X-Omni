@@ -6449,7 +6449,7 @@ async def test_alldata_vehicle_string_is_schema_and_handler_supported(
 ) -> None:
     from jsonschema import validate
 
-    from core.services import research_alldata_navigation, research_operator
+    from core.services import research_navigator_agent, research_operator
 
     arguments = {
         "action": "alldata_vehicle_research",
@@ -6464,20 +6464,27 @@ async def test_alldata_vehicle_string_is_schema_and_handler_supported(
     validate(instance=arguments, schema=tool["function"]["parameters"])
 
     forwarded: dict[str, Any] = {}
+    sentinel = object()
 
     async def capture_search(
-        _browser: Any,
-        _query: str = "",
         *,
-        vehicle: dict[str, Any] | None = None,
-        topic: str | None = None,
+        client: Any,
+        provider: str,
+        target: dict[str, Any],
+        topic: str,
+        capture: bool = False,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
-        forwarded.update(vehicle=vehicle, topic=topic)
-        return {"status": "invalid_vehicle", "verified": False}
+        assert client is sentinel
+        assert provider == "alldata"
+        assert capture is False
+        forwarded.update(vehicle=target, topic=topic)
+        return {"status": "invalid_vehicle", "verified": False, "captured": False}
 
+    monkeypatch.setattr(research_navigator_agent, "current_model_client", lambda: sentinel)
     monkeypatch.setattr(
-        research_alldata_navigation,
-        "search_alldata_vehicle_first",
+        research_navigator_agent,
+        "run_navigator_search",
         capture_search,
     )
     browser = research_operator.LicensedBrowser(ROOT)

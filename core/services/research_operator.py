@@ -555,8 +555,8 @@ class LicensedBrowser:
                     "verified": False,
                     "captured": False,
                     "message": (
-                        "The agentic ALLDATA Navigator requires the active X model "
-                        "execution context; the retired scripted fallback was not run."
+                        "The ALLDATA Navigator requires the active X model execution "
+                        "context; no substitute navigation path was run."
                     ),
                 }
             result = await research_navigator_agent.run_navigator_search(

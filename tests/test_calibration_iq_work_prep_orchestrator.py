@@ -120,24 +120,30 @@ class _Router:
 
 
 @pytest.mark.parametrize(
-    ("utterance", "expected_mode", "expected_phase"),
+    ("utterance", "expected_mode", "expected_phase", "execute_missing"),
     [
-        ("let's prepare for the weak", "week_readiness", None),
+        ("let's prepare for the weak", "week_readiness", None, True),
         (
             "do all cars in phase 5 have an ADAS Map report in ADAS SI?",
             "phase_coverage",
             "5",
+            False,
         ),
     ],
 )
 @pytest.mark.asyncio
 async def test_work_prep_turn_uses_model_selected_structured_mode(
-    utterance: str, expected_mode: str, expected_phase: str | None
+    utterance: str,
+    expected_mode: str,
+    expected_phase: str | None,
+    execute_missing: bool,
 ):
     prep.install()
     store = _Store(utterance)
     registry = _Registry()
     expected_args = {"mode": expected_mode}
+    if execute_missing:
+        expected_args["execute_missing"] = True
     if expected_phase:
         expected_args.update({"phase": expected_phase, "coverage_focus": "adas_map"})
     client = _ModelClient(expected_args)
@@ -168,6 +174,7 @@ async def test_work_prep_turn_uses_model_selected_structured_mode(
     args = registry.invocations[0][1]
     assert args["mode"] == expected_mode
     assert args.get("phase") == expected_phase
+    assert args.get("execute_missing") is (True if execute_missing else None)
     assert args.get("coverage_focus") == (
         "adas_map" if expected_mode == "phase_coverage" else None
     )

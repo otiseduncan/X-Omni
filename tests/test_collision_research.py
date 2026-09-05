@@ -7,6 +7,7 @@ import pytest
 from core.services import (
     research_alldata_navigation,
     research_capture,
+    research_navigator_agent,
     research_operator,
 )
 from core.tools.registry import Registry, TOOL_SCHEMAS
@@ -119,24 +120,24 @@ async def test_alldata_vehicle_research_executes_model_supplied_structured_field
 ):
     browser = research_operator.LicensedBrowser(tmp_path)
     received: dict = {}
+    sentinel = object()
 
-    async def structured_search(browser_arg, query="", *, vehicle=None, topic=None):
-        assert browser_arg is browser
-        assert query == ""
-        received.update({"vehicle": vehicle, "topic": topic})
+    async def navigator_search(*, client, provider, target, topic, capture=False, **_kwargs):
+        assert client is sentinel
+        assert provider == "alldata"
+        assert capture is False
+        received.update({"vehicle": target, "topic": topic})
         return {
-            "status": "success",
             "searched": True,
             "verified": True,
-            "vehicle": vehicle,
+            "captured": False,
+            "target": target,
             "topic": topic,
         }
 
-    monkeypatch.setattr(
-        research_alldata_navigation,
-        "search_alldata_vehicle_first",
-        structured_search,
-    )
+    monkeypatch.setattr(research_navigator_agent, "current_model_client", lambda: sentinel)
+    monkeypatch.setattr(research_navigator_agent, "run_navigator_search", navigator_search)
+
     result = await browser.operator_action(
         {
             "action": "alldata_vehicle_research",
@@ -148,6 +149,7 @@ async def test_alldata_vehicle_research_executes_model_supplied_structured_field
         }
     )
     assert result["verified"] is True
+    assert result["success"] is True
     assert received == {
         "vehicle": {
             "year": 2020,
@@ -165,24 +167,24 @@ async def test_alldata_vehicle_research_normalizes_advertised_vehicle_label(
 ):
     browser = research_operator.LicensedBrowser(tmp_path)
     received: dict = {}
+    sentinel = object()
 
-    async def structured_search(browser_arg, query="", *, vehicle=None, topic=None):
-        assert browser_arg is browser
-        assert query == ""
-        received.update({"vehicle": vehicle, "topic": topic})
+    async def navigator_search(*, client, provider, target, topic, capture=False, **_kwargs):
+        assert client is sentinel
+        assert provider == "alldata"
+        assert capture is False
+        received.update({"vehicle": target, "topic": topic})
         return {
-            "status": "success",
             "searched": True,
             "verified": True,
-            "vehicle": vehicle,
+            "captured": False,
+            "target": target,
             "topic": topic,
         }
 
-    monkeypatch.setattr(
-        research_alldata_navigation,
-        "search_alldata_vehicle_first",
-        structured_search,
-    )
+    monkeypatch.setattr(research_navigator_agent, "current_model_client", lambda: sentinel)
+    monkeypatch.setattr(research_navigator_agent, "run_navigator_search", navigator_search)
+
     result = await browser.operator_action(
         {
             "action": "alldata_vehicle_research",

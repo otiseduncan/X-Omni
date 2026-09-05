@@ -31,7 +31,6 @@ from . import calibration_iq_weekly_queue as weekly_queue
 from . import research_alldata_navigation as nav
 from . import research_alldata_quick_reference as quick
 from . import research_navigator_agent
-from . import research_operator
 from . import scrapex as scrapex_svc
 
 TOOL_NAME = "calibration_iq_work_prep"
@@ -2721,43 +2720,6 @@ async def _queue_next_mode(settings: Any, adas: Any, args: dict[str, Any]) -> di
         }
     result = await resolve_queue_next(settings, adas, context["conversation_id"])
     return {"mode": "queue_next", **result}
-
-
-async def _bounded_selected_vehicle_signals(page: Any) -> list[str]:
-    signals: list[str] = []
-    try:
-        current = await nav._current_vehicle_label(page)  # noqa: SLF001
-        if current:
-            signals.append(" ".join(str(current).split())[:500])
-    except Exception:
-        pass
-    try:
-        title = await page.title()
-        if title:
-            signals.append(" ".join(str(title).split())[:500])
-    except Exception:
-        pass
-    selectors = (
-        "[data-testid*='vehicle' i]", "[data-test*='vehicle' i]",
-        "[aria-label*='vehicle' i]", "[id*='vehicle' i]", "[class*='vehicle' i]",
-    )
-    for selector in selectors:
-        try:
-            nodes = page.locator(selector)
-            count = min(await nodes.count(), 12)
-        except Exception:
-            continue
-        for index in range(count):
-            node = nodes.nth(index)
-            try:
-                if not await node.is_visible(timeout=150):
-                    continue
-                text = " ".join((await node.inner_text(timeout=500)).split())
-            except Exception:
-                continue
-            if text and text not in signals:
-                signals.append(text[:500])
-    return signals[:25]
 
 
 def _row_matches_signals(row: dict[str, Any], signals: list[str]) -> bool:

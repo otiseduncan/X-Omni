@@ -426,6 +426,7 @@ def test_adas_map_schema_uses_complete_action_specific_branches() -> None:
 
     valid_arguments = [
         {"action": "open_authentication"},
+        {"action": "acquire_exact", "ro_number": "9000000009"},
         {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
         {"action": "create_phase_batch", "phases": ["5", "6"]},
         {
@@ -441,6 +442,8 @@ def test_adas_map_schema_uses_complete_action_specific_branches() -> None:
 
     invalid_arguments = [
         {"action": "open_authentication", "batch_id": "batch-9"},
+        {"action": "acquire_exact"},
+        {"action": "acquire_exact", "ro_number": "9000000009", "batch_id": "batch-9"},
         {
             "action": "create_exact_batch",
             "ro_numbers": ["9000000009"],
