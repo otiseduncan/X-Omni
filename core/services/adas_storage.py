@@ -289,8 +289,6 @@ def migrate_library(
             continue
         if relative.parts[0].casefold() == ADAS_MAP_DIRNAME.casefold():
             continue
-        if canonical_vehicle_identity(root, source) is not None:
-            continue
 
         sidecar = _read_sidecar(source)
         catalog_row = catalog.get(str(source.resolve()), {})
@@ -299,6 +297,10 @@ def migrate_library(
         if ro_number:
             destination = adas_map_pdf_path(root, ro_number)
         else:
+            # A Year/Make/Model path is already canonical SI only after the
+            # file has been ruled out as ADAS Map evidence.
+            if canonical_vehicle_identity(root, source) is not None:
+                continue
             vehicle = _vehicle_from_catalog(catalog_row)
             if vehicle is None:
                 vehicle = _vehicle_from_sidecar(sidecar)

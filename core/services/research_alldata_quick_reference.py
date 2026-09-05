@@ -626,11 +626,13 @@ async def _capture_one(
         "alldata_article_id": article,
         "quick_reference_url": _canonical_alldata_url(quick_reference_url),
         "retrieved_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
-        "vehicle": {
+        # Keep the legacy label field stable for title-dedupe compatibility;
+        # structured identity lives alongside it for storage/migration.
+        "vehicle": vehicle.get("label"),
+        "vehicle_identity": {
             "year": vehicle.get("year"),
             "make": vehicle.get("make"),
             "model": vehicle.get("model") or vehicle.get("model_trim"),
-            "label": vehicle.get("label"),
         },
         "storage_policy": "year/make/model",
         "title": source_title,

@@ -117,3 +117,24 @@ def test_storage_directory_rule_is_year_make_model(tmp_path: Path):
         "ALLDATA",
     )
     assert target == root.resolve() / "2022" / "Honda" / "CR-V" / "ALLDATA"
+
+
+def test_adas_map_inside_old_vehicle_tree_is_still_moved_by_ro(tmp_path: Path):
+    root = tmp_path / "ADAS SI"
+    old = root / "2023" / "Toyota" / "Camry"
+    old.mkdir(parents=True)
+    pdf = old / "2400911777 adas map.pdf"
+    pdf.write_bytes(b"%PDF-1.4 map")
+    cache = tmp_path / "empty2.sqlite"
+
+    result = adas_storage.migrate_library(root, cache, adas_si.describe_document)
+
+    expected = (
+        root
+        / "ADAS Map"
+        / "2400911777"
+        / "2400911777 ADAS Map.pdf"
+    )
+    assert result["moved"] == 1
+    assert expected.is_file()
+    assert not pdf.exists()
