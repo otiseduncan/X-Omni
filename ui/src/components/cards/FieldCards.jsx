@@ -993,6 +993,10 @@ export function ScrapeXCard({ data }) {
     batches,
     completionLabel,
   } = scrapexCardPresentation(data);
+  const reconciliation = provenance?.ciq_reconciliation || {};
+  const mapAttachment =
+    data?.ciq_attachment || reconciliation?.adas_map_attachment || null;
+  const researchStarted = reconciliation?.research_started || null;
 
   return (
     <Card
@@ -1016,21 +1020,24 @@ export function ScrapeXCard({ data }) {
         {data?.local_report?.verified === true && (
           <div><span>PDF saved</span><strong>yes</strong></div>
         )}
-        {data?.ciq_attachment?.attached === true && (
+        {mapAttachment?.attached === true && (
           <div><span>Attached to RO</span><strong>yes</strong></div>
+        )}
+        {researchStarted?.to_state === "research_in_progress" && (
+          <div><span>Research</span><strong>in progress</strong></div>
         )}
       </div>
 
-      {data?.chat_document && data?.ciq_attachment?.attached === true && (
+      {data?.chat_document && mapAttachment?.attached === true && (
         <div style={{ marginTop: 10 }}>
           <DocumentViewer doc={data.chat_document} compact />
         </div>
       )}
 
-      {data?.ciq_attachment?.download_url && (
+      {mapAttachment?.download_url && (
         <div className="field-actions" style={{ marginTop: 8 }}>
           <a
-            href={data.ciq_attachment.download_url}
+            href={mapAttachment.download_url}
             target="_blank"
             rel="noreferrer"
             className="field-link"
