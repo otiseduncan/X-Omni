@@ -43,7 +43,9 @@ def _health(status: str, base_url: str = "http://127.0.0.1:8084") -> dict:
 
 
 @pytest.mark.asyncio
-async def test_already_healthy_short_circuits_without_spawning(settings, monkeypatch):
+async def test_already_healthy_still_delegates_to_revision_aware_launcher(
+    settings, monkeypatch
+):
     calls = {"run": 0}
 
     async def fake_health(_settings):
@@ -51,17 +53,22 @@ async def test_already_healthy_short_circuits_without_spawning(settings, monkeyp
 
     def fake_run(_project_path):
         calls["run"] += 1
-        raise AssertionError("should not spawn the launcher when already healthy")
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="Calibration IQ native stack is already healthy and matches the current source revision.\n",
+            stderr="",
+        )
 
     monkeypatch.setattr(ciq, "health", fake_health)
     monkeypatch.setattr(ciq, "_run_start_native_script", fake_run)
 
     result = await ciq.start_native(settings)
 
-    assert result["status"] == "already_healthy"
-    assert result["executed"] is False
+    assert result["status"] == "healthy"
+    assert result["executed"] is True
     assert result["verified"] is True
-    assert calls["run"] == 0
+    assert calls["run"] == 1
 
 
 @pytest.mark.asyncio
