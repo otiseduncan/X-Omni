@@ -68,6 +68,26 @@ function Get-SourceRevision {
     return $null
 }
 
+function Assert-NoMergeConflicts {
+    $unmerged = @(& git -C $root diff --name-only --diff-filter=U 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'X Omni could not inspect the Git working tree for unresolved merges.'
+    }
+    if ($unmerged.Count -gt 0) {
+        throw "X Omni has unresolved Git merge conflicts and will not build or launch them.`n`n$($unmerged -join [Environment]::NewLine)`n`nResolve or abort the merge, then launch again."
+    }
+
+    $markerOutput = @(& git -C $root grep -n -E '^(<<<<<<< |=======|>>>>>>> )' -- ui/src core scripts 2>$null)
+    $markerExitCode = $LASTEXITCODE
+    if ($markerExitCode -eq 0 -and $markerOutput.Count -gt 0) {
+        $preview = @($markerOutput | Select-Object -First 12)
+        throw "X Omni found Git conflict markers in build/runtime source and will not continue.`n`n$($preview -join [Environment]::NewLine)"
+    }
+    if ($markerExitCode -ne 0 -and $markerExitCode -ne 1) {
+        throw 'X Omni could not scan source files for leftover Git conflict markers.'
+    }
+}
+
 function Get-PortOwner {
     param([Parameter(Mandatory)][int]$Port)
     $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
@@ -296,6 +316,8 @@ try {
 
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     $script:launcherLog = Join-Path $logDirectory 'x-omni-launcher.log'
+
+    Assert-NoMergeConflicts
 
     $runtimeMissing = -not (Test-Path -LiteralPath $venvPython)
     $interfaceMissing = -not (Test-Path -LiteralPath (Join-Path $root 'ui\dist\index.html'))
