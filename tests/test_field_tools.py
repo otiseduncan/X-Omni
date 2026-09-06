@@ -120,10 +120,17 @@ async def test_read_clamps_limit_and_allowlists_params(settings, monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
     await ciq.read_repair_orders(
-        settings, {"limit": 5000, "q": "F-150", "evil": "drop table", "shop": ""}
+        settings, {
+            "limit": 5000,
+            "q": "F-150",
+            "si_attached": False,
+            "evil": "drop table",
+            "shop": "",
+        }
     )
     assert seen["params"]["limit"] == 100          # clamped
     assert seen["params"]["q"] == "F-150"
+    assert seen["params"]["si_attached"] is False
     assert "evil" not in seen["params"]            # not on the allow-list
     assert "shop" not in seen["params"]            # empty string dropped
     assert seen["auth"] == "Bearer quoted-secret-token"
@@ -422,15 +429,17 @@ def test_calibration_iq_tool_schema_compatibility():
     summary = TOOL_SCHEMAS["calibration_iq_summary"]["parameters"]["properties"]
     listing = TOOL_SCHEMAS["calibration_iq_read"]["parameters"]["properties"]
     assert set(summary) == {
-        "shop", "phase", "status", "insurance", "q", "include_completed",
-        "terminal_only",
+        "shop", "phase", "status", "insurance", "q", "si_attached",
+        "include_completed", "terminal_only",
     }
     assert set(listing) == {
-        "q", "shop", "insurance", "status", "phase", "limit", "include_completed",
-        "terminal_only",
+        "q", "shop", "insurance", "status", "phase", "si_attached", "limit",
+        "include_completed", "terminal_only",
     }
     assert summary["include_completed"]["type"] == "boolean"
     assert summary["terminal_only"]["type"] == "boolean"
+    assert summary["si_attached"]["type"] == "boolean"
+    assert listing["si_attached"]["type"] == "boolean"
     assert listing["limit"]["type"] == "integer"
 
 
