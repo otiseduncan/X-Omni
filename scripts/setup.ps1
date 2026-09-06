@@ -34,6 +34,9 @@
     } catch {
         throw "Node.js is not on PATH. Install Node 18+ and re-run."
     }
+    if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
+        throw "npm.cmd is not on PATH. Repair the Node.js installation and re-run."
+    }
     try {
         $null = (nvidia-smi --query-gpu=index --format=csv,noheader) 2>&1
         Write-Host "  nvidia-smi : found"
