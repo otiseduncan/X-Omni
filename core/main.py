@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
 from contextlib import asynccontextmanager
@@ -511,6 +512,7 @@ def build_app(settings: Settings) -> FastAPI:
             "core": "running",
             "worker": router.active_name,
             "swapping": router.swapping,
+            "source_revision": os.environ.get("XOMNI_SOURCE_REVISION") or None,
             "model": model_health,
         }
         return JSONResponse(payload, status_code=200 if ready else 503)
