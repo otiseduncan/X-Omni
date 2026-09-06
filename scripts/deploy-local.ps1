@@ -55,7 +55,20 @@ function Pull-Main {
     # local commits. A real content conflict still stops here for review.
     & git -C $Path merge --no-edit origin/main | Out-Host
     if ($LASTEXITCODE -ne 0) {
-        throw "$Name could not merge origin/main. Resolve the reported Git conflict, then rerun deployment."
+        $unmerged = @(& git -C $Path diff --name-only --diff-filter=U 2>$null)
+        & git -C $Path merge --abort 2>$null | Out-Null
+        $detail = if ($unmerged.Count -gt 0) {
+            " Conflicted file(s): " + ($unmerged -join ', ')
+        } else {
+            ''
+        }
+        throw "$Name could not merge origin/main.$detail The merge was aborted automatically; local commits were left intact."
+    }
+
+    $leftoverMarkers = @(& git -C $Path grep -n -E '^(<<<<<<< |=======|>>>>>>> )' -- . 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $leftoverMarkers.Count -gt 0) {
+        $preview = @($leftoverMarkers | Select-Object -First 12)
+        throw "$Name contains leftover Git conflict markers and deployment was stopped.`n$($preview -join [Environment]::NewLine)"
     }
 
     $revision = Get-Revision -Path $Path
