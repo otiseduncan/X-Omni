@@ -3126,6 +3126,9 @@ def _readiness_exception_line(
             f"{lead} ADAS SI association is unverified for {', '.join(shown)}{suffix}."
         )
     if map_status != "verified":
+        sources = (item.get("adas_map") or {}).get("sources") or []
+        if sources:
+            return f"{lead} ADAS Map is attached, but its requirement data is not verified in the artifact catalog."
         return f"{lead} ADAS Map requirement data could not be verified."
     if item.get("status") == "reconciliation_failed":
         return f"{lead} CIQ requirement reconciliation was not verified."
@@ -3225,10 +3228,10 @@ def _readiness_summary(mode: str, data: dict[str, Any]) -> str:
     lines = [
         lead,
         (
-            "ADAS Map: "
+            "ADAS Map requirements: "
             f"{map_verified_count} verified; "
-            f"{map_missing_count} genuinely missing; "
-            f"{map_unverified_count} unverified."
+            f"{map_missing_count} report(s) genuinely missing; "
+            f"{map_unverified_count} requirement set(s) unverified."
         ),
         (
             "ADAS SI: "
