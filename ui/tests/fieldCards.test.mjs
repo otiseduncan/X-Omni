@@ -40,6 +40,9 @@ test("Calibration IQ cards expose summary, list, empty, error, and incomplete st
   assert.equal((cards.match(/calibration_iq_summary:\s*CalibrationSummaryCard/g) || []).length, 1);
   assert.match(cards, /<div className="ciq-count">[\s\S]*?<strong>/);
   assert.match(cards, /calibrationPhaseBreakdown\(label, n\)/);
+  assert.match(cards, /typeof siAttachmentFilter === "boolean"/);
+  assert.match(cards, /ROs without SI attached/);
+  assert.match(cards, /ROs with SI attached/);
   assert.match(cards, /Showing \{data\.shown_count\} of \{totalLabel\}/);
   assert.match(cards, /No repair orders matched that filter/);
   assert.match(cards, /Calibration IQ is unavailable/);
