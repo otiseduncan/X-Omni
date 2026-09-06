@@ -103,6 +103,42 @@ async def test_calibration_iq_read_is_selected_by_model_not_prerouted(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_simple_si_count_uses_board_summary_without_inventing_a_phase(tmp_path):
+    store = Store(tmp_path / "ciq-si-count.sqlite")
+    conversation_id = store.create_conversation("Calibration IQ SI count")
+    calls: list[tuple[str, dict]] = []
+    client = _ScriptedModel([
+        [{
+            "type": "tool_call",
+            "id": "call-si-count",
+            "name": "calibration_iq_summary",
+            "arguments": '{"si_attached":false}',
+        }],
+        [{"type": "content", "text": "There are six active ROs without SI attached."}],
+    ])
+    orchestrator = _orchestrator(store, client, calls)
+
+    events = await _run(
+        store,
+        conversation_id,
+        orchestrator,
+        "how many ROs need SI?",
+    )
+
+    assert client.calls == 2
+    assert calls == [("calibration_iq_summary", {"si_attached": False})]
+    assert "phase" not in calls[0][1]
+    assert [event["name"] for event in events if event["type"] == "tool_start"] == [
+        "calibration_iq_summary"
+    ]
+    assert any(
+        event.get("text") == "There are six active ROs without SI attached."
+        for event in events
+    )
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_model_selected_truncated_list_preserves_truth_and_single_card_order(
     tmp_path,
 ):
