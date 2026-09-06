@@ -605,7 +605,7 @@ def test_weekly_summary_is_bounded_and_reports_three_state_counts():
             "repair_orders": rows,
         },
     )
-    assert "ADAS Map: 7 verified; 0 genuinely missing; 3 unverified" in summary
+    assert "ADAS Map requirements: 7 verified; 0 report(s) genuinely missing; 3 requirement set(s) unverified" in summary
     assert "ADAS SI: 6 fully covered; 1 genuinely missing; 3 unverified" in summary
     assert summary.count("\nRO ") == 3
     assert "7 additional RO exception(s)" in summary
