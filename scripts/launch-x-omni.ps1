@@ -232,17 +232,37 @@ function Invoke-SetupRepair {
     }
 
     Write-LauncherLog 'Required runtime/build files are missing; running X Omni setup repair automatically.'
-    try {
-        & $setupScript 2>&1 | ForEach-Object { Write-LauncherLog "[setup] $($_)" }
-    } catch {
-        throw "Automatic X Omni setup repair failed: $($_.Exception.Message)"
+
+    $setupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $setupStdout = Join-Path $logDirectory "setup-$setupStamp.out.log"
+    $setupStderr = Join-Path $logDirectory "setup-$setupStamp.err.log"
+    $hostExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$setupScript`""
+
+    $setupProcess = Start-Process -FilePath $hostExe -ArgumentList $arguments `
+        -WorkingDirectory $root -WindowStyle Hidden `
+        -RedirectStandardOutput $setupStdout -RedirectStandardError $setupStderr -PassThru -Wait
+
+    if ($setupProcess.ExitCode -ne 0) {
+        $details = @()
+        if (Test-Path -LiteralPath $setupStderr) {
+            $details += @(Get-Content -LiteralPath $setupStderr -Tail 30 -ErrorAction SilentlyContinue)
+        }
+        if (Test-Path -LiteralPath $setupStdout) {
+            $details += @(Get-Content -LiteralPath $setupStdout -Tail 50 -ErrorAction SilentlyContinue)
+        }
+        $detailText = ($details -join [Environment]::NewLine).Trim()
+        if (-not $detailText) { $detailText = "No setup detail was captured." }
+        Write-LauncherLog "Automatic setup failed with exit code $($setupProcess.ExitCode)."
+        foreach ($line in $details) { Write-LauncherLog "[setup failure] $line" }
+        throw "Automatic X Omni setup repair failed with exit code $($setupProcess.ExitCode).`n`n$detailText`n`nLogs: $setupStdout ; $setupStderr"
     }
 
     if (-not (Test-Path -LiteralPath $venvPython)) {
         throw "Automatic setup finished without creating the isolated Python runtime: $venvPython"
     }
     if (-not (Test-Path -LiteralPath (Join-Path $root 'ui\dist\index.html'))) {
-        throw "Automatic setup finished without producing ui\dist\index.html. See $($script:launcherLog)."
+        throw "Automatic setup finished without producing ui\dist\index.html. See $setupStdout."
     }
     Write-LauncherLog 'Automatic X Omni setup repair completed successfully.'
 }
