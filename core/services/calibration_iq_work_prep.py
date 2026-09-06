@@ -3378,10 +3378,12 @@ def install() -> None:
                     "Verified gaps may add or reactivate CIQ calibrations. When the "
                     "user asks to actually prepare/do the missing work rather than merely "
                     "audit it, set execute_missing=true so X acquires missing ADAS Map and "
-                    "SI evidence through their isolated ScrapeX provider sessions. Do not use "
-                    "this capability for a simple CIQ board question about how many ROs have or "
-                    "lack SI attached; calibration_iq_summary with si_attached is authoritative "
-                    "for that. queue_list reads the saved conversation queue; statuses filters "
+                    "SI evidence through their isolated ScrapeX provider sessions. This capability is a "
+                    "coverage/readiness workflow, not a document-presence query. Never use it to "
+                    "answer how many ROs/cards have SI attached, lack SI attached, or simply need "
+                    "an SI document; calibration_iq_summary/read with si_attached is authoritative "
+                    "for those CIQ board facts. Do not invent/default a phase. queue_list reads "
+                    "the saved conversation queue; statuses filters "
                     "exact lifecycle rows."
                 ),
                 "parameters": {
