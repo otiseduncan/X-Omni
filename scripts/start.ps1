@@ -94,7 +94,24 @@
         Write-Host "UI is not built. Run .\scripts\setup.ps1 first." -ForegroundColor Yellow
     }
 
+    $sourceRevision = $null
+    try {
+        $revisionOutput = & git -C $root rev-parse HEAD 2>$null
+        $revisionExitCode = $LASTEXITCODE
+        $candidateRevision = ([string]($revisionOutput | Select-Object -First 1)).Trim()
+        if ($revisionExitCode -eq 0 -and $candidateRevision -match "^[0-9a-fA-F]{40}$") {
+            $sourceRevision = $candidateRevision.ToLowerInvariant()
+            $env:XOMNI_SOURCE_REVISION = $sourceRevision
+        }
+    } catch {
+        $sourceRevision = $null
+    }
+    if (-not $sourceRevision) {
+        Remove-Item Env:XOMNI_SOURCE_REVISION -ErrorAction SilentlyContinue
+    }
+
     Write-Host "Core     : http://127.0.0.1:8100"
+    Write-Host "Revision : $(if ($sourceRevision) { $sourceRevision } else { 'unknown' })"
     Write-Host "Stop with Ctrl+C (the model worker is stopped too)."
     Write-Host ""
 
