@@ -109,6 +109,8 @@ test("calibration_iq_work_prep is wired to a dedicated card, not silently droppe
   assert.match(cards, /data\?\.exception_count/);
   assert.match(cards, /data\?\.queue_count/);
   assert.match(cards, /adas_map_verified_count/);
+  assert.match(cards, /ADAS Map requirements/);
+  assert.match(cards, /Map attached · requirements unverified/);
   assert.match(cards, /si_covered_count/);
   assert.match(cards, /repair_orders_truncated/);
   assert.match(cards, /r\.ready !== true/);
