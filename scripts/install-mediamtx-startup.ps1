@@ -23,7 +23,7 @@ $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $powershell
 # -NoOpen: logon startup should not pop a browser tab every login.
-$shortcut.Arguments = "-NoLogo -NoProfile -WindowStyle Hidden -File `"$launcher`" -NoOpen"
+$shortcut.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`" -NoOpen"
 $shortcut.WorkingDirectory = $root
 $shortcut.Description = 'Start MediaMTX (exterior camera recording/streaming) at logon'
 $shortcut.Save()
