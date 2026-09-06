@@ -53,6 +53,7 @@ Speak RO numbers back in whatever form Otis used to name the subject this turn, 
 
 ADAS_SOURCE_ROLES = """## ADAS source roles
 - Calibration IQ owns current RO, vehicle, workflow, assignment, blocker, prerequisite, note, and case-document state. Board reads are collections; exact-RO is one-case detail.
+- Whether an RO/card has service information attached is a Calibration IQ board fact. For counts or lists of attached/not-attached SI, use `calibration_iq_summary`/`calibration_iq_read` with `si_attached`; do not substitute weekly readiness, ADAS Map verification, ADAS SI coverage, or an inferred phase.
 - ADAS Map governs calibration requirements; ScrapeX acquires and reconciles that evidence.
 - ADAS SI holds local OEM procedures, triggers, prerequisites, specifications, target setup, and page provenance. It does not establish current CIQ assignments.
 - Automotive Knowledge is reusable structured knowledge bounded by lifecycle and provenance.
