@@ -29,6 +29,9 @@ def test_local_deploy_script_pulls_builds_restarts_and_verifies_all_field_servic
     script = (ROOT / "scripts" / "deploy-local.ps1").read_text(encoding="utf-8")
     assert "git -C $Path fetch origin main" in script
     assert "git -C $Path merge --no-edit origin/main" in script
+    assert "git -C $Path merge --abort" in script
+    assert "diff --name-only --diff-filter=U" in script
+    assert "leftover Git conflict markers" in script
     assert "pull --ff-only" not in script
     assert "scripts\\install.ps1" in script
     assert "Start-Native.ps1" in script
@@ -52,6 +55,9 @@ def test_x_omni_launcher_source_is_single_clean_script() -> None:
     assert "$runtimeMissing -or $interfaceMissing" in script
     assert "Automatic X Omni setup repair completed successfully" in script
     assert "built interface is missing. Run setup before launching." not in script
+    assert "Assert-NoMergeConflicts" in script
+    assert "diff --name-only --diff-filter=U" in script
+    assert "leftover Git conflict markers" not in script
 
 
 @pytest.mark.skipif(
