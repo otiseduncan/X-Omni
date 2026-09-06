@@ -254,7 +254,7 @@ try {
     $script:launcherLog = Join-Path $logDirectory 'x-omni-launcher.log'
     $corePort = Get-CorePort
     $expectedRevision = Get-SourceRevision
-    Write-LauncherLog "Launch requested for $localOrigin`:$corePort; source revision=$($expectedRevision ?? 'unknown')."
+    Write-LauncherLog "Launch requested for $localOrigin`:$corePort; source revision=$(if ($expectedRevision) { $expectedRevision } else { 'unknown' })."
 
     # Double-clicking the launcher means "give me a known-good, current X
     # Omni" -- not "tell me whether the old one still happens to be alive."
