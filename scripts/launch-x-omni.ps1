@@ -61,6 +61,7 @@ function Get-SourceRevision {
         $revisionExitCode = $LASTEXITCODE
         $revision = ([string]($revisionOutput | Select-Object -First 1)).Trim()
         if ($revisionExitCode -eq 0 -and $revision -match '^[0-9a-fA-F]{40}
+    param([Parameter(Mandatory)][int]$Port)
     $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $listener) { return $null }
@@ -254,7 +255,8 @@ try {
     $script:launcherLog = Join-Path $logDirectory 'x-omni-launcher.log'
     $corePort = Get-CorePort
     $expectedRevision = Get-SourceRevision
-    Write-LauncherLog "Launch requested for $localOrigin`:$corePort; source revision=$(if ($expectedRevision) { $expectedRevision } else { 'unknown' })."
+    $revisionLabel = if ($expectedRevision) { $expectedRevision } else { 'unknown' }
+    Write-LauncherLog "Launch requested for $localOrigin`:$corePort; source revision=$revisionLabel."
 
     # Double-clicking the launcher means "give me a known-good, current X
     # Omni" -- not "tell me whether the old one still happens to be alive."
