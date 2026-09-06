@@ -15,7 +15,7 @@ foreach ($required in @($launcher, $icon, $powershell)) {
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $powershell
-$shortcut.Arguments = "-NoLogo -NoProfile -WindowStyle Hidden -File `"$launcher`""
+$shortcut.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`""
 $shortcut.WorkingDirectory = $root
 $shortcut.IconLocation = "$icon,0"
 $shortcut.Description = 'Launch X Omni and wait for the local model'
