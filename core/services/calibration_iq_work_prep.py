@@ -2566,7 +2566,9 @@ async def _phase_coverage(
             "mode": "phase_coverage",
             "success": False,
             "verified": False,
-            "message": "Tell me which Calibration IQ phase to check for ADAS SI coverage.",
+            "message": (
+                "Phase coverage requires an explicit Calibration IQ phase from the user's request."
+            ),
         }
     coverage_focus = str(args.get("coverage_focus") or "si_readiness").casefold()
     if coverage_focus not in {"adas_map", "si_readiness"}:
@@ -3376,8 +3378,11 @@ def install() -> None:
                     "Verified gaps may add or reactivate CIQ calibrations. When the "
                     "user asks to actually prepare/do the missing work rather than merely "
                     "audit it, set execute_missing=true so X acquires missing ADAS Map and "
-                    "SI evidence through their isolated ScrapeX provider sessions. queue_list "
-                    "reads the saved conversation queue; statuses filters exact lifecycle rows."
+                    "SI evidence through their isolated ScrapeX provider sessions. Do not use "
+                    "this capability for a simple CIQ board question about how many ROs have or "
+                    "lack SI attached; calibration_iq_summary with si_attached is authoritative "
+                    "for that. queue_list reads the saved conversation queue; statuses filters "
+                    "exact lifecycle rows."
                 ),
                 "parameters": {
                     "type": "object",
@@ -3397,7 +3402,9 @@ def install() -> None:
                                 "Choose an authoritative CIQ RO workload/readiness "
                                 "operation: phase_list and queue_list read lists; "
                                 "phase_coverage and week_readiness audit; ro_requirements "
-                                "reads one RO; queue_next advances one saved weekly row."
+                                "reads one RO; queue_next advances one saved weekly row. "
+                                "phase_coverage is only for a phase explicitly supplied by the "
+                                "user, never an inferred/default phase."
                             ),
                         },
                         "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
@@ -3409,7 +3416,13 @@ def install() -> None:
                             ),
                         },
                         "repair_order_id": {"type": "string"},
-                        "phase": {"type": "string"},
+                        "phase": {
+                            "type": "string",
+                            "description": (
+                                "Use only when the user's current request explicitly names a CIQ "
+                                "phase. Never infer a phase from prior context or choose a default."
+                            ),
+                        },
                         "shop": {"type": "string"},
                         "statuses": {
                             "type": "array",
