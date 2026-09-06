@@ -16,6 +16,28 @@ def test_double_click_launcher_uses_bounded_windows_launcher() -> None:
     assert "-WindowStyle Hidden" in command
 
 
+def test_start_script_stamps_runtime_revision_and_health_exposes_it() -> None:
+    start = (ROOT / "scripts" / "start.ps1").read_text(encoding="utf-8")
+    main = (ROOT / "core" / "main.py").read_text(encoding="utf-8")
+    assert "XOMNI_SOURCE_REVISION" in start
+    assert "git -C $root rev-parse HEAD" in start
+    assert '"source_revision": os.environ.get("XOMNI_SOURCE_REVISION") or None' in main
+
+
+def test_local_deploy_script_pulls_builds_restarts_and_verifies_all_field_services() -> None:
+    script = (ROOT / "scripts" / "deploy-local.ps1").read_text(encoding="utf-8")
+    assert "git -C $Path pull --ff-only origin main" in script
+    assert "scripts\\install.ps1" in script
+    assert "Start-Native.ps1" in script
+    assert "-Profile Production -NoBrowser" in script
+    assert "scripts\\setup.ps1" in script
+    assert "scripts\\launch-x-omni.ps1" in script
+    assert "scrapex.start_native" in script
+    assert "source_revision" in script
+    assert "runtime_revision" in script
+    assert "LOCAL DEPLOYMENT VERIFIED" in script
+
+
 def test_launcher_preserves_foreign_processes_and_gates_browser_on_health() -> None:
     script = (ROOT / "scripts" / "launch-x-omni.ps1").read_text(encoding="utf-8")
     assert "Test-XOmniCoreProcess" in script
@@ -27,6 +49,9 @@ def test_launcher_preserves_foreign_processes_and_gates_browser_on_health() -> N
     assert "[math]::Abs(($actualStart - $recordedStart).TotalSeconds) -lt 4" in script
     assert "X Omni will not stop it" in script
     assert "StatusCode -eq 200" in script
+    assert "Get-SourceRevision" in script
+    assert "Payload.source_revision" in script
+    assert "stale source revision" in script
     assert script.index("StatusCode -eq 200") < script.rindex("Open-XOmni -Port $corePort")
     assert '-ExecutionPolicy Bypass -File `"$startScript`"' in script
 
