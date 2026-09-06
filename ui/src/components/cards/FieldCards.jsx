@@ -391,6 +391,27 @@ export function CalibrationSummaryCard({ data }) {
     );
   }
 
+  const siAttachmentFilter = data?.filters?.si_attached;
+  if (typeof siAttachmentFilter === "boolean") {
+    const boardFilters = Object.fromEntries(
+      Object.entries(data.filters || {}).filter(([key]) => key !== "si_attached"),
+    );
+    const boardScope = filterLabel(boardFilters);
+    return (
+      <Card icon={ClipboardList} title="Service Info" meta={boardScope || "active work"}>
+        <div className="ciq-count">
+          <strong>{data.count}{data.collection_capped ? "+" : ""}</strong>
+          <span>{siAttachmentFilter ? "ROs with SI attached" : "ROs without SI attached"}</span>
+        </div>
+        {data.collection_capped && (
+          <p className="card-note ciq-incomplete" role="status">
+            {CALIBRATION_COLLECTION_WARNING}
+          </p>
+        )}
+      </Card>
+    );
+  }
+
   const scope = filterLabel(data.filters);
   const byStatus = Object.entries(data.breakdown?.by_status || {});
   const byShop = Object.entries(data.breakdown?.by_shop || {});
