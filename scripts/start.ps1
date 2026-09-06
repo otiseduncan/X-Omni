@@ -72,7 +72,7 @@
             for ($attempt = 1; $attempt -le 4 -and -not $probeMatches; $attempt++) {
                 try {
                     $probe = Invoke-WebRequest -Uri "http://127.0.0.1:$corePort/healthz" `
-                        -TimeoutSec 5 -SkipHttpErrorCheck
+                        -TimeoutSec 5 -UseBasicParsing
                     $payload = $probe.Content | ConvertFrom-Json
                     $runtimeRevision = [string]$payload.source_revision
                     $probeMatches = (
