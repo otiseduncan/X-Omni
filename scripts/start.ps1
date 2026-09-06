@@ -19,6 +19,22 @@
         throw "The isolated Python runtime is missing. Run .\scripts\setup.ps1 first."
     }
 
+    $sourceRevision = $null
+    try {
+        $revisionOutput = & git -C $root rev-parse HEAD 2>$null
+        $revisionExitCode = $LASTEXITCODE
+        $candidateRevision = ([string]($revisionOutput | Select-Object -First 1)).Trim()
+        if ($revisionExitCode -eq 0 -and $candidateRevision -match "^[0-9a-fA-F]{40}$") {
+            $sourceRevision = $candidateRevision.ToLowerInvariant()
+            $env:XOMNI_SOURCE_REVISION = $sourceRevision
+        }
+    } catch {
+        $sourceRevision = $null
+    }
+    if (-not $sourceRevision) {
+        Remove-Item Env:XOMNI_SOURCE_REVISION -ErrorAction SilentlyContinue
+    }
+
     # Refuse to create a second Core. Uvicorn runs application startup before
     # reporting a bind failure, so relying on port-bind failure alone could let
     # the losing instance adopt the model and then stop it during shutdown.
@@ -58,7 +74,11 @@
                     $probe = Invoke-WebRequest -Uri "http://127.0.0.1:$corePort/healthz" `
                         -TimeoutSec 5 -SkipHttpErrorCheck
                     $payload = $probe.Content | ConvertFrom-Json
-                    $probeMatches = $payload.core -eq "running"
+                    $runtimeRevision = [string]$payload.source_revision
+                    $probeMatches = (
+                        $payload.core -eq "running" -and
+                        (-not $sourceRevision -or $runtimeRevision -eq $sourceRevision)
+                    )
                 } catch {
                     $probeMatches = $false
                 }
@@ -73,7 +93,7 @@
         if (-not $identityMatches) {
             throw "Port $corePort is held by pid $listenerProcessId, which is not X Omni's own Core process (command line does not match). X Omni will not replace it."
         }
-        throw "Port $corePort is held by X Omni's own Core (pid $listenerProcessId), but it did not answer a healthy /healthz after several attempts. It may be mid-swap or stuck -- check logs\launcher before stopping it yourself."
+        throw "Port $corePort is held by X Omni's own Core (pid $listenerProcessId), but it is unhealthy or not running the current source revision. Run .\scripts\launch-x-omni.ps1 or .\scripts\deploy-local.ps1 to replace the verified stale runtime safely."
     }
 
     $workerConfig = Get-Content (Join-Path $root "config\workers.json") -Raw | ConvertFrom-Json
@@ -92,22 +112,6 @@
 
     if (-not (Test-Path (Join-Path $root "ui\dist"))) {
         Write-Host "UI is not built. Run .\scripts\setup.ps1 first." -ForegroundColor Yellow
-    }
-
-    $sourceRevision = $null
-    try {
-        $revisionOutput = & git -C $root rev-parse HEAD 2>$null
-        $revisionExitCode = $LASTEXITCODE
-        $candidateRevision = ([string]($revisionOutput | Select-Object -First 1)).Trim()
-        if ($revisionExitCode -eq 0 -and $candidateRevision -match "^[0-9a-fA-F]{40}$") {
-            $sourceRevision = $candidateRevision.ToLowerInvariant()
-            $env:XOMNI_SOURCE_REVISION = $sourceRevision
-        }
-    } catch {
-        $sourceRevision = $null
-    }
-    if (-not $sourceRevision) {
-        Remove-Item Env:XOMNI_SOURCE_REVISION -ErrorAction SilentlyContinue
     }
 
     Write-Host "Core     : http://127.0.0.1:8100"
