@@ -2381,9 +2381,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "calibration_iq_summary": {
         "description": (
-            "Return a verified aggregate count and status/phase/shop breakdown for a "
-            "structured Calibration IQ repair-order scope without returning rows. "
-            "Finished work is excluded unless include_completed is true."
+            "Return a verified aggregate count for a structured Calibration IQ repair-order "
+            "scope without returning rows. Finished work is excluded unless include_completed "
+            "is true. For simple questions such as 'how many ROs need SI' or 'how many cards "
+            "do not have SI attached', set si_attached=false and do not add a phase unless the "
+            "user explicitly supplied one. SI attachment is a CIQ board fact, not an ADAS SI "
+            "coverage/readiness audit."
         ),
         "parameters": {
             "type": "object",
@@ -2393,6 +2396,14 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "status": {"type": "string"},
                 "insurance": {"type": "string"},
                 "q": {"type": "string", "description": "Free-text search"},
+                "si_attached": {
+                    "type": "boolean",
+                    "description": (
+                        "Filter by an actual non-ADAS-Map service-information document attached "
+                        "to the CIQ RO. false answers 'needs SI / no SI attached'; true answers "
+                        "'has SI attached'. Omit unless the user is asking about SI attachment."
+                    ),
+                },
                 "include_completed": {
                     "type": "boolean",
                     "description": "Include finished work. Default false -- complete is not active.",
@@ -2430,6 +2441,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "insurance": {"type": "string"},
                 "status": {"type": "string"},
                 "phase": {"type": "string"},
+                "si_attached": {
+                    "type": "boolean",
+                    "description": (
+                        "Filter rows by actual non-ADAS-Map service-information attachment. "
+                        "Do not substitute ADAS SI coverage/readiness for this board fact."
+                    ),
+                },
                 "limit": {"type": "integer", "description": "Rows to display, 1-100. Default 20."},
                 "include_completed": {
                     "type": "boolean",
