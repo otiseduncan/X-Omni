@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $startScript = Join-Path $PSScriptRoot 'start.ps1'
+$setupScript = Join-Path $PSScriptRoot 'setup.ps1'
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
 $logDirectory = Join-Path $root 'logs\launcher'
 $localOrigin = 'http://127.0.0.1'
@@ -225,6 +226,27 @@ function Open-XOmni {
     }
 }
 
+function Invoke-SetupRepair {
+    if (-not (Test-Path -LiteralPath $setupScript)) {
+        throw "X Omni setup script is missing: $setupScript"
+    }
+
+    Write-LauncherLog 'Required runtime/build files are missing; running X Omni setup repair automatically.'
+    try {
+        & $setupScript 2>&1 | ForEach-Object { Write-LauncherLog "[setup] $($_)" }
+    } catch {
+        throw "Automatic X Omni setup repair failed: $($_.Exception.Message)"
+    }
+
+    if (-not (Test-Path -LiteralPath $venvPython)) {
+        throw "Automatic setup finished without creating the isolated Python runtime: $venvPython"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $root 'ui\dist\index.html'))) {
+        throw "Automatic setup finished without producing ui\dist\index.html. See $($script:launcherLog)."
+    }
+    Write-LauncherLog 'Automatic X Omni setup repair completed successfully.'
+}
+
 function Invoke-UiRebuild {
     $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
     if (-not $npmCmd) { $npmCmd = Get-Command npm -ErrorAction SilentlyContinue }
@@ -248,18 +270,18 @@ try {
     $hasMutex = $mutex.WaitOne(0)
     if (-not $hasMutex) { return }
 
-    if (-not (Test-Path -LiteralPath $venvPython)) {
-        throw "X Omni's isolated Python runtime is missing. Run setup before launching."
-    }
     if (-not (Test-Path -LiteralPath $startScript)) {
         throw "X Omni's start script is missing: $startScript"
-    }
-    if (-not (Test-Path -LiteralPath (Join-Path $root 'ui\dist\index.html'))) {
-        throw "X Omni's built interface is missing. Run setup before launching."
     }
 
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     $script:launcherLog = Join-Path $logDirectory 'x-omni-launcher.log'
+
+    $runtimeMissing = -not (Test-Path -LiteralPath $venvPython)
+    $interfaceMissing = -not (Test-Path -LiteralPath (Join-Path $root 'ui\dist\index.html'))
+    if ($runtimeMissing -or $interfaceMissing) {
+        Invoke-SetupRepair
+    }
     $corePort = Get-CorePort
     $expectedRevision = Get-SourceRevision
     $revisionLabel = if ($expectedRevision) { $expectedRevision } else { 'unknown' }
