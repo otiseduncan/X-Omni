@@ -2392,7 +2392,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "type": "object",
             "properties": {
                 "shop": {"type": "string", "description": "e.g. Macon, Perry, Warner Robins"},
-                "phase": {"type": "string", "description": "Phase number, e.g. 5"},
+                "phase": {
+                    "type": "string",
+                    "description": (
+                        "Phase number only when the user's current request explicitly names one. "
+                        "Never infer or default a phase."
+                    ),
+                },
                 "status": {"type": "string"},
                 "insurance": {"type": "string"},
                 "q": {"type": "string", "description": "Free-text search"},
@@ -2440,7 +2446,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "shop": {"type": "string"},
                 "insurance": {"type": "string"},
                 "status": {"type": "string"},
-                "phase": {"type": "string"},
+                "phase": {
+                    "type": "string",
+                    "description": (
+                        "Phase number only when the user's current request explicitly names one. "
+                        "Never infer or default a phase."
+                    ),
+                },
                 "si_attached": {
                     "type": "boolean",
                     "description": (
