@@ -724,6 +724,7 @@ function WorkPrepExceptionRow({ item }) {
   const missing = (item.missing_si || [])
     .map((m) => m?.calibration || m?.label)
     .filter(Boolean);
+  const mapAttached = (item?.adas_map?.sources || []).length > 0;
   return (
     <div className="ro-item" key={item.ro_number}>
       <div className="ro-line">
@@ -735,7 +736,9 @@ function WorkPrepExceptionRow({ item }) {
           {coverageLabel(item.coverage_status)}
         </span>
         {item.status === "adas_map_unverified" && (
-          <span className="ro-shop">ADAS Map unverified</span>
+          <span className="ro-shop">
+            {mapAttached ? "Map attached · requirements unverified" : "ADAS Map requirements unverified"}
+          </span>
         )}
         {item.status === "reconciliation_failed" && (
           <span className="ro-shop">reconciliation failed</span>
@@ -906,9 +909,9 @@ function WorkPrepReadinessCard({ data }) {
 
       <div className="kv" style={{ marginTop: 10 }}>
         <div>
-          <span>ADAS Map</span>
+          <span>ADAS Map requirements</span>
           <strong>
-            {data?.adas_map_verified_count ?? 0} verified · {data?.adas_map_missing_count ?? 0} missing · {data?.adas_map_unverified_count ?? 0} unverified
+            {data?.adas_map_verified_count ?? 0} verified · {data?.adas_map_missing_count ?? 0} report missing · {data?.adas_map_unverified_count ?? 0} requirement sets unverified
           </strong>
         </div>
         <div>
