@@ -427,7 +427,13 @@ def test_work_prep_schema_owns_ciq_field_work_not_calendar_events():
     assert "upcoming shop field work" in description
     assert "weekly ro readiness" in description
     assert "does not read google calendar appointments or events" in description
+    assert "simple ciq board question" in description
+    assert "calibration_iq_summary" in description
     assert "authoritative ciq ro workload/readiness operation" in mode_description
+    assert "only for a phase explicitly supplied by the user" in mode_description
+    phase_description = schema["parameters"]["properties"]["phase"]["description"].casefold()
+    assert "current request explicitly names" in phase_description
+    assert "never infer" in phase_description
 
 
 @pytest.mark.asyncio
