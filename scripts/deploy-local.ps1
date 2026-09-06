@@ -44,8 +44,9 @@ function Get-Revision {
 function Pull-Main {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
     Write-Step "Pulling $Name"
-    & git -C $Path pull --ff-only origin main
-    if ($LASTEXITCODE -ne 0) {
+    & git -C $Path pull --ff-only origin main | Out-Host
+    $pullExitCode = $LASTEXITCODE
+    if ($pullExitCode -ne 0) {
         throw "$Name git pull failed."
     }
     $revision = Get-Revision -Path $Path
