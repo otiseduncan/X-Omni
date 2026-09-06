@@ -27,7 +27,9 @@ def test_start_script_stamps_runtime_revision_and_health_exposes_it() -> None:
 
 def test_local_deploy_script_pulls_builds_restarts_and_verifies_all_field_services() -> None:
     script = (ROOT / "scripts" / "deploy-local.ps1").read_text(encoding="utf-8")
-    assert "git -C $Path pull --ff-only origin main" in script
+    assert "git -C $Path fetch origin main" in script
+    assert "git -C $Path merge --no-edit origin/main" in script
+    assert "pull --ff-only" not in script
     assert "scripts\\install.ps1" in script
     assert "Start-Native.ps1" in script
     assert "-Profile Production -NoBrowser" in script
@@ -46,6 +48,10 @@ def test_x_omni_launcher_source_is_single_clean_script() -> None:
     assert script.count("function Get-PortOwner") == 1
     assert "^[0-9a-fA-F]{40}$" in script
     assert "source revision=$revisionLabel" in script
+    assert "Invoke-SetupRepair" in script
+    assert "$runtimeMissing -or $interfaceMissing" in script
+    assert "Automatic X Omni setup repair completed successfully" in script
+    assert "built interface is missing. Run setup before launching." not in script
 
 
 @pytest.mark.skipif(
@@ -68,6 +74,15 @@ def test_x_omni_launcher_parses_in_windows_powershell() -> None:
         capture_output=True,
         text=True,
     )
+
+
+def test_setup_checks_native_exit_codes_and_verifies_built_interface() -> None:
+    script = (ROOT / "scripts" / "setup.ps1").read_text(encoding="utf-8")
+    assert "function Assert-NativeSuccess" in script
+    assert "UI dependency installation" in script
+    assert "UI production build" in script
+    assert "ui\\dist\\index.html" in script
+    assert "UI build reported success" in script
 
 
 def test_launcher_preserves_foreign_processes_and_gates_browser_on_health() -> None:
