@@ -218,6 +218,8 @@ def test_mediamtx_desktop_installer_creates_a_real_shortcut_with_app_icon() -> N
     assert "MediaMTX.lnk" in installer
     assert "x-omni.ico" in installer
     assert "-ExecutionPolicy Bypass" in installer
+    assert "Parser]::ParseFile" in installer
+    assert "Shortcut was not installed" in installer
     assert "GetFolderPath('Desktop')" in installer
     # Unlike the Startup entry, a double-clicked desktop icon should open
     # MediaMTX's own status page -- no -NoOpen here.
