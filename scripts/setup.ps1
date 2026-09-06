@@ -8,6 +8,13 @@
     $ErrorActionPreference = "Stop"
     $root = Split-Path -Parent $PSScriptRoot
 
+    function Assert-NativeSuccess {
+        param([Parameter(Mandatory)][string]$Step)
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Step failed with exit code $LASTEXITCODE."
+        }
+    }
+
     Write-Host "=== X Omni setup ===" -ForegroundColor Cyan
     Write-Host "Project root: $root"
     Write-Host ""
@@ -41,12 +48,15 @@
     $venvPython = Join-Path $venvDir "Scripts\python.exe"
     if (-not (Test-Path -LiteralPath $venvPython)) {
         & $bootstrapPython -m venv $venvDir
+        Assert-NativeSuccess -Step 'Python virtual environment creation'
         Write-Host "  Created .venv"
     } else {
         Write-Host "  Reusing .venv"
     }
     & $venvPython -m pip install --upgrade pip
+    Assert-NativeSuccess -Step 'pip upgrade'
     & $venvPython -m pip install -r (Join-Path $root "requirements.lock.txt")
+    Assert-NativeSuccess -Step 'Python dependency installation'
     Write-Host ""
 
     # --- env file ---
@@ -93,10 +103,17 @@
     Write-Host "--- Building the UI (this takes a minute) ---" -ForegroundColor Cyan
     Push-Location (Join-Path $root "ui")
     try {
-        npm ci
-        npm run build
+        & npm.cmd ci
+        Assert-NativeSuccess -Step 'UI dependency installation'
+        & npm.cmd run build
+        Assert-NativeSuccess -Step 'UI production build'
     } finally {
         Pop-Location
+    }
+
+    $builtIndex = Join-Path $root "ui\dist\index.html"
+    if (-not (Test-Path -LiteralPath $builtIndex)) {
+        throw "UI build reported success but $builtIndex was not created."
     }
 
     Write-Host ""
