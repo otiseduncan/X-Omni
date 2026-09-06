@@ -43,12 +43,21 @@ function Get-Revision {
 
 function Pull-Main {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
-    Write-Step "Pulling $Name"
-    & git -C $Path pull --ff-only origin main | Out-Host
-    $pullExitCode = $LASTEXITCODE
-    if ($pullExitCode -ne 0) {
-        throw "$Name git pull failed."
+    Write-Step "Updating $Name"
+
+    & git -C $Path fetch origin main | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Name git fetch failed."
     }
+
+    # Merge explicitly instead of relying on git-pull's user-level strategy.
+    # This handles the common local+remote divergence case without discarding
+    # local commits. A real content conflict still stops here for review.
+    & git -C $Path merge --no-edit origin/main | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Name could not merge origin/main. Resolve the reported Git conflict, then rerun deployment."
+    }
+
     $revision = Get-Revision -Path $Path
     Write-Host "$Name revision: $revision" -ForegroundColor Green
     return $revision
