@@ -395,7 +395,7 @@ def test_phase_map_report_summary_separates_missing_from_unverified_ros():
     assert text.startswith(
         "No — 2 of 3 active Calibration IQ ROs in Phase 5 do not have verified ADAS Map reports."
     )
-    assert "ADAS Map: 1 verified; 1 genuinely missing; 1 unverified." in text
+    assert "ADAS Map requirements: 1 verified; 1 report(s) genuinely missing; 1 requirement set(s) unverified." in text
     assert "RO 101" in text and "genuinely missing" in text
     assert "RO 102" in text and "ambiguous" in text
     assert "RO 100" not in text
@@ -427,8 +427,10 @@ def test_work_prep_schema_owns_ciq_field_work_not_calendar_events():
     assert "upcoming shop field work" in description
     assert "weekly ro readiness" in description
     assert "does not read google calendar appointments or events" in description
-    assert "simple ciq board question" in description
-    assert "calibration_iq_summary" in description
+    assert "coverage/readiness workflow" in description
+    assert "si_attached" in description
+    assert "calibration_iq_summary/read" in description
+    assert "do not invent/default a phase" in description
     assert "authoritative ciq ro workload/readiness operation" in mode_description
     assert "only for a phase explicitly supplied by the user" in mode_description
     phase_description = schema["parameters"]["properties"]["phase"]["description"].casefold()
