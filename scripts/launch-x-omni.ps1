@@ -279,8 +279,10 @@ try {
 
     $runtimeMissing = -not (Test-Path -LiteralPath $venvPython)
     $interfaceMissing = -not (Test-Path -LiteralPath (Join-Path $root 'ui\dist\index.html'))
+    $setupRepaired = $false
     if ($runtimeMissing -or $interfaceMissing) {
         Invoke-SetupRepair
+        $setupRepaired = $true
     }
     $corePort = Get-CorePort
     $expectedRevision = Get-SourceRevision
@@ -308,7 +310,11 @@ try {
     # separately) -- restarting Core must never stop either one. See
     # install-mediamtx-startup.ps1 for how MediaMTX starts at logon.
 
-    Invoke-UiRebuild
+    if (-not $setupRepaired) {
+        Invoke-UiRebuild
+    } else {
+        Write-LauncherLog 'Skipping duplicate UI rebuild because setup repair already produced the current interface.'
+    }
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $stdout = Join-Path $logDirectory "core-$stamp.out.log"
