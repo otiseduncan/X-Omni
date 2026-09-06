@@ -14,6 +14,7 @@ def test_double_click_launcher_uses_bounded_windows_launcher() -> None:
     command = (ROOT / "Launch-X-Omni.cmd").read_text(encoding="utf-8")
     assert "scripts\\launch-x-omni.ps1" in command
     assert "-WindowStyle Hidden" in command
+    assert "-ExecutionPolicy Bypass" in command
 
 
 def test_start_script_stamps_runtime_revision_and_health_exposes_it() -> None:
@@ -36,6 +37,37 @@ def test_local_deploy_script_pulls_builds_restarts_and_verifies_all_field_servic
     assert "source_revision" in script
     assert "runtime_revision" in script
     assert "LOCAL DEPLOYMENT VERIFIED" in script
+
+
+def test_x_omni_launcher_source_is_single_clean_script() -> None:
+    script = (ROOT / "scripts" / "launch-x-omni.ps1").read_text(encoding="utf-8")
+    assert len(script) < 18_000
+    assert script.count("function Get-SourceRevision") == 1
+    assert script.count("function Get-PortOwner") == 1
+    assert "^[0-9a-fA-F]{40}$" in script
+    assert "source revision=$revisionLabel" in script
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or POWERSHELL is None,
+    reason="Windows PowerShell parser is only available on Windows",
+)
+def test_x_omni_launcher_parses_in_windows_powershell() -> None:
+    import subprocess
+
+    script_path = str(ROOT / "scripts" / "launch-x-omni.ps1").replace("'", "''")
+    command = (
+        "$tokens=$null; $errors=$null; "
+        f"[void][System.Management.Automation.Language.Parser]::ParseFile('{script_path}', [ref]$tokens, [ref]$errors); "
+        "if ($errors.Count -gt 0) { $errors | ForEach-Object { $_.ToString() }; exit 1 }"
+    )
+    subprocess.run(
+        [POWERSHELL, "-NoLogo", "-NoProfile", "-Command", command],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_launcher_preserves_foreign_processes_and_gates_browser_on_health() -> None:
@@ -176,6 +208,7 @@ def test_mediamtx_startup_installer_creates_a_hidden_logon_shortcut() -> None:
     assert "WScript.Shell" in startup
     assert "MediaMTX.lnk" in startup
     assert "GetFolderPath('Startup')" in startup
+    assert "-ExecutionPolicy Bypass" in startup
     assert "-NoOpen" in startup
 
 
@@ -184,6 +217,7 @@ def test_mediamtx_desktop_installer_creates_a_real_shortcut_with_app_icon() -> N
     assert "WScript.Shell" in installer
     assert "MediaMTX.lnk" in installer
     assert "x-omni.ico" in installer
+    assert "-ExecutionPolicy Bypass" in installer
     assert "GetFolderPath('Desktop')" in installer
     # Unlike the Startup entry, a double-clicked desktop icon should open
     # MediaMTX's own status page -- no -NoOpen here.
@@ -194,6 +228,7 @@ def test_double_click_x_dvr_launcher_uses_bounded_windows_launcher() -> None:
     command = (ROOT / "Launch-X-DVR.cmd").read_text(encoding="utf-8")
     assert "scripts\\launch-x-dvr.ps1" in command
     assert "-WindowStyle Hidden" in command
+    assert "-ExecutionPolicy Bypass" in command
 
 
 def test_x_dvr_gui_launcher_owns_no_recorder_and_verifies_before_replacing() -> None:
