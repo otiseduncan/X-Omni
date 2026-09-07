@@ -426,8 +426,9 @@ def test_alldata_service_information_is_the_advertised_ro_si_acquisition_surface
     assert "checks local adas si itself first" in description
     assert "scrapex's licensed alldata navigator" in description
     assert "never acquires an adas map report" in description
-    assert set(properties) == {"repair_order_id", "topic"}
-    assert parameters["required"] == ["repair_order_id", "topic"]
+    assert {"repair_order_id", "topic", "action"} <= set(properties)
+    assert {"required": ["repair_order_id", "topic"]} in parameters["anyOf"]
+    assert {"required": ["action"]} in parameters["anyOf"]
     assert parameters["additionalProperties"] is False
     assert (
         "ro_si_acquire"
