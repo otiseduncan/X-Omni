@@ -55,7 +55,7 @@ EXPECTED_ADAS_TOOLS = {
     "calibration_iq_operator",
     "calibration_iq_destructive",
     "calibration_iq_work_prep",
-    "collision_research",
+    "service_information_research",
     "research_provider_setup",
     "scrapex_status",
     "scrapex_start_native",
@@ -78,6 +78,7 @@ NON_ADAS_NORMAL_TOOLS = {
     "adas_si_record_modify",
     "automotive_knowledge_lifecycle",
     "calibration_iq_update",
+    "collision_research",
 }
 
 
@@ -114,7 +115,7 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
 
     assert adas_names == EXPECTED_ADAS_TOOLS
     assert len(adas_catalog) == 35
-    assert len(full_catalog) == 50
+    assert len(full_catalog) == 51
     assert NON_ADAS_NORMAL_TOOLS <= full_names
 
 
