@@ -3655,13 +3655,12 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Authoritative Calibration IQ source for ADAS work-prep: phase/queue reads, one-RO requirements, "
-                    "readiness audits, and one-RO SI acquisition. CIQ owns the work queue; "
-                    "ADAS Map governs requirements; ADAS SI is the local procedure library. "
+                    "Authoritative Calibration IQ source for upcoming shop field work and weekly RO readiness; "
+                    "does not read Google Calendar appointments or events. Coverage/readiness workflow for "
+                    "phase/queue reads, one-RO requirements, readiness audits, and one-RO SI acquisition. "
                     "ro_si_acquire checks ADAS SI then licensed ALLDATA on a miss. "
-                    "week_readiness with execute_missing=true acquires missing evidence. "
-                    "For board-level attached-SI counts/lists use calibration_iq_summary/read "
-                    "with si_attached. Never infer a phase."
+                    "For attached-SI board counts/lists use calibration_iq_summary/read with si_attached. "
+                    "Do not invent/default a phase."
                 ),
                 "parameters": {
                     "type": "object",
@@ -3679,8 +3678,9 @@ def install() -> None:
                                 "queue_next",
                             ],
                             "description": (
-                                "Operation: list/audit work, read one RO, acquire one RO's SI, "
-                                "or advance the saved queue. phase_coverage requires an explicit phase."
+                                "Authoritative CIQ RO workload/readiness operation: list/audit, read one RO, "
+                                "acquire one RO's SI, or advance the queue. phase_coverage is only for a phase "
+                                "explicitly supplied by the user."
                             ),
                         },
                         "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
