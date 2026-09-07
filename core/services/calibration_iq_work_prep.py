@@ -3794,10 +3794,13 @@ def install() -> None:
 
                 self.register(TOOL_NAME, handler)
 
+                collision_research_handler = self._handlers.get(  # noqa: SLF001
+                    "collision_research"
+                )
+
                 async def si_research_handler(tool_args: dict[str, Any]):
                     from ..config import Settings
                     from . import adas_si as adas_si_mod
-                    from . import research_operator
                     settings = Settings.load()
                     adas = adas_si_mod.get_shared_instance(
                         settings.adas_si_root,
@@ -3818,8 +3821,10 @@ def install() -> None:
                         )
                     generic_args = dict(tool_args)
                     generic_args.pop(_CONTEXT_KEY, None)
-                    browser = research_operator.get_browser(settings.root, adas=adas)
-                    return await browser.operator_action(generic_args)
+                    if collision_research_handler is None:
+                        raise ValueError("Licensed service-information research is unavailable.")
+                    result = collision_research_handler(generic_args)
+                    return await result if hasattr(result, "__await__") else result
 
                 self.register(SI_RESEARCH_TOOL_NAME, si_research_handler)
 
