@@ -1954,6 +1954,10 @@ def test_topic_coverage_matches_si_wording_to_governing_requirement():
             "state": prep.adas_artifact_catalog.MISSING,
         },
         {
+            "calibration": "Front long-range radar calibration",
+            "state": prep.adas_artifact_catalog.MISSING,
+        },
+        {
             "calibration": "Surround View Camera",
             "state": prep.adas_artifact_catalog.MISSING,
         },
