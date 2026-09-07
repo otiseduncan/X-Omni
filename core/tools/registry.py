@@ -3573,7 +3573,11 @@ class Registry:
                     or "ScrapeX did not provide verified execution proof."
                 )
             return None
-        if name == "calibration_iq_work_prep":
+        if name == "calibration_iq_work_prep" or (
+            name == "service_information_research"
+            and isinstance(result, dict)
+            and result.get("mode") == "ro_si_acquire"
+        ):
             if not isinstance(result, dict):
                 return "Calibration IQ work prep returned an invalid result."
 
@@ -4008,12 +4012,13 @@ class Registry:
             "calibration_iq_operator",
             "calibration_iq_destructive",
             "calibration_iq_work_prep",
+            "service_information_research",
         }:
-            # This namespace is Registry-owned. Drop a model-provided value
-            # before approval persistence, summaries, audit logging, or handler
-            # execution; an authoritative value is injected later.
+            # These private namespaces are Registry-owned. Drop model-provided
+            # values before logging/handler execution; authoritative context
+            # is injected later.
             args = dict(args)
-            if name == "calibration_iq_work_prep":
+            if name in {"calibration_iq_work_prep", "service_information_research"}:
                 args.pop(_CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY, None)
             else:
                 args.pop(_CALIBRATION_IQ_CONTEXT_KEY, None)
@@ -4164,7 +4169,7 @@ class Registry:
                 user_id=user_id,
                 role=role,
             )
-        if name == "calibration_iq_work_prep":
+        if name in {"calibration_iq_work_prep", "service_information_research"}:
             handler_args = dict(args)
             handler_args[_CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY] = (
                 self._calibration_iq_invocation_context(
