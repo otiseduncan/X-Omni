@@ -56,7 +56,7 @@ profiles:
       - calibration_iq_operator
       - calibration_iq_destructive
       - calibration_iq_work_prep
-      - service_information_research
+      - alldata_service_information
       - research_provider_setup
       - scrapex_status
       - scrapex_start_native
@@ -196,7 +196,7 @@ tools:
   # ---- ADAS SI: the source library is read-only; annotations are gated ----
   adas_si_search:
     tier: read_only
-    description: "Search the local authoritative ADAS SI library only. A miss is not acquisition; for an RO SI request use service_information_research so ALLDATA can continue the job."
+    description: "Search the local authoritative ADAS SI library only. A miss is not acquisition; for an RO SI request use alldata_service_information so the licensed ALLDATA Navigator can continue the job."
 
   adas_si_inventory:
     tier: read_only
@@ -271,32 +271,37 @@ tools:
   service_information_research:
     tier: operator_authorized
     description: >-
-      Primary ADAS service-information research capability. With a Calibration IQ
-      repair_order_id and topic, check ADAS SI first, continue through licensed
-      ALLDATA on a local miss/unverified result, preserve verified evidence, refresh
-      ADAS SI coverage, and link it back to the RO. Without an RO, supports the
-      existing licensed ALLDATA/public OEM research actions.
+      Backward-compatible general service-information research. Retained for the
+      full maintenance profile; not advertised in the normal ADAS operator surface.
+
+  alldata_service_information:
+    tier: operator_authorized
+    description: >-
+      Primary one-RO OEM service-information acquisition. Checks local ADAS SI
+      first, then uses ScrapeX's licensed ALLDATA Navigator on a miss or unverified
+      result, captures verified procedure evidence, refreshes ADAS SI, and links it
+      to Calibration IQ. This capability never acquires or authenticates ADAS Map.
 
   # ---- ScrapeX: loopback-only ADAS Map acquisition and CIQ reconciliation ----
   scrapex_status:
     tier: read_only
     description: >-
-      Read ScrapeX health, managed Work Chrome authentication state, and bounded
-      batch status without starting browser work or changing Calibration IQ.
+      Read the ScrapeX ADAS Map worker health and managed Work Chrome authentication
+      state only. This is not ALLDATA status and does not retrieve service information.
 
   scrapex_read:
     tier: read_only
     description: >-
-      Read ScrapeX batches, exact-RO ADAS Map provenance, exceptions, summaries,
-      or a non-mutating Calibration IQ queue preview.
+      Read ScrapeX ADAS Map batches, exact-RO ADAS Map provenance, exceptions,
+      summaries, or a non-mutating Calibration IQ queue preview. Not for ALLDATA SI.
 
   scrapex_adas_map:
     tier: operator_authorized
     description: >-
-      Run a structured ScrapeX ADAS Map queue or exact-RO action through the
-      loopback-only service. ScrapeX verifies exact inspection provenance and
-      Calibration IQ reconciliation; authentication-required and partial states
-      are returned truthfully and never converted to success.
+      Acquire ADAS Map requirement reports only. This tool never retrieves OEM
+      service-information procedures and never opens ALLDATA. ScrapeX verifies
+      exact ADAS Map provenance and Calibration IQ reconciliation; authentication
+      boundaries apply only to the ADAS Map work-browser profile.
 
   scrapex_start_native:
     tier: operator_authorized
@@ -347,9 +352,8 @@ tools:
       Prepare Calibration IQ work from the authoritative RO queue: read phase and
       RO requirements, run full ADAS Map and ADAS SI coverage for an explicit
       phase, reconcile ADAS Map requirements into Calibration IQ through verified
-      routine operator actions, check exact ADAS SI procedure coverage, and acquire
-      requested one-RO SI through licensed ALLDATA when local coverage is missing
-      or unverified.
+      routine operator actions and check exact ADAS SI procedure coverage. Direct
+      one-RO SI acquisition is owned by alldata_service_information.
 
   calibration_iq_destructive:
     tier: confirm_required
