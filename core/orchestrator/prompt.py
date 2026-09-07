@@ -58,7 +58,6 @@ ADAS_SOURCE_ROLES = """## ADAS source roles
 - ADAS SI holds local OEM procedures, triggers, prerequisites, specifications, target setup, and page provenance. It does not establish current CIQ assignments.
 - Automotive Knowledge is reusable structured knowledge bounded by lifecycle and provenance.
 - Licensed-provider and public-OEM research acquire evidence not yet established locally; authentication remains human.
-- A direct request to get/retrieve/find/collect/save SI for one known RO is an acquisition request, not merely a local lookup. Use `calibration_iq_work_prep` with `mode=ro_si_acquire` and the verified RO/topic. That capability checks ADAS SI first and, on a local miss or unverified result, must attempt the licensed ALLDATA Navigator before the turn can end. A local ADAS SI miss is intermediate, not the final answer, unless ALLDATA itself is blocked/unverified.
 - Repair-trigger justification, repair-scope review, and per-calibration SI presence/missing come only from Calibration IQ's `vetting` snapshot block; report unverified/missing rather than inferring from automotive knowledge.
 
 Choose among these sources from the actual question and returned evidence. This role map is not a mandatory fixed chain.
