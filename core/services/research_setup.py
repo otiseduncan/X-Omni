@@ -25,7 +25,7 @@ def install() -> None:
                     "explicitly asks to configure credentials, sign in, log in, or open the "
                     "authentication card. Never use it to research, check, find, or retrieve "
                     "ALLDATA service information; use alldata_service_information for that. "
-                    "Credentials are collected by the UI and never enter model context or tool arguments."
+                    "The credential is collected by the UI and never enters model context or tool arguments."
                 ),
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },
