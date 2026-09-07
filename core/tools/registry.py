@@ -3574,7 +3574,7 @@ class Registry:
                 )
             return None
         if name == "calibration_iq_work_prep" or (
-            name == "service_information_research"
+            name in {"service_information_research", "alldata_service_information"}
             and isinstance(result, dict)
             and result.get("mode") == "ro_si_acquire"
         ):
@@ -4013,12 +4013,17 @@ class Registry:
             "calibration_iq_destructive",
             "calibration_iq_work_prep",
             "service_information_research",
+            "alldata_service_information",
         }:
             # These private namespaces are Registry-owned. Drop model-provided
             # values before logging/handler execution; authoritative context
             # is injected later.
             args = dict(args)
-            if name in {"calibration_iq_work_prep", "service_information_research"}:
+            if name in {
+                "calibration_iq_work_prep",
+                "service_information_research",
+                "alldata_service_information",
+            }:
                 args.pop(_CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY, None)
             else:
                 args.pop(_CALIBRATION_IQ_CONTEXT_KEY, None)
@@ -4169,7 +4174,11 @@ class Registry:
                 user_id=user_id,
                 role=role,
             )
-        if name in {"calibration_iq_work_prep", "service_information_research"}:
+        if name in {
+            "calibration_iq_work_prep",
+            "service_information_research",
+            "alldata_service_information",
+        }:
             handler_args = dict(args)
             handler_args[_CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY] = (
                 self._calibration_iq_invocation_context(
