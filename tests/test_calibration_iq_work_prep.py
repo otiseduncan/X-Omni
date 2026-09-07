@@ -407,13 +407,30 @@ def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
         "phase_list",
         "phase_coverage",
         "ro_requirements",
-        "ro_si_acquire",
         "week_readiness",
         "queue_list",
         "queue_next",
     }
     assert set(schema["parameters"]["properties"]["statuses"]["items"]["enum"]) == set(
         weekly_queue.LIFECYCLE_STATUSES
+    )
+
+
+def test_service_information_research_is_the_advertised_ro_si_acquisition_surface():
+    schema = registry_mod.TOOL_SCHEMAS[prep.SI_RESEARCH_TOOL_NAME]
+    description = schema["description"].casefold()
+    properties = schema["parameters"]["properties"]
+
+    assert "primary service-information acquisition" in description
+    assert "adas si first" in description
+    assert "licensed alldata navigator" in description
+    assert "local database miss is not a terminal answer" in description
+    assert {"repair_order_id", "topic", "action"} <= set(properties)
+    assert {"required": ["repair_order_id", "topic"]} in schema["parameters"]["anyOf"]
+    assert {"required": ["action"]} in schema["parameters"]["anyOf"]
+    assert (
+        "ro_si_acquire"
+        not in registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]["parameters"]["properties"]["mode"]["enum"]
     )
 
 
