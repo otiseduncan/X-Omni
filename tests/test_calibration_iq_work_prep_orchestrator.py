@@ -388,3 +388,166 @@ async def test_one_ro_si_acquisition_terminal_summary_reports_capture_not_local_
     assert "There is no local SI." not in text
     assert "CIQ mutation receipts: 0" not in text
     assert registry.invocations[0][1]["mode"] == "ro_si_acquire"
+
+
+class _SIModelClient(_ModelClient):
+    async def stream(self, _messages, tools=None):
+        assert tools
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "type": "tool_call",
+                "id": "model-si-research",
+                "name": prep.SI_RESEARCH_TOOL_NAME,
+                "arguments": json.dumps(self.args),
+            }
+            return
+        yield {"type": "content", "text": self.final_text}
+
+
+class _SIRegistry(_Registry):
+    def model_tools(self, _role="owner"):
+        return [{
+            "type": "function",
+            "function": {
+                "name": prep.SI_RESEARCH_TOOL_NAME,
+                "description": (
+                    "Retrieve service information for a Calibration IQ RO; "
+                    "local ADAS SI miss continues to licensed ALLDATA."
+                ),
+                "parameters": {"type": "object"},
+            },
+        }]
+
+
+@pytest.mark.asyncio
+async def test_service_information_research_ro_result_is_truth_sealed():
+    result = {
+        "status": "captured",
+        "mode": "ro_si_acquire",
+        "executed": True,
+        "success": True,
+        "verified": True,
+        "work_complete": True,
+        "repair_order_id": "ro-santa-fe",
+        "ro_number": "2400612495",
+        "vehicle": "2024 Hyundai Santa Fe Calligraphy",
+        "topic": "front long-range radar SI",
+        "si_acquired_count": 1,
+        "coverage_resolved": True,
+        "alldata_acquisitions": [{
+            "verified": True,
+            "captured": True,
+            "capture": {
+                "data": {
+                    "relative_path": (
+                        "2024/Hyundai/Santa Fe/ALLDATA/"
+                        "Front Radar Calibration.pdf"
+                    )
+                }
+            },
+        }],
+    }
+    registry = _SIRegistry(result)
+    store = _Store("get the front long range radar SI for this ro 2400612495")
+    client = _SIModelClient(
+        {
+            "repair_order_id": "2400612495",
+            "topic": "front long-range radar SI",
+        },
+        "No service information was found.",
+    )
+    orchestrator = Orchestrator(
+        _Router(),
+        client,
+        registry,
+        store,
+        SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
+    )
+
+    events = [
+        event
+        async for event in orchestrator.run_turn(
+            61,
+            "get the front long range radar SI for this ro 2400612495",
+            approval_context={
+                "session_id": "local:owner",
+                "user_id": "owner",
+                "role": "owner",
+                "message_id": 345,
+            },
+        )
+    ]
+    text = "".join(
+        event["text"] for event in events if event.get("type") == "token"
+    )
+
+    assert registry.invocations[0][0] == prep.SI_RESEARCH_TOOL_NAME
+    assert registry.invocations[0][1] == {
+        "repair_order_id": "2400612495",
+        "topic": "front long-range radar SI",
+    }
+    assert "captured 1 verified ALLDATA SI procedure" in text
+    assert "No service information was found." not in text
+
+
+@pytest.mark.asyncio
+async def test_real_registry_binds_service_information_research_context(tmp_path):
+    store = Store(tmp_path / "si-research-context.sqlite")
+    registry = Registry("config/tools.yaml", store=store)
+    captured: dict[str, Any] = {}
+
+    async def handler(args: dict[str, Any]) -> dict[str, Any]:
+        captured.update(args)
+        return {
+            "status": "acquisition_failed",
+            "mode": "ro_si_acquire",
+            "executed": True,
+            "success": False,
+            "verified": False,
+            "work_complete": False,
+            "message": "ALLDATA acquisition did not verify a capture.",
+        }
+
+    registry.register(prep.SI_RESEARCH_TOOL_NAME, handler)
+    conversation_id = store.create_conversation("SI research context")
+    message_id = store.add_message(
+        conversation_id,
+        "user",
+        "get front radar SI for 2400612495",
+    )
+    spoof = {
+        "conversation_id": 999,
+        "message_id": 998,
+        "tool_call_id": "spoofed-si-call",
+        "user_id": "attacker",
+        "role": "owner",
+    }
+
+    await registry.invoke(
+        prep.SI_RESEARCH_TOOL_NAME,
+        {
+            "repair_order_id": "2400612495",
+            "topic": "front radar SI",
+            prep._CONTEXT_KEY: spoof,  # noqa: SLF001
+        },
+        message_id=message_id,
+        conversation_id=conversation_id,
+        tool_call_id="real-si-call",
+        user_id="local-dev",
+        role="owner",
+    )
+
+    context = captured[prep._CONTEXT_KEY]  # noqa: SLF001
+    assert context["conversation_id"] == conversation_id
+    assert context["message_id"] == message_id
+    assert context["tool_call_id"] == "real-si-call"
+    assert context["user_id"] == "local-dev"
+    row = store.conn.execute(
+        "SELECT status, approved_by, args_json FROM tool_calls WHERE tool_call_id = ?",
+        ("real-si-call",),
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["approved_by"] == "operator_authorized"
+    assert prep._CONTEXT_KEY not in json.loads(row["args_json"])  # noqa: SLF001
+    store.close()
