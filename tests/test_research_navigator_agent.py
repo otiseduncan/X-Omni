@@ -38,7 +38,9 @@ class _FakeNavigator:
         self.calls: list[dict[str, Any]] = []
         self._create_ok = create_ok
         self.verified_after_extract = False
+        self.verification_sequence: list[bool] = []
         self._extracted = False
+        self.extract_count = 0
 
     async def __call__(self, settings, args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG002
         self.calls.append(dict(args))
@@ -82,9 +84,10 @@ class _FakeNavigator:
                 },
             )
 
-        if action in {"click", "fill", "press", "back", "open", "extract", "done"}:
+        if action in {"click", "fill", "press", "back", "open", "scroll", "wait", "extract", "done"}:
             if action == "extract":
                 self._extracted = True
+                self.extract_count += 1
             return _navigator_result(
                 action,
                 status="acted",
@@ -101,7 +104,11 @@ class _FakeNavigator:
             )
 
         if action == "verify":
-            verified = bool(self.verified_after_extract and self._extracted)
+            verified = (
+                self.verification_sequence.pop(0)
+                if self.verification_sequence
+                else bool(self.verified_after_extract and self._extracted)
+            )
             return _navigator_result(
                 "verify",
                 status="verified" if verified else "unverified",
@@ -183,7 +190,7 @@ async def test_happy_path_reaches_verified_via_scrapex_verify_not_model_narratio
     assert result["attempted"] is True
     assert result["verified"] is True
     assert result["captured"] is False
-    assert result["agent_stopped_reason"] == "model_done"
+    assert result["agent_stopped_reason"] == "verified_after_extract"
     assert result["task_id"] == "task-1"
     assert result["source_url"] == "https://my.alldata.com/leaf"
     assert "calibration procedure" in result["extracted_text"]
@@ -193,9 +200,13 @@ async def test_happy_path_reaches_verified_via_scrapex_verify_not_model_narratio
     assert actions_called[1] == "observe"
     assert "verify" in actions_called
     assert "get_evidence" in actions_called
-    # Model never spends its own turn budget re-deriving verification --
-    # verify/get_evidence happen only in the epilogue, after the loop ends.
-    assert actions_called.index("verify") > actions_called.index("done")
+    # Candidate verification happens immediately after extract, while the
+    # browser context is still live; a final verify still runs as the
+    # authoritative epilogue before evidence/capture.
+    extract_index = actions_called.index("extract")
+    verify_indexes = [i for i, action in enumerate(actions_called) if action == "verify"]
+    assert verify_indexes[0] == extract_index + 1
+    assert "done" not in actions_called
 
 
 @pytest.mark.asyncio
@@ -261,6 +272,59 @@ async def test_model_never_calling_extract_never_verifies_even_if_it_claims_succ
 
     assert result["verified"] is False
     assert result["agent_stopped_reason"] == "model_finished"
+
+
+@pytest.mark.asyncio
+async def test_rejected_extract_is_fed_back_and_model_can_backtrack_to_a_verified_leaf(monkeypatch):
+    navigator = _FakeNavigator()
+    navigator.verification_sequence = [False, True, True]
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([
+        [("extract", {})],
+        [("back", {})],
+        [("extract", {})],
+    ])
+
+    result = await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2023, "make": "Toyota", "model": "Camry"},
+        topic="blind spot monitor calibration",
+    )
+
+    assert result["verified"] is True
+    assert result["agent_stopped_reason"] == "verified_after_extract"
+    assert navigator.extract_count == 2
+    actions = [call["action"] for call in navigator.calls]
+    assert actions.count("verify") == 3  # two candidate checks + final authority check
+    assert "back" in actions
+    # The second model turn must be able to see why its first candidate failed.
+    second_turn_context = json.dumps(client.messages_seen[1], default=str)
+    assert "verification_after_extract" in second_turn_context
+    assert "Candidate rejected" in second_turn_context
+
+
+@pytest.mark.asyncio
+async def test_observation_summary_includes_page_text_and_breadcrumb():
+    summary = research_navigator_agent._observation_summary(
+        _navigator_result(
+            "observe",
+            data={
+                "url": "https://my.alldata.com/procedure",
+                "title": "Procedure",
+                "breadcrumb": ["ADAS", "Lane Change Assist"],
+                "page_text": "Rear Side Radar Beam Axis Adjustment",
+                "elements": [],
+            },
+        )
+    )
+    assert summary["page_text"] == "Rear Side Radar Beam Axis Adjustment"
+    assert summary["breadcrumb"] == ["ADAS", "Lane Change Assist"]
 
 
 @pytest.mark.asyncio
