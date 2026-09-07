@@ -246,6 +246,7 @@ ARTIFACT_FOR_TOOL = {
     # the same structured queue state instead of reconstructing it from prose.
     "calibration_iq_work_prep": "calibration_iq_work_prep",
     "collision_research": "research_provider",
+    "service_information_research": "research_provider",
     "scrapex_status": "scrapex",
     "scrapex_read": "scrapex",
     "scrapex_adas_map": "scrapex",
@@ -263,6 +264,7 @@ _CALIBRATION_IQ_OPERATOR_TOOLS = frozenset(
 )
 
 _CALIBRATION_IQ_WORK_PREP_TOOL = "calibration_iq_work_prep"
+_SERVICE_INFORMATION_RESEARCH_TOOL = "service_information_research"
 
 
 def _calibration_iq_operator_payload(result: Any) -> dict[str, Any]:
@@ -1154,6 +1156,12 @@ def tool_result_visible_to_model(name: str, result: Any) -> Any:
 
 def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
     """Choose media success cards only when result truth is self-consistent."""
+    if (
+        name == "service_information_research"
+        and isinstance(result, dict)
+        and result.get("mode") == "ro_si_acquire"
+    ):
+        return "calibration_iq_work_prep"
     if name == "camera_footage" and isinstance(result, dict) and "analysis_status" in result:
         return "camera_footage_analysis"
     if name not in {"image_generate", "video_generate"}:
@@ -2092,20 +2100,32 @@ class Orchestrator:
                             last_calibration_iq_operator_result
                         )
                     if (
-                        call.get("name") == _CALIBRATION_IQ_WORK_PREP_TOOL
+                        call.get("name")
+                        in {
+                            _CALIBRATION_IQ_WORK_PREP_TOOL,
+                            _SERVICE_INFORMATION_RESEARCH_TOOL,
+                        }
                         and ev.get("type") == "tool_result"
                     ):
                         work_prep_result = ev.get("result")
-                        calibration_iq_work_prep_results.append(
-                            work_prep_result
-                            if isinstance(work_prep_result, dict)
-                            else {
-                                "mode": args.get("mode"),
-                                "status": "unverified_result",
-                                "success": False,
-                                "verified": False,
-                            }
+                        is_work_prep_result = bool(
+                            call.get("name") == _CALIBRATION_IQ_WORK_PREP_TOOL
+                            or (
+                                isinstance(work_prep_result, dict)
+                                and work_prep_result.get("mode") == "ro_si_acquire"
+                            )
                         )
+                        if is_work_prep_result:
+                            calibration_iq_work_prep_results.append(
+                                work_prep_result
+                                if isinstance(work_prep_result, dict)
+                                else {
+                                    "mode": args.get("mode") or "ro_si_acquire",
+                                    "status": "unverified_result",
+                                    "success": False,
+                                    "verified": False,
+                                }
+                            )
                     if (
                         call.get("name") == "web_research_current"
                         and ev.get("type") == "tool_result"
