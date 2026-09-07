@@ -476,7 +476,7 @@ def _alldata_scope(arguments: dict[str, Any]) -> None:
     tool = next(
         item
         for item in _production_profile_tools()
-        if item["function"]["name"] == "service_information_research"
+        if item["function"]["name"] == "alldata_service_information"
     )
     errors = sorted(
         Draft202012Validator(tool["function"]["parameters"]).iter_errors(arguments),
@@ -1795,7 +1795,7 @@ def _perry_phase_list_call() -> CallExpectation:
 
 def _alldata_research_call() -> CallExpectation:
     return CallExpectation(
-        "service_information_research",
+        "alldata_service_information",
         {
             "status": "success",
             "verified": True,
@@ -6210,7 +6210,7 @@ def test_production_safe_live_alternatives_are_structurally_declared() -> None:
             ),
         },
         ("licensed_alldata_is_not_scrapex", 0): {
-            ("research_provider_setup", "service_information_research")
+            ("research_provider_setup", "alldata_service_information")
         },
         ("adas_si_supplies_answer_after_durable_miss", 0): {
             ("automotive_knowledge_search", "adas_si_search")
@@ -6459,7 +6459,7 @@ async def test_alldata_vehicle_string_is_schema_and_handler_supported(
     tool = next(
         item
         for item in _production_profile_tools()
-        if item["function"]["name"] == "service_information_research"
+        if item["function"]["name"] == "alldata_service_information"
     )
     validate(instance=arguments, schema=tool["function"]["parameters"])
 
