@@ -3789,6 +3789,12 @@ def install() -> None:
                 "additionalProperties": False,
             },
         }
+        # The normal ALLDATA-named surface retains the general licensed research
+        # actions for compatibility, but its name/description make source ownership
+        # explicit to the conversational model.
+        registry_mod.TOOL_SCHEMAS[ALLDATA_SI_TOOL_NAME]["parameters"] = copy.deepcopy(
+            registry_mod.TOOL_SCHEMAS[SI_RESEARCH_TOOL_NAME]["parameters"]
+        )
 
         previous_registry_init = registry_mod.Registry.__init__
         if not getattr(previous_registry_init, "_xomni_ciq_work_prep", False):
@@ -3869,14 +3875,16 @@ def install() -> None:
                 self.register(SI_RESEARCH_TOOL_NAME, si_research_handler)
 
                 async def alldata_si_handler(tool_args: dict[str, Any]):
-                    from ..config import Settings
-                    from . import adas_si as adas_si_mod
-                    settings = Settings.load()
-                    adas = adas_si_mod.get_shared_instance(
-                        settings.adas_si_root,
-                        settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite",
-                    )
-                    return await _ro_si_acquire(settings, adas, tool_args)
+                    if str(tool_args.get("repair_order_id") or "").strip():
+                        from ..config import Settings
+                        from . import adas_si as adas_si_mod
+                        settings = Settings.load()
+                        adas = adas_si_mod.get_shared_instance(
+                            settings.adas_si_root,
+                            settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite",
+                        )
+                        return await _ro_si_acquire(settings, adas, tool_args)
+                    return await si_research_handler(tool_args)
 
                 self.register(ALLDATA_SI_TOOL_NAME, alldata_si_handler)
 
