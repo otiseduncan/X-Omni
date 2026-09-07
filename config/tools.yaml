@@ -56,7 +56,7 @@ profiles:
       - calibration_iq_operator
       - calibration_iq_destructive
       - calibration_iq_work_prep
-      - collision_research
+      - service_information_research
       - research_provider_setup
       - scrapex_status
       - scrapex_start_native
@@ -196,7 +196,7 @@ tools:
   # ---- ADAS SI: the source library is read-only; annotations are gated ----
   adas_si_search:
     tier: read_only
-    description: "Search the authoritative ADAS SI library for calibration procedures."
+    description: "Search the local authoritative ADAS SI library only. A miss is not acquisition; for an RO SI request use service_information_research so ALLDATA can continue the job."
 
   adas_si_inventory:
     tier: read_only
@@ -232,7 +232,8 @@ tools:
     tier: read_only
     description: >-
       Search durable structured automotive knowledge. Verified, non-superseded
-      records are the safe default; an empty result is only a miss in this store.
+      records are the safe default; an empty result is only a miss in this store,
+      not a service-information acquisition result.
 
   automotive_knowledge_read:
     tier: read_only
@@ -264,10 +265,17 @@ tools:
   collision_research:
     tier: operator_authorized
     description: >-
-      Perform targeted post-collision research using the licensed ALLDATA browser
-      and public OEM/manufacturer sources. Preserve selected ALLDATA or public OEM
-      evidence into ADAS SI with provenance. Do not bypass CAPTCHA, access controls,
-      subscription limits, or other provider boundaries.
+      Backward-compatible targeted post-collision research using licensed ALLDATA
+      and public OEM sources. Retained for full-profile maintenance.
+
+  service_information_research:
+    tier: operator_authorized
+    description: >-
+      Primary ADAS service-information research capability. With a Calibration IQ
+      repair_order_id and topic, check ADAS SI first, continue through licensed
+      ALLDATA on a local miss/unverified result, preserve verified evidence, refresh
+      ADAS SI coverage, and link it back to the RO. Without an RO, supports the
+      existing licensed ALLDATA/public OEM research actions.
 
   # ---- ScrapeX: loopback-only ADAS Map acquisition and CIQ reconciliation ----
   scrapex_status:
