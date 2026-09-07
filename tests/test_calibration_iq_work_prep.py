@@ -407,6 +407,7 @@ def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
         "phase_list",
         "phase_coverage",
         "ro_requirements",
+        "ro_si_acquire",
         "week_readiness",
         "queue_list",
         "queue_next",
