@@ -19,7 +19,7 @@ def install() -> None:
         previous = registry_mod.Registry._approved_result_error
         if not getattr(previous, "_xomni_research_truth", False):
             def approved_result_error(name: str, result: Any) -> Optional[str]:
-                if name == "collision_research" and isinstance(result, dict):
+                if name in {"collision_research", "service_information_research"} and isinstance(result, dict):
                     action = str(result.get("action") or "").casefold()
                     if action == "full_research":
                         status = str(result.get("status") or "").casefold()
