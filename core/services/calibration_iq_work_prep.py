@@ -3654,12 +3654,9 @@ def install() -> None:
                     "Authoritative Calibration IQ source for upcoming shop field work "
                     "and weekly RO readiness. It does not read Google Calendar "
                     "appointments or events. Use it for active CIQ RO phase or queue "
-                    "lists, saved one-RO requirements, and live ADAS Map requirement or "
-                    "ADAS SI procedure audits/acquisition. For a direct request to get, "
-                    "retrieve, find, collect, or save SI for one known RO, use "
-                    "mode=ro_si_acquire; a local ADAS SI miss is intermediate and this "
-                    "mode automatically attempts licensed ALLDATA before returning. "
-                    "CIQ is the work queue; ADAS Map governs "
+                    "lists, saved one-RO requirements, and live ADAS Map/SI work. "
+                    "For one-RO SI retrieval use ro_si_acquire; it checks local ADAS SI "
+                    "then licensed ALLDATA on a miss. CIQ is the work queue; ADAS Map governs "
                     "calibration requirements; ADAS SI supplies procedure coverage. "
                     "Verified gaps may add or reactivate CIQ calibrations. When the "
                     "user asks to actually prepare/do the missing work rather than merely "
@@ -3690,11 +3687,9 @@ def install() -> None:
                             "description": (
                                 "Choose an authoritative CIQ RO workload/readiness "
                                 "operation: phase_list and queue_list read lists; "
-                                "phase_coverage and week_readiness audit; ro_requirements "
-                                "reads one RO; ro_si_acquire gets requested SI for one RO, "
-                                "checking ADAS SI first and automatically escalating a local "
-                                "miss/unverified result to the licensed ALLDATA Navigator; "
-                                "queue_next advances one saved weekly row. "
+                                "phase_coverage/week_readiness audit; ro_requirements reads "
+                                "one RO; ro_si_acquire retrieves one RO's SI via local-first "
+                                "ADAS SI then ALLDATA; queue_next advances a saved row. "
                                 "phase_coverage is only for a phase explicitly supplied by the "
                                 "user, never an inferred/default phase."
                             ),
@@ -3711,11 +3706,7 @@ def install() -> None:
                         "topic": {
                             "type": "string",
                             "maxLength": 220,
-                            "description": (
-                                "For ro_si_acquire: the requested calibration/service-information "
-                                "topic, copied from the user's intent or verified RO requirement. "
-                                "Omit only when the user explicitly wants all missing SI for the RO."
-                            ),
+                            "description": "For ro_si_acquire: requested calibration/SI topic.",
                         },
                         "phase": {
                             "type": "string",
