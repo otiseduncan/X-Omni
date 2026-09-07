@@ -47,6 +47,8 @@ def test_navigator_schema_uses_complete_action_specific_branches() -> None:
         {"action": "press", "task_id": "task-1", "ref": "e1", "key": "Enter"},
         {"action": "back", "task_id": "task-1"},
         {"action": "open", "task_id": "task-1", "url": "https://my.alldata.com/x"},
+        {"action": "scroll", "task_id": "task-1", "delta_y": 800},
+        {"action": "wait", "task_id": "task-1", "milliseconds": 700},
         {"action": "extract", "task_id": "task-1"},
         {"action": "done", "task_id": "task-1"},
     ]
@@ -61,6 +63,8 @@ def test_navigator_schema_uses_complete_action_specific_branches() -> None:
         {"action": "fill", "task_id": "task-1", "ref": "e1"},
         {"action": "press", "task_id": "task-1", "ref": "e1"},
         {"action": "open", "task_id": "task-1"},
+        {"action": "scroll", "task_id": "task-1", "delta_y": 5000},
+        {"action": "wait", "task_id": "task-1", "milliseconds": 20},
         {"action": "create_task", "provider": "nope", "target": {}, "topic": "t"},
     ]
     for arguments in invalid_arguments:
@@ -189,6 +193,33 @@ async def test_click_sends_the_exact_ref_and_task_id(monkeypatch):
     assert result["status"] == "acted"
     assert result["success"] is True
     assert result["work_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_scroll_and_wait_send_bounded_action_payloads(monkeypatch):
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"url": "https://my.alldata.com/x", "title": "X", "elements": []},
+        )
+
+    _install_transport(monkeypatch, handler)
+    scroll = await scrapex.navigator(
+        FakeSettings(), {"action": "scroll", "task_id": "task-1", "delta_y": 900}
+    )
+    wait = await scrapex.navigator(
+        FakeSettings(), {"action": "wait", "task_id": "task-1", "milliseconds": 650}
+    )
+
+    assert scroll["success"] is True
+    assert wait["success"] is True
+    assert requests == [
+        {"action": "scroll", "delta_y": 900},
+        {"action": "wait", "milliseconds": 650},
+    ]
 
 
 @pytest.mark.asyncio
