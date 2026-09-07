@@ -1938,3 +1938,262 @@ async def test_readiness_is_the_map_handoff_and_does_not_wait_on_si(monkeypatch)
     # The outstanding SI is still visible for whoever chases it.
     assert result["si_missing_count"] == 1
     assert result["repair_orders"][0]["missing_si"]
+
+
+def test_front_long_range_radar_alias_matches_front_radar_family():
+    assert prep._calibration_key("Front long-range radar calibration") == "frontradar"  # noqa: SLF001
+    assert prep._calibration_key("Front Radar") == "frontradar"  # noqa: SLF001
+    assert prep._calibration_key("forward long range radar service information") == "frontradar"  # noqa: SLF001
+
+
+def test_topic_coverage_matches_si_wording_to_governing_requirement():
+    coverage = [
+        {
+            "calibration": "Front Radar",
+            "state": prep.adas_artifact_catalog.MISSING,
+        },
+        {
+            "calibration": "Surround View Camera",
+            "state": prep.adas_artifact_catalog.MISSING,
+        },
+    ]
+    selected = prep._topic_coverage(coverage, "front long-range radar SI")  # noqa: SLF001
+    assert [item["calibration"] for item in selected] == ["Front Radar"]
+
+
+@pytest.mark.asyncio
+async def test_ro_si_acquire_escalates_local_miss_to_alldata_and_refreshes_coverage(
+    monkeypatch,
+):
+    snapshot = {
+        "repair_order": {
+            "id": "ro-santa-fe",
+            "ro_number": "2400612495",
+        },
+        "vehicle": {
+            "year": 2024,
+            "make": "Hyundai",
+            "model": "Santa Fe",
+            "trim": "Calligraphy",
+            "vin": "5NMP54GL0RH000001",
+        },
+        "calibrations": [
+            {
+                "id": "cal-front-radar",
+                "calibration_type": "Front long-range radar calibration",
+                "determination": "REQUIRED",
+                "method": "STATIC",
+            }
+        ],
+    }
+
+    async def load_snapshot(_settings, identifier):
+        assert identifier == "2400612495"
+        return {"status": "verified", "snapshot": snapshot}
+
+    async def discover_map(_catalog, _snapshot):
+        return {
+            "status": "verified",
+            "requirements": [{"label": "Front Radar", "method": "STATIC"}],
+            "requirement_count": 1,
+        }
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [], None
+
+    coverage_calls = 0
+
+    async def catalog_coverage(_catalog, _snapshot, _map_info):
+        nonlocal coverage_calls
+        coverage_calls += 1
+        return [
+            {
+                "calibration": "Front Radar",
+                "state": (
+                    prep.adas_artifact_catalog.MISSING
+                    if coverage_calls == 1
+                    else prep.adas_artifact_catalog.COVERED
+                ),
+                "documents": (
+                    []
+                    if coverage_calls == 1
+                    else ["2024/Hyundai/Santa Fe/ALLDATA/Front Radar Calibration.pdf"]
+                ),
+            }
+        ]
+
+    acquisition_inputs: list[list[dict]] = []
+
+    async def acquire_si(
+        _settings,
+        _adas,
+        current_snapshot,
+        coverage,
+        *,
+        include_unverified=False,
+    ):
+        assert current_snapshot == snapshot
+        assert include_unverified is True
+        acquisition_inputs.append(list(coverage))
+        return [
+            {
+                "topic": "Front Radar",
+                "verified": True,
+                "captured": True,
+                "capture": {
+                    "success": True,
+                    "verified": True,
+                    "work_complete": True,
+                    "data": {
+                        "relative_path": "2024/Hyundai/Santa Fe/ALLDATA/Front Radar Calibration.pdf"
+                    },
+                },
+            }
+        ]
+
+    async def link_evidence(_settings, _adas, repair_order_id, context):
+        assert repair_order_id == "ro-santa-fe"
+        assert context["conversation_id"] == 77
+        return {
+            "status": "success",
+            "executed": True,
+            "success": True,
+            "verified": True,
+        }
+
+    operator_payloads: list[dict] = []
+
+    async def operator_execute(_settings, _adas, payload):
+        operator_payloads.append(payload)
+        return {
+            "status": "success",
+            "executed": True,
+            "success": True,
+            "verified": True,
+            "receipts": [
+                {
+                    "status": "completed",
+                    "success": True,
+                    "verification": {"verified": True},
+                }
+                for _ in payload["actions"]
+            ],
+        }
+
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_coverage", catalog_coverage)
+    monkeypatch.setattr(prep, "_acquire_si_gaps", acquire_si)
+    monkeypatch.setattr(prep, "_link_ro_research_evidence", link_evidence)
+    monkeypatch.setattr(prep.calibration_iq, "operator_execute", operator_execute)
+
+    result = await prep._ro_si_acquire(  # noqa: SLF001
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {
+            "repair_order_id": "2400612495",
+            "topic": "front long-range radar SI",
+            prep._CONTEXT_KEY: {  # noqa: SLF001
+                "conversation_id": 77,
+                "message_id": 88,
+                "tool_call_id": "single-ro-si",
+            },
+        },
+    )
+
+    assert result["status"] == "captured"
+    assert result["success"] is True
+    assert result["verified"] is True
+    assert result["work_complete"] is True
+    assert result["si_acquired_count"] == 1
+    assert result["coverage_resolved"] is True
+    assert acquisition_inputs[0][0]["calibration"] == "Front Radar"
+    assert result["alldata_acquisitions"][0]["captured"] is True
+    assert result["research_link"]["verified"] is True
+    assert result["target_coverage_after"][0]["state"] == prep.adas_artifact_catalog.COVERED
+    assert operator_payloads  # missing-SI bookkeeping is reconciled after refresh
+
+
+@pytest.mark.asyncio
+async def test_ro_si_acquire_does_not_open_alldata_when_si_is_already_covered(
+    monkeypatch,
+):
+    snapshot = {
+        "repair_order": {"id": "ro-covered", "ro_number": "2400000001"},
+        "vehicle": {"year": 2024, "make": "Hyundai", "model": "Santa Fe"},
+        "calibrations": [],
+    }
+
+    async def load_snapshot(_settings, _identifier):
+        return {"status": "verified", "snapshot": snapshot}
+
+    async def discover_map(_catalog, _snapshot):
+        return {
+            "status": "verified",
+            "requirements": [{"label": "Front Radar", "method": "STATIC"}],
+        }
+
+    async def reconcile(_settings, _adas, current, _map_info, _context):
+        return current, [], None
+
+    async def catalog_coverage(_catalog, _snapshot, _map_info):
+        return [
+            {
+                "calibration": "Front Radar",
+                "state": prep.adas_artifact_catalog.COVERED,
+                "documents": ["2024/Hyundai/Santa Fe/front-radar.pdf"],
+            }
+        ]
+
+    async def acquire_si(*_args, **_kwargs):
+        raise AssertionError("ALLDATA must not run when local SI is already covered")
+
+    monkeypatch.setattr(prep, "_load_ro_snapshot", load_snapshot)
+    monkeypatch.setattr(prep, "_discover_adas_map", discover_map)
+    monkeypatch.setattr(prep, "_reconcile_one", reconcile)
+    monkeypatch.setattr(prep, "_catalog_coverage", catalog_coverage)
+    monkeypatch.setattr(prep, "_acquire_si_gaps", acquire_si)
+
+    result = await prep._ro_si_acquire(  # noqa: SLF001
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {
+            "repair_order_id": "2400000001",
+            "topic": "front long-range radar SI",
+        },
+    )
+
+    assert result["status"] == "already_present"
+    assert result["success"] is True
+    assert result["si_acquired_count"] == 0
+    assert result["alldata_acquisitions"] == []
+
+
+@pytest.mark.asyncio
+async def test_handle_routes_ro_si_acquire_mode(monkeypatch):
+    observed: dict = {}
+
+    async def acquire(_settings, _adas, args):
+        observed.update(args)
+        return {
+            "status": "captured",
+            "mode": "ro_si_acquire",
+            "success": True,
+            "verified": True,
+        }
+
+    monkeypatch.setattr(prep, "_ro_si_acquire", acquire)
+    result = await prep.handle(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        {
+            "mode": "ro_si_acquire",
+            "repair_order_id": "2400612495",
+            "topic": "front long-range radar SI",
+        },
+    )
+
+    assert observed["repair_order_id"] == "2400612495"
+    assert observed["topic"] == "front long-range radar SI"
+    assert result["verified"] is True
