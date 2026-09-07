@@ -423,3 +423,24 @@ async def test_navigator_screenshot_rejects_wrong_task_echo(monkeypatch):
     with pytest.raises(scrapex.ScrapeXContract) as exc:
         await scrapex.navigator_screenshot(FakeSettings(), "task-1")
     assert exc.value.code == "navigator_task_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_alldata_authentication_required_is_not_mislabeled_as_adas_map(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/navigator/tasks/task-1/observe"
+        return httpx.Response(
+            409,
+            json={"detail": "ALLDATA requires interactive authentication."},
+        )
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.navigator(
+        FakeSettings(), {"action": "observe", "task_id": "task-1"}
+    )
+
+    assert result["status"] == "authentication_required"
+    assert result["provider"] == "alldata"
+    assert result["requires_human"] is True
+    assert "ALLDATA requires interactive authentication" in result["message"]
+    assert "ADAS Map" not in result["message"]
