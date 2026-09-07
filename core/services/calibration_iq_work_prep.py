@@ -1463,12 +1463,16 @@ def _topic_coverage(
     topic_key = _calibration_key(clean_topic)
     if not topic_key:
         return []
-    return [
-        item
-        for item in coverage
-        if isinstance(item, dict)
-        and _calibration_key(item.get("calibration")) == topic_key
-    ]
+    # A governing source/CIQ may expose aliases for the same physical system
+    # (for example "Front long-range radar" and "Front Radar"). A focused SI
+    # request is one acquisition target, not two duplicate browser searches.
+    for item in coverage:
+        if (
+            isinstance(item, dict)
+            and _calibration_key(item.get("calibration")) == topic_key
+        ):
+            return [item]
+    return []
 
 
 async def _ro_si_acquire(
