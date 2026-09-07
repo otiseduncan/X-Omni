@@ -3655,7 +3655,7 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Calibration IQ/ADAS work-prep: phase/queue reads, one-RO requirements, "
+                    "Authoritative Calibration IQ source for ADAS work-prep: phase/queue reads, one-RO requirements, "
                     "readiness audits, and one-RO SI acquisition. CIQ owns the work queue; "
                     "ADAS Map governs requirements; ADAS SI is the local procedure library. "
                     "ro_si_acquire checks ADAS SI then licensed ALLDATA on a miss. "
