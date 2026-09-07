@@ -601,7 +601,20 @@ def scrapex_evidence_from_result(
 
 
 NAVIGATOR_ID_BOUND_ACTIONS = frozenset(
-    {"observe", "verify", "get_evidence", "click", "fill", "press", "back", "open", "extract", "done"}
+    {
+        "observe",
+        "verify",
+        "get_evidence",
+        "click",
+        "fill",
+        "press",
+        "back",
+        "open",
+        "scroll",
+        "wait",
+        "extract",
+        "done",
+    }
 )
 _NAVIGATOR_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
