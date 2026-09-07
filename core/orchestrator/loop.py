@@ -517,7 +517,10 @@ def calibration_iq_work_prep_terminal_summary(results: Any) -> str:
             or reconciliation_failed
             or indeterminate
             or may_have_executed
-            or result.get("executed") is True
+            or (
+                result.get("executed") is True
+                and mode != "ro_si_acquire"
+            )
             or (
                 isinstance(reconciliation, dict)
                 and (
