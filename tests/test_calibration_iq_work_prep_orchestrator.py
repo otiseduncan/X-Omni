@@ -398,7 +398,7 @@ class _SIModelClient(_ModelClient):
             yield {
                 "type": "tool_call",
                 "id": "model-si-research",
-                "name": prep.SI_RESEARCH_TOOL_NAME,
+                "name": prep.ALLDATA_SI_TOOL_NAME,
                 "arguments": json.dumps(self.args),
             }
             return
@@ -410,7 +410,7 @@ class _SIRegistry(_Registry):
         return [{
             "type": "function",
             "function": {
-                "name": prep.SI_RESEARCH_TOOL_NAME,
+                "name": prep.ALLDATA_SI_TOOL_NAME,
                 "description": (
                     "Retrieve service information for a Calibration IQ RO; "
                     "local ADAS SI miss continues to licensed ALLDATA."
@@ -421,7 +421,7 @@ class _SIRegistry(_Registry):
 
 
 @pytest.mark.asyncio
-async def test_service_information_research_ro_result_is_truth_sealed():
+async def test_alldata_service_information_ro_result_is_truth_sealed():
     result = {
         "status": "captured",
         "mode": "ro_si_acquire",
@@ -482,7 +482,7 @@ async def test_service_information_research_ro_result_is_truth_sealed():
         event["text"] for event in events if event.get("type") == "token"
     )
 
-    assert registry.invocations[0][0] == prep.SI_RESEARCH_TOOL_NAME
+    assert registry.invocations[0][0] == prep.ALLDATA_SI_TOOL_NAME
     assert registry.invocations[0][1] == {
         "repair_order_id": "2400612495",
         "topic": "front long-range radar SI",
@@ -492,7 +492,7 @@ async def test_service_information_research_ro_result_is_truth_sealed():
 
 
 @pytest.mark.asyncio
-async def test_real_registry_binds_service_information_research_context(tmp_path):
+async def test_real_registry_binds_alldata_service_information_context(tmp_path):
     store = Store(tmp_path / "si-research-context.sqlite")
     registry = Registry("config/tools.yaml", store=store)
     captured: dict[str, Any] = {}
@@ -509,7 +509,7 @@ async def test_real_registry_binds_service_information_research_context(tmp_path
             "message": "ALLDATA acquisition did not verify a capture.",
         }
 
-    registry.register(prep.SI_RESEARCH_TOOL_NAME, handler)
+    registry.register(prep.ALLDATA_SI_TOOL_NAME, handler)
     conversation_id = store.create_conversation("SI research context")
     message_id = store.add_message(
         conversation_id,
@@ -525,7 +525,7 @@ async def test_real_registry_binds_service_information_research_context(tmp_path
     }
 
     await registry.invoke(
-        prep.SI_RESEARCH_TOOL_NAME,
+        prep.ALLDATA_SI_TOOL_NAME,
         {
             "repair_order_id": "2400612495",
             "topic": "front radar SI",
