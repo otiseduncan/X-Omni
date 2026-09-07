@@ -20,6 +20,7 @@ _RESEARCH_TOOLS = frozenset({
     "research_provider_setup",
     "collision_research",
     "service_information_research",
+    "alldata_service_information",
 })
 
 
