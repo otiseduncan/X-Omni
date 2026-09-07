@@ -35,7 +35,8 @@ from . import research_navigator_agent
 from . import scrapex as scrapex_svc
 
 TOOL_NAME = "calibration_iq_work_prep"
-SI_RESEARCH_TOOL_NAME = "service_information_research"
+SI_RESEARCH_TOOL_NAME = "service_information_research"  # legacy/full-profile surface
+ALLDATA_SI_TOOL_NAME = "alldata_service_information"
 _CONTEXT_KEY = "__xomni_work_prep_context"
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
@@ -3660,7 +3661,7 @@ def install() -> None:
                     "Authoritative Calibration IQ source for upcoming shop field work and weekly RO readiness; "
                     "does not read Google Calendar appointments or events. Coverage/readiness workflow for "
                     "phase/queue reads, one-RO requirements, and readiness audits. "
-                    "For actually retrieving service information use service_information_research. "
+                    "For actually retrieving one-RO service information use alldata_service_information. "
                     "For attached-SI board counts/lists use calibration_iq_summary/read with si_attached. "
                     "Do not invent/default a phase."
                 ),
@@ -3716,6 +3717,35 @@ def install() -> None:
                 },
             },
         )
+
+        registry_mod.TOOL_SCHEMAS[ALLDATA_SI_TOOL_NAME] = {
+            "description": (
+                "ALLDATA service-information acquisition for one Calibration IQ repair order. "
+                "Use this when the user asks to get, find, retrieve, check, or collect OEM SI/"
+                "procedure information for a specific RO, including an explicit request to check "
+                "ALLDATA. This capability checks local ADAS SI itself first; if coverage is "
+                "missing or unverified it launches ScrapeX's licensed ALLDATA Navigator, lets "
+                "the active X model navigate the live provider menus, captures verified procedure "
+                "evidence into ADAS SI, refreshes coverage, and links the evidence back to the RO. "
+                "It never acquires an ADAS Map report and never uses the ADAS Map browser."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "repair_order_id": {
+                        "type": "string",
+                        "description": "Exact Calibration IQ RO id or displayed RO number.",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "maxLength": 220,
+                        "description": "Requested calibration, component, procedure, or SI topic.",
+                    },
+                },
+                "required": ["repair_order_id", "topic"],
+            },
+        }
 
         base_research_schema = copy.deepcopy(
             registry_mod.TOOL_SCHEMAS.get("collision_research") or {}
@@ -3781,6 +3811,16 @@ def install() -> None:
                         ),
                     },
                 )
+                self.policy.setdefault(
+                    ALLDATA_SI_TOOL_NAME,
+                    {
+                        "tier": "operator_authorized",
+                        "description": (
+                            "Acquire one RO's OEM service information through local ADAS SI and "
+                            "ScrapeX's licensed ALLDATA Navigator; never ADAS Map."
+                        ),
+                    },
+                )
 
                 async def handler(tool_args: dict[str, Any]):
                     from ..config import Settings
@@ -3827,6 +3867,18 @@ def install() -> None:
                     return await result if hasattr(result, "__await__") else result
 
                 self.register(SI_RESEARCH_TOOL_NAME, si_research_handler)
+
+                async def alldata_si_handler(tool_args: dict[str, Any]):
+                    from ..config import Settings
+                    from . import adas_si as adas_si_mod
+                    settings = Settings.load()
+                    adas = adas_si_mod.get_shared_instance(
+                        settings.adas_si_root,
+                        settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite",
+                    )
+                    return await _ro_si_acquire(settings, adas, tool_args)
+
+                self.register(ALLDATA_SI_TOOL_NAME, alldata_si_handler)
 
             registry_init._xomni_ciq_work_prep = True  # type: ignore[attr-defined]
             registry_mod.Registry.__init__ = registry_init
