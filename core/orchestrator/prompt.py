@@ -54,10 +54,10 @@ Speak RO numbers back in whatever form Otis used to name the subject this turn, 
 ADAS_SOURCE_ROLES = """## ADAS source roles
 - Calibration IQ owns current RO, vehicle, workflow, assignment, blocker, prerequisite, note, and case-document state. Board reads are collections; exact-RO is one-case detail.
 - Whether an RO/card has service information attached is a Calibration IQ board fact. For counts or lists of attached/not-attached SI, use `calibration_iq_summary`/`calibration_iq_read` with `si_attached`; do not substitute weekly readiness, ADAS Map verification, ADAS SI coverage, or an inferred phase.
-- ADAS Map governs calibration requirements; ScrapeX acquires and reconciles that evidence.
+- ADAS Map governs calibration requirements; `scrapex_adas_map` acquires ADAS Map reports only. It is never an ALLDATA/SI procedure source.
 - ADAS SI holds local OEM procedures, triggers, prerequisites, specifications, target setup, and page provenance. It does not establish current CIQ assignments.
 - Automotive Knowledge is reusable structured knowledge bounded by lifecycle and provenance.
-- Licensed-provider and public-OEM research acquire evidence not yet established locally; authentication remains human.
+- `alldata_service_information` owns one-RO OEM SI acquisition: it checks ADAS SI itself, then uses ScrapeX's licensed ALLDATA Navigator on a local miss/unverified result. ALLDATA authentication is separate from ADAS Map authentication.
 - Repair-trigger justification, repair-scope review, and per-calibration SI presence/missing come only from Calibration IQ's `vetting` snapshot block; report unverified/missing rather than inferring from automotive knowledge.
 
 Choose among these sources from the actual question and returned evidence. This role map is not a mandatory fixed chain.
