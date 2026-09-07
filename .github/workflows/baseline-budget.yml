@@ -1,0 +1,20 @@
+name: Baseline prompt budget
+on:
+  push:
+    branches:
+      - baseline-budget-20260907
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pytest -q tests/test_prompt_tool_budget.py tests/test_adas_operator_profile.py
