@@ -58,7 +58,7 @@ def current_model_client() -> Any | None:
 
 
 MAX_MODEL_TURNS = 40
-_NAV_ACTIONS = ("observe", "click", "fill", "press", "back", "open", "extract", "done")
+_NAV_ACTIONS = ("observe", "click", "fill", "press", "back", "open", "scroll", "wait", "extract", "done")
 # Bounded at the element level, not by an outer character truncation --
 # confirmed live against real ALLDATA search results (500+ entries): a flat
 # json.dumps(...)[:N] cap cut the elements array off mid-object, so the
@@ -81,8 +81,10 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
             "state rather than predicting what a page should contain. Maintain the exact "
             "requested vehicle as a hard evidence requirement, explore/backtrack as needed, "
             "and call extract only when actual procedure content is on screen rather than a "
-            "menu or results list. Call done when the requested evidence has been extracted "
-            "or when the observed site state shows the goal is not reachable."
+            "menu or results list. Every extract is immediately checked by ScrapeX; if the "
+            "candidate is rejected, use the returned verification gates/reason to backtrack "
+            "and explore a different branch. Call done only when the observed site state "
+            "shows the exact goal is not reachable."
         ),
         "parameters": {
             "type": "object",
@@ -103,6 +105,18 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
                 "url": {
                     "type": "string",
                     "description": "Only used by open; must stay on this provider's own domain.",
+                },
+                "delta_y": {
+                    "type": "integer",
+                    "minimum": -1600,
+                    "maximum": 1600,
+                    "description": "Only used by scroll; positive scrolls down, negative scrolls up.",
+                },
+                "milliseconds": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 2500,
+                    "description": "Only used by wait for bounded client-rendered content settling.",
                 },
             },
             "required": ["action"],
@@ -138,7 +152,12 @@ def _system_prompt(target: dict[str, Any], topic: str) -> str:
         "listed in the structured observation. Use pixels to understand layout, grouping, "
         "selected state, menus, and drill-down context, but act only by an observed ref. The "
         "browser will be re-observed after each executed action, so choose one action at a time "
-        "and then reassess. Your final claim is independently checked against the real page. "
+        "and then reassess. Do not require exact article-title wording: OEMs may express the same "
+        "intent as calibration, aiming, alignment, adjustment, initialization, relearn, setup, "
+        "registration, learn, or zero-point procedures, and system names also vary. Use the live "
+        "page context to reason semantically while preserving the exact requested vehicle/system. "
+        "Your final claim is independently checked against the real page. After extract, read the "
+        "verification feedback; if it is rejected, correct course instead of declaring success. "
         "If a tool call returns an error, adapt to the observed state rather than repeating it. "
         "If the exact vehicle/topic cannot be found after reasonable exploration, call 'done' "
         "and say so plainly instead of guessing."
@@ -157,6 +176,22 @@ def _validate_args(action: str, args: dict[str, Any]) -> Optional[str]:
         return "press requires a non-empty 'key', e.g. Enter."
     if action == "open" and not str(args.get("url") or "").strip():
         return "open requires a non-empty 'url'."
+    if action == "scroll":
+        delta_y = args.get("delta_y")
+        if (
+            isinstance(delta_y, bool)
+            or not isinstance(delta_y, int)
+            or not -1600 <= delta_y <= 1600
+        ):
+            return "scroll requires integer 'delta_y' from -1600 to 1600."
+    if action == "wait":
+        milliseconds = args.get("milliseconds")
+        if (
+            isinstance(milliseconds, bool)
+            or not isinstance(milliseconds, int)
+            or not 100 <= milliseconds <= 2500
+        ):
+            return "wait requires integer 'milliseconds' from 100 to 2500."
     return None
 
 
@@ -184,6 +219,11 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "url": data.get("url"),
         "title": data.get("title"),
+        "breadcrumb": data.get("breadcrumb"),
+        # ScrapeX bounds this to 8k chars while building the observation.
+        # This is the semantic content X was previously missing when it had
+        # only labels/refs and a screenshot to reason from.
+        "page_text": str(data.get("page_text") or ""),
         "elements": elements,
         "loop_warning": data.get("loop_warning"),
         "backtrack_available": data.get("backtrack_available"),
@@ -306,6 +346,7 @@ async def run_navigator_search(
     last_failed_call: Optional[tuple[str, tuple[tuple[str, Any], ...]]] = None
     repeated_failure_count = 0
     model_called_done = False
+    candidate_verified = False
 
     for turn in range(max_turns):
         try:
@@ -374,12 +415,58 @@ async def run_navigator_search(
                     dispatch_args["key"] = args.get("key")
                 elif action == "open":
                     dispatch_args["url"] = args.get("url")
+                elif action == "scroll":
+                    dispatch_args["delta_y"] = args.get("delta_y")
+                elif action == "wait":
+                    dispatch_args["milliseconds"] = args.get("milliseconds")
                 dispatched = True
                 navigator_result = await scrapex_svc.navigator(settings, dispatch_args)
                 if navigator_result.get("success"):
                     result = _observation_summary(navigator_result)
                     if action != "done":
                         latest_visual_summary = result
+
+                    # Close the reasoning loop at the moment X proposes a
+                    # candidate procedure. ScrapeX remains the truth authority:
+                    # if the candidate fails any vehicle/subject/leaf/content
+                    # gate, feed that proof straight back to X while the live
+                    # page and navigation history are still available.
+                    if action == "extract":
+                        candidate_check = await scrapex_svc.navigator(
+                            settings, {"action": "verify", "task_id": task_id}
+                        )
+                        candidate_proof = (
+                            candidate_check.get("data")
+                            if isinstance(candidate_check.get("data"), dict)
+                            else {}
+                        )
+                        candidate_verified = bool(candidate_proof.get("verified"))
+                        result["verification_after_extract"] = {
+                            "verified": candidate_verified,
+                            "reason": candidate_proof.get("reason"),
+                            "vehicle_verified": candidate_proof.get("vehicle_verified"),
+                            "subject_verified": candidate_proof.get("subject_verified"),
+                            "procedure_leaf_verified": candidate_proof.get("procedure_leaf_verified"),
+                            "content_extracted": candidate_proof.get("content_extracted"),
+                            "matched_terms": candidate_proof.get("matched_terms"),
+                        }
+                        result["next_instruction"] = (
+                            "Candidate verified. Stop browsing; verified evidence has been reached."
+                            if candidate_verified
+                            else (
+                                "Candidate rejected by ScrapeX verification. Use the failed gates/reason "
+                                "and current page state to backtrack or choose a different branch; do not "
+                                "repeat extract on the same unchanged page."
+                            )
+                        )
+                        trace.append(
+                            {
+                                "turn": turn,
+                                "action": "verify_after_extract",
+                                "verified": candidate_verified,
+                                "reason": candidate_proof.get("reason"),
+                            }
+                        )
                 else:
                     result = {
                         "error": (navigator_result.get("error") or {}).get("message")
@@ -434,6 +521,9 @@ async def run_navigator_search(
                 }
             )
 
+        if candidate_verified:
+            stopped_reason = "verified_after_extract"
+            break
         if model_called_done:
             stopped_reason = "model_done"
             break
