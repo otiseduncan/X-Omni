@@ -96,9 +96,10 @@ MAX_NAV_SCREENSHOT_BYTES = 4 * 1024 * 1024
 
 SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
     "description": (
-        "Safe, non-mutating provider preflight. Check the local ScrapeX ADAS Map "
-        "worker, Calibration IQ dependency, and managed-browser authentication "
-        "state. It may run before acquisition or provider setup and opens nothing."
+        "Safe, non-mutating preflight for the ScrapeX ADAS Map worker only. Check "
+        "Calibration IQ dependency and the managed ADAS Map work-browser authentication "
+        "state. This is not ALLDATA status, does not use ALLDATA credentials, and does "
+        "not retrieve OEM service-information procedures. It opens nothing."
     ),
     "parameters": {
         "type": "object",
@@ -109,11 +110,11 @@ SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_READ_SCHEMA: dict[str, Any] = {
     "description": (
-        "Read ScrapeX batches, exact-RO ADAS Map evidence, exceptions, or a "
-        "non-mutating CIQ queue preview. For a create result, batch_id is exactly "
-        "result.data.id, never evidence_id. Existing-evidence reads begin with "
-        "list_batches when no id is known; new acquisition uses "
-        "scrapex_adas_map.create_exact_batch instead."
+        "Read ScrapeX ADAS Map batches, exact-RO ADAS Map evidence, exceptions, or a "
+        "non-mutating CIQ queue preview. This tool is never an ALLDATA/SI procedure "
+        "source. For a create result, batch_id is exactly result.data.id, never "
+        "evidence_id. Existing-evidence reads begin with list_batches when no id is "
+        "known; new ADAS Map acquisition uses scrapex_adas_map instead."
     ),
     "parameters": {
         "type": "object",
@@ -219,8 +220,10 @@ SCRAPEX_READ_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
     "description": (
-        "Run bounded ScrapeX ADAS Map actions. For one exact RO that the user wants "
-        "acquired now, prefer acquire_exact: it starts ScrapeX if needed, verifies "
+        "Acquire ADAS Map requirement reports only; this tool never opens ALLDATA and "
+        "never retrieves OEM service-information procedures. For one exact RO that the "
+        "user wants an ADAS Map acquired now, prefer acquire_exact: it starts ScrapeX "
+        "if needed, verifies "
         "managed-browser sign-in before any batch exists, creates the exact one-RO "
         "batch, processes that RO synchronously, verifies the canonical ADAS Map PDF, "
         "and attaches that document to the matching Calibration IQ RO before the "
