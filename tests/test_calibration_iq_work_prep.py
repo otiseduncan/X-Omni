@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from core.services import calibration_iq_weekly_queue as weekly_queue
 from core.services import calibration_iq_work_prep as prep
@@ -399,6 +400,86 @@ def test_phase_map_report_summary_separates_missing_from_unverified_ros():
     assert "RO 101" in text and "genuinely missing" in text
     assert "RO 102" in text and "ambiguous" in text
     assert "RO 100" not in text
+
+
+def test_phase_list_schema_cannot_run_without_an_explicit_phase():
+    schema = registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]["parameters"]
+    validator = Draft202012Validator(schema)
+
+    assert validator.is_valid({"mode": "phase_list", "phase": "5"})
+    assert not validator.is_valid({"mode": "phase_list"})
+    assert validator.is_valid({"mode": "phase_coverage", "phase": "5"})
+    assert not validator.is_valid({"mode": "phase_coverage"})
+    assert validator.is_valid({"mode": "ro_requirements", "repair_order_id": "2400612495"})
+    assert not validator.is_valid({"mode": "ro_requirements"})
+
+
+@pytest.mark.asyncio
+async def test_phase_list_fails_closed_when_phase_is_missing(monkeypatch):
+    async def should_not_read(*_args, **_kwargs):
+        raise AssertionError("phase_list must not query CIQ without a phase")
+
+    monkeypatch.setattr(prep.calibration_iq, "read_repair_orders", should_not_read)
+    result = await prep._phase_list(SimpleNamespace(), {"shop": "Warner Robins"})  # noqa: SLF001
+
+    assert result["status"] == "invalid_request"
+    assert result["verified"] is False
+    assert result["rows"] == []
+    assert result["count"] is None
+
+
+@pytest.mark.asyncio
+async def test_phase_list_rejects_mixed_phase_rows_instead_of_mislabeling_them(monkeypatch):
+    async def read(_settings, args):
+        assert args == {"phase": "5", "limit": 100, "shop": "Warner Robins"}
+        return {
+            "status": "verified",
+            "count": 2,
+            "filters": {"phase": "5", "shop": "Warner Robins"},
+            "rows": [
+                {"RO": "2400711878", "Phase": 5, "Shop": "Warner Robins"},
+                {"RO": "2400711874", "Phase": 6, "Shop": "Warner Robins"},
+            ],
+        }
+
+    monkeypatch.setattr(prep.calibration_iq, "read_repair_orders", read)
+    result = await prep._phase_list(  # noqa: SLF001
+        SimpleNamespace(),
+        {"phase": "Phase 5", "shop": "Warner Robins"},
+    )
+
+    assert result["status"] == "filter_mismatch"
+    assert result["verified"] is False
+    assert result["mismatch_count"] == 1
+    assert result["rows"] == []
+    assert result["count"] is None
+    assert "rejected the mixed result" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_phase_list_returns_only_verified_requested_phase(monkeypatch):
+    async def read(_settings, args):
+        assert args == {"phase": "5", "limit": 100, "shop": "Warner Robins"}
+        return {
+            "status": "verified",
+            "count": 2,
+            "filters": {"phase": "5", "shop": "Warner Robins"},
+            "rows": [
+                {"RO": "2400711878", "Phase": 5, "Shop": "Warner Robins"},
+                {"RO": "2400711854", "Phase": "Phase 5", "Shop": "Warner Robins"},
+            ],
+        }
+
+    monkeypatch.setattr(prep.calibration_iq, "read_repair_orders", read)
+    result = await prep._phase_list(  # noqa: SLF001
+        SimpleNamespace(),
+        {"phase": "5", "shop": "Warner Robins"},
+    )
+
+    assert result["status"] == "verified"
+    assert result["requested_phase"] == "5"
+    assert result["count"] == 2
+    assert all(prep._phase_token(row["Phase"]) == "5" for row in result["rows"])  # noqa: SLF001
 
 
 def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
