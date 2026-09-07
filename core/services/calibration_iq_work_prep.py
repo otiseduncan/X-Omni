@@ -19,6 +19,7 @@ checking ADAS SI. No calibration is invented from ADAS SI or ALLDATA.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import threading
@@ -34,6 +35,7 @@ from . import research_navigator_agent
 from . import scrapex as scrapex_svc
 
 TOOL_NAME = "calibration_iq_work_prep"
+SI_RESEARCH_TOOL_NAME = "service_information_research"
 _CONTEXT_KEY = "__xomni_work_prep_context"
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
@@ -3657,8 +3659,8 @@ def install() -> None:
                 "description": (
                     "Authoritative Calibration IQ source for upcoming shop field work and weekly RO readiness; "
                     "does not read Google Calendar appointments or events. Coverage/readiness workflow for "
-                    "phase/queue reads, one-RO requirements, readiness audits, and one-RO SI acquisition. "
-                    "ro_si_acquire checks ADAS SI then licensed ALLDATA on a miss. "
+                    "phase/queue reads, one-RO requirements, and readiness audits. "
+                    "For actually retrieving service information use service_information_research. "
                     "For attached-SI board counts/lists use calibration_iq_summary/read with si_attached. "
                     "Do not invent/default a phase."
                 ),
@@ -3672,15 +3674,14 @@ def install() -> None:
                                 "phase_list",
                                 "phase_coverage",
                                 "ro_requirements",
-                                "ro_si_acquire",
                                 "week_readiness",
                                 "queue_list",
                                 "queue_next",
                             ],
                             "description": (
                                 "Authoritative CIQ RO workload/readiness operation: list/audit, read one RO, "
-                                "acquire one RO's SI, or advance the queue. phase_coverage is only for a phase "
-                                "explicitly supplied by the user."
+                                "or advance the queue. phase_coverage is only for a phase explicitly supplied "
+                                "by the user."
                             ),
                         },
                         "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
@@ -3692,11 +3693,6 @@ def install() -> None:
                             ),
                         },
                         "repair_order_id": {"type": "string"},
-                        "topic": {
-                            "type": "string",
-                            "maxLength": 220,
-                            "description": "For ro_si_acquire: requested calibration/SI topic.",
-                        },
                         "phase": {
                             "type": "string",
                             "description": (
@@ -3721,6 +3717,49 @@ def install() -> None:
             },
         )
 
+        base_research_schema = copy.deepcopy(
+            registry_mod.TOOL_SCHEMAS.get("collision_research") or {}
+        )
+        base_parameters = (
+            base_research_schema.get("parameters")
+            if isinstance(base_research_schema, dict)
+            else None
+        )
+        research_properties = copy.deepcopy(
+            (base_parameters or {}).get("properties") or {}
+        )
+        research_properties["repair_order_id"] = {
+            "type": "string",
+            "description": (
+                "Calibration IQ repair order identifier/number. When supplied with topic, "
+                "this tool owns the complete SI acquisition path."
+            ),
+        }
+        research_properties["topic"] = {
+            "type": "string",
+            "maxLength": 220,
+            "description": "Requested calibration, component, procedure, or service-information topic.",
+        }
+        registry_mod.TOOL_SCHEMAS[SI_RESEARCH_TOOL_NAME] = {
+            "description": (
+                "Primary service-information acquisition and research tool. For a known "
+                "Calibration IQ RO, provide repair_order_id and topic: X checks ADAS SI first, "
+                "then uses the licensed ALLDATA Navigator when local coverage is missing or "
+                "unverified, captures verified SI into ADAS SI, refreshes coverage, and links "
+                "the evidence back to the RO. A local database miss is not a terminal answer. "
+                "Without an RO, action-based licensed ALLDATA/public OEM research remains available."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": research_properties,
+                "anyOf": [
+                    {"required": ["repair_order_id", "topic"]},
+                    {"required": ["action"]},
+                ],
+                "additionalProperties": False,
+            },
+        }
+
         previous_registry_init = registry_mod.Registry.__init__
         if not getattr(previous_registry_init, "_xomni_ciq_work_prep", False):
             def registry_init(self, *args, **kwargs):
@@ -3730,6 +3769,16 @@ def install() -> None:
                     {
                         "tier": "operator_authorized",
                         "description": "Verified Calibration IQ/ADAS Map/ADAS SI work preparation and routine requirement reconciliation.",
+                    },
+                )
+                self.policy.setdefault(
+                    SI_RESEARCH_TOOL_NAME,
+                    {
+                        "tier": "operator_authorized",
+                        "description": (
+                            "Retrieve RO service information through ADAS SI and licensed ALLDATA, "
+                            "or perform general licensed/public OEM service-information research."
+                        ),
                     },
                 )
 
@@ -3744,6 +3793,35 @@ def install() -> None:
                     return await handle(settings, adas, tool_args)
 
                 self.register(TOOL_NAME, handler)
+
+                async def si_research_handler(tool_args: dict[str, Any]):
+                    from ..config import Settings
+                    from . import adas_si as adas_si_mod
+                    from . import research_operator
+                    settings = Settings.load()
+                    adas = adas_si_mod.get_shared_instance(
+                        settings.adas_si_root,
+                        settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite",
+                    )
+                    repair_order_id = str(
+                        tool_args.get("repair_order_id") or ""
+                    ).strip()
+                    if repair_order_id:
+                        return await _ro_si_acquire(
+                            settings,
+                            adas,
+                            {
+                                "repair_order_id": repair_order_id,
+                                "topic": str(tool_args.get("topic") or "").strip(),
+                                _CONTEXT_KEY: tool_args.get(_CONTEXT_KEY),
+                            },
+                        )
+                    generic_args = dict(tool_args)
+                    generic_args.pop(_CONTEXT_KEY, None)
+                    browser = research_operator.get_browser(settings.root, adas=adas)
+                    return await browser.operator_action(generic_args)
+
+                self.register(SI_RESEARCH_TOOL_NAME, si_research_handler)
 
             registry_init._xomni_ciq_work_prep = True  # type: ignore[attr-defined]
             registry_mod.Registry.__init__ = registry_init
