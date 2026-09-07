@@ -1,0 +1,27 @@
+name: Agentic SI validation
+on:
+  push:
+    branches:
+      - agentic-si-navigator-20260907
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install X Omni test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - name: Test Navigator integration
+        run: |
+          python -m pytest -q tests/test_research_navigator_agent.py tests/test_scrapex_navigator_service.py tests/test_registry_navigator_evidence.py
+          python -m compileall -q core/services/research_navigator_agent.py core/services/scrapex.py
