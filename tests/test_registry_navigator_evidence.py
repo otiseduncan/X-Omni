@@ -184,6 +184,20 @@ def test_indeterminate_id_bound_action_quarantines_only_that_task_for_turn() -> 
         conversation_id=11,
         message_id=22,
     )
+    validate_navigator_task_binding(
+        "scrapex_navigator",
+        {"action": "scroll", "task_id": "task-safe", "delta_y": 800},
+        quarantined,
+        conversation_id=11,
+        message_id=22,
+    )
+    validate_navigator_task_binding(
+        "scrapex_navigator",
+        {"action": "wait", "task_id": "task-safe", "milliseconds": 700},
+        quarantined,
+        conversation_id=11,
+        message_id=22,
+    )
 
 
 def test_task_binding_rejects_evidence_from_a_different_turn_or_a_guessed_id() -> None:
