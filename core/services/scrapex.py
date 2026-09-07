@@ -81,7 +81,7 @@ SOURCE_SCOPES = frozenset({"active", "all", "terminal"})
 # ScrapeX Navigator architecture plan.
 NAVIGATOR_PROVIDERS = frozenset({"alldata"})
 NAVIGATOR_META_ACTIONS = frozenset({"create_task", "observe", "verify", "get_evidence"})
-NAVIGATOR_ACT_KINDS = frozenset({"click", "fill", "press", "back", "open", "extract", "done"})
+NAVIGATOR_ACT_KINDS = frozenset({"click", "fill", "press", "back", "open", "scroll", "wait", "extract", "done"})
 NAVIGATOR_ACTIONS = NAVIGATOR_META_ACTIONS | NAVIGATOR_ACT_KINDS
 MAX_TASK_ID_CHARS = 80
 MAX_TOPIC_CHARS = 400
@@ -423,7 +423,7 @@ SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
         "session-scoped task; every other action requires its exact task_id. "
         "observe/act both return the current page's element list -- always "
         "act using a ref from the most recent one, never an older observation. "
-        "click/fill/press/back/open/extract are ordinary navigation steps; "
+        "click/fill/press/back/open/scroll/wait/extract are ordinary navigation steps; "
         "done ends the task and verify computes the verification proof of "
         "whether real, on-topic procedure content was actually reached and "
         "extracted for the requested target. A page changing after an action "
@@ -538,6 +538,42 @@ SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
                     "url": {"type": "string", "maxLength": MAX_NAV_URL_CHARS},
                 },
                 "required": ["action", "task_id", "url"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "scroll",
+                        "description": "Scroll the rendered page to reveal lazy/long drill-down content.",
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "delta_y": {
+                        "type": "integer",
+                        "minimum": -1600,
+                        "maximum": 1600,
+                    },
+                },
+                "required": ["action", "task_id", "delta_y"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "wait",
+                        "description": "Wait briefly for client-rendered/lazy-loaded provider content.",
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "milliseconds": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 2500,
+                    },
+                },
+                "required": ["action", "task_id", "milliseconds"],
             },
             {
                 "type": "object",
@@ -2778,6 +2814,8 @@ _NAVIGATOR_ALLOWED_KEYS: dict[str, set[str]] = {
     "fill": {"action", "task_id", "ref", "text"},
     "press": {"action", "task_id", "ref", "key"},
     "open": {"action", "task_id", "url"},
+    "scroll": {"action", "task_id", "delta_y"},
+    "wait": {"action", "task_id", "milliseconds"},
 }
 
 
@@ -2947,8 +2985,8 @@ async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
             )
             return _success(action, evidence, status="read", verified=True)
 
-        # click/fill/press/back/open/extract/done all drive the same bounded
-        # /act endpoint; ScrapeX's own executor is the sole authority on
+        # click/fill/press/back/open/scroll/wait/extract/done all drive the same
+        # bounded /act endpoint; ScrapeX's own executor is the sole authority on
         # whether the ref/url is valid and the action kind is legal.
         body = {"action": action}
         if action == "click":
@@ -2967,6 +3005,24 @@ async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
             url = _text(clean.get("url"), "url", maximum=MAX_NAV_URL_CHARS)
             assert url is not None
             body["url"] = url
+        elif action == "scroll":
+            delta_y = clean.get("delta_y")
+            if (
+                isinstance(delta_y, bool)
+                or not isinstance(delta_y, int)
+                or not -1600 <= delta_y <= 1600
+            ):
+                raise ScrapeXInput("delta_y must be an integer from -1600 to 1600.")
+            body["delta_y"] = delta_y
+        elif action == "wait":
+            milliseconds = clean.get("milliseconds")
+            if (
+                isinstance(milliseconds, bool)
+                or not isinstance(milliseconds, int)
+                or not 100 <= milliseconds <= 2500
+            ):
+                raise ScrapeXInput("milliseconds must be an integer from 100 to 2500.")
+            body["milliseconds"] = milliseconds
         data = await _request(
             settings,
             "POST",
