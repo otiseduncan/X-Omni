@@ -317,6 +317,22 @@ async def run_navigator_search(
         settings, {"action": "observe", "task_id": task_id}
     )
     if not initial_observation.get("success"):
+        if initial_observation.get("status") == "authentication_required":
+            return {
+                "status": "authentication_required",
+                "provider": provider,
+                "attempted": True,
+                "searched": False,
+                "verified": False,
+                "captured": False,
+                "requires_human": True,
+                "task_id": task_id,
+                "reason": str(
+                    initial_observation.get("message")
+                    or "ALLDATA requires interactive authentication."
+                ),
+                "navigator": initial_observation,
+            }
         return {
             "attempted": True,
             "searched": False,
