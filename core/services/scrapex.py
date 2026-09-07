@@ -910,7 +910,19 @@ def _remote_failure(action: str, exc: ScrapeXRemote) -> dict[str, Any]:
     if exc.status_code == 409 and "adas map" in lowered and (
         "not authenticated" in lowered or "login" in lowered
     ):
-        return _authentication_required(action, {"detail": detail}, executed=False)
+        return _authentication_required(
+            action, {"detail": detail}, executed=False, provider="adas_map"
+        )
+    if exc.status_code == 409 and "alldata" in lowered and (
+        "authentication" in lowered
+        or "signed out" in lowered
+        or "credential" in lowered
+        or "mfa" in lowered
+        or "captcha" in lowered
+    ):
+        return _authentication_required(
+            action, {"detail": detail}, executed=False, provider="alldata"
+        )
     # A server/proxy error can be returned after the remote side committed a
     # POST.  The adapter has no request-id lookup that could safely disprove
     # execution, so fail closed and forbid an automatic retry.  Validation,
@@ -1027,10 +1039,13 @@ def _authentication_required(
     authentication: Any,
     *,
     executed: bool,
+    provider: str = "adas_map",
 ) -> dict[str, Any]:
+    is_alldata = str(provider or "").casefold() == "alldata"
     return {
         "service": "ScrapeX",
         "action": action,
+        "provider": "alldata" if is_alldata else "adas_map",
         "status": "authentication_required",
         "success": False,
         "executed": executed,
@@ -1040,8 +1055,14 @@ def _authentication_required(
         "requires_human": True,
         "authentication": _sanitize(authentication),
         "message": (
-            "ADAS Map needs interactive sign-in in ScrapeX's managed work Chrome "
-            "window. No credential is requested or returned through the model."
+            "ALLDATA requires interactive authentication in ScrapeX's visible "
+            "Navigator browser. Saved credentials are handled outside model context; "
+            "human MFA/CAPTCHA/provider confirmation must be completed there."
+            if is_alldata
+            else (
+                "ADAS Map needs interactive sign-in in ScrapeX's managed work Chrome "
+                "window. No credential is requested or returned through the model."
+            )
         ),
     }
 
