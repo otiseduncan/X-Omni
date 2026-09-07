@@ -96,9 +96,10 @@ MAX_NAV_SCREENSHOT_BYTES = 4 * 1024 * 1024
 
 SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
     "description": (
-        "Safe, non-mutating provider preflight. Check the local ScrapeX ADAS Map "
-        "worker, Calibration IQ dependency, and managed-browser authentication "
-        "state. It may run before acquisition or provider setup and opens nothing."
+        "Safe, non-mutating preflight for the ScrapeX ADAS Map worker only. Check "
+        "Calibration IQ dependency and the managed ADAS Map work-browser authentication "
+        "state. This is not ALLDATA status, does not use ALLDATA credentials, and does "
+        "not retrieve OEM service-information procedures. It opens nothing."
     ),
     "parameters": {
         "type": "object",
@@ -109,11 +110,11 @@ SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_READ_SCHEMA: dict[str, Any] = {
     "description": (
-        "Read ScrapeX batches, exact-RO ADAS Map evidence, exceptions, or a "
-        "non-mutating CIQ queue preview. For a create result, batch_id is exactly "
-        "result.data.id, never evidence_id. Existing-evidence reads begin with "
-        "list_batches when no id is known; new acquisition uses "
-        "scrapex_adas_map.create_exact_batch instead."
+        "Read ScrapeX ADAS Map batches, exact-RO ADAS Map evidence, exceptions, or a "
+        "non-mutating CIQ queue preview. This tool is never an ALLDATA/SI procedure "
+        "source. For a create result, batch_id is exactly result.data.id, never "
+        "evidence_id. Existing-evidence reads begin with list_batches when no id is "
+        "known; new ADAS Map acquisition uses scrapex_adas_map instead."
     ),
     "parameters": {
         "type": "object",
@@ -219,8 +220,10 @@ SCRAPEX_READ_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
     "description": (
-        "Run bounded ScrapeX ADAS Map actions. For one exact RO that the user wants "
-        "acquired now, prefer acquire_exact: it starts ScrapeX if needed, verifies "
+        "Acquire ADAS Map requirement reports only; this tool never opens ALLDATA and "
+        "never retrieves OEM service-information procedures. For one exact RO that the "
+        "user wants an ADAS Map acquired now, prefer acquire_exact: it starts ScrapeX "
+        "if needed, verifies "
         "managed-browser sign-in before any batch exists, creates the exact one-RO "
         "batch, processes that RO synchronously, verifies the canonical ADAS Map PDF, "
         "and attaches that document to the matching Calibration IQ RO before the "
@@ -230,9 +233,11 @@ SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
         "the operator signs in, instead of manual create/start/process/pause steps. "
         "process_one requires an observed exact batch_id. After create_exact_batch or "
         "create_phase_batch, copy result.data.id exactly; never copy evidence_id. "
-        "open_authentication is a parameterless browser-opening human/provider handoff "
-        "used after status reports authentication_required or when the user explicitly "
-        "requests provider setup. Queued or started is not completed."
+        "open_authentication is a parameterless browser-opening human handoff for the "
+        "ADAS Map work browser only, used after status reports authentication_required "
+        "or when the user explicitly asks to sign in to ADAS Map. It never signs in to "
+        "ALLDATA; ALLDATA sign-in belongs to research_provider_setup. Queued or started "
+        "is not completed."
     ),
     "parameters": {
         "type": "object",
@@ -907,7 +912,19 @@ def _remote_failure(action: str, exc: ScrapeXRemote) -> dict[str, Any]:
     if exc.status_code == 409 and "adas map" in lowered and (
         "not authenticated" in lowered or "login" in lowered
     ):
-        return _authentication_required(action, {"detail": detail}, executed=False)
+        return _authentication_required(
+            action, {"detail": detail}, executed=False, provider="adas_map"
+        )
+    if exc.status_code == 409 and "alldata" in lowered and (
+        "authentication" in lowered
+        or "signed out" in lowered
+        or "credential" in lowered
+        or "mfa" in lowered
+        or "captcha" in lowered
+    ):
+        return _authentication_required(
+            action, {"detail": detail}, executed=False, provider="alldata"
+        )
     # A server/proxy error can be returned after the remote side committed a
     # POST.  The adapter has no request-id lookup that could safely disprove
     # execution, so fail closed and forbid an automatic retry.  Validation,
@@ -1024,10 +1041,13 @@ def _authentication_required(
     authentication: Any,
     *,
     executed: bool,
+    provider: str = "adas_map",
 ) -> dict[str, Any]:
+    is_alldata = str(provider or "").casefold() == "alldata"
     return {
         "service": "ScrapeX",
         "action": action,
+        "provider": "alldata" if is_alldata else "adas_map",
         "status": "authentication_required",
         "success": False,
         "executed": executed,
@@ -1037,8 +1057,14 @@ def _authentication_required(
         "requires_human": True,
         "authentication": _sanitize(authentication),
         "message": (
-            "ADAS Map needs interactive sign-in in ScrapeX's managed work Chrome "
-            "window. No credential is requested or returned through the model."
+            "ALLDATA requires interactive authentication in ScrapeX's visible "
+            "Navigator browser. Saved credentials are handled outside model context; "
+            "human MFA/CAPTCHA/provider confirmation must be completed there."
+            if is_alldata
+            else (
+                "ADAS Map needs interactive sign-in in ScrapeX's managed work Chrome "
+                "window. No credential is requested or returned through the model."
+            )
         ),
     }
 

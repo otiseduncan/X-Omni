@@ -497,18 +497,20 @@ def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
     )
 
 
-def test_service_information_research_is_the_advertised_ro_si_acquisition_surface():
-    schema = registry_mod.TOOL_SCHEMAS[prep.SI_RESEARCH_TOOL_NAME]
+def test_alldata_service_information_is_the_advertised_ro_si_acquisition_surface():
+    schema = registry_mod.TOOL_SCHEMAS[prep.ALLDATA_SI_TOOL_NAME]
     description = schema["description"].casefold()
-    properties = schema["parameters"]["properties"]
+    parameters = schema["parameters"]
+    properties = parameters["properties"]
 
-    assert "primary service-information acquisition" in description
-    assert "adas si first" in description
-    assert "licensed alldata navigator" in description
-    assert "local database miss is not a terminal answer" in description
+    assert "alldata service-information acquisition" in description
+    assert "checks local adas si itself first" in description
+    assert "scrapex's licensed alldata navigator" in description
+    assert "never acquires an adas map report" in description
     assert {"repair_order_id", "topic", "action"} <= set(properties)
-    assert {"required": ["repair_order_id", "topic"]} in schema["parameters"]["anyOf"]
-    assert {"required": ["action"]} in schema["parameters"]["anyOf"]
+    assert {"required": ["repair_order_id", "topic"]} in parameters["anyOf"]
+    assert {"required": ["action"]} in parameters["anyOf"]
+    assert parameters["additionalProperties"] is False
     assert (
         "ro_si_acquire"
         not in registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]["parameters"]["properties"]["mode"]["enum"]

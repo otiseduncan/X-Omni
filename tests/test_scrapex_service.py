@@ -1579,10 +1579,22 @@ async def test_structured_actions_reject_irrelevant_or_secret_arguments_before_n
 
     assert result["status"] == "invalid_request"
     assert result["executed"] is False
+
+    # The guarantee is about the input surface: no ScrapeX schema may invite the
+    # model to supply a secret or an infrastructure address. Check the parameter
+    # objects rather than the whole schema, so a description is still free to say
+    # what a tool does *not* touch (e.g. "does not use ALLDATA credentials")
+    # without tripping a substring ban on the word itself.
+    for name, schema in scrapex.SCRAPEX_TOOL_SCHEMAS.items():
+        parameter_text = json.dumps(schema.get("parameters") or {}).casefold()
+        for forbidden in ("password", "credential", "secret", "token", "base_url"):
+            assert forbidden not in parameter_text, (
+                f"{name} advertises a {forbidden}-shaped input to the model"
+            )
+
+    # A description may disclaim a secret, but must never solicit one.
     schema_text = json.dumps(scrapex.SCRAPEX_TOOL_SCHEMAS).casefold()
     assert "password" not in schema_text
-    assert "credential" not in schema_text
-    assert "base_url" not in schema_text
 
 
 def test_schemas_name_authoritative_batch_id_and_safe_provider_preflights() -> None:
@@ -1590,13 +1602,26 @@ def test_schemas_name_authoritative_batch_id_and_safe_provider_preflights() -> N
     adas_map_text = json.dumps(scrapex.SCRAPEX_ADAS_MAP_SCHEMA).casefold()
     read_text = json.dumps(scrapex.SCRAPEX_READ_SCHEMA).casefold()
 
-    assert "safe, non-mutating provider preflight" in status_text
-    assert "before acquisition or provider setup" in status_text
+    assert "safe, non-mutating preflight" in status_text
+    assert "it opens nothing" in status_text
     assert "result.data.id" in adas_map_text
     assert "never copy evidence_id" in adas_map_text
-    assert "parameterless browser-opening human/provider handoff" in adas_map_text
-    assert "user explicitly requests provider setup" in adas_map_text
+    assert "parameterless browser-opening human handoff" in adas_map_text
+    assert "sign in to adas map" in adas_map_text
     assert "result.data.id, never evidence_id" in read_text
+
+    # These three tools are the ADAS Map surface. Each must tell the model, in
+    # its own description, that it is not the ALLDATA/OEM service-information
+    # source -- the confusion that once sent an ALLDATA SI request to the ADAS
+    # Map browser and asked the operator to sign in to the wrong provider.
+    for label, text in (
+        ("status", status_text),
+        ("adas_map", adas_map_text),
+        ("read", read_text),
+    ):
+        assert "alldata" in text, f"{label} schema does not disclaim ALLDATA"
+    assert "never signs in to alldata" in adas_map_text
+    assert "research_provider_setup" in adas_map_text
 
 
 def _verified_scrapex_result(action: str, data: Any) -> dict[str, Any]:

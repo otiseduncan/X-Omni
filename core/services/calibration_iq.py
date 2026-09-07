@@ -570,6 +570,28 @@ def is_terminal(item: dict) -> bool:
     return _normalized_label(_status_of(item)) in TERMINAL_STATUSES
 
 
+def normalize_phase(value: Any) -> Optional[str]:
+    """Canonical phase token for user, API, and display values.
+
+    Otis and the model both say "Phase 5" as often as "5", and Calibration IQ
+    itself returns 5, "5", and "5.0" across response shapes. The upstream
+    collection filter rejects "Phase 5" outright, so an unnormalized value
+    turns a perfectly clear request into an invalid_filter error. Returns None
+    for an absent phase; a non-numeric label is passed through untouched so a
+    named phase still reaches the service.
+    """
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"(?i)(?:phase\s*)?(\d+(?:\.0+)?)", text)
+    if not match:
+        return text
+    try:
+        return str(int(float(match.group(1))))
+    except (TypeError, ValueError):
+        return match.group(1)
+
+
 def _phase_of(item: dict) -> Any:
     """Return a display-safe scalar phase across known response shapes."""
     phase = _dig(
@@ -834,6 +856,12 @@ async def query_repair_orders(settings, args: dict) -> dict[str, Any]:
     include_completed = bool(args.get("include_completed")) or terminal_only
     params = {k: args[k] for k in READ_PARAMS
               if k not in {"limit", "offset"} and args.get(k) not in (None, "")}
+    # A phase filter is the one param where a natural value ("Phase 5") and the
+    # wire value ("5") differ. Normalize once, here, so every caller of this
+    # shared path -- list, summary, and work prep -- sends the same token.
+    requested_phase = normalize_phase(params.get("phase"))
+    if requested_phase is not None:
+        params["phase"] = requested_phase
 
     collected, collection, error = await _collect(base, token, params)
     if error:
@@ -883,6 +911,35 @@ async def query_repair_orders(settings, args: dict) -> dict[str, Any]:
                 "read_only": True,
             },
         }
+
+    # Asking for one phase and being handed the whole board is the failure that
+    # once reported 56 mixed-phase ROs as a Phase 5 list. Upstream honors the
+    # filter today, but proving it here means a future contract change fails
+    # closed instead of quietly widening the answer.
+    if requested_phase is not None:
+        off_phase = [
+            item for item in matched
+            if normalize_phase(_phase_of(item)) != requested_phase
+        ]
+        if off_phase:
+            return {
+                "status": "filter_mismatch",
+                "items": [],
+                "rows": [],
+                "count": None,
+                "requested_phase": requested_phase,
+                "mismatch_count": len(off_phase),
+                "filters": params,
+                "message": (
+                    f"Calibration IQ returned {len(off_phase)} row(s) outside Phase "
+                    f"{requested_phase}. The phase filter was not applied, so no "
+                    "count or list is reported as phase-scoped."
+                ),
+                "evidence": {
+                    "source": "calibration_iq_authenticated_api",
+                    "read_only": True,
+                },
+            }
 
     return {
         "status": "verified",

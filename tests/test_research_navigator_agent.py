@@ -475,3 +475,61 @@ async def test_multiple_model_actions_do_not_run_blind_against_one_observation(m
 
     acted = [call["action"] for call in navigator.calls if call["action"] in {"fill", "click"}]
     assert acted == ["fill"]
+
+
+@pytest.mark.asyncio
+async def test_initial_alldata_authentication_boundary_short_circuits_before_model_turn(monkeypatch):
+    class AuthBoundaryNavigator(_FakeNavigator):
+        async def __call__(self, settings, args):  # noqa: ARG002
+            self.calls.append(dict(args))
+            action = args.get("action")
+            if action == "create_task":
+                return _navigator_result(
+                    "create_task",
+                    status="created",
+                    data={
+                        "id": "task-1",
+                        "provider": args["provider"],
+                        "target": args["target"],
+                        "topic": args["topic"],
+                    },
+                )
+            if action == "observe":
+                return {
+                    "service": "ScrapeX",
+                    "action": "observe",
+                    "provider": "alldata",
+                    "status": "authentication_required",
+                    "success": False,
+                    "executed": False,
+                    "verified": False,
+                    "work_complete": False,
+                    "authentication_required": True,
+                    "requires_human": True,
+                    "message": "ALLDATA requires interactive authentication in ScrapeX's visible Navigator browser.",
+                }
+            raise AssertionError(f"unexpected action after auth boundary: {action}")
+
+    navigator = AuthBoundaryNavigator()
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([[("click", {"ref": "e1"})]])
+
+    result = await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2024, "make": "Hyundai", "model": "Santa Fe"},
+        topic="front long-range radar calibration",
+    )
+
+    assert result["status"] == "authentication_required"
+    assert result["requires_human"] is True
+    assert result["searched"] is False
+    assert result["verified"] is False
+    assert "ALLDATA requires interactive authentication" in result["reason"]
+    assert client.messages_seen == []
+    assert [call["action"] for call in navigator.calls] == ["create_task", "observe"]

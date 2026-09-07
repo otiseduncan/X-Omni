@@ -88,6 +88,9 @@ def install() -> None:
             si_research_declared = _policy_declares_tool(
                 policy_path, prep.SI_RESEARCH_TOOL_NAME
             )
+            alldata_si_declared = _policy_declares_tool(
+                policy_path, prep.ALLDATA_SI_TOOL_NAME
+            )
             previous_init(self, *args, **kwargs)
             if not declared:
                 self.policy.pop(prep.TOOL_NAME, None)
@@ -95,6 +98,9 @@ def install() -> None:
             if not si_research_declared:
                 self.policy.pop(prep.SI_RESEARCH_TOOL_NAME, None)
                 self._handlers.pop(prep.SI_RESEARCH_TOOL_NAME, None)  # noqa: SLF001
+            if not alldata_si_declared:
+                self.policy.pop(prep.ALLDATA_SI_TOOL_NAME, None)
+                self._handlers.pop(prep.ALLDATA_SI_TOOL_NAME, None)  # noqa: SLF001
 
         registry_init._xomni_work_prep_policy_guard = True  # type: ignore[attr-defined]
         registry_mod.Registry.__init__ = registry_init

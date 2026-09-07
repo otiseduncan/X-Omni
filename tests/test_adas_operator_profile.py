@@ -55,7 +55,7 @@ EXPECTED_ADAS_TOOLS = {
     "calibration_iq_operator",
     "calibration_iq_destructive",
     "calibration_iq_work_prep",
-    "service_information_research",
+    "alldata_service_information",
     "research_provider_setup",
     "scrapex_status",
     "scrapex_start_native",
@@ -79,6 +79,7 @@ NON_ADAS_NORMAL_TOOLS = {
     "automotive_knowledge_lifecycle",
     "calibration_iq_update",
     "collision_research",
+    "service_information_research",
 }
 
 
@@ -115,7 +116,7 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
 
     assert adas_names == EXPECTED_ADAS_TOOLS
     assert len(adas_catalog) == 35
-    assert len(full_catalog) == 51
+    assert len(full_catalog) == 52
     assert NON_ADAS_NORMAL_TOOLS <= full_names
 
 
@@ -335,6 +336,19 @@ def test_read_status_and_exact_resource_descriptions_expose_distinct_contracts()
         item["function"]["name"]: item["function"]["description"]
         for item in configured_profile_catalog(_settings())
     }
+
+    assert "alldata_service_information" in catalog
+    assert "service_information_research" not in catalog
+    alldata_description = catalog["alldata_service_information"].casefold()
+    adas_map_description = catalog["scrapex_adas_map"].casefold()
+    scrapex_status_description = catalog["scrapex_status"].casefold()
+    assert "alldata" in alldata_description
+    assert "service-information" in alldata_description
+    assert "licensed alldata navigator" in alldata_description
+    assert "never acquires" in alldata_description and "adas map" in alldata_description
+    assert "adas map requirement reports only" in adas_map_description
+    assert "never opens alldata" in adas_map_description
+    assert "not alldata status" in scrapex_status_description
 
     assert "Primary read for whether X is configured and permitted" in catalog[
         "assistant_capabilities_read"

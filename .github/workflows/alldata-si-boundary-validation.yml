@@ -1,0 +1,80 @@
+name: ALLDATA SI boundary validation
+on:
+  push:
+    branches:
+      - alldata-si-tool-boundary-20260907
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - name: Focused suites
+        run: |
+          python -m pytest -q \
+            tests/test_calibration_iq_work_prep.py \
+            tests/test_calibration_iq_work_prep_orchestrator.py \
+            tests/test_adas_operator_profile.py \
+            tests/test_model_first_live_acceptance.py \
+            tests/test_collision_research.py \
+            tests/test_calibration_iq_routing.py \
+            tests/test_research_alldata_quick_reference.py \
+            tests/test_research_workflow.py \
+            tests/test_calibration_deep_route.py \
+            tests/test_adas_calibration_depth_intent.py \
+            -k "not normal_prompt_is_concise_and_free_of_capability_micro_routing and not prompt_and_profile_budget_remain_visible_and_bounded"
+          python -m compileall -q \
+            core/services/calibration_iq_work_prep.py \
+            core/services/calibration_iq_work_prep_guards.py \
+            core/services/research_policy.py \
+            core/services/research_truth.py \
+            core/tools/registry.py \
+            core/orchestrator/loop.py \
+            core/orchestrator/prompt.py
+      - name: Production catalog boundary
+        run: |
+          python - <<'PY'
+          from types import SimpleNamespace
+          from core.config import Settings
+          from core.main import configured_profile_catalog
+          from core.orchestrator.prompt import prompt_budget_metrics
+
+          s = Settings.load()
+          tools = configured_profile_catalog(s, profile="adas_operator")
+          catalog = {item["function"]["name"]: item["function"] for item in tools}
+          assert len(catalog) == 35
+          assert "alldata_service_information" in catalog
+          assert "service_information_research" not in catalog
+
+          alldata = catalog["alldata_service_information"]["description"].casefold()
+          amap = catalog["scrapex_adas_map"]["description"].casefold()
+          assert "licensed alldata navigator" in alldata
+          assert "adas map" in alldata
+          assert "never opens alldata" in amap
+
+          metrics = prompt_budget_metrics(
+              SimpleNamespace(active_config=lambda: SimpleNamespace(supports_vision=True, supports_audio=True)),
+              tools,
+              context_tokens=s.context_tokens,
+              reserve_for_response=s.max_response_tokens,
+          )
+          print({
+              "tool_count": metrics["advertised_tools"]["count"],
+              "catalog_chars": metrics["advertised_tools"]["catalog_chars"],
+              "catalog_tokens": metrics["advertised_tools"]["catalog_tokens"],
+              "remaining_normal_turn_tokens": metrics["remaining_normal_turn_tokens"],
+          })
+          assert metrics["advertised_tools"]["catalog_tokens"] <= 13600
+          PY
