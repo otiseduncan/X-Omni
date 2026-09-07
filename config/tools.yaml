@@ -258,9 +258,11 @@ tools:
   research_provider_setup:
     tier: read_only
     description: >-
-      Open the secure ALLDATA credential and mobile authentication card in chat.
-      Credentials are sent directly to Core and Windows Credential Manager and
-      never become model arguments or conversation content.
+      ALLDATA account setup/authentication only. Use only for an explicit request
+      to configure credentials, sign in, log in, or open the authentication card.
+      Never use for SI research or "check ALLDATA"; alldata_service_information
+      owns that work. Credentials go directly to Core/Windows Credential Manager
+      and never become model arguments or conversation content.
 
   collision_research:
     tier: operator_authorized
