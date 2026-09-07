@@ -16,7 +16,11 @@ import yaml
 
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
-_RESEARCH_TOOLS = frozenset({"research_provider_setup", "collision_research"})
+_RESEARCH_TOOLS = frozenset({
+    "research_provider_setup",
+    "collision_research",
+    "service_information_research",
+})
 
 
 def install() -> None:
