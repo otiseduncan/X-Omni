@@ -3767,9 +3767,9 @@ def install() -> None:
                         "phase": {
                             "type": "string",
                             "description": (
-                                "Required for phase_list and phase_coverage. Use the CIQ phase "
-                                "explicitly named in the user's current request; never infer one "
-                                "from prior context or choose a default."
+                                "Required for phase_list and phase_coverage. Use only when the "
+                                "user's current request explicitly names a CIQ phase; never infer "
+                                "one from prior context or choose a default."
                             ),
                         },
                         "shop": {"type": "string"},
