@@ -84,7 +84,9 @@ def _calibration_key(value: object) -> str:
             "frontcamera",
         ),
         (
-            r"\b(?:millimeter[-\s]*wave|front|forward|adaptive\s+cruise)\s+radar\b|\bccm\b",
+            r"\b(?:millimeter[-\s]*wave\s+radar|"
+            r"(?:front|forward)(?:[-\s]+long[-\s]*range)?\s+radar|"
+            r"adaptive\s+cruise(?:\s+control)?\s+radar|\bccm\b)",
             "frontradar",
         ),
         (r"\b(?:blind\s*spot(?:\s+monitor(?:ing)?)?|bsm|bsd|sodcm)\b", "blindspot"),
@@ -104,7 +106,9 @@ def _calibration_key(value: object) -> str:
             " frontcamera ",
         ),
         (
-            r"\b(?:millimeter[-\s]*wave|forward|front|adaptive\s+cruise)\s+radar\b",
+            r"\b(?:millimeter[-\s]*wave\s+radar|"
+            r"(?:front|forward)(?:[-\s]+long[-\s]*range)?\s+radar|"
+            r"adaptive\s+cruise(?:\s+control)?\s+radar)\b",
             " frontradar ",
         ),
         (r"\b(?:rear\s*view|rear)\s+camera\b", " rearcamera "),
@@ -115,7 +119,8 @@ def _calibration_key(value: object) -> str:
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     text = re.sub(
         r"\b(?:calibration|calibrate|recalibration|recalibrate|aiming|aim|alignment|align|"
-        r"adjustment|adjust|initialization|initialize|relearn|reset|setup|procedure|system|sensor)\b",
+        r"adjustment|adjust|initialization|initialize|relearn|reset|setup|procedure|system|sensor|"
+        r"service\s+information|service\s+info|si)\b",
         " ",
         text,
     )
@@ -315,17 +320,22 @@ async def _acquire_si_gaps(
     adas: Any,
     snapshot: dict[str, Any],
     coverage: list[dict[str, Any]],
+    *,
+    include_unverified: bool = False,
 ) -> list[dict[str, Any]]:
     """Research confirmed SI gaps through the same active X model.
 
     The model decides the live browser steps. ScrapeX owns the isolated
     ALLDATA profile, page verification, and canonical capture.
     """
+    acquisition_states = {adas_artifact_catalog.MISSING}
+    if include_unverified:
+        acquisition_states.add(adas_artifact_catalog.UNVERIFIED)
     missing = [
         item
         for item in coverage
         if isinstance(item, dict)
-        and item.get("state") == adas_artifact_catalog.MISSING
+        and item.get("state") in acquisition_states
         and str(item.get("calibration") or "").strip()
     ]
     if not missing:
@@ -1440,6 +1450,243 @@ async def _ro_requirements(
         "reconciliation_actions": planned,
         "reconciliation": reconciliation,
         "reconciliation_issues": reconciliation_issues,
+    }
+
+
+def _topic_coverage(
+    coverage: list[dict[str, Any]], topic: str
+) -> list[dict[str, Any]]:
+    """Select one requested calibration family without relying on title wording."""
+    clean_topic = " ".join(str(topic or "").split()).strip()
+    if not clean_topic:
+        return [item for item in coverage if isinstance(item, dict)]
+    topic_key = _calibration_key(clean_topic)
+    if not topic_key:
+        return []
+    return [
+        item
+        for item in coverage
+        if isinstance(item, dict)
+        and _calibration_key(item.get("calibration")) == topic_key
+    ]
+
+
+async def _ro_si_acquire(
+    settings: Any, adas: Any, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Acquire requested SI for one authoritative Calibration IQ repair order.
+
+    This is the single-RO counterpart to week_readiness(execute_missing=true):
+    local ADAS SI coverage is checked first, but a local miss/unverified result
+    is an intermediate state, not a terminal answer. X immediately delegates
+    the exact requested calibration to the licensed ALLDATA Navigator, captures
+    verified evidence into ADAS SI, refreshes coverage, and links the research
+    evidence back to Calibration IQ when the invocation context permits it.
+    """
+    identifier = str(args.get("repair_order_id") or "").strip()
+    topic = " ".join(str(args.get("topic") or "").split()).strip()
+    if not identifier:
+        return {
+            "status": "invalid_request",
+            "mode": "ro_si_acquire",
+            "success": False,
+            "verified": False,
+            "work_complete": False,
+            "message": "repair_order_id is required for one-RO SI acquisition.",
+        }
+
+    loaded = await _load_ro_snapshot(settings, identifier)
+    if loaded.get("status") != "verified":
+        return {
+            "mode": "ro_si_acquire",
+            "success": False,
+            "verified": False,
+            "work_complete": False,
+            **loaded,
+        }
+
+    snapshot = dict(loaded["snapshot"])
+    catalog = _catalog_for(adas)
+    map_info = await _discover_adas_map(catalog, snapshot)
+    if map_info.get("status") != "verified":
+        return {
+            "status": "adas_map_unverified",
+            "mode": "ro_si_acquire",
+            "executed": False,
+            "success": False,
+            "verified": True,
+            "work_complete": False,
+            "repair_order_id": str(
+                calibration_iq._authoritative_repair_order_id(snapshot) or identifier
+            ),
+            "ro_number": _ro_number(snapshot, identifier),
+            "vehicle": _vehicle_label(snapshot),
+            "topic": topic or None,
+            "adas_map": map_info,
+            "message": (
+                "The governing ADAS Map requirement set is not verified for this RO, "
+                "so X did not acquire service information against an unproven requirement."
+            ),
+        }
+
+    context = _valid_context(args.get(_CONTEXT_KEY))
+    snapshot, planned, reconciliation = await _reconcile_one(
+        settings, adas, snapshot, map_info, context
+    )
+    coverage_before = await _catalog_coverage(catalog, snapshot, map_info)
+    selected_before = _topic_coverage(coverage_before, topic)
+
+    if topic and not selected_before:
+        labels = [
+            str(item.get("calibration") or "")
+            for item in coverage_before
+            if isinstance(item, dict) and item.get("calibration")
+        ]
+        return {
+            "status": "topic_not_required",
+            "mode": "ro_si_acquire",
+            "executed": bool(
+                reconciliation is not None and reconciliation.get("executed") is True
+            ),
+            "success": False,
+            "verified": True,
+            "work_complete": False,
+            "repair_order_id": str(
+                calibration_iq._authoritative_repair_order_id(snapshot) or identifier
+            ),
+            "ro_number": _ro_number(snapshot, identifier),
+            "vehicle": _vehicle_label(snapshot),
+            "topic": topic,
+            "adas_map": map_info,
+            "coverage_before": coverage_before,
+            "message": (
+                f"The requested SI topic '{topic}' does not match a governing ADAS Map "
+                f"requirement on this RO. Verified requirement labels: "
+                f"{', '.join(labels) if labels else 'none'}."
+            ),
+        }
+
+    selected_before = selected_before or coverage_before
+    already_covered = bool(selected_before) and all(
+        item.get("state") == adas_artifact_catalog.COVERED
+        for item in selected_before
+    )
+    acquisitions: list[dict[str, Any]] = []
+    if not already_covered:
+        acquisitions = await _acquire_si_gaps(
+            settings,
+            adas,
+            snapshot,
+            selected_before,
+            include_unverified=True,
+        )
+
+    captured = [
+        item
+        for item in acquisitions
+        if isinstance(item, dict)
+        and item.get("captured") is True
+        and item.get("verified") is True
+    ]
+    if captured:
+        catalog = _catalog_for(adas)
+    coverage_after = await _catalog_coverage(catalog, snapshot, map_info)
+    selected_after = _topic_coverage(coverage_after, topic) or (
+        coverage_after if not topic else []
+    )
+    coverage_resolved = bool(selected_after) and all(
+        item.get("state") == adas_artifact_catalog.COVERED
+        for item in selected_after
+    )
+
+    ro_id = str(
+        calibration_iq._authoritative_repair_order_id(snapshot) or identifier
+    )
+    research_link: Optional[dict[str, Any]] = None
+    if captured and ro_id:
+        research_link = await _link_ro_research_evidence(
+            settings, adas, ro_id, context
+        )
+
+    missing_si_result: Optional[dict[str, Any]] = None
+    if context is not None and ro_id:
+        actions = build_missing_si_actions(snapshot, coverage_after, ro_id)
+        if actions:
+            missing_si_result = await calibration_iq.operator_execute(
+                settings,
+                adas,
+                {
+                    "actions": actions,
+                    "continue_on_error": True,
+                    calibration_iq._INVOCATION_CONTEXT_KEY: {  # noqa: SLF001
+                        **context,
+                        "tool_call_id": (
+                            f"{context['tool_call_id']}-single-ro-si-{ro_id[:12]}"
+                        ),
+                    },
+                },
+            )
+
+    acquisition_verified = bool(
+        already_covered
+        or (
+            acquisitions
+            and all(
+                isinstance(item, dict)
+                and item.get("verified") is True
+                and item.get("captured") is True
+                for item in acquisitions
+            )
+        )
+    )
+    work_complete = bool(already_covered or captured)
+    status = (
+        "already_present"
+        if already_covered
+        else "captured"
+        if captured and coverage_resolved
+        else "captured_pending_index"
+        if captured
+        else "acquisition_failed"
+    )
+    message = (
+        "The requested SI was already present in ADAS SI."
+        if already_covered
+        else "ALLDATA SI was captured and ADAS SI coverage now verifies."
+        if captured and coverage_resolved
+        else "ALLDATA SI was captured, but the refreshed ADAS SI catalog has not verified coverage yet."
+        if captured
+        else "The licensed ALLDATA Navigator did not capture verified SI for the requested calibration."
+    )
+
+    return {
+        "status": status,
+        "mode": "ro_si_acquire",
+        "executed": bool(
+            acquisitions
+            or (reconciliation is not None and reconciliation.get("executed") is True)
+            or (isinstance(research_link, dict) and research_link.get("executed") is True)
+        ),
+        "success": acquisition_verified,
+        "verified": acquisition_verified,
+        "work_complete": work_complete,
+        "repair_order_id": ro_id,
+        "ro_number": _ro_number(snapshot, identifier),
+        "vehicle": _vehicle_label(snapshot),
+        "topic": topic or None,
+        "adas_map": map_info,
+        "coverage_before": coverage_before,
+        "target_coverage_before": selected_before,
+        "alldata_acquisitions": acquisitions,
+        "si_acquired_count": len(captured),
+        "coverage_after": coverage_after,
+        "target_coverage_after": selected_after,
+        "coverage_resolved": coverage_resolved,
+        "research_link": research_link,
+        "missing_si_reconciliation": missing_si_result,
+        "reconciliation_actions": planned,
+        "reconciliation": reconciliation,
+        "message": message,
     }
 
 
@@ -2657,6 +2904,8 @@ async def handle(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, An
         return await _phase_list(settings, args)
     if mode == "ro_requirements":
         return await _ro_requirements(settings, adas, args)
+    if mode == "ro_si_acquire":
+        return await _ro_si_acquire(settings, adas, args)
     if mode == "week_readiness":
         return await _week_readiness(settings, adas, args)
     if mode == "phase_coverage":
@@ -3296,6 +3545,36 @@ def summarize(mode: str, result: Any) -> str:
         lead = f"Calibration IQ has {int(data.get('count') or 0)} active vehicle(s) in phase {phase}."
         detail = "; ".join(f"RO {row.get('RO')} — {row.get('Vehicle')}" for row in rows)
         return f"{lead} {detail}" if detail else lead
+    if mode == "ro_si_acquire":
+        if data.get("success") is not True:
+            return message or "The requested one-RO SI acquisition was not verified."
+        ro = data.get("ro_number") or data.get("repair_order_id")
+        vehicle = data.get("vehicle") or "vehicle"
+        topic = data.get("topic") or "requested service information"
+        acquired = int(data.get("si_acquired_count") or 0)
+        if data.get("status") == "already_present":
+            return f"RO {ro} — {vehicle}: {topic} is already present in ADAS SI."
+        paths: list[str] = []
+        for item in (data.get("alldata_acquisitions") or []):
+            if not isinstance(item, dict):
+                continue
+            capture = item.get("capture")
+            capture = capture if isinstance(capture, dict) else {}
+            capture_data = capture.get("data")
+            capture_data = capture_data if isinstance(capture_data, dict) else {}
+            path = str(capture_data.get("relative_path") or "").strip()
+            if path and path not in paths:
+                paths.append(path)
+        location = f" Saved: {', '.join(paths[:3])}." if paths else ""
+        coverage = (
+            " ADAS SI coverage verifies after capture."
+            if data.get("coverage_resolved") is True
+            else " The capture is verified; ADAS SI index verification is still pending."
+        )
+        return (
+            f"RO {ro} — {vehicle}: captured {acquired} verified ALLDATA SI "
+            f"procedure(s) for {topic}.{location}{coverage}"
+        )
     if mode == "ro_requirements":
         if data.get("verified") is not True:
             return message or "Calibration IQ did not return a verified repair order."
@@ -3376,7 +3655,11 @@ def install() -> None:
                     "and weekly RO readiness. It does not read Google Calendar "
                     "appointments or events. Use it for active CIQ RO phase or queue "
                     "lists, saved one-RO requirements, and live ADAS Map requirement or "
-                    "ADAS SI procedure audits. CIQ is the work queue; ADAS Map governs "
+                    "ADAS SI procedure audits/acquisition. For a direct request to get, "
+                    "retrieve, find, collect, or save SI for one known RO, use "
+                    "mode=ro_si_acquire; a local ADAS SI miss is intermediate and this "
+                    "mode automatically attempts licensed ALLDATA before returning. "
+                    "CIQ is the work queue; ADAS Map governs "
                     "calibration requirements; ADAS SI supplies procedure coverage. "
                     "Verified gaps may add or reactivate CIQ calibrations. When the "
                     "user asks to actually prepare/do the missing work rather than merely "
@@ -3399,6 +3682,7 @@ def install() -> None:
                                 "phase_list",
                                 "phase_coverage",
                                 "ro_requirements",
+                                "ro_si_acquire",
                                 "week_readiness",
                                 "queue_list",
                                 "queue_next",
@@ -3407,7 +3691,10 @@ def install() -> None:
                                 "Choose an authoritative CIQ RO workload/readiness "
                                 "operation: phase_list and queue_list read lists; "
                                 "phase_coverage and week_readiness audit; ro_requirements "
-                                "reads one RO; queue_next advances one saved weekly row. "
+                                "reads one RO; ro_si_acquire gets requested SI for one RO, "
+                                "checking ADAS SI first and automatically escalating a local "
+                                "miss/unverified result to the licensed ALLDATA Navigator; "
+                                "queue_next advances one saved weekly row. "
                                 "phase_coverage is only for a phase explicitly supplied by the "
                                 "user, never an inferred/default phase."
                             ),
@@ -3421,6 +3708,15 @@ def install() -> None:
                             ),
                         },
                         "repair_order_id": {"type": "string"},
+                        "topic": {
+                            "type": "string",
+                            "maxLength": 220,
+                            "description": (
+                                "For ro_si_acquire: the requested calibration/service-information "
+                                "topic, copied from the user's intent or verified RO requirement. "
+                                "Omit only when the user explicitly wants all missing SI for the RO."
+                            ),
+                        },
                         "phase": {
                             "type": "string",
                             "description": (
