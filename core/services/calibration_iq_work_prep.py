@@ -1696,11 +1696,82 @@ async def _ro_si_acquire(
     }
 
 
+def _phase_token(value: Any) -> Optional[str]:
+    """Normalize user/API/display phase values like 5, "5", or "Phase 5"."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"(?i)(?:phase\s*)?(\d+(?:\.0+)?)", text)
+    if not match:
+        return text
+    try:
+        return str(int(float(match.group(1))))
+    except (TypeError, ValueError):
+        return match.group(1)
+
+
 async def _phase_list(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
-    filters = {"phase": str(args.get("phase") or "").strip(), "limit": 100}
+    requested_phase = _phase_token(args.get("phase"))
+    if requested_phase is None:
+        return {
+            "status": "invalid_request",
+            "mode": "phase_list",
+            "success": False,
+            "verified": False,
+            "rows": [],
+            "count": None,
+            "message": "phase_list requires an explicit phase.",
+        }
+
+    filters = {"phase": requested_phase, "limit": 100}
     if args.get("shop"):
-        filters["shop"] = str(args["shop"])
+        filters["shop"] = str(args["shop"]).strip()
+
     result = await calibration_iq.read_repair_orders(settings, filters)
+    if result.get("status") != "verified":
+        return {"mode": "phase_list", **result}
+
+    echoed_phase = _phase_token((result.get("filters") or {}).get("phase"))
+    if echoed_phase != requested_phase:
+        return {
+            "status": "filter_unverified",
+            "mode": "phase_list",
+            "success": False,
+            "verified": False,
+            "rows": [],
+            "count": None,
+            "requested_phase": requested_phase,
+            "upstream_filters": result.get("filters"),
+            "message": (
+                f"Calibration IQ did not verify the requested Phase {requested_phase} "
+                "filter, so X did not return a mixed-phase list."
+            ),
+        }
+
+    rows = [row for row in (result.get("rows") or []) if isinstance(row, dict)]
+    mismatched = [
+        row
+        for row in rows
+        if _phase_token(row.get("Phase")) != requested_phase
+    ]
+    if mismatched:
+        return {
+            "status": "filter_mismatch",
+            "mode": "phase_list",
+            "success": False,
+            "verified": False,
+            "rows": [],
+            "count": None,
+            "requested_phase": requested_phase,
+            "mismatch_count": len(mismatched),
+            "message": (
+                f"Calibration IQ returned {len(mismatched)} row(s) outside Phase "
+                f"{requested_phase}; X rejected the mixed result instead of labeling it "
+                "as a Phase-only list."
+            ),
+        }
+
+    result["requested_phase"] = requested_phase
     return {"mode": "phase_list", **result}
 
 
@@ -3713,6 +3784,29 @@ def install() -> None:
                         },
                     },
                     "required": ["mode"],
+                    "allOf": [
+                        {
+                            "if": {
+                                "properties": {"mode": {"const": "phase_list"}},
+                                "required": ["mode"],
+                            },
+                            "then": {"required": ["phase"]},
+                        },
+                        {
+                            "if": {
+                                "properties": {"mode": {"const": "phase_coverage"}},
+                                "required": ["mode"],
+                            },
+                            "then": {"required": ["phase"]},
+                        },
+                        {
+                            "if": {
+                                "properties": {"mode": {"const": "ro_requirements"}},
+                                "required": ["mode"],
+                            },
+                            "then": {"required": ["repair_order_id"]},
+                        },
+                    ],
                 },
             },
         )
