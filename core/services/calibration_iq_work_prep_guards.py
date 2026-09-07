@@ -40,14 +40,18 @@ def _strict_adas_map_marker(value: Any, path: tuple[str, ...]) -> bool:
     return False
 
 
-def _policy_declares_work_prep(policy_path: object) -> bool:
-    """Only production policies that explicitly declare the tool may expose it."""
+def _policy_declares_tool(policy_path: object, tool_name: str) -> bool:
+    """Only policies that explicitly declare a capability may expose it."""
     try:
         raw = yaml.safe_load(Path(str(policy_path)).read_text(encoding="utf-8")) or {}
     except (OSError, TypeError, ValueError, yaml.YAMLError):
         return False
     tools = raw.get("tools") if isinstance(raw, dict) else None
-    return isinstance(tools, dict) and prep.TOOL_NAME in tools
+    return isinstance(tools, dict) and tool_name in tools
+
+
+def _policy_declares_work_prep(policy_path: object) -> bool:
+    return _policy_declares_tool(policy_path, prep.TOOL_NAME)
 
 
 async def _restore_browser_session_if_stale(browser: Any, session_id: str) -> None:
@@ -81,10 +85,16 @@ def install() -> None:
         def registry_init(self, *args, **kwargs):
             policy_path = args[0] if args else kwargs.get("policy_path")
             declared = _policy_declares_work_prep(policy_path)
+            si_research_declared = _policy_declares_tool(
+                policy_path, prep.SI_RESEARCH_TOOL_NAME
+            )
             previous_init(self, *args, **kwargs)
             if not declared:
                 self.policy.pop(prep.TOOL_NAME, None)
                 self._handlers.pop(prep.TOOL_NAME, None)  # noqa: SLF001
+            if not si_research_declared:
+                self.policy.pop(prep.SI_RESEARCH_TOOL_NAME, None)
+                self._handlers.pop(prep.SI_RESEARCH_TOOL_NAME, None)  # noqa: SLF001
 
         registry_init._xomni_work_prep_policy_guard = True  # type: ignore[attr-defined]
         registry_mod.Registry.__init__ = registry_init
