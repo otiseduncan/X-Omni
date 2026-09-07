@@ -337,6 +337,19 @@ def test_read_status_and_exact_resource_descriptions_expose_distinct_contracts()
         for item in configured_profile_catalog(_settings())
     }
 
+    assert "alldata_service_information" in catalog
+    assert "service_information_research" not in catalog
+    alldata_description = catalog["alldata_service_information"].casefold()
+    adas_map_description = catalog["scrapex_adas_map"].casefold()
+    scrapex_status_description = catalog["scrapex_status"].casefold()
+    assert "alldata" in alldata_description
+    assert "service-information" in alldata_description
+    assert "licensed alldata navigator" in alldata_description
+    assert "never acquires" in alldata_description and "adas map" in alldata_description
+    assert "adas map requirement reports only" in adas_map_description
+    assert "never opens alldata" in adas_map_description
+    assert "not alldata status" in scrapex_status_description
+
     assert "Primary read for whether X is configured and permitted" in catalog[
         "assistant_capabilities_read"
     ]
