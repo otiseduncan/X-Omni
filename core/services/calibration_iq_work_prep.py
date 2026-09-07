@@ -3651,23 +3651,13 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Authoritative Calibration IQ source for upcoming shop field work "
-                    "and weekly RO readiness. It does not read Google Calendar "
-                    "appointments or events. Use it for active CIQ RO phase or queue "
-                    "lists, saved one-RO requirements, and live ADAS Map/SI work. "
-                    "For one-RO SI retrieval use ro_si_acquire; it checks local ADAS SI "
-                    "then licensed ALLDATA on a miss. CIQ is the work queue; ADAS Map governs "
-                    "calibration requirements; ADAS SI supplies procedure coverage. "
-                    "Verified gaps may add or reactivate CIQ calibrations. When the "
-                    "user asks to actually prepare/do the missing work rather than merely "
-                    "audit it, set execute_missing=true so X acquires missing ADAS Map and "
-                    "SI evidence through their isolated ScrapeX provider sessions. This capability is a "
-                    "coverage/readiness workflow, not a document-presence query. Never use it to "
-                    "answer how many ROs/cards have SI attached, lack SI attached, or simply need "
-                    "an SI document; calibration_iq_summary/read with si_attached is authoritative "
-                    "for those CIQ board facts. Do not invent/default a phase. queue_list reads "
-                    "the saved conversation queue; statuses filters "
-                    "exact lifecycle rows."
+                    "Calibration IQ/ADAS work-prep: phase/queue reads, one-RO requirements, "
+                    "readiness audits, and one-RO SI acquisition. CIQ owns the work queue; "
+                    "ADAS Map governs requirements; ADAS SI is the local procedure library. "
+                    "ro_si_acquire checks ADAS SI then licensed ALLDATA on a miss. "
+                    "week_readiness with execute_missing=true acquires missing evidence. "
+                    "For board-level attached-SI counts/lists use calibration_iq_summary/read "
+                    "with si_attached. Never infer a phase."
                 ),
                 "parameters": {
                     "type": "object",
@@ -3685,13 +3675,8 @@ def install() -> None:
                                 "queue_next",
                             ],
                             "description": (
-                                "Choose an authoritative CIQ RO workload/readiness "
-                                "operation: phase_list and queue_list read lists; "
-                                "phase_coverage/week_readiness audit; ro_requirements reads "
-                                "one RO; ro_si_acquire retrieves one RO's SI via local-first "
-                                "ADAS SI then ALLDATA; queue_next advances a saved row. "
-                                "phase_coverage is only for a phase explicitly supplied by the "
-                                "user, never an inferred/default phase."
+                                "Operation: list/audit work, read one RO, acquire one RO's SI, "
+                                "or advance the saved queue. phase_coverage requires an explicit phase."
                             ),
                         },
                         "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
