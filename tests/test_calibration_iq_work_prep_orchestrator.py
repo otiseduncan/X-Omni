@@ -316,3 +316,75 @@ async def test_real_registry_binds_work_prep_context_and_logs_partial_receipts_f
     assert row["approved_by"] == "operator_authorized"
     assert prep._CONTEXT_KEY not in json.loads(row["args_json"])  # noqa: SLF001
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_one_ro_si_acquisition_terminal_summary_reports_capture_not_local_miss():
+    result = {
+        "status": "captured",
+        "mode": "ro_si_acquire",
+        "executed": True,
+        "success": True,
+        "verified": True,
+        "work_complete": True,
+        "repair_order_id": "ro-santa-fe",
+        "ro_number": "2400612495",
+        "vehicle": "2024 Hyundai Santa Fe Calligraphy",
+        "topic": "front long-range radar SI",
+        "si_acquired_count": 1,
+        "coverage_resolved": True,
+        "alldata_acquisitions": [
+            {
+                "verified": True,
+                "captured": True,
+                "capture": {
+                    "data": {
+                        "relative_path": (
+                            "2024/Hyundai/Santa Fe/ALLDATA/"
+                            "Front Radar Calibration.pdf"
+                        )
+                    }
+                },
+            }
+        ],
+    }
+    registry = _Registry(result)
+    store = _Store("get the front long range radar SI for this row")
+    client = _ModelClient(
+        {
+            "mode": "ro_si_acquire",
+            "repair_order_id": "2400612495",
+            "topic": "front long-range radar SI",
+        },
+        "There is no local SI.",
+    )
+    orchestrator = Orchestrator(
+        _Router(),
+        client,
+        registry,
+        store,
+        SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
+    )
+
+    events = [
+        event
+        async for event in orchestrator.run_turn(
+            61,
+            "get the front long range radar SI for this row",
+            approval_context={
+                "session_id": "local:owner",
+                "user_id": "owner",
+                "role": "owner",
+                "message_id": 345,
+            },
+        )
+    ]
+    text = "".join(
+        event["text"] for event in events if event.get("type") == "token"
+    )
+
+    assert "captured 1 verified ALLDATA SI procedure" in text
+    assert "Front Radar Calibration.pdf" in text
+    assert "There is no local SI." not in text
+    assert "CIQ mutation receipts: 0" not in text
+    assert registry.invocations[0][1]["mode"] == "ro_si_acquire"
