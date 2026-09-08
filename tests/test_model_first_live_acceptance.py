@@ -198,6 +198,19 @@ def _production_profile_tools() -> list[dict[str, Any]]:
     )
 
 
+def _full_profile_tools() -> list[dict[str, Any]]:
+    """Read the maintenance catalog used only to prove dormant implementations remain."""
+    from core.config import Settings
+    from core.main import configured_profile_catalog
+
+    settings = Settings.load()
+    return configured_profile_catalog(
+        settings,
+        role="owner",
+        profile="full",
+    )
+
+
 def _production_system_prompt() -> str:
     from core.orchestrator.prompt import system_prompt
 
@@ -475,7 +488,7 @@ def _alldata_scope(arguments: dict[str, Any]) -> None:
 
     tool = next(
         item
-        for item in _production_profile_tools()
+        for item in _full_profile_tools()
         if item["function"]["name"] == "alldata_service_information"
     )
     errors = sorted(
@@ -3546,32 +3559,6 @@ SCENARIOS: tuple[Scenario, ...] = (
         category="acquisition_auth_boundary",
         negative_truths=frozenset({"no_false_acquisition_success"}),
     ),
-    Scenario(
-        "licensed_alldata_is_not_scrapex",
-        (
-            Turn(
-                "Use the licensed ALLDATA provider to research collision-repair procedures for this Tahoe's forward camera after windshield replacement.",
-                (_alldata_research_call(),),
-                ReportExpectation(
-                    _report(
-                        "answered",
-                        found=True,
-                        used_subject=True,
-                        subject_id="ro-uuid-17",
-                    ),
-                    frozenset({"alldata"}),
-                    frozenset({"alldata-evidence-tahoe-1"}),
-                ),
-                alternative_calls=(
-                    (
-                        _alldata_provider_ready_call(),
-                        _alldata_research_call(),
-                    ),
-                ),
-            ),
-        ),
-        initial_subject=SUBJECT,
-    ),
 )
 
 ESCALATION_SCENARIOS = (
@@ -6209,9 +6196,6 @@ def test_production_safe_live_alternatives_are_structurally_declared() -> None:
                 "scrapex_adas_map",
             ),
         },
-        ("licensed_alldata_is_not_scrapex", 0): {
-            ("research_provider_setup", "alldata_service_information")
-        },
         ("adas_si_supplies_answer_after_durable_miss", 0): {
             ("automotive_knowledge_search", "adas_si_search")
         },
@@ -6458,7 +6442,7 @@ async def test_alldata_vehicle_string_is_schema_and_handler_supported(
     }
     tool = next(
         item
-        for item in _production_profile_tools()
+        for item in _full_profile_tools()
         if item["function"]["name"] == "alldata_service_information"
     )
     validate(instance=arguments, schema=tool["function"]["parameters"])
