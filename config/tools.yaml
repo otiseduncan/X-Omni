@@ -56,8 +56,6 @@ profiles:
       - calibration_iq_operator
       - calibration_iq_destructive
       - calibration_iq_work_prep
-      - alldata_service_information
-      - research_provider_setup
       - scrapex_status
       - scrapex_start_native
       - scrapex_read
@@ -340,22 +338,17 @@ tools:
   calibration_iq_operator:
     tier: operator_authorized
     description: >-
-      Perform verified, idempotent Calibration IQ operator batches, including
-      research, photos, managed case-file/document work, status undo,
-      no-calibration decisions, and location administration. Routine authorized
-      operations run immediately and are audited upstream and in X. Also
-      records repair-trigger justification and repair-scope review, and
-      tracks/clears durable ADAS SI service-information gaps
-      (create_missing_si_record/resolve_missing_si_record).
+      Perform verified, idempotent Calibration IQ operator batches for the
+      active field workflow: research state, photos, ADAS Map/case documents,
+      status undo, calibration decisions, and location administration. SI-gap
+      bookkeeping and CIQ service-information attachment are dormant.
 
   calibration_iq_work_prep:
     tier: operator_authorized
     description: >-
-      Prepare Calibration IQ work from the authoritative RO queue: read phase and
-      RO requirements, run full ADAS Map and ADAS SI coverage for an explicit
-      phase, reconcile ADAS Map requirements into Calibration IQ through verified
-      routine operator actions and check exact ADAS SI procedure coverage. Direct
-      one-RO SI acquisition is owned by alldata_service_information.
+      Prepare active Calibration IQ field work from the authoritative RO queue:
+      list an explicitly named phase or read/reconcile one RO's governing ADAS Map
+      requirements. CIQ service-information coverage/acquisition is dormant.
 
   calibration_iq_destructive:
     tier: confirm_required
