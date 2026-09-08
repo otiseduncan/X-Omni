@@ -408,8 +408,10 @@ def test_phase_list_schema_cannot_run_without_an_explicit_phase():
 
     assert validator.is_valid({"mode": "phase_list", "phase": "5"})
     assert not validator.is_valid({"mode": "phase_list"})
-    assert validator.is_valid({"mode": "phase_coverage", "phase": "5"})
-    assert not validator.is_valid({"mode": "phase_coverage"})
+    assert not validator.is_valid({"mode": "phase_coverage", "phase": "5"})
+    assert not validator.is_valid({"mode": "week_readiness"})
+    assert not validator.is_valid({"mode": "queue_list"})
+    assert not validator.is_valid({"mode": "queue_next"})
     assert validator.is_valid({"mode": "ro_requirements", "repair_order_id": "2400612495"})
     assert not validator.is_valid({"mode": "ro_requirements"})
 
@@ -482,19 +484,16 @@ async def test_phase_list_returns_only_verified_requested_phase(monkeypatch):
     assert all(prep._phase_token(row["Phase"]) == "5" for row in result["rows"])  # noqa: SLF001
 
 
-def test_work_prep_tool_is_advertised_as_operator_authorized_after_install():
+def test_work_prep_tool_advertises_only_active_non_si_modes():
     schema = registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]
-    assert set(schema["parameters"]["properties"]["mode"]["enum"]) == {
+    parameters = schema["parameters"]
+    assert set(parameters["properties"]["mode"]["enum"]) == {
         "phase_list",
-        "phase_coverage",
         "ro_requirements",
-        "week_readiness",
-        "queue_list",
-        "queue_next",
     }
-    assert set(schema["parameters"]["properties"]["statuses"]["items"]["enum"]) == set(
-        weekly_queue.LIFECYCLE_STATUSES
-    )
+    assert "coverage_focus" not in parameters["properties"]
+    assert "execute_missing" not in parameters["properties"]
+    assert "statuses" not in parameters["properties"]
 
 
 def test_alldata_service_information_is_the_advertised_ro_si_acquisition_surface():
@@ -517,7 +516,7 @@ def test_alldata_service_information_is_the_advertised_ro_si_acquisition_surface
     )
 
 
-def test_work_prep_schema_owns_ciq_field_work_not_calendar_events():
+def test_work_prep_schema_owns_active_ciq_field_work_without_si():
     schema = registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]
     description = schema["description"].casefold()
     mode_description = schema["parameters"]["properties"]["mode"][
@@ -525,15 +524,14 @@ def test_work_prep_schema_owns_ciq_field_work_not_calendar_events():
     ].casefold()
 
     assert "authoritative calibration iq source" in description
-    assert "upcoming shop field work" in description
-    assert "weekly ro readiness" in description
-    assert "does not read google calendar appointments or events" in description
-    assert "coverage/readiness workflow" in description
-    assert "si_attached" in description
-    assert "calibration_iq_summary/read" in description
+    assert "active field-work preparation" in description
+    assert "adas map" in description
+    assert "service-information" in description
+    assert "dormant" in description
+    assert "missing-si queues are dormant" in description
     assert "do not invent/default a phase" in description
-    assert "authoritative ciq ro workload/readiness operation" in mode_description
-    assert "only for a phase explicitly supplied by the user" in mode_description
+    assert "active ciq preparation operation" in mode_description
+    assert "adas map requirements" in mode_description
     phase_description = schema["parameters"]["properties"]["phase"]["description"].casefold()
     assert "current request explicitly names" in phase_description
     assert "never infer" in phase_description
