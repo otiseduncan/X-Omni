@@ -130,7 +130,7 @@ async def test_read_clamps_limit_and_allowlists_params(settings, monkeypatch):
     )
     assert seen["params"]["limit"] == 100          # clamped
     assert seen["params"]["q"] == "F-150"
-    assert seen["params"]["si_attached"] is False
+    assert "si_attached" not in seen["params"]      # dormant CIQ SI filter is dropped
     assert "evil" not in seen["params"]            # not on the allow-list
     assert "shop" not in seen["params"]            # empty string dropped
     assert seen["auth"] == "Bearer quoted-secret-token"
