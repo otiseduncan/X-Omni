@@ -429,17 +429,17 @@ def test_calibration_iq_tool_schema_compatibility():
     summary = TOOL_SCHEMAS["calibration_iq_summary"]["parameters"]["properties"]
     listing = TOOL_SCHEMAS["calibration_iq_read"]["parameters"]["properties"]
     assert set(summary) == {
-        "shop", "phase", "status", "insurance", "q", "si_attached",
+        "shop", "phase", "status", "insurance", "q",
         "include_completed", "terminal_only",
     }
     assert set(listing) == {
-        "q", "shop", "insurance", "status", "phase", "si_attached", "limit",
+        "q", "shop", "insurance", "status", "phase", "limit",
         "include_completed", "terminal_only",
     }
     assert summary["include_completed"]["type"] == "boolean"
     assert summary["terminal_only"]["type"] == "boolean"
-    assert summary["si_attached"]["type"] == "boolean"
-    assert listing["si_attached"]["type"] == "boolean"
+    assert "si_attached" not in summary
+    assert "si_attached" not in listing
     assert listing["limit"]["type"] == "integer"
 
 
