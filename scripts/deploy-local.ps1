@@ -143,6 +143,15 @@ $xPython = Join-Path $XOmniRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $xPython)) {
     throw "X Omni Python runtime is missing: $xPython"
 }
+# Single-quote every string below. Windows PowerShell strips double quotes
+# when it builds a native command line, so result.get("success") reached
+# Python as result.get(success) -- a NameError that failed the deployment
+# immediately after ScrapeX had in fact synchronized successfully.
+#
+# This has to stay a -c script rather than a temp .py file: with -c, sys.path[0]
+# is the working directory (set by Push-Location below), which is what makes
+# 'from core.config import ...' resolve. A script file would put sys.path[0] in
+# the file's own directory and break the import.
 $scrapexBootstrap = @'
 import asyncio
 import json
@@ -151,7 +160,7 @@ from core.services import scrapex
 
 result = asyncio.run(scrapex.start_native(Settings.load()))
 print(json.dumps(result, sort_keys=True))
-raise SystemExit(0 if result.get("success") is True else 1)
+raise SystemExit(0 if result.get('success') is True else 1)
 '@
 Push-Location $XOmniRoot
 try {
