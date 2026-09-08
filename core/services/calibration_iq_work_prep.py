@@ -458,10 +458,36 @@ def build_reconciliation_actions(
             for item in matches
             if str(item.get("determination") or "").upper() == "REQUIRED"
         ]
-        if any(
+        method_already_satisfied = any(
             map_method == "UNKNOWN" or _method(item.get("method")) == map_method
             for item in active_required
-        ):
+        )
+        if method_already_satisfied and len(active_required) == 1:
+            current_label = str(active_required[0].get("calibration_type") or "").strip()
+            if current_label != label:
+                item_id = str(active_required[0].get("id") or "").strip()
+                version = active_required[0].get("version")
+                if (
+                    item_id
+                    and not isinstance(version, bool)
+                    and isinstance(version, int)
+                    and version >= 1
+                ):
+                    actions.append(
+                        {
+                            "operation": "update_calibration",
+                            "target_id": item_id,
+                            "expected_version": version,
+                            "arguments": {
+                                "calibration_type": label,
+                                "research_status": "ADAS Map governing source",
+                            },
+                        }
+                    )
+            continue
+        if method_already_satisfied:
+            # Multiple active aliases for one governing requirement are a data
+            # integrity issue; do not guess which record to rewrite here.
             continue
         if not matches:
             actions.append(
@@ -504,6 +530,7 @@ def build_reconciliation_actions(
         ):
             continue
         changes: dict[str, Any] = {
+            "calibration_type": label,
             "determination": "REQUIRED",
             "research_status": "ADAS Map governing source",
         }
