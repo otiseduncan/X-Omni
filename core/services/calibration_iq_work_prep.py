@@ -3724,11 +3724,10 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Authoritative Calibration IQ source for upcoming shop field work and weekly RO readiness; "
-                    "does not read Google Calendar appointments or events. Coverage/readiness workflow for "
-                    "phase/queue reads, one-RO requirements, and readiness audits. "
-                    "For actually retrieving one-RO service information use alldata_service_information. "
-                    "For attached-SI board counts/lists use calibration_iq_summary/read with si_attached. "
+                    "Authoritative Calibration IQ source for active field-work preparation. "
+                    "Use it to list one explicitly named production phase or read/reconcile "
+                    "one RO's governing ADAS Map calibration requirements. Calibration IQ "
+                    "service-information coverage, acquisition, and missing-SI queues are dormant. "
                     "Do not invent/default a phase."
                 ),
                 "parameters": {
@@ -3739,24 +3738,11 @@ def install() -> None:
                             "type": "string",
                             "enum": [
                                 "phase_list",
-                                "phase_coverage",
                                 "ro_requirements",
-                                "week_readiness",
-                                "queue_list",
-                                "queue_next",
                             ],
                             "description": (
-                                "Authoritative CIQ RO workload/readiness operation: list/audit, read one RO, "
-                                "or advance the queue. phase_coverage is only for a phase explicitly supplied "
-                                "by the user."
-                            ),
-                        },
-                        "coverage_focus": {"type": "string", "enum": ["adas_map", "si_readiness"]},
-                        "execute_missing": {
-                            "type": "boolean",
-                            "description": (
-                                "For week_readiness: true when the user asked X to prepare/"
-                                "acquire the missing work now; false/omit for an audit/status check."
+                                "Active CIQ preparation operation: list one explicitly named phase "
+                                "or read/reconcile one RO's governing ADAS Map requirements."
                             ),
                         },
                         "repair_order_id": {"type": "string"},
@@ -3769,29 +3755,12 @@ def install() -> None:
                             ),
                         },
                         "shop": {"type": "string"},
-                        "statuses": {
-                            "type": "array",
-                            "maxItems": 6,
-                            "uniqueItems": True,
-                            "items": {
-                                "type": "string",
-                                "enum": sorted(weekly_queue.LIFECYCLE_STATUSES),
-                            },
-                            "description": "For queue_list only: exact persisted lifecycle statuses to return. Omit to return every unresolved row.",
-                        },
                     },
                     "required": ["mode"],
                     "allOf": [
                         {
                             "if": {
                                 "properties": {"mode": {"const": "phase_list"}},
-                                "required": ["mode"],
-                            },
-                            "then": {"required": ["phase"]},
-                        },
-                        {
-                            "if": {
-                                "properties": {"mode": {"const": "phase_coverage"}},
                                 "required": ["mode"],
                             },
                             "then": {"required": ["phase"]},
