@@ -956,14 +956,13 @@ export function CalibrationWorkPrepCard({ data }) {
   switch (data?.mode) {
     case "phase_list":
       return <WorkPrepPhaseListCard data={data} />;
-    case "queue_list":
-      return <WorkPrepQueueListCard data={data} />;
-    case "queue_next":
-      return <WorkPrepQueueNextCard data={data} />;
     case "ro_requirements":
       return <WorkPrepRoRequirementsCard data={data} />;
     default:
-      return <WorkPrepReadinessCard data={data} />;
+      // Weekly/SI readiness and persisted SI queues are intentionally dormant.
+      // Keep their implementation in source, but never render them in the
+      // active product while the CIQ SI integration is disabled.
+      return null;
   }
 }
 
