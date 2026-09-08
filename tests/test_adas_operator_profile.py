@@ -55,8 +55,6 @@ EXPECTED_ADAS_TOOLS = {
     "calibration_iq_operator",
     "calibration_iq_destructive",
     "calibration_iq_work_prep",
-    "alldata_service_information",
-    "research_provider_setup",
     "scrapex_status",
     "scrapex_start_native",
     "scrapex_read",
@@ -80,6 +78,8 @@ NON_ADAS_NORMAL_TOOLS = {
     "calibration_iq_update",
     "collision_research",
     "service_information_research",
+    "alldata_service_information",
+    "research_provider_setup",
 }
 
 
@@ -115,7 +115,7 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
     full_names = {item["function"]["name"] for item in full_catalog}
 
     assert adas_names == EXPECTED_ADAS_TOOLS
-    assert len(adas_catalog) == 35
+    assert len(adas_catalog) == 33
     assert len(full_catalog) == 52
     assert NON_ADAS_NORMAL_TOOLS <= full_names
 
@@ -337,18 +337,17 @@ def test_read_status_and_exact_resource_descriptions_expose_distinct_contracts()
         for item in configured_profile_catalog(_settings())
     }
 
-    assert "alldata_service_information" in catalog
+    assert "alldata_service_information" not in catalog
+    assert "research_provider_setup" not in catalog
     assert "service_information_research" not in catalog
-    alldata_description = catalog["alldata_service_information"].casefold()
     adas_map_description = catalog["scrapex_adas_map"].casefold()
     scrapex_status_description = catalog["scrapex_status"].casefold()
-    assert "alldata" in alldata_description
-    assert "service-information" in alldata_description
-    assert "licensed alldata navigator" in alldata_description
-    assert "never acquires" in alldata_description and "adas map" in alldata_description
+    work_prep_description = catalog["calibration_iq_work_prep"].casefold()
     assert "adas map requirement reports only" in adas_map_description
     assert "never opens alldata" in adas_map_description
     assert "not alldata status" in scrapex_status_description
+    assert "service-information" in work_prep_description
+    assert "dormant" in work_prep_description
 
     assert "Primary read for whether X is configured and permitted" in catalog[
         "assistant_capabilities_read"
@@ -387,7 +386,6 @@ def test_production_profile_catalog_exposes_disjoint_unversioned_action_families
     research = operations_for(set(CALIBRATION_IQ_RESEARCH_RO_OPERATIONS))
     add = operations_for(set(CALIBRATION_IQ_ADD_CALIBRATION_OPERATIONS))
     exact_groups = (
-        {"create_missing_si_record", "resolve_missing_si_record"},
         {"ensure_case_workspace"},
         {"create_folder", "archive_entry"},
         {"rename_entry"},
@@ -464,12 +462,11 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
     assert metrics["stored_artifact_context"]["chars"] <= 8_000
-    assert metrics["advertised_tools"]["count"] == 35
-    # The vetting-contract operations (mark_repair_scope_reviewed,
-    # record_repair_trigger_justification, create_missing_si_record,
-    # resolve_missing_si_record) grew calibration_iq_operator's schema; the
-    # calibration_iq_ro `shop` parameter (short-RO-number resolution) grew
-    # it again, and the anti-copy warnings on `repair_order_id`/`shop`
+    assert metrics["advertised_tools"]["count"] == 33
+    # The active CIQ operator schema retains repair-scope and trigger
+    # justification while dormant SI bookkeeping is removed. The
+    # calibration_iq_ro `shop` parameter (short-RO-number resolution) and
+    # anti-copy warnings on `repair_order_id`/`shop`
     # (never copy an identifier from the Active conversation subject block
     # into a fresh call) grew it once more. The single-owner ScrapeX v3
     # handoff descriptions and the scrapex_adas_map auth-before-batch
