@@ -47,7 +47,7 @@ MUTATION_OPERATIONS = {
     "update_requirement": "Update a calibration requirement",
 }
 
-READ_PARAMS = ("q", "shop", "insurance", "status", "phase", "si_attached", "limit", "offset")
+READ_PARAMS = ("q", "shop", "insurance", "status", "phase", "limit", "offset")
 
 # Terminal statuses proved by the current Calibration IQ contract.  Match the
 # normalized label exactly: substring rules make active values such as
@@ -111,8 +111,6 @@ ROUTINE_OPERATOR_OPERATIONS = frozenset({
     "update_research",
     "mark_repair_scope_reviewed",
     "record_repair_trigger_justification",
-    "create_missing_si_record",
-    "resolve_missing_si_record",
     "research_ro",
     "ensure_case_workspace",
     "create_folder",
