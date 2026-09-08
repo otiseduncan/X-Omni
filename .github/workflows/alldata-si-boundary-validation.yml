@@ -54,8 +54,9 @@ jobs:
           s = Settings.load()
           tools = configured_profile_catalog(s, profile="adas_operator")
           catalog = {item["function"]["name"]: item["function"] for item in tools}
-          assert len(catalog) == 35
-          assert "alldata_service_information" in catalog
+          assert len(catalog) == 33
+          assert "alldata_service_information" not in catalog
+          assert "research_provider_setup" not in catalog
           assert "service_information_research" not in catalog
 
           alldata = catalog["alldata_service_information"]["description"].casefold()
