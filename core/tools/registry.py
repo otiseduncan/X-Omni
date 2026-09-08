@@ -92,8 +92,6 @@ CALIBRATION_IQ_ROUTINE_OPERATIONS = (
     "update_research",
     "mark_repair_scope_reviewed",
     "record_repair_trigger_justification",
-    "create_missing_si_record",
-    "resolve_missing_si_record",
     "research_ro",
     "ensure_case_workspace",
     "create_folder",
@@ -181,8 +179,6 @@ CALIBRATION_IQ_RO_REQUIRED_OPERATIONS = (
     "add_prerequisite",
     "update_research",
     "mark_repair_scope_reviewed",
-    "create_missing_si_record",
-    "resolve_missing_si_record",
     "research_ro",
     "ensure_case_workspace",
     "create_folder",
@@ -2396,10 +2392,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "description": (
             "Return a verified aggregate count for a structured Calibration IQ repair-order "
             "scope without returning rows. Finished work is excluded unless include_completed "
-            "is true. For simple questions such as 'how many ROs need SI' or 'how many cards "
-            "do not have SI attached', set si_attached=false and do not add a phase unless the "
-            "user explicitly supplied one. SI attachment is a CIQ board fact, not an ADAS SI "
-            "coverage/readiness audit."
+            "is true. SI attachment/readiness is intentionally not part of the active CIQ product."
         ),
         "parameters": {
             "type": "object",
@@ -2415,14 +2408,6 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "status": {"type": "string"},
                 "insurance": {"type": "string"},
                 "q": {"type": "string", "description": "Free-text search"},
-                "si_attached": {
-                    "type": "boolean",
-                    "description": (
-                        "Filter by an actual non-ADAS-Map service-information document attached "
-                        "to the CIQ RO. false answers 'needs SI / no SI attached'; true answers "
-                        "'has SI attached'. Omit unless the user is asking about SI attachment."
-                    ),
-                },
                 "include_completed": {
                     "type": "boolean",
                     "description": "Include finished work. Default false -- complete is not active.",
@@ -2464,13 +2449,6 @@ TOOL_SCHEMAS: dict[str, dict] = {
                     "description": (
                         "Phase number only when the user's current request explicitly names one. "
                         "Never infer or default a phase."
-                    ),
-                },
-                "si_attached": {
-                    "type": "boolean",
-                    "description": (
-                        "Filter rows by actual non-ADAS-Map service-information attachment. "
-                        "Do not substitute ADAS SI coverage/readiness for this board fact."
                     ),
                 },
                 "limit": {"type": "integer", "description": "Rows to display, 1-100. Default 20."},
