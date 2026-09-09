@@ -514,9 +514,15 @@ async def test_phase_list_returns_only_verified_requested_phase(monkeypatch):
 def test_work_prep_tool_advertises_only_active_non_si_modes():
     schema = registry_mod.TOOL_SCHEMAS[prep.TOOL_NAME]
     parameters = schema["parameters"]
+    # adas_map_inventory is the CIQ-native answer to "how many ROs need an
+    # ADAS Map". Without it the model reached for ScrapeX and created an
+    # 83-vehicle acquisition batch in reply to a counting question, then
+    # reported the first five rows of it as the total. It is an active,
+    # non-SI mode and belongs on this surface.
     assert set(parameters["properties"]["mode"]["enum"]) == {
         "phase_list",
         "ro_requirements",
+        "adas_map_inventory",
     }
     assert "coverage_focus" not in parameters["properties"]
     assert "execute_missing" not in parameters["properties"]
