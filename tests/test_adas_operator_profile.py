@@ -321,7 +321,9 @@ def test_normal_prompt_is_concise_and_free_of_capability_micro_routing() -> None
     assert "use `assistant_capabilities_read`" in prompt
     assert "exact-number list match is a thin row" in prompt.casefold()
     assert "current_calibration_detail_included=false" in prompt
-    assert "model memory and current ciq assignments are not oem evidence" in prompt.casefold()
+    assert "ciq state is not oem proof" in prompt.casefold()
+    assert "adas_map_inventory" in prompt
+    assert "never scrapex" in prompt.casefold()
     assert "before any schema-versioned write" in prompt.casefold()
     assert "close_ro` is the normal whole-ro finished/complete transition" in prompt.casefold()
     assert "change_status` is only for an explicitly named target status" in prompt.casefold()
@@ -348,6 +350,9 @@ def test_read_status_and_exact_resource_descriptions_expose_distinct_contracts()
     assert "not alldata status" in scrapex_status_description
     assert "service-information" in work_prep_description
     assert "dormant" in work_prep_description
+    assert "adas_map_inventory" in work_prep_description
+    assert "never calls scrapex" in work_prep_description
+    assert "not a read path for current calibration iq state" in adas_map_description
 
     assert "Primary read for whether X is configured and permitted" in catalog[
         "assistant_capabilities_read"
