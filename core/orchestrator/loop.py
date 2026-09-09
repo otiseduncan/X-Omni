@@ -36,6 +36,7 @@ from ..tools.registry import (
     scrapex_evidence_from_result,
 )
 from . import prompt as prompt_mod
+from . import truth_review as truth_review_mod
 
 log = logging.getLogger("xomni.loop")
 
@@ -459,13 +460,137 @@ def _calibration_iq_work_prep_reconciliation_counts(
     )
 
 
-def calibration_iq_work_prep_terminal_summary(results: Any) -> str:
-    """Seal work-prep turns with the service's structured audit truth.
+def _calibration_iq_work_prep_result_mutated(result: Any) -> bool:
+    """Did this work-prep result actually change state?
 
-    Work prep can perform receipt-bound CIQ reconciliation while also returning
-    a truthful *partial* readiness audit.  The model still sees the structured
-    result for tool choice, but it cannot replace the final aggregate counts,
-    named exceptions, omissions, or receipt state with optimistic prose.
+    Structural fields only -- receipt counts, reconciliation payloads, and
+    executed acquisition flags. This is the truth-review trigger for the
+    work-prep surface, so it must never grow an English-parsing branch: a
+    read-only audit answers on the plain model path, and anything that
+    attempted a CIQ mutation or an SI acquisition gets the model truth review.
+    """
+    if not isinstance(result, dict):
+        return False
+    requested, processed, receipt_total, verified = (
+        _calibration_iq_work_prep_reconciliation_counts(result)
+    )
+    if requested or processed or receipt_total or verified:
+        return True
+    if _bounded_nonnegative_int(result.get("reconciliation_failed_count"), 0):
+        return True
+    if _bounded_nonnegative_int(
+        result.get("ciq_indeterminate_reconciliation_count"), 0
+    ) or _bounded_nonnegative_int(
+        result.get("ciq_may_have_executed_reconciliation_count"), 0
+    ):
+        return True
+    reconciliation = result.get("reconciliation")
+    if isinstance(reconciliation, dict) and (
+        reconciliation.get("executed") is True
+        or reconciliation.get("may_have_executed") is True
+        or _bounded_nonnegative_int(reconciliation.get("requested_count"), 0) > 0
+    ):
+        return True
+    # An SI acquisition writes into ADAS SI and links evidence back to the RO;
+    # its success claim is exactly what the truth review exists to check.
+    return bool(
+        result.get("executed") is True
+        and str(result.get("mode") or "") == "ro_si_acquire"
+    )
+
+
+def calibration_iq_mutation_truth_review_required(
+    operator_results: list[dict[str, Any]],
+    work_prep_results: list[dict[str, Any]],
+) -> bool:
+    """Whether this turn's final answer needs the model truth review.
+
+    Derived purely from which capabilities executed and what their structured
+    results report -- never from the wording of the user's request or of the
+    model's answer. Operator/destructive calls are mutations by definition;
+    work-prep results qualify only when they carry structural mutation
+    evidence. Plain reads stay on the fast path with no review call.
+    """
+    if operator_results:
+        return True
+    return any(
+        _calibration_iq_work_prep_result_mutated(result)
+        for result in work_prep_results
+    )
+
+
+def _calibration_iq_structural_verification_state(
+    operator_results: list[dict[str, Any]],
+    work_prep_results: list[dict[str, Any]],
+) -> str:
+    """Classify the turn's mutation evidence: verified, failed, indeterminate.
+
+    Used only to pick the tiny fail-closed line when the model truth review
+    could not validate any wording. Indeterminate outranks failed outranks
+    verified, so an uncertain execution is never narrated with confidence.
+    """
+    failed = False
+    indeterminate = False
+    all_verified = True
+    for result in operator_results:
+        if calibration_iq_operator_result_is_verified(result):
+            continue
+        all_verified = False
+        payload = _calibration_iq_operator_payload(result)
+        status = str(payload.get("status") or "").casefold()
+        if status in {"indeterminate", "may_have_executed"} or payload.get(
+            "may_have_executed"
+        ) is True:
+            indeterminate = True
+        elif payload.get("success") is False or status in {"failed", "rejected"}:
+            failed = True
+        else:
+            indeterminate = True
+    for result in work_prep_results:
+        if not _calibration_iq_work_prep_result_mutated(result):
+            continue
+        if _bounded_nonnegative_int(
+            result.get("ciq_indeterminate_reconciliation_count"), 0
+        ) or _bounded_nonnegative_int(
+            result.get("ciq_may_have_executed_reconciliation_count"), 0
+        ):
+            indeterminate = True
+        reconciliation = result.get("reconciliation")
+        if isinstance(reconciliation, dict) and (
+            reconciliation.get("may_have_executed") is True
+            and reconciliation.get("executed") is not True
+        ):
+            indeterminate = True
+        requested, _processed, _returned, verified = (
+            _calibration_iq_work_prep_reconciliation_counts(result)
+        )
+        if _bounded_nonnegative_int(result.get("reconciliation_failed_count"), 0) or (
+            result.get("success") is False
+        ):
+            failed = True
+            all_verified = False
+        elif requested > verified:
+            all_verified = False
+            indeterminate = True
+        if result.get("verified") is not True:
+            all_verified = False
+    if indeterminate:
+        return "indeterminate"
+    if failed:
+        return "failed"
+    return "verified" if all_verified else "indeterminate"
+
+
+def calibration_iq_work_prep_terminal_summary(results: Any) -> str:
+    """Render a work-prep result's structured audit truth as prose.
+
+    AUDIT/DEBUG RENDERER ONLY. This used to be the automatic final response
+    for every Calibration IQ work-prep turn, which replaced the model's answer
+    with a multi-section report -- the model-first boundary defect. Normal
+    conversation is now model-owned, with mutation turns checked by the
+    bounded model truth review in ``truth_review``. Keep this function for
+    audit cards, diagnostics, and explicit debugging; do NOT wire it back into
+    the conversational path.
     """
     from ..services import calibration_iq_work_prep as work_prep
 
@@ -564,6 +689,11 @@ def _calibration_iq_protected_terminal_summary(
     operator_results: list[dict[str, Any]],
     work_prep_results: list[dict[str, Any]],
 ) -> str:
+    """AUDIT/DEBUG RENDERER ONLY -- see the section renderers above.
+
+    Never call this to produce the user-facing chat response; the model owns
+    that, with mutation turns gated by the ``truth_review`` model pass.
+    """
     sections: list[str] = []
     if operator_results:
         sections.append(calibration_iq_operator_terminal_summary(operator_results))
@@ -748,7 +878,13 @@ def _calibration_iq_snapshot_state(
 
 
 def calibration_iq_operator_terminal_summary(results: Any) -> str:
-    """Seal operator turns with only receipt and final-snapshot truth.
+    """Render operator receipt and final-snapshot truth as prose.
+
+    AUDIT/DEBUG RENDERER ONLY -- no longer the automatic final response for
+    operator turns (that substitution was the model-first boundary defect).
+    Final wording is model-owned and checked by the ``truth_review`` model
+    pass; keep this for audit cards, diagnostics, and explicit debugging, and
+    do NOT wire it back into the conversational path.
 
     Multiple tool calls can be required when a later action consumes an id from
     an earlier receipt. Verified receipts are accumulated. A failed receipt is
@@ -1445,6 +1581,66 @@ class Orchestrator:
             rewritten.append(current)
         return rewritten
 
+    async def _calibration_iq_truth_reviewed_text(
+        self,
+        messages: list[dict[str, Any]],
+        candidate: str,
+        operator_results: list[dict[str, Any]],
+        work_prep_results: list[dict[str, Any]],
+    ) -> str:
+        """Validate (or repair) a mutation turn's wording against its evidence.
+
+        The mutation already executed; receipts and authoritative rereads are
+        in the structured results. This method never touches execution: every
+        model call it makes goes through ``truth_review`` with ``tools=None``,
+        so language repair structurally cannot replay an action. Flow is
+        candidate -> review -> at most one regeneration -> final review ->
+        tiny fail-closed line chosen from structural verification state.
+        """
+        state = _calibration_iq_structural_verification_state(
+            operator_results, work_prep_results
+        )
+        candidate = (candidate or "").strip()
+        if not candidate:
+            # Abnormal exit (approval pause, round cap): no candidate exists.
+            # Synthesize one from the authoritative evidence -- embedded
+            # explicitly because the message history may not carry the
+            # completed results on these paths.
+            evidence_json = _bounded_tool_result_json(
+                {
+                    "calibration_iq_operator_results": operator_results,
+                    "calibration_iq_work_prep_results": work_prep_results,
+                }
+            )
+            candidate = (
+                await truth_review_mod.synthesize_candidate(
+                    self.client, messages, evidence_json
+                )
+            ).strip()
+            if not candidate:
+                return truth_review_mod.fail_closed_text(state)
+        review = await truth_review_mod.review_candidate(
+            self.client, messages, candidate
+        )
+        if review is None:
+            # Reviewer unavailable/unparseable: never release unreviewed
+            # mutation wording, never re-execute -- state the structural truth.
+            return truth_review_mod.fail_closed_text(state)
+        if review.valid:
+            return candidate
+        regenerated = (
+            await truth_review_mod.regenerate_candidate(
+                self.client, messages, candidate, review
+            )
+        ).strip()
+        if regenerated:
+            second = await truth_review_mod.review_candidate(
+                self.client, messages, regenerated
+            )
+            if second is not None and second.valid:
+                return regenerated
+        return truth_review_mod.fail_closed_text(state)
+
     async def run_turn(
         self,
         conversation_id: int,
@@ -1917,13 +2113,18 @@ class Orchestrator:
                     full_text += NO_TOOL_SELF_CHECK_FALLBACK
                     break
 
-            operator_turn_active = bool(calibration_iq_operator_results)
-            work_prep_turn_active = bool(calibration_iq_work_prep_results)
-            calibration_iq_protected_turn_active = bool(
-                operator_turn_active or work_prep_turn_active
+            # Model-first boundary: a Calibration IQ turn no longer forfeits
+            # its final wording to a deterministic terminal summary. Only a
+            # turn whose structured evidence shows an actual mutation routes
+            # through the bounded model truth review; reads flow straight
+            # through like any other turn. The trigger is capability/result
+            # metadata -- never the wording of the request or the answer.
+            calibration_iq_mutation_turn = calibration_iq_mutation_truth_review_required(
+                calibration_iq_operator_results,
+                calibration_iq_work_prep_results,
             )
             guarded_calibration_iq_response = bool(
-                calibration_iq_protected_turn_active and not tool_calls
+                calibration_iq_mutation_turn and not tool_calls
             )
             guarded_web_response = bool(
                 last_web_research_result is not None
@@ -1951,7 +2152,7 @@ class Orchestrator:
             # this round, not just those two families, now seals its round.
             if (
                 not tool_calls
-                and not calibration_iq_protected_turn_active
+                and not calibration_iq_mutation_turn
                 and not guarded_web_response
             ):
                 if synthesis_boundary_failed:
@@ -1961,18 +2162,24 @@ class Orchestrator:
                         yield token_event
 
             if guarded_calibration_iq_response:
-                guarded_text = _calibration_iq_protected_terminal_summary(
+                # Mutation turn: the model's candidate is withheld until the
+                # bounded truth review validates it against the receipts and
+                # rereads already in this turn. Language may be regenerated
+                # once; execution is never repeated.
+                reviewed_text = await self._calibration_iq_truth_reviewed_text(
+                    messages,
+                    round_text,
                     calibration_iq_operator_results,
                     calibration_iq_work_prep_results,
                 )
-                yield {"type": "token", "text": guarded_text}
-                full_text = guarded_text
+                yield {"type": "token", "text": reviewed_text}
+                full_text += reviewed_text
                 calibration_iq_truth_emitted = True
             elif guarded_web_response:
                 guarded_text = web_research_fallback_summary(last_web_research_result)
                 yield {"type": "token", "text": guarded_text}
                 full_text += guarded_text
-            elif not tool_calls and not calibration_iq_protected_turn_active:
+            elif not tool_calls and not calibration_iq_mutation_turn:
                 full_text += (
                     TOOL_ROUND_CAP_FALLBACK
                     if synthesis_boundary_failed
@@ -2193,40 +2400,28 @@ class Orchestrator:
                 # Stop here. The UI shows the approval card; approving it
                 # starts a new turn carrying approved_tool.
                 break
-        if (
-            paused
-            and not calibration_iq_truth_emitted
-            and (
-                calibration_iq_operator_results
-                or calibration_iq_work_prep_results
-            )
+        if not calibration_iq_truth_emitted and calibration_iq_mutation_truth_review_required(
+            calibration_iq_operator_results,
+            calibration_iq_work_prep_results,
         ):
-            # A routine operator action may complete before a later destructive
-            # action pauses the turn for approval. Preserve the completed
-            # receipt truth in this turn instead of saving a blank assistant
-            # message; the approval continuation owns only the protected call.
-            guarded_text = _calibration_iq_protected_terminal_summary(
+            # Abnormal exits only: a completed mutation whose turn ended
+            # without a reviewed answer -- most commonly a routine action that
+            # finished before a later destructive call paused the turn for
+            # approval, or a round-cap exit. There is no model candidate here,
+            # so the truth-review path synthesizes one from the receipts (a
+            # bounded, tool-less call), reviews it, and fails closed to the
+            # tiny fallback if it cannot be validated. Read-only turns never
+            # reach this block; their text already streamed on the normal
+            # model-owned path.
+            reviewed_text = await self._calibration_iq_truth_reviewed_text(
+                messages,
+                "",
                 calibration_iq_operator_results,
                 calibration_iq_work_prep_results,
             )
-            yield {"type": "token", "text": guarded_text}
-            full_text = guarded_text
+            yield {"type": "token", "text": reviewed_text}
+            full_text += reviewed_text
             calibration_iq_truth_emitted = True
-
-        if (
-            not paused
-            and not calibration_iq_truth_emitted
-            and (
-                calibration_iq_operator_results
-                or calibration_iq_work_prep_results
-            )
-        ):
-            guarded_text = _calibration_iq_protected_terminal_summary(
-                calibration_iq_operator_results,
-                calibration_iq_work_prep_results,
-            )
-            yield {"type": "token", "text": guarded_text}
-            full_text = guarded_text
 
         message_id = self.store.add_message(
             conversation_id,

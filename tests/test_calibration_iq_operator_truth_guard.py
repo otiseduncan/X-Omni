@@ -126,104 +126,140 @@ def _orchestrator(client: Any, registry: Any, store: _Store) -> Orchestrator:
     )
 
 
+
+VALID_REVIEW = json.dumps(
+    {
+        "valid": True,
+        "unsupported_claims": [],
+        "contradictions": [],
+        "correction_guidance": "",
+    }
+)
+
+
+def _invalid_review(
+    *contradictions: str, guidance: str = "State only what the receipts prove."
+) -> str:
+    return json.dumps(
+        {
+            "valid": False,
+            "unsupported_claims": [],
+            "contradictions": list(contradictions),
+            "correction_guidance": guidance,
+        }
+    )
+
+
+class _ScriptedClient:
+    # Drives one turn: scripted tool rounds, then a candidate answer, then a
+    # queue of responses for the tools=None calls (truth review, regeneration,
+    # synthesis). The split is structural: the orchestrator passes tools=None
+    # for every truth-review-path call, so language repair cannot select or
+    # execute a tool even in principle.
+    def __init__(self, tool_rounds=None, candidate="", review_responses=()):
+        self.tool_rounds = [list(round_events) for round_events in (tool_rounds or [])]
+        self.candidate = candidate
+        self.review_responses = list(review_responses)
+        self.no_tool_calls = 0
+        self.tool_advertised_calls = 0
+
+    async def stream(self, _messages, tools=None):
+        if tools is None:
+            self.no_tool_calls += 1
+            yield {"type": "content", "text": self.review_responses.pop(0)}
+            return
+        self.tool_advertised_calls += 1
+        if self.tool_rounds:
+            for event in self.tool_rounds.pop(0):
+                yield event
+            return
+        yield {"type": "content", "text": self.candidate}
+
+
+def _operator_call(call_id: str = "operator-call") -> dict:
+    return {
+        "type": "tool_call",
+        "id": call_id,
+        "name": "calibration_iq_operator",
+        "arguments": json.dumps(
+            {
+                "actions": [
+                    {
+                        "operation": "add_note",
+                        "repair_order_id": "ro-1",
+                        "arguments": {"body": "ready"},
+                    }
+                ]
+            }
+        ),
+    }
+
+
 @pytest.mark.asyncio
-async def test_failed_operator_replaces_model_invention_with_exact_receipt_truth(
+async def test_failed_operator_lie_is_regenerated_to_receipt_truth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A candidate that misstates WHY the mutation failed is repaired by the
+    # model truth review -- language only, never a second execution.
     failure = _failed_result()
     registry = _Registry([failure])
     store = _Store()
-
-    class Client:
-        calls = 0
-
-        async def stream(self, messages: list[dict], tools: Any = None):
-            self.calls += 1
-            if self.calls == 1:
-                yield {"type": "content", "text": "I will update the RO now."}
-                yield {
-                    "type": "tool_call",
-                    "id": "operator-failure",
-                    "name": "calibration_iq_operator",
-                    "arguments": json.dumps(
-                        {
-                            "actions": [
-                                {
-                                    "operation": "add_note",
-                                    "repair_order_id": "ro-1",
-                                    "arguments": {"body": "ready"},
-                                }
-                            ]
-                        }
-                    ),
-                }
-                return
-            assert any(message.get("role") == "tool" for message in messages)
-            yield {
-                "type": "content",
-                "text": "That repair order was not found, so nothing could be done.",
-            }
+    truthful = (
+        "The note couldn't be added: the idempotency key belongs to a "
+        "different action."
+    )
+    client = _ScriptedClient(
+        tool_rounds=[[_operator_call("operator-failure")]],
+        candidate="That repair order was not found, so nothing could be done.",
+        review_responses=[
+            _invalid_review(
+                "The receipt reports idempotency_conflict, not a missing "
+                "repair order."
+            ),
+            truthful,
+            VALID_REVIEW,
+        ],
+    )
 
     monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
     events = [
         event
-        async for event in _orchestrator(Client(), registry, store).run_turn(
+        async for event in _orchestrator(client, registry, store).run_turn(
             1, "Add a note to this repair order."
         )
     ]
 
-    expected = calibration_iq_operator_failure_summary(failure)
     token_text = "".join(
         event["text"] for event in events if event.get("type") == "token"
     )
-    assert token_text == expected
-    assert "idempotency_conflict" in token_text
-    assert "Verified actions: 0 of 1; processed actions: 1 of 1." in token_text
+    assert token_text == truthful
     assert "not found" not in token_text
-    assert "I will update" not in token_text
+    assert len(registry.invocations) == 1  # language repair never re-executes
+    assert client.no_tool_calls == 3  # review, one regeneration, final review
     assert store.saved is not None
-    assert store.saved[0][2] == expected
+    assert store.saved[0][2] == truthful
 
 
 @pytest.mark.asyncio
-async def test_later_verified_operator_self_correction_seals_success_summary(
+async def test_supported_self_correction_candidate_is_released_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A failed attempt corrected by a later verified receipt supports the
+    # model's concise success claim, so the candidate is released as written --
+    # not replaced by the deterministic audit renderer.
     registry = _Registry([_failed_result(), _successful_result()])
     store = _Store()
-
-    class Client:
-        calls = 0
-
-        async def stream(self, _messages: list[dict], tools: Any = None):
-            self.calls += 1
-            if self.calls <= 2:
-                yield {
-                    "type": "tool_call",
-                    "id": f"operator-attempt-{self.calls}",
-                    "name": "calibration_iq_operator",
-                    "arguments": json.dumps(
-                        {
-                            "actions": [
-                                {
-                                    "operation": "add_note",
-                                    "repair_order_id": "ro-1",
-                                    "arguments": {"body": "ready"},
-                                }
-                            ]
-                        }
-                    ),
-                }
-                return
-            yield {
-                "type": "content",
-                "text": "The note is now verified in Calibration IQ.",
-            }
+    candidate = "The note is now verified in Calibration IQ."
+    client = _ScriptedClient(
+        tool_rounds=[[_operator_call("attempt-1")], [_operator_call("attempt-2")]],
+        candidate=candidate,
+        review_responses=[VALID_REVIEW],
+    )
 
     monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
     events = [
         event
-        async for event in _orchestrator(Client(), registry, store).run_turn(
+        async for event in _orchestrator(client, registry, store).run_turn(
             1, "Add the note, correcting the request if needed."
         )
     ]
@@ -231,96 +267,84 @@ async def test_later_verified_operator_self_correction_seals_success_summary(
     token_text = "".join(
         event["text"] for event in events if event.get("type") == "token"
     )
+    assert token_text == candidate
     assert len(registry.invocations) == 2
-    assert token_text == calibration_iq_operator_terminal_summary(
+    assert client.no_tool_calls == 1  # one review; no regeneration needed
+    # The audit renderer still exists for cards/debugging but no longer owns
+    # the conversational answer.
+    assert token_text != calibration_iq_operator_terminal_summary(
         [_failed_result(), _successful_result()]
     )
-    assert "verified 1 of 1 requested actions" in token_text
-    assert "add_note -> type=note, id=note-1" in token_text
-    assert "version=6" in token_text
-    assert "Structured error" not in token_text
-    assert "The note is now" not in token_text
     assert store.saved is not None
-    assert store.saved[0][2] == token_text
+    assert store.saved[0][2] == candidate
 
 
 @pytest.mark.asyncio
-async def test_verified_success_replaces_false_version_change_prose_and_keeps_card(
+async def test_false_claim_is_repaired_and_receipt_card_is_kept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     success = _successful_result()
     registry = _Registry([success])
     store = _Store()
-
-    class Client:
-        calls = 0
-
-        async def stream(self, _messages: list[dict], tools: Any = None):
-            self.calls += 1
-            if self.calls == 1:
-                yield {
-                    "type": "tool_call",
-                    "id": "operator-success",
-                    "name": "calibration_iq_operator",
-                    "arguments": json.dumps(
-                        {
-                            "actions": [
-                                {
-                                    "operation": "add_note",
-                                    "repair_order_id": "ro-1",
-                                    "arguments": {"body": "ready"},
-                                }
-                            ]
-                        }
-                    ),
-                }
-                return
-            yield {
-                "type": "content",
-                "text": "The RO version has been incremented to 6.",
-            }
+    truthful = "Done. The note was added and Calibration IQ verified it."
+    client = _ScriptedClient(
+        tool_rounds=[[_operator_call("operator-success")]],
+        candidate="The RO version has been incremented to 6.",
+        review_responses=[
+            _invalid_review(
+                "The evidence shows only the current version, not that this "
+                "action incremented it."
+            ),
+            truthful,
+            VALID_REVIEW,
+        ],
+    )
 
     monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
     events = [
         event
-        async for event in _orchestrator(Client(), registry, store).run_turn(
+        async for event in _orchestrator(client, registry, store).run_turn(
             1, "Add the shared note."
         )
     ]
 
-    expected = calibration_iq_operator_terminal_summary([success])
     token_text = "".join(
         event["text"] for event in events if event.get("type") == "token"
     )
-    assert token_text == expected
+    assert token_text == truthful
     assert "incremented" not in token_text
-    assert "changed" not in token_text
-    assert "Current repair order:" in token_text
-    assert "number=XOP-20260821211550-c28d41ae" in token_text
-    assert "status=REPAIR_IN_PROGRESS" in token_text
-    assert "version=6" in token_text
+    # Full receipt/audit evidence stays available on the card even though the
+    # conversational answer is concise.
     assert any(
         event.get("type") == "artifact"
         and (event.get("artifact") or {}).get("type") == "calibration_iq_receipt"
         for event in events
     )
     assert store.saved is not None
-    assert store.saved[0][2] == expected
+    assert store.saved[0][2] == truthful
 
 
 @pytest.mark.asyncio
-async def test_failed_approved_destructive_result_uses_same_truth_guard(
+async def test_failed_approved_destructive_lie_fails_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     failure = _failed_result(code="conflict", message="The photo version changed.")
     store = _Store()
-
-    class Client:
-        async def stream(self, _messages: list[dict], tools: Any = None):
-            yield {
-                "type": "content",
-                "text": "The photo was already missing from that repair order.",
-            }
+    truthful = (
+        "I couldn't delete the photo: its version changed in Calibration IQ, "
+        "so nothing was removed."
+    )
+    client = _ScriptedClient(
+        candidate="The photo was already missing from that repair order.",
+        review_responses=[
+            _invalid_review(
+                "The receipt reports a version conflict, not an already-"
+                "missing photo."
+            ),
+            truthful,
+            VALID_REVIEW,
+        ],
+    )
 
     monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
     approved = {
@@ -338,7 +362,7 @@ async def test_failed_approved_destructive_result_uses_same_truth_guard(
     }
     events = [
         event
-        async for event in _orchestrator(Client(), _Registry([]), store).run_turn(
+        async for event in _orchestrator(client, _Registry([]), store).run_turn(
             1, "Delete that photo.", approved_tool=approved
         )
     ]
@@ -346,13 +370,12 @@ async def test_failed_approved_destructive_result_uses_same_truth_guard(
     token_text = "".join(
         event["text"] for event in events if event.get("type") == "token"
     )
-    assert token_text == calibration_iq_operator_failure_summary(failure)
-    assert "conflict" in token_text
+    assert token_text == truthful
     assert "already missing" not in token_text
 
 
 @pytest.mark.asyncio
-async def test_verified_approved_destructive_success_is_receipt_sealed(
+async def test_verified_approved_destructive_overclaim_is_reined_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     success = _successful_result()
@@ -366,13 +389,20 @@ async def test_verified_approved_destructive_success_is_receipt_sealed(
         }
     )
     store = _Store()
-
-    class Client:
-        async def stream(self, _messages: list[dict], tools: Any = None):
-            yield {
-                "type": "content",
-                "text": "The photo and all of its retained bytes were permanently erased.",
-            }
+    truthful = "Done. Photo photo-1 was deleted and Calibration IQ verified it."
+    client = _ScriptedClient(
+        candidate=(
+            "The photo and all of its retained bytes were permanently erased."
+        ),
+        review_responses=[
+            _invalid_review(
+                "The evidence verifies the deletion only; it says nothing "
+                "about retained bytes."
+            ),
+            truthful,
+            VALID_REVIEW,
+        ],
+    )
 
     monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
     approved = {
@@ -390,7 +420,7 @@ async def test_verified_approved_destructive_success_is_receipt_sealed(
     }
     events = [
         event
-        async for event in _orchestrator(Client(), _Registry([]), store).run_turn(
+        async for event in _orchestrator(client, _Registry([]), store).run_turn(
             1, "Delete that photo.", approved_tool=approved
         )
     ]
@@ -398,8 +428,7 @@ async def test_verified_approved_destructive_success_is_receipt_sealed(
     token_text = "".join(
         event["text"] for event in events if event.get("type") == "token"
     )
-    assert token_text == calibration_iq_operator_terminal_summary([success])
-    assert "delete_photo -> type=photo, id=photo-1" in token_text
+    assert token_text == truthful
     assert "permanently erased" not in token_text
     assert any(
         event.get("type") == "artifact"
@@ -649,16 +678,31 @@ def test_later_indeterminate_result_invalidates_older_current_snapshot() -> None
     assert "version=6" not in zero_count_summary
 
 
+
 @pytest.mark.asyncio
 async def test_approved_success_fails_closed_when_outer_receipt_does_not_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The deterministic approval-replay verification stays exactly where it
+    # was: a tampered outer receipt downgrades the result to failed before the
+    # model ever speaks. The truth review then rejects any success claim.
     success = _successful_result()
     store = _Store()
-
-    class Client:
-        async def stream(self, _messages: list[dict], tools: Any = None):
-            yield {"type": "content", "text": "The photo was deleted successfully."}
+    truthful = (
+        "That deletion could not be verified: the approval receipt did not "
+        "match the executed action."
+    )
+    client = _ScriptedClient(
+        candidate="The photo was deleted successfully.",
+        review_responses=[
+            _invalid_review(
+                "The result is an approval_receipt_mismatch failure, not a "
+                "verified deletion."
+            ),
+            truthful,
+            VALID_REVIEW,
+        ],
+    )
 
     monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
     approved = {
@@ -676,7 +720,7 @@ async def test_approved_success_fails_closed_when_outer_receipt_does_not_match(
     }
     events = [
         event
-        async for event in _orchestrator(Client(), _Registry([]), store).run_turn(
+        async for event in _orchestrator(client, _Registry([]), store).run_turn(
             1, "Delete that photo.", approved_tool=approved
         )
     ]
@@ -684,9 +728,8 @@ async def test_approved_success_fails_closed_when_outer_receipt_does_not_match(
     token_text = "".join(
         event["text"] for event in events if event.get("type") == "token"
     )
-    assert "approval_receipt_mismatch" in token_text
+    assert token_text == truthful
     assert "deleted successfully" not in token_text
-    assert "Calibration IQ verified" not in token_text
     ciq_card = next(
         event["artifact"]["data"]
         for event in events
@@ -697,16 +740,20 @@ async def test_approved_success_fails_closed_when_outer_receipt_does_not_match(
 
 
 @pytest.mark.asyncio
-async def test_routine_success_is_summarized_before_destructive_approval_pause(
+async def test_routine_success_before_destructive_pause_is_synthesized_and_reviewed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A routine action completes, then a destructive call pauses the turn for
+    # approval, so no model candidate exists. The orchestrator synthesizes one
+    # from the receipts with a bounded tools=None call and truth-reviews it;
+    # the pre-tool narration stays sealed and the protected handler never runs.
     success = _successful_result()
 
     class ApprovalStore(_Store):
-        def create_approval(self, *_args: Any, **_kwargs: Any) -> str:
+        def create_approval(self, *_args, **_kwargs) -> str:
             return "approval-1"
 
-        def get_approval(self, _approval_id: str) -> dict[str, Any]:
+        def get_approval(self, _approval_id: str) -> dict:
             return {
                 "id": "approval-1",
                 "tool_name": "calibration_iq_destructive",
@@ -720,7 +767,7 @@ async def test_routine_success_is_summarized_before_destructive_approval_pause(
     class ApprovalRegistry:
         protected_handler_ran = False
 
-        def model_tools(self, _role: str = "owner") -> list[dict[str, Any]]:
+        def model_tools(self, _role: str = "owner") -> list[dict]:
             return [
                 {
                     "type": "function",
@@ -732,7 +779,7 @@ async def test_routine_success_is_summarized_before_destructive_approval_pause(
                 )
             ]
 
-        async def invoke(self, name: str, _args: dict, **_kwargs: Any) -> dict:
+        async def invoke(self, name: str, _args: dict, **_kwargs) -> dict:
             if name == "calibration_iq_operator":
                 return success
             if name == "calibration_iq_destructive":
@@ -745,7 +792,7 @@ async def test_routine_success_is_summarized_before_destructive_approval_pause(
             return args
 
         @staticmethod
-        def public_approval(record: dict, receipt: Any = None) -> dict:
+        def public_approval(record: dict, receipt=None) -> dict:
             del receipt
             return {
                 "tool": record["tool_name"],
@@ -753,40 +800,43 @@ async def test_routine_success_is_summarized_before_destructive_approval_pause(
                 "args": record["args"],
             }
 
+    synthesized = (
+        "Added the note to RO 1; the photo deletion is waiting for your "
+        "approval."
+    )
+
     class Client:
-        async def stream(self, _messages: list[dict], tools: Any = None):
+        def __init__(self) -> None:
+            self.review_responses = [synthesized, VALID_REVIEW]
+            self.no_tool_calls = 0
+
+        async def stream(self, _messages, tools=None):
+            if tools is None:
+                self.no_tool_calls += 1
+                yield {"type": "content", "text": self.review_responses.pop(0)}
+                return
             yield {"type": "content", "text": "Everything is already complete."}
-            yield {
-                "type": "tool_call",
-                "id": "routine-call",
-                "name": "calibration_iq_operator",
-                "arguments": json.dumps(
-                    {
-                        "actions": [
-                            {
-                                "operation": "add_note",
-                                "repair_order_id": "ro-1",
-                                "arguments": {"body": "ready"},
-                            }
-                        ]
-                    }
-                ),
-            }
+            yield _operator_call("routine-call")
             yield {
                 "type": "tool_call",
                 "id": "destructive-call",
                 "name": "calibration_iq_destructive",
                 "arguments": json.dumps(
-                    {"actions": [{"operation": "delete_photo", "target_id": "photo-1"}]}
+                    {
+                        "actions": [
+                            {"operation": "delete_photo", "target_id": "photo-1"}
+                        ]
+                    }
                 ),
             }
 
     monkeypatch.setattr(loop_mod.prompt_mod, "build_messages", lambda *_a, **_k: [])
     store = ApprovalStore()
     registry = ApprovalRegistry()
+    client = Client()
     events = [
         event
-        async for event in _orchestrator(Client(), registry, store).run_turn(
+        async for event in _orchestrator(client, registry, store).run_turn(
             1,
             "Add the note, then delete the photo.",
             approval_context={
@@ -797,13 +847,13 @@ async def test_routine_success_is_summarized_before_destructive_approval_pause(
         )
     ]
 
-    expected = calibration_iq_operator_terminal_summary([success])
     token_text = "".join(
         event["text"] for event in events if event.get("type") == "token"
     )
-    assert token_text == expected
+    assert token_text == synthesized
     assert "Everything is already complete" not in token_text
+    assert client.no_tool_calls == 2  # synthesis + one review, both tool-less
     assert any(event.get("type") == "approval" for event in events)
     assert registry.protected_handler_ran is False
     assert store.saved is not None
-    assert store.saved[0][2] == expected
+    assert store.saved[0][2] == synthesized

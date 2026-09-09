@@ -65,7 +65,7 @@ Choose among these sources from the actual question and returned evidence. This 
 OPERATOR_TRUTH = """## Operator truth
 Calibration IQ writes require fresh schema ids/versions, receipts, and rereads. `close_ro` is the normal whole-RO finished/Complete transition and changes no child calibration. `change_status` is only for an explicitly named target status in `arguments.status`, never generic closure. Use `complete_calibration` only for an explicit child-state request with fresh target/version. Destructive child deletion requires approval. Completion requires verified receipts and final snapshot.
 
-Copy opaque ids exactly from authoritative results; never guess. Started or queued is not completed. Authentication required, conflict, partial, indeterminate, may-have-executed, failed, and unverified are not success. Keep field responses concise: decisive answer first, then evidence or unresolved boundary.
+Copy opaque ids exactly from authoritative results; never guess. Started or queued is not completed. Authentication required, conflict, partial, indeterminate, may-have-executed, failed, and unverified are not success. Answer the actual question first at the minimum useful detail; expand when asked. Use all returned evidence internally, but volunteer receipts, counts, exception inventories, or workflow diagnostics only when omitting them would make the answer false or Otis asks.
 """
 
 WORKER_OMNI = """## Active worker

@@ -33,12 +33,22 @@ class _ModelClient:
         self,
         args: dict[str, Any],
         final_text: str = "The work-prep audit found one exception.",
+        review_responses: tuple[str, ...] = (),
     ) -> None:
         self.args = args
         self.final_text = final_text
+        # Responses for tools=None calls: the truth review / regeneration /
+        # synthesis path. Structural split -- the orchestrator advertises no
+        # tools on those calls, so language repair cannot execute anything.
+        self.review_responses = list(review_responses)
         self.calls = 0
+        self.no_tool_calls = 0
 
     async def stream(self, _messages, tools=None):
+        if tools is None:
+            self.no_tool_calls += 1
+            yield {"type": "content", "text": self.review_responses.pop(0)}
+            return
         assert tools
         self.calls += 1
         if self.calls == 1:
@@ -50,6 +60,27 @@ class _ModelClient:
             }
             return
         yield {"type": "content", "text": self.final_text}
+
+
+VALID_REVIEW = json.dumps(
+    {
+        "valid": True,
+        "unsupported_claims": [],
+        "contradictions": [],
+        "correction_guidance": "",
+    }
+)
+
+
+def _invalid_review(*contradictions: str) -> str:
+    return json.dumps(
+        {
+            "valid": False,
+            "unsupported_claims": [],
+            "contradictions": list(contradictions),
+            "correction_guidance": "State only what the structured audit proves.",
+        }
+    )
 
 
 class _Registry:
@@ -180,14 +211,17 @@ async def test_work_prep_turn_uses_model_selected_structured_mode(
     )
     text = "".join(event["text"] for event in events if event.get("type") == "token")
     assert registry.last_result is not None
-    assert text == prep.summarize(expected_mode, registry.last_result)
-    assert "The work-prep audit found one exception." not in text
+    # Model-first boundary: for a read/audit turn the model's own synthesis is
+    # the final answer. The deterministic audit renderer must not replace it,
+    # and the truth review is not invoked (no tools=None calls were made).
+    assert text == "The work-prep audit found one exception."
+    assert text != prep.summarize(expected_mode, registry.last_result)
+    assert client.no_tool_calls == 0
     assert store.saved is not None and store.saved[0][2] == text
 
 
-@pytest.mark.asyncio
-async def test_work_prep_terminal_summary_seals_counts_exceptions_and_receipt_truth():
-    result = {
+def _mutating_week_result() -> dict[str, Any]:
+    return {
         "status": "partial_success",
         "mode": "week_readiness",
         "executed": True,
@@ -226,12 +260,56 @@ async def test_work_prep_terminal_summary_seals_counts_exceptions_and_receipt_tr
             for ro_number in (401, 402, 403)
         ],
     }
-    registry = _Registry(result)
+
+
+def test_work_prep_audit_renderer_still_reports_counts_exceptions_and_receipts():
+    """The audit renderer is preserved for cards/diagnostics.
+
+    It no longer owns the conversational answer, but its receipt/exception
+    truth must stay intact for the UI card and debugging.
+    """
+    from core.orchestrator.loop import calibration_iq_work_prep_terminal_summary
+
+    text = calibration_iq_work_prep_terminal_summary([_mutating_week_result()])
+
+    assert "No — 5 of 8" in text
+    assert all(f"RO {ro_number}" in text for ro_number in (401, 402, 403))
+    assert "2 additional RO exception(s)" in text
+    assert "1 verified of 2 requested; 1 processed; 1 returned; 1 unverified" in text
+    assert "Indeterminate reconciliation outcomes: 1" in text
+    assert "may-have-executed outcomes: 1" in text
+
+
+@pytest.mark.asyncio
+async def test_mutating_week_prep_lie_is_regenerated_against_receipt_truth():
+    """A week-prep turn that reconciled CIQ mutations gets the truth review.
+
+    The result carries receipts plus indeterminate reconciliation outcomes, so
+    an optimistic candidate must be rejected and regenerated -- language only:
+    the tool is never invoked a second time.
+    """
+    registry = _Registry(_mutating_week_result())
     store = _Store("prepare us for the week")
     model_lie = "All eight vehicles are ready and both CIQ changes completed."
+    truthful = (
+        "5 of 8 aren't ready yet, and only one of the two CIQ changes "
+        "verified — one outcome is still indeterminate."
+    )
+    client = _ModelClient(
+        {"mode": "week_readiness"},
+        model_lie,
+        review_responses=(
+            _invalid_review(
+                "The audit shows 5 of 8 not ready and one indeterminate "
+                "reconciliation outcome, not completed changes."
+            ),
+            truthful,
+            VALID_REVIEW,
+        ),
+    )
     orchestrator = Orchestrator(
         _Router(),
-        _ModelClient({"mode": "week_readiness"}, model_lie),
+        client,
         registry,
         store,
         SimpleNamespace(context_tokens=32768, max_response_tokens=1024),
@@ -247,13 +325,10 @@ async def test_work_prep_terminal_summary_seals_counts_exceptions_and_receipt_tr
     ]
     text = "".join(event["text"] for event in events if event.get("type") == "token")
 
+    assert text == truthful
     assert model_lie not in text
-    assert "No — 5 of 8" in text
-    assert all(f"RO {ro_number}" in text for ro_number in (401, 402, 403))
-    assert "2 additional RO exception(s)" in text
-    assert "1 verified of 2 requested; 1 processed; 1 returned; 1 unverified" in text
-    assert "Indeterminate reconciliation outcomes: 1" in text
-    assert "may-have-executed outcomes: 1" in text
+    assert len(registry.invocations) == 1  # language repair never re-executes
+    assert client.no_tool_calls == 3  # review, one regeneration, final review
     assert store.saved is not None and store.saved[0][2] == text
 
 
@@ -319,7 +394,13 @@ async def test_real_registry_binds_work_prep_context_and_logs_partial_receipts_f
 
 
 @pytest.mark.asyncio
-async def test_one_ro_si_acquisition_terminal_summary_reports_capture_not_local_miss():
+async def test_one_ro_si_acquisition_local_miss_lie_is_regenerated():
+    """An executed SI acquisition is a state change, so it gets the review.
+
+    The candidate claims a local miss while the evidence shows a verified
+    ALLDATA capture saved into ADAS SI; the review rejects it and the
+    regenerated wording reports the capture. No second acquisition runs.
+    """
     result = {
         "status": "captured",
         "mode": "ro_si_acquire",
@@ -350,6 +431,11 @@ async def test_one_ro_si_acquisition_terminal_summary_reports_capture_not_local_
     }
     registry = _Registry(result)
     store = _Store("get the front long range radar SI for this row")
+    truthful = (
+        "Captured and verified the front long-range radar procedure from "
+        "ALLDATA; saved as Front Radar Calibration.pdf in ADAS SI and linked "
+        "to the RO."
+    )
     client = _ModelClient(
         {
             "mode": "ro_si_acquire",
@@ -357,6 +443,14 @@ async def test_one_ro_si_acquisition_terminal_summary_reports_capture_not_local_
             "topic": "front long-range radar SI",
         },
         "There is no local SI.",
+        review_responses=(
+            _invalid_review(
+                "The result shows a verified ALLDATA capture saved into "
+                "ADAS SI, not a miss."
+            ),
+            truthful,
+            VALID_REVIEW,
+        ),
     )
     orchestrator = Orchestrator(
         _Router(),
@@ -383,16 +477,19 @@ async def test_one_ro_si_acquisition_terminal_summary_reports_capture_not_local_
         event["text"] for event in events if event.get("type") == "token"
     )
 
-    assert "captured 1 verified ALLDATA SI procedure" in text
+    assert text == truthful
     assert "Front Radar Calibration.pdf" in text
     assert "There is no local SI." not in text
-    assert "CIQ mutation receipts: 0" not in text
+    assert len(registry.invocations) == 1  # the acquisition never re-runs
     assert registry.invocations[0][1]["mode"] == "ro_si_acquire"
 
 
 class _SIModelClient(_ModelClient):
     async def stream(self, _messages, tools=None):
-        assert tools
+        if tools is None:
+            self.no_tool_calls += 1
+            yield {"type": "content", "text": self.review_responses.pop(0)}
+            return
         self.calls += 1
         if self.calls == 1:
             yield {
@@ -421,7 +518,8 @@ class _SIRegistry(_Registry):
 
 
 @pytest.mark.asyncio
-async def test_alldata_service_information_ro_result_is_truth_sealed():
+async def test_alldata_service_information_false_miss_is_repaired_by_review():
+    """Same review boundary through the explicit ALLDATA SI capability."""
     result = {
         "status": "captured",
         "mode": "ro_si_acquire",
@@ -450,12 +548,23 @@ async def test_alldata_service_information_ro_result_is_truth_sealed():
     }
     registry = _SIRegistry(result)
     store = _Store("get the front long range radar SI for this ro 2400612495")
+    truthful = (
+        "Got it — the front long-range radar procedure is captured from "
+        "ALLDATA, verified, and linked to RO 2400612495."
+    )
     client = _SIModelClient(
         {
             "repair_order_id": "2400612495",
             "topic": "front long-range radar SI",
         },
         "No service information was found.",
+        review_responses=(
+            _invalid_review(
+                "The result shows a verified ALLDATA capture, not a miss."
+            ),
+            truthful,
+            VALID_REVIEW,
+        ),
     )
     orchestrator = Orchestrator(
         _Router(),
@@ -487,8 +596,9 @@ async def test_alldata_service_information_ro_result_is_truth_sealed():
         "repair_order_id": "2400612495",
         "topic": "front long-range radar SI",
     }
-    assert "captured 1 verified ALLDATA SI procedure" in text
+    assert text == truthful
     assert "No service information was found." not in text
+    assert len(registry.invocations) == 1  # the acquisition never re-runs
 
 
 @pytest.mark.asyncio
