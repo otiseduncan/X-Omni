@@ -2327,3 +2327,109 @@ async def test_handle_routes_ro_si_acquire_mode(monkeypatch):
     assert observed["repair_order_id"] == "2400612495"
     assert observed["topic"] == "front long-range radar SI"
     assert result["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_adas_map_inventory_is_ciq_only_and_supports_multi_phase_scope(monkeypatch):
+    rows = [
+        {"id": "ro-1", "ro_number": "2400610001", "phase": 1},
+        {"id": "ro-2", "ro_number": "2400610002", "phase": 2},
+        {"id": "ro-8", "ro_number": "2400610008", "phase": 8},
+        {"id": "ro-9", "ro_number": "2400610009", "phase": 9},
+    ]
+
+    async def fake_query(_settings, filters):
+        assert filters == {"include_completed": False}
+        return {"status": "verified", "items": rows}
+
+    snapshots = {
+        "ro-1": {
+            "repair_order": {"id": "ro-1", "ro_number": "2400610001"},
+            "vehicle": {"year": 2024, "make": "Nissan", "model": "Kicks"},
+            "documents": [{"title": "ADAS Map Report - RO 2400610001"}],
+        },
+        "ro-2": {
+            "repair_order": {"id": "ro-2", "ro_number": "2400610002"},
+            "vehicle": {"year": 2023, "make": "Toyota", "model": "Camry"},
+            "documents": [{"title": "Damage photo"}],
+        },
+        "ro-8": {
+            "repair_order": {"id": "ro-8", "ro_number": "2400610008"},
+            "vehicle": {
+                "year": 2025,
+                "make": "Honda",
+                "model": "Accord",
+                "repair_information": {
+                    "adas_map": {
+                        "provider": "ADAS Map",
+                        "required_calibrations": [
+                            {"label": "Forward camera calibration"}
+                        ],
+                    }
+                },
+            },
+        },
+        "ro-9": {
+            "repair_order": {"id": "ro-9", "ro_number": "2400610009"},
+            "vehicle": {"year": 2022, "make": "Ford", "model": "Escape"},
+        },
+    }
+
+    async def fake_snapshot(_settings, ident):
+        return {"status": "verified", "snapshot": snapshots[ident]}
+
+    async def must_not_call_scrapex(*_args, **_kwargs):
+        raise AssertionError("read-only CIQ inventory must never call ScrapeX")
+
+    monkeypatch.setattr(prep.calibration_iq, "query_repair_orders", fake_query)
+    monkeypatch.setattr(prep, "_load_ro_snapshot", fake_snapshot)
+    monkeypatch.setattr(prep.scrapex_svc, "adas_map", must_not_call_scrapex)
+
+    result = await prep._adas_map_inventory(  # noqa: SLF001
+        SimpleNamespace(),
+        {"phases": ["1", "2", "3", "4", "5", "6", "7", "8"]},
+    )
+
+    assert result["status"] == "verified"
+    assert result["source"] == "calibration_iq"
+    assert result["read_only"] is True
+    assert result["scrapex_called"] is False
+    assert result["queue_count"] == 3
+    assert result["adas_map_present_count"] == 2
+    assert result["adas_map_missing_count"] == 1
+    assert result["adas_map_unverified_count"] == 0
+    assert result["phase_counts"]["1"] == {
+        "total": 1,
+        "present": 1,
+        "missing": 0,
+        "unverified": 0,
+    }
+    assert result["phase_counts"]["2"] == {
+        "total": 1,
+        "present": 0,
+        "missing": 1,
+        "unverified": 0,
+    }
+    assert result["phase_counts"]["8"] == {
+        "total": 1,
+        "present": 1,
+        "missing": 0,
+        "unverified": 0,
+    }
+    assert [item["ro_number"] for item in result["missing_repair_orders"]] == [
+        "2400610002"
+    ]
+
+
+def test_adas_map_inventory_schema_is_explicitly_ciq_only():
+    prep.install()
+    schema = registry_mod.TOOL_SCHEMAS["calibration_iq_work_prep"]
+    description = schema["description"].casefold()
+    modes = schema["parameters"]["properties"]["mode"]["enum"]
+    phases = schema["parameters"]["properties"]["phases"]
+
+    assert "adas_map_inventory" in modes
+    assert "reads calibration iq only" in description
+    assert "never calls scrapex" in description
+    assert phases["maxItems"] >= 8
+    assert phases["uniqueItems"] is True
