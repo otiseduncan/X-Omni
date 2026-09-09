@@ -2902,6 +2902,206 @@ async def _week_readiness(
     }
 
 
+async def _adas_map_inventory(
+    settings: Any, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Read-only Calibration IQ inventory of attached ADAS Map reports.
+
+    This deliberately does not call ScrapeX, reconcile CIQ calibrations, inspect
+    ADAS SI, or start any acquisition. It answers ordinary board questions such
+    as "how many active cars in phases 1-8 are missing an ADAS Map?" from
+    Calibration IQ's current repair-order snapshots.
+    """
+    raw_phases = args.get("phases")
+    if raw_phases is not None and not isinstance(raw_phases, list):
+        return {
+            "status": "invalid_request",
+            "mode": "adas_map_inventory",
+            "success": False,
+            "verified": False,
+            "message": "phases must be an array when supplied.",
+        }
+
+    phase_scope: list[str] = []
+    for value in raw_phases or []:
+        token = calibration_iq.normalize_phase(value)
+        if token and token not in phase_scope:
+            phase_scope.append(token)
+
+    filters: dict[str, Any] = {"include_completed": False}
+    shop = str(args.get("shop") or "").strip()
+    if shop:
+        filters["shop"] = shop
+
+    queue = await calibration_iq.query_repair_orders(settings, filters)
+    if queue.get("status") != "verified":
+        return {
+            "status": "failed",
+            "mode": "adas_map_inventory",
+            "success": False,
+            "verified": False,
+            "message": queue.get("message")
+            or "Calibration IQ did not return a complete active board.",
+            "calibration_iq": queue,
+        }
+
+    rows = [
+        item
+        for item in (queue.get("items") or [])
+        if isinstance(item, dict) and _row_is_source_active(item)
+    ]
+    requested_phases = set(phase_scope)
+    if requested_phases:
+        rows = [
+            row
+            for row in rows
+            if _row_phase_token(row) in requested_phases
+        ]
+
+    semaphore = asyncio.Semaphore(8)
+
+    async def load(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        ident = str(
+            calibration_iq._dig(  # noqa: SLF001
+                item,
+                "id",
+                "repair_order_id",
+                "uuid",
+                "ro_number",
+                "roNumber",
+                "number",
+                "ro",
+            )
+            or ""
+        ).strip()
+        async with semaphore:
+            return item, await _load_ro_snapshot(settings, ident)
+
+    loaded = await asyncio.gather(*(load(item) for item in rows))
+    phase_counts: dict[str, dict[str, int]] = {}
+    for phase in phase_scope:
+        phase_counts[phase] = {
+            "total": 0,
+            "present": 0,
+            "missing": 0,
+            "unverified": 0,
+        }
+
+    missing_rows: list[dict[str, Any]] = []
+    unverified_rows: list[dict[str, Any]] = []
+    present_count = 0
+    missing_count = 0
+    unverified_count = 0
+
+    for row, envelope in loaded:
+        phase = _row_phase_token(row) or "unknown"
+        bucket = phase_counts.setdefault(
+            phase,
+            {"total": 0, "present": 0, "missing": 0, "unverified": 0},
+        )
+        bucket["total"] += 1
+
+        fallback_ro = str(
+            calibration_iq._dig(  # noqa: SLF001
+                row, "ro_number", "roNumber", "number", "ro"
+            )
+            or ""
+        )
+        fallback_vehicle = calibration_iq._vehicle_label(row)  # noqa: SLF001
+
+        if envelope.get("status") != "verified" or not isinstance(
+            envelope.get("snapshot"), dict
+        ):
+            unverified_count += 1
+            bucket["unverified"] += 1
+            unverified_rows.append(
+                {
+                    "ro_number": fallback_ro,
+                    "vehicle": fallback_vehicle,
+                    "phase": phase,
+                    "reason": envelope.get("message")
+                    or "Calibration IQ exact-RO detail was unavailable.",
+                }
+            )
+            continue
+
+        snapshot = dict(envelope["snapshot"])
+        map_info = extract_adas_map(snapshot)
+        map_status = str(map_info.get("status") or "not_found")
+        detail = {
+            "repair_order_id": str(
+                calibration_iq._authoritative_repair_order_id(snapshot) or ""  # noqa: SLF001
+            ),
+            "ro_number": _ro_number(snapshot, fallback_ro),
+            "vehicle": _vehicle_label(snapshot, fallback_vehicle),
+            "phase": phase,
+            "adas_map_status": map_status,
+        }
+
+        if map_status == "not_found":
+            missing_count += 1
+            bucket["missing"] += 1
+            missing_rows.append(detail)
+        elif map_status in {"verified", "present_unparsed"}:
+            present_count += 1
+            bucket["present"] += 1
+        else:
+            unverified_count += 1
+            bucket["unverified"] += 1
+            unverified_rows.append(
+                {
+                    **detail,
+                    "reason": map_info.get("reason")
+                    or "Calibration IQ ADAS Map state could not be classified.",
+                }
+            )
+
+    ordered_phase_counts = {
+        key: phase_counts[key]
+        for key in sorted(
+            phase_counts,
+            key=lambda value: (
+                0,
+                int(value),
+            )
+            if str(value).isdigit()
+            else (1, str(value)),
+        )
+    }
+    scope_label = (
+        f"phases {phase_scope[0]}-{phase_scope[-1]}"
+        if len(phase_scope) > 1
+        else f"phase {phase_scope[0]}"
+        if phase_scope
+        else "the active board"
+    )
+
+    return {
+        "status": "verified",
+        "mode": "adas_map_inventory",
+        "success": True,
+        "verified": True,
+        "source": "calibration_iq",
+        "source_bounded": True,
+        "read_only": True,
+        "scrapex_called": False,
+        "filters": filters,
+        "phase_scope": phase_scope or ["active"],
+        "queue_count": len(rows),
+        "adas_map_present_count": present_count,
+        "adas_map_missing_count": missing_count,
+        "adas_map_unverified_count": unverified_count,
+        "phase_counts": ordered_phase_counts,
+        "missing_repair_orders": missing_rows,
+        "unverified_repair_orders": unverified_rows,
+        "message": (
+            f"Calibration IQ ADAS Map inventory completed for {scope_label}: "
+            f"{missing_count} missing, {present_count} present, "
+            f"{unverified_count} unverified out of {len(rows)} active ROs."
+        ),
+    }
+
+
 async def _phase_coverage(
     settings: Any, adas: Any, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -3004,6 +3204,8 @@ async def handle(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, An
         return await _phase_list(settings, args)
     if mode == "ro_requirements":
         return await _ro_requirements(settings, adas, args)
+    if mode == "adas_map_inventory":
+        return await _adas_map_inventory(settings, args)
     if mode == "ro_si_acquire":
         return await _ro_si_acquire(settings, adas, args)
     if mode == "week_readiness":
@@ -3753,10 +3955,13 @@ def install() -> None:
                 "description": (
                     "Authoritative Calibration IQ source for active field-work preparation; "
                     "does not read Google Calendar appointments or events. Use it to list "
-                    "one explicitly named production phase or read/reconcile one RO's "
-                    "governing ADAS Map calibration requirements. Calibration IQ "
-                    "service-information coverage, acquisition, and missing-SI queues are dormant. "
-                    "Do not invent/default a phase."
+                    "one explicitly named production phase, read/reconcile one RO's governing "
+                    "ADAS Map calibration requirements, or answer read-only questions about "
+                    "which active ROs already have or are missing an attached ADAS Map. "
+                    "For ADAS Map presence/count/list questions use adas_map_inventory; it "
+                    "reads Calibration IQ only and never calls ScrapeX or starts acquisition. "
+                    "Calibration IQ service-information coverage, acquisition, and missing-SI "
+                    "queues are dormant. Do not invent/default a phase or shop."
                 ),
                 "parameters": {
                     "type": "object",
@@ -3767,10 +3972,12 @@ def install() -> None:
                             "enum": [
                                 "phase_list",
                                 "ro_requirements",
+                                "adas_map_inventory",
                             ],
                             "description": (
-                                "Active CIQ preparation operation: list one explicitly named phase "
-                                "or read/reconcile one RO's governing ADAS Map requirements."
+                                "Active CIQ preparation operation: list one explicitly named phase, "
+                                "read/reconcile one RO's governing ADAS Map requirements, or run a "
+                                "read-only CIQ ADAS Map presence inventory."
                             ),
                         },
                         "repair_order_id": {"type": "string"},
@@ -3782,7 +3989,25 @@ def install() -> None:
                                 "one from prior context or choose a default."
                             ),
                         },
-                        "shop": {"type": "string"},
+                        "phases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 16,
+                            "uniqueItems": True,
+                            "description": (
+                                "Optional explicit phase set for adas_map_inventory, e.g. "
+                                "['1','2','3','4','5','6','7','8']. Omit to inspect the whole "
+                                "active Calibration IQ board. Never infer phases from prior context."
+                            ),
+                        },
+                        "shop": {
+                            "type": "string",
+                            "description": (
+                                "Use only when the user's current request explicitly names a shop. "
+                                "Never carry a shop forward from prior conversation context."
+                            ),
+                        },
                     },
                     "required": ["mode"],
                     "allOf": [
