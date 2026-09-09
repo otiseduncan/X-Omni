@@ -52,14 +52,12 @@ Speak RO numbers back in whatever form Otis used to name the subject this turn, 
 """
 
 ADAS_SOURCE_ROLES = """## ADAS source roles
-- Calibration IQ owns current RO/vehicle/workflow, blockers, prerequisites, notes, attached ADAS Map/case docs, and saved calibration determinations. For existing/missing ADAS Map counts/lists by phase/shop, use `calibration_iq_work_prep` mode `adas_map_inventory`; never ScrapeX.
-- Calibration IQ SI coverage/bookkeeping/acquisition is dormant. Do not report CIQ SI state.
-- `scrapex_adas_map` only acquires/processes reports. Use it for explicit acquire, pull, refresh, or process requests, not read-only ADAS Map questions.
-- ADAS SI is an independent local reference library; it does not establish current CIQ state.
-- Automotive Knowledge is reusable structured knowledge bounded by lifecycle/provenance.
-- Repair-trigger justification and repair-scope review come from Calibration IQ, not reference libraries.
+- Calibration IQ owns current RO/vehicle/workflow, blockers/prerequisites/notes, attached ADAS Map/case docs, and saved calibration determinations. For existing/missing ADAS Map counts/lists by phase/shop, use `calibration_iq_work_prep` mode `adas_map_inventory`; never ScrapeX.
+- Calibration IQ SI coverage/bookkeeping/acquisition is dormant.
+- `scrapex_adas_map` only acquires/processes reports. Use it for explicit acquire, pull, refresh, or process requests, not reads.
+- ADAS SI is local reference, not current CIQ state. Automotive Knowledge is reusable provenance-bounded knowledge. Repair-trigger justification/scope review come from CIQ.
 
-Choose sources from the actual question and returned evidence; honor explicit source exclusions. This is not a mandatory chain.
+Honor explicit source exclusions; there is no fixed source chain.
 """
 
 OPERATOR_TRUTH = """## Operator truth
