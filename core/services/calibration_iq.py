@@ -59,6 +59,32 @@ TERMINAL_STATUSES = frozenset({
     "no calibration required",
 })
 
+# The exact workflow-status vocabulary Calibration IQ's collection filter
+# accepts, in board order, taken from the service's own HTTP 422 enum
+# rejection -- which remains the authority. Advertising it to the model stops
+# invented values like "IN_PROGRESS" (an immediate 422 and a wasted round
+# trip), and a status CIQ adds later still reaches the API and is judged
+# there rather than blocked here.
+#
+# The real hazard is not an invalid value -- that fails loudly -- but a valid
+# one nobody asked for. "How many cars are in phase 5" answered 0 because the
+# model volunteered status=CALIBRATION_IN_PROGRESS: legal, currently matching
+# nothing, silently hiding all 36. A filter must come from Otis's request,
+# never from the model's sense of what "active" ought to mean.
+WORKFLOW_STATUSES = (
+    "NEW_ARRIVAL",
+    "NEEDS_TECHNICIAN_REVIEW",
+    "INITIAL_ASSESSMENT_COMPLETE",
+    "REPAIR_IN_PROGRESS",
+    "WAITING_ON_PREREQUISITES",
+    "READY_FOR_TECHNICIAN_VERIFICATION",
+    "CALIBRATION_READY",
+    "CALIBRATION_IN_PROGRESS",
+    "RETURNED_TO_SHOP",
+    "CALIBRATION_COMPLETE",
+    "ARCHIVED",
+)
+
 READ_TIMEOUT = 20.0
 MUTATE_TIMEOUT = 25.0
 HEALTH_TIMEOUT = 4.0

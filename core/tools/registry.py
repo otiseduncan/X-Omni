@@ -1720,6 +1720,43 @@ class NeedsApproval(Exception):
         super().__init__(summary)
 
 
+# Calibration IQ's workflow-status filter, shared by the board summary and
+# list reads. Mirrors calibration_iq.WORKFLOW_STATUSES -- duplicated rather
+# than imported because importing the service here would pull in
+# services/__init__, whose install() hooks import this module back. A test
+# pins the two together so they cannot drift.
+#
+# The enum stops invented values ("IN_PROGRESS" is an immediate HTTP 422 and a
+# wasted round trip). The description carries the same never-infer contract
+# `phase` already has, and for the same reason: a status Otis never asked for
+# silently narrows the board. Asking "how many cars are in phase 5" once
+# answered 0, because the model added status=CALIBRATION_IN_PROGRESS -- a
+# legal value matching nothing, hiding all 36.
+_CIQ_STATUS_PARAM: dict[str, Any] = {
+    "type": "string",
+    "enum": [
+        "NEW_ARRIVAL",
+        "NEEDS_TECHNICIAN_REVIEW",
+        "INITIAL_ASSESSMENT_COMPLETE",
+        "REPAIR_IN_PROGRESS",
+        "WAITING_ON_PREREQUISITES",
+        "READY_FOR_TECHNICIAN_VERIFICATION",
+        "CALIBRATION_READY",
+        "CALIBRATION_IN_PROGRESS",
+        "RETURNED_TO_SHOP",
+        "CALIBRATION_COMPLETE",
+        "ARCHIVED",
+    ],
+    "description": (
+        "Exact CIQ workflow status, only when the user's current request names "
+        "one. Never infer or default a status: omitting it reads the whole "
+        "active board, which is what an unqualified count or list asks for. "
+        "Do not add one to express 'active', 'open', or 'in progress' -- "
+        "finished work is already excluded unless include_completed is true."
+    ),
+}
+
+
 # Tool schemas advertised to the model. Kept in one place so the registry
 # and the prompt can never drift apart.
 TOOL_SCHEMAS: dict[str, dict] = {
@@ -2405,7 +2442,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "Never infer or default a phase."
                     ),
                 },
-                "status": {"type": "string"},
+                "status": dict(_CIQ_STATUS_PARAM),
                 "insurance": {"type": "string"},
                 "q": {"type": "string", "description": "Free-text search"},
                 "include_completed": {
@@ -2443,7 +2480,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 },
                 "shop": {"type": "string"},
                 "insurance": {"type": "string"},
-                "status": {"type": "string"},
+                "status": dict(_CIQ_STATUS_PARAM),
                 "phase": {
                     "type": "string",
                     "description": (

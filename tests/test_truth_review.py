@@ -165,3 +165,31 @@ def test_review_prompts_forbid_rewriting_and_tool_choice() -> None:
     assert "short answer is valid" in text
     regen = tr.REGENERATION_INSTRUCTION.casefold()
     assert "do not repeat or re-execute" in regen
+
+
+def test_reviewer_is_a_truth_gate_not_a_style_gate() -> None:
+    """Correction guidance must not be able to bloat the regenerated answer.
+
+    The reviewer judges truth only. If its guidance were free to demand
+    receipts or a fuller breakdown, the regenerated answer would grow an audit
+    tail and then pass review -- reintroducing the very verbosity this work
+    removed, one layer later.
+    """
+    text = tr.TRUTH_REVIEW_INSTRUCTION.casefold()
+    assert "brevity is never a defect" in text
+    assert "extra detail is never required" in text
+    assert "never ask for receipts, ids, versions, timestamps, or a fuller breakdown" in text
+    assert "one short sentence" in text
+
+
+def test_reviewer_may_accept_a_failure_reason_the_evidence_carries() -> None:
+    """Observed live: a truthful reason was rejected as an overreach.
+
+    Evidence held error code 'conflict' / 'Version changed.', and the
+    candidate "could not be closed due to a version conflict" was still
+    rejected -- costing the answer its specificity and falling back to the
+    generic line. Restating what the evidence contains is supported.
+    """
+    text = tr.TRUTH_REVIEW_INSTRUCTION.casefold()
+    assert "restating a failure reason the evidence itself carries" in text
+    assert "is supported, not an overreach" in text
