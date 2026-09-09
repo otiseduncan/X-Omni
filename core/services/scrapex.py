@@ -98,8 +98,10 @@ SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
     "description": (
         "Safe, non-mutating preflight for the ScrapeX ADAS Map worker only. Check "
         "Calibration IQ dependency and the managed ADAS Map work-browser authentication "
-        "state. This is not ALLDATA status, does not use ALLDATA credentials, and does "
-        "not retrieve OEM service-information procedures. It opens nothing."
+        "state. Do not use this to answer whether Calibration IQ already has ADAS Map "
+        "documents or which ROs are missing them; that is a Calibration IQ read. This is "
+        "not ALLDATA status, does not use ALLDATA credentials, and does not retrieve OEM "
+        "service-information procedures. It opens nothing."
     ),
     "parameters": {
         "type": "object",
@@ -110,11 +112,14 @@ SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_READ_SCHEMA: dict[str, Any] = {
     "description": (
-        "Read ScrapeX ADAS Map batches, exact-RO ADAS Map evidence, exceptions, or a "
-        "non-mutating CIQ queue preview. This tool is never an ALLDATA/SI procedure "
-        "source. For a create result, batch_id is exactly result.data.id, never "
-        "evidence_id. Existing-evidence reads begin with list_batches when no id is "
-        "known; new ADAS Map acquisition uses scrapex_adas_map instead."
+        "Read ScrapeX ADAS Map acquisition batches, exact-RO acquisition evidence, "
+        "exceptions, or a non-mutating acquisition-queue preview. This is not the source "
+        "for current Calibration IQ ADAS Map presence, missing-map counts, phase coverage, "
+        "or current RO state; use Calibration IQ for those questions. This tool is never "
+        "an ALLDATA/SI procedure source. For a create result, batch_id is exactly "
+        "result.data.id, never evidence_id. Existing ScrapeX acquisition evidence begins "
+        "with list_batches when no id is known; new ADAS Map acquisition uses "
+        "scrapex_adas_map instead."
     ),
     "parameters": {
         "type": "object",
@@ -220,8 +225,11 @@ SCRAPEX_READ_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
     "description": (
-        "Acquire ADAS Map requirement reports only; this tool never opens ALLDATA and "
-        "never retrieves OEM service-information procedures. For one exact RO that the "
+        "Acquire or process ADAS Map requirement reports only; this is an execution/"
+        "acquisition tool, not a read path for current Calibration IQ state. Never call "
+        "it merely to answer whether CIQ already has an ADAS Map, which ROs are missing "
+        "one, or counts by phase/shop. This tool never opens ALLDATA and never retrieves "
+        "OEM service-information procedures. For one exact RO that the "
         "user wants an ADAS Map acquired now, prefer acquire_exact: it starts ScrapeX "
         "if needed, verifies "
         "managed-browser sign-in before any batch exists, creates the exact one-RO "
