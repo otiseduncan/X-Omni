@@ -59,7 +59,7 @@ ADAS_SOURCE_ROLES = """## ADAS source roles
 - Automotive Knowledge is reusable structured knowledge bounded by lifecycle/provenance.
 - Repair-trigger justification and repair-scope review come from Calibration IQ, not reference libraries.
 
-Choose sources from the actual question and returned evidence; this is not a mandatory chain.
+Choose sources from the actual question and returned evidence; honor explicit source exclusions. This is not a mandatory chain.
 """
 
 OPERATOR_TRUTH = """## Operator truth
