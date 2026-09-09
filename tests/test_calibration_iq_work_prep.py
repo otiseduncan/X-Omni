@@ -129,16 +129,39 @@ def test_reconciliation_adds_only_missing_and_reactivates_historical_item():
         ],
     }
     actions = prep.build_reconciliation_actions(snapshot, map_info, "ro-id")
-    assert len(actions) == 2
-    update = next(item for item in actions if item["operation"] == "update_calibration")
+    # Three: reactivate the historical steering record, add the missing camera
+    # requirement, and (since d3b91bb) relabel the already-satisfied blind spot
+    # record to the ADAS Map governing wording.
+    assert len(actions) == 3
+    update = next(
+        item
+        for item in actions
+        if item["operation"] == "update_calibration"
+        and item["target_id"] == "steering-old"
+    )
     add = next(item for item in actions if item["operation"] == "add_calibration")
-    assert update["target_id"] == "steering-old"
     assert update["expected_version"] == 4
     assert update["arguments"]["determination"] == "REQUIRED"
     assert add["repair_order_id"] == "ro-id"
     assert add["arguments"]["calibration_type"] == "Forward Facing Camera Calibration"
     assert add["arguments"]["determination"] == "REQUIRED"
-    assert all("Blind Spot Monitor" not in str(item) for item in actions)
+
+    # The blind spot requirement is already satisfied, so it is relabeled in
+    # place -- never re-added, which would duplicate a governed requirement.
+    relabel = next(
+        item
+        for item in actions
+        if item["operation"] == "update_calibration"
+        and item["target_id"] != "steering-old"
+    )
+    assert relabel["arguments"]["calibration_type"] == "Blind Spot Monitor Calibration"
+    assert relabel["arguments"]["research_status"] == "ADAS Map governing source"
+    assert "determination" not in relabel["arguments"]
+    assert not any(
+        item["operation"] == "add_calibration"
+        and "Blind Spot Monitor" in str(item["arguments"].get("calibration_type"))
+        for item in actions
+    )
 
 
 def test_likely_requirement_is_promoted_without_creating_a_duplicate():
@@ -163,6 +186,10 @@ def test_likely_requirement_is_promoted_without_creating_a_duplicate():
             "target_id": "1",
             "expected_version": 1,
             "arguments": {
+                # d3b91bb: reconciliation carries the ADAS Map governing label
+                # onto the CIQ record, so the board stops showing the shop's
+                # local wording ("BSM calibration") for a governed requirement.
+                "calibration_type": "BSM calibration",
                 "determination": "REQUIRED",
                 "research_status": "ADAS Map governing source",
                 "method": "STATIC",

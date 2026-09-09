@@ -23,7 +23,12 @@ def _snapshot(ro_id: str, ro_number: str, vin: str) -> dict:
         "calibrations": [
             {
                 "id": f"cal-{ro_id}",
-                "calibration_type": "Occupant Classification / Seat-weight sensor calibration",
+                # Matches the catalog's governing ADAS Map label below. Since
+                # d3b91bb, reconciliation relabels a CIQ record whose wording
+                # differs from the governing source, and these pipeline tests
+                # are about readiness separation, not relabeling -- alias
+                # handling has its own test.
+                "calibration_type": "Occupant Classification System",
                 "determination": "REQUIRED",
                 "method": "UNKNOWN",
                 "version": 1,
@@ -508,7 +513,23 @@ def test_alias_parity_is_bounded_and_does_not_let_si_invent_requirements():
             {"label": "Occupant Classification System", "method": "UNKNOWN"}
         ],
     }
-    assert prep.build_reconciliation_actions(snapshot, map_info, "ro-1") == []
+    # The alias is recognized, so the requirement is never re-added as a
+    # duplicate. Since d3b91bb the single satisfied record is relabeled in
+    # place to the governing ADAS Map wording -- that is the whole point of
+    # alias parity: one requirement, one CIQ record, the source's own name.
+    actions = prep.build_reconciliation_actions(snapshot, map_info, "ro-1")
+    assert actions == [
+        {
+            "operation": "update_calibration",
+            "target_id": "cal-1",
+            "expected_version": 1,
+            "arguments": {
+                "calibration_type": "Occupant Classification System",
+                "research_status": "ADAS Map governing source",
+            },
+        }
+    ]
+    assert not any(item["operation"] == "add_calibration" for item in actions)
     assert prep._reconciliation_issues(snapshot, map_info) == []
 
     # A document-library term never enters the action planner; only the typed

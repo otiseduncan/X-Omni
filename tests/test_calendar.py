@@ -23,12 +23,16 @@ def test_calendar_and_ciq_work_prep_schemas_have_distinct_source_ownership():
     ].casefold()
 
     assert "appointments and events from google calendar only" in calendar_description
-    assert "not calibration iq repair-order field workload or readiness" in (
-        calendar_description
-    )
-    assert "calibration_iq_work_prep is authoritative" in calendar_description
-    assert "upcoming shop field work" in work_prep_description
-    assert "weekly ro readiness" in work_prep_description
+    assert "not calibration iq repair-order field workload" in calendar_description
+    # The calendar must point at CIQ capabilities that actually exist. It used
+    # to promise work_prep was authoritative for "weekly RO readiness", but
+    # that mode was un-advertised when the CIQ SI workflow was made dormant,
+    # so the pointer aimed the model at a choice it could no longer make --
+    # and "What do I have coming up this week?" went to the calendar instead.
+    assert "calibration_iq_summary/calibration_iq_read" in calendar_description
+    assert "calibration_iq_work_prep" in calendar_description
+    assert "weekly ro readiness" not in calendar_description
+    # The disclaimer is reciprocal: each side states what it is not.
     assert "does not read google calendar appointments or events" in work_prep_description
 
 

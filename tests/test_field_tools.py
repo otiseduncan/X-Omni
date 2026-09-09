@@ -113,12 +113,20 @@ async def test_read_clamps_limit_and_allowlists_params(settings, monkeypatch):
     seen = {}
 
     async def fake_get(self, url, params=None, headers=None, **kw):
+        # resolve_base probes {base}/health with no auth header when its
+        # module-level cache is cold. Capture only the collection read, so
+        # this test does not depend on whether an earlier test (or a live
+        # Calibration IQ) happened to warm that cache first.
+        if str(url).endswith("/health"):
+            return httpx.Response(200, json={"ok": True},
+                                  request=httpx.Request("GET", url))
         seen["params"] = params
-        seen["auth"] = headers.get("Authorization")
+        seen["auth"] = (headers or {}).get("Authorization")
         return httpx.Response(200, json={"items": [], "count": 0, "returned_count": 0},
                               request=httpx.Request("GET", url))
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(ciq, "_RESOLVED_BASE", {})
     await ciq.read_repair_orders(
         settings, {
             "limit": 5000,

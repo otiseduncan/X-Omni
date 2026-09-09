@@ -3751,9 +3751,10 @@ def install() -> None:
             TOOL_NAME,
             {
                 "description": (
-                    "Authoritative Calibration IQ source for active field-work preparation. "
-                    "Use it to list one explicitly named production phase or read/reconcile "
-                    "one RO's governing ADAS Map calibration requirements. Calibration IQ "
+                    "Authoritative Calibration IQ source for active field-work preparation; "
+                    "does not read Google Calendar appointments or events. Use it to list "
+                    "one explicitly named production phase or read/reconcile one RO's "
+                    "governing ADAS Map calibration requirements. Calibration IQ "
                     "service-information coverage, acquisition, and missing-SI queues are dormant. "
                     "Do not invent/default a phase."
                 ),

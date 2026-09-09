@@ -76,16 +76,11 @@ function Assert-NoMergeConflicts {
     if ($unmerged.Count -gt 0) {
         throw "X Omni has unresolved Git merge conflicts and will not build or launch them.`n`n$($unmerged -join [Environment]::NewLine)`n`nResolve or abort the merge, then launch again."
     }
-
-    $markerOutput = @(& git -C $root grep -n -E '^(<<<<<<< |=======|>>>>>>> )' -- ui/src core scripts 2>$null)
-    $markerExitCode = $LASTEXITCODE
-    if ($markerExitCode -eq 0 -and $markerOutput.Count -gt 0) {
-        $preview = @($markerOutput | Select-Object -First 12)
-        throw "X Omni found Git conflict markers in build/runtime source and will not continue.`n`n$($preview -join [Environment]::NewLine)"
-    }
-    if ($markerExitCode -ne 0 -and $markerExitCode -ne 1) {
-        throw 'X Omni could not scan source files for leftover Git conflict markers.'
-    }
+    # The index check above is the authoritative signal and it is cheap. The
+    # full source scan for leftover conflict markers belongs to deploy-local,
+    # which runs deliberately; this script runs on every double-click, where a
+    # grep over ui/src, core and scripts costs startup time and can refuse to
+    # launch over a legitimate line that merely begins with "=======".
 }
 
 function Get-PortOwner {
@@ -142,13 +137,11 @@ function Stop-VerifiedCore {
     }
 
     # A Windows venv launcher can remain briefly after its base-Python child
-    # exits. Stop only exact X Omni core command lines; never name-match Python.
-    $expectedPython = [IO.Path]::GetFullPath($venvPython)
-    $stragglers = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -ieq 'python.exe' -and
-        ([string]$_.CommandLine).IndexOf($expectedPython, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-        ([string]$_.CommandLine) -match '(?i)(?:^|\s)-m\s+core\.main(?:\s|$)'
-    })
+    # exits. Stop only exact X Omni core command lines; never name-match
+    # Python. Test-XOmniCoreProcess owns that rule -- a second copy here meant
+    # a future tightening could land in one and not the other.
+    $stragglers = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { Test-XOmniCoreProcess -Process $_ })
     foreach ($process in $stragglers) {
         Write-LauncherLog "Stopping verified X Omni Core straggler PID $($process.ProcessId)."
         Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue

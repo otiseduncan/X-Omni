@@ -1767,8 +1767,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "get_calendar": {
         "description": (
             "Read appointments and events from Google Calendar only, not Calibration IQ "
-            "repair-order field workload or readiness. calibration_iq_work_prep is "
-            "authoritative for upcoming CIQ field work and weekly RO readiness."
+            "repair-order field workload. Shop work counts, lists, and board questions "
+            "come from calibration_iq_summary/calibration_iq_read; phase lists and one "
+            "RO's requirements come from calibration_iq_work_prep."
         ),
         "parameters": {
             "type": "object",
@@ -2720,39 +2721,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                     "required": ["calibration_type", "determination"],
                                 },
                             ),
-                            _calibration_iq_action_branch(
-                                ("create_missing_si_record", "resolve_missing_si_record"),
-                                ("repair_order_id", "arguments"),
-                                "Track or clear a durable ADAS SI gap for one calibration.",
-                                operation_description=(
-                                    "create_missing_si_record when ADAS SI has no applicable "
-                                    "procedure for this calibration yet; resolve_missing_si_record "
-                                    "once it does, or the gap no longer applies. Calibration IQ is "
-                                    "the durable, cross-conversation record of this fact."
-                                ),
-                                arguments_schema=_calibration_iq_arguments_schema(
-                                    {
-                                        "calibration_item_id": {
-                                            "type": "string",
-                                            "minLength": 1,
-                                        },
-                                        "missing_document_type": {
-                                            "type": "string",
-                                            "enum": [
-                                                "ADAS_MAP_REPORT",
-                                                "OEM_PROCEDURE",
-                                                "SUPPORTING_SERVICE_INFO",
-                                                "UNCLASSIFIED",
-                                            ],
-                                        },
-                                        "search_query": {"type": "string"},
-                                        "search_details": {"type": "object"},
-                                        "resolved_document_id": {"type": "string"},
-                                        "reason": {"type": "string"},
-                                    },
-                                    required=("calibration_item_id",),
-                                ),
-                            ),
+                            # create_missing_si_record / resolve_missing_si_record
+                            # are intentionally NOT advertised: CIQ's SI workflow is
+                            # dormant, and operator_execute rejects them as
+                            # invalid_operation since they are absent from
+                            # ROUTINE_OPERATOR_OPERATIONS. Advertising an operation the
+                            # service refuses only invites a guaranteed failure.
                             _calibration_iq_action_branch(
                                 ("ensure_case_workspace",),
                                 ("repair_order_id",),

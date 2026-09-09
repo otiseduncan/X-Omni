@@ -658,6 +658,72 @@ def _record_identity(item: dict) -> str:
     return f"row:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
 
 
+async def _eliminating_filters(
+    base: str,
+    token: str,
+    params: dict,
+    *,
+    terminal_only: bool,
+    include_completed: bool,
+) -> dict[str, Any]:
+    """For an empty filtered read, name which filter emptied it.
+
+    A zero that came from a filter nobody asked for is the most dangerous
+    answer this service can produce: it is indistinguishable from "there is
+    no such work". Live, the model intermittently volunteers a
+    status=CALIBRATION_IN_PROGRESS that is legal and currently matches
+    nothing, turning "how many cars are in phase 5" into a confident "zero"
+    while 35 sit on the board. Schema guidance reduced that but cannot
+    eliminate it -- the model samples.
+
+    So prove it instead of guessing intent. Drop one filter at a time and
+    re-count: if removing exactly that filter produces rows, it is the one
+    that emptied the result, and the model receives that as evidence rather
+    than reporting the zero as the whole truth. Purely structural -- nothing
+    here inspects what Otis asked for, and the filter is never silently
+    dropped from the actual answer.
+
+    Bounded: runs only on an otherwise-complete zero, at most one extra
+    collection per applied filter.
+    """
+    # Scope filters only. `q` is the search itself: "nothing matches F-150" is
+    # the honest and useful answer, and adding "but 137 exist without your
+    # search term" is noise. status/phase/shop/insurance are different -- one
+    # of those applied by mistake silently hides the whole board.
+    candidates = [
+        key for key in params if key in {"status", "phase", "shop", "insurance"}
+    ]
+    if not candidates:
+        return {}
+    findings: dict[str, int] = {}
+    for key in candidates:
+        probe = {k: v for k, v in params.items() if k != key}
+        collected, collection, error = await _collect(base, token, probe)
+        if error or not collection["complete"]:
+            continue
+        if terminal_only:
+            probe_matched = [i for i in collected if is_terminal(i)]
+        elif include_completed:
+            probe_matched = collected
+        else:
+            probe_matched = [i for i in collected if not is_terminal(i)]
+        if probe_matched:
+            findings[key] = len(probe_matched)
+    if not findings:
+        return {}
+    dropped = ", ".join(
+        f"{key} (leaves {count})" for key, count in sorted(findings.items())
+    )
+    return {
+        "applied_filters": dict(params),
+        "count_without_each_filter": findings,
+        "message": (
+            f"This filtered read matched nothing, but dropping {dropped} does "
+            "match work."
+        ),
+    }
+
+
 def _breakdown(items: list[dict]) -> dict[str, Any]:
     """Counts by status, phase and shop. This is what a spoken answer needs --
     'fifteen, nine new arrival, five waiting' rather than fifteen rows."""
@@ -965,7 +1031,7 @@ async def query_repair_orders(settings, args: dict) -> dict[str, Any]:
                 },
             }
 
-    return {
+    result = {
         "status": "verified",
         "items": matched,
         "count": len(matched),
@@ -983,6 +1049,33 @@ async def query_repair_orders(settings, args: dict) -> dict[str, Any]:
         "duplicate_count": collection["duplicate_count"],
         "evidence": {"source": "calibration_iq_authenticated_api", "read_only": True},
     }
+    # A filtered zero is the one verified answer that can be true and still
+    # deeply misleading. Say which filter emptied it so the model can tell
+    # "there is no such work" apart from "you narrowed it away".
+    if not matched:
+        diagnostic = await _eliminating_filters(
+            base,
+            token,
+            params,
+            terminal_only=terminal_only,
+            include_completed=include_completed,
+        )
+        if diagnostic:
+            result["empty_because_of_filters"] = diagnostic
+            # Evidence alone proved insufficient: given the structured
+            # diagnostic and nothing else, the model still reported the zero
+            # as the whole answer every time. State the obligation as well as
+            # the fact, the way the website-preview projection already does.
+            eliminating = ", ".join(sorted(diagnostic["count_without_each_filter"]))
+            result["message"] = diagnostic["message"]
+            result["assistant_instruction"] = (
+                f"Do not report this 0 as the answer on its own. The {eliminating} "
+                "filter emptied it. If Otis did not name that filter in his "
+                "request, call this tool again without it and answer from that "
+                "result. If he did name it, say nothing matches it and give the "
+                "count that matches his remaining criteria."
+            )
+    return result
 
 
 async def summarize_repair_orders(settings, args: dict) -> dict[str, Any]:

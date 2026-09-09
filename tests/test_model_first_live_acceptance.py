@@ -1614,6 +1614,24 @@ def _five_turn_research_attach_call() -> CallExpectation:
     )
 
 
+def _accepts_either_ro_identifier(arguments: dict[str, Any]) -> None:
+    """calibration_iq_ro takes the displayed RO number or the internal id.
+
+    Its own schema says exactly that, and production get_repair_order resolves
+    a bare RO number through the collection search. Otis names the number, so
+    refreshing the active subject with 2400911724 is correct behavior;
+    demanding ro-uuid-17 here failed the model for honoring the contract it
+    was given. The internal id still has to appear on the *write*, which the
+    operator call's own expectation asserts -- that is where it matters.
+    """
+    identifier = str(arguments.get("repair_order_id") or "")
+    if identifier not in {"ro-uuid-17", "2400911724"}:
+        raise AssertionError(
+            "expected the active subject by internal id or displayed RO number, "
+            f"got {identifier!r}"
+        )
+
+
 def _existing_ciq_ro_call() -> CallExpectation:
     result = json.loads(json.dumps(RO_RESULT))
     result["evidence_id"] = "existing-chain-ciq-ro"
@@ -1621,7 +1639,7 @@ def _existing_ciq_ro_call() -> CallExpectation:
     return CallExpectation(
         "calibration_iq_ro",
         result,
-        {"repair_order_id": "ro-uuid-17"},
+        validator=_accepts_either_ro_identifier,
     )
 
 
@@ -5867,17 +5885,31 @@ class LiveQwenHarness:
         return results
 
 
+# Scenarios that exercise a capability deliberately made dormant, so the model
+# can no longer satisfy them however well it reasons. They are kept, not
+# deleted: their fixtures are reused by offline tests, and they are the record
+# of what the capability looked like if it is ever brought back. Excluded from
+# a default run; still selectable by name.
+#
+# field_weekly_work_readiness expects calibration_iq_work_prep with
+# mode="week_readiness". That mode was un-advertised in ac496e4 ("make CIQ SI
+# workflow dormant without deleting implementation"); the advertised enum is
+# now phase_list/ro_requirements only. Asking "What do I have coming up this
+# week?" and demanding a retired mode fails the model for a decision it was
+# never offered.
+DORMANT_SCENARIOS = frozenset({"field_weekly_work_readiness"})
+
+
 def run_suite(
     target: WorkerTarget,
     *,
     scenario_names: set[str] | None = None,
     timeout: float = 300.0,
 ) -> dict[str, Any]:
-    selected = [
-        scenario
-        for scenario in SCENARIOS
-        if not scenario_names or scenario.name in scenario_names
-    ]
+    if scenario_names:
+        selected = [s for s in SCENARIOS if s.name in scenario_names]
+    else:
+        selected = [s for s in SCENARIOS if s.name not in DORMANT_SCENARIOS]
     if scenario_names:
         missing = scenario_names - {scenario.name for scenario in selected}
         if missing:

@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 from pathlib import Path
 import shutil
 
@@ -46,7 +47,23 @@ def test_local_deploy_script_pulls_builds_restarts_and_verifies_all_field_servic
 
 def test_x_omni_launcher_source_is_single_clean_script() -> None:
     script = (ROOT / "scripts" / "launch-x-omni.ps1").read_text(encoding="utf-8")
-    assert len(script) < 18_000
+
+    # The failure worth guarding is a bad merge leaving duplicated function
+    # bodies. Check that directly -- every function defined exactly once --
+    # instead of inferring it from a byte count, which flags honest growth and
+    # would miss a duplicate that arrives alongside a deletion.
+    defined = re.findall(r"^function\s+([\w-]+)\s*\{", script, re.MULTILINE)
+    duplicated = sorted({name for name in defined if defined.count(name) > 1})
+    assert not duplicated, f"duplicated function bodies: {duplicated}"
+
+    # A real cap still applies so the script cannot sprawl unnoticed. Nudged
+    # from 18,000 only after auditing the overage and removing what should not
+    # have been here: a second inline copy of the Test-XOmniCoreProcess
+    # predicate in the straggler sweep, and the source-wide conflict-marker
+    # grep that belongs to deploy-local (asserted there). What remains is
+    # named features and strict process-identity verification, which must not
+    # be compressed away to satisfy a byte count.
+    assert len(script) < 18_500
     assert script.count("function Get-SourceRevision") == 1
     assert script.count("function Get-PortOwner") == 1
     assert "^[0-9a-fA-F]{40}$" in script
