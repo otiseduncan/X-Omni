@@ -200,8 +200,11 @@ SCRAPEX_READ_SCHEMA: dict[str, Any] = {
                         "const": "preview_ciq_queue",
                         "description": (
                             "Non-mutating view of Calibration IQ candidate work selected "
-                            "by phases, shop, and source scope. This is not stored ADAS Map "
-                            "evidence and does not provide an existing ScrapeX batch or "
+                            "by phases, shop, and source scope, only for planning a future "
+                            "ScrapeX ADAS Map acquisition batch. Do not use this to answer which "
+                            "Calibration IQ ROs already have or are missing an ADAS Map; use "
+                            "Calibration IQ adas_map_inventory for that. This is not stored ADAS "
+                            "Map evidence and does not provide an existing ScrapeX batch or "
                             "batch item; list_batches discovers existing evidence."
                         ),
                     },
