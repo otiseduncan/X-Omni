@@ -452,6 +452,11 @@ export default function App() {
           break;
         }
 
+        case "conversation_updated":
+          // Background work (an ADAS Map sweep finishing) added a message.
+          window.setTimeout(() => reconcile(), 0);
+          break;
+
         case "error":
           setThinking(false);
           setActiveTool(null);

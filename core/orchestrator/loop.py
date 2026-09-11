@@ -44,6 +44,25 @@ log = logging.getLogger("xomni.loop")
 MAX_TOOL_ROUNDS = 6
 MAX_TOOL_CALLS_PER_ROUND = 8
 
+# Returned to the model for every call beyond the per-round limit. Before
+# 2026-09-11 those calls were dropped silently: X asked for 19 ADAS Map
+# acquisitions, Core ran 8, and X reported all 19 as started.
+DEFERRED_CALL_RESULT = {
+    "status": "not_run",
+    "executed": False,
+    "deferred": True,
+    "message": (
+        f"Not run: at most {MAX_TOOL_CALLS_PER_ROUND} tool calls execute per step, so "
+        "nothing happened for this call. Request it again in the next step if it is "
+        "still needed; for many ADAS Maps use stage_action sweep_adas_maps instead."
+    ),
+}
+
+# Measured on Qwen3-Omni 2026-09-11: JSON tool results ran 2.92 characters per
+# token (74,409 chars -> 25,448 tokens), denser than the 3.5 prose estimate.
+GUARD_JSON_CHARS_PER_TOKEN = 2.9
+_GUARD_SHRINK_STEPS = (6_000, 3_000, 1_500, 600)
+
 FINAL_SYNTHESIS_MESSAGE = (
     "Internal final-synthesis boundary; this is not a new user request. The six "
     "tool-capable rounds for this turn are complete. Using only the original "
@@ -52,12 +71,28 @@ FINAL_SYNTHESIS_MESSAGE = (
     "or imply that an unexecuted action ran. Preserve source, approval, receipt, "
     "and indeterminate-result boundaries."
 )
+REPEAT_ONLY_SYNTHESIS_MESSAGE = (
+    "Internal final-synthesis boundary; this is not a new user request. Your last "
+    "tool requests only repeated reads that already returned in this turn, so no "
+    "new evidence can arrive now. Using only the original request and tool results "
+    "already returned, provide one concise, truthful final answer now. No more tools "
+    "are available: do not request another tool or imply that an unexecuted action "
+    "ran. Preserve source, approval, receipt, and indeterminate-result boundaries."
+)
 TOOL_ROUND_CAP_FALLBACK = (
     "The six-round tool limit was reached. No additional tool was run, and I’m "
     "not making a claim beyond the tool results already returned."
 )
 
 NO_TOOL_SELF_CHECK_ACCEPT = "NO_TOOL_NEEDED"
+BACKGROUND_REVIEW_PREFIX = (
+    "Internal evidence check; this is not a new user request. Core's own record of "
+    "background work, current as of this message: {record} First question: does the "
+    "withheld draft state an outcome, a completion, or attached/acquired results for "
+    "that background work that this record does not contain? If it does, the draft "
+    "is unsupported: do not output NO_TOOL_NEEDED; call query_ciq with "
+    "kind=adas_map_sweep now and answer from what it returns."
+)
 NO_TOOL_SELF_CHECK_MESSAGE = """Internal final-answer evidence check; this is not a new user request. Review the withheld draft against the original request, current structured context, advertised tool contracts, and returned evidence. If a safe answer requires current or live business state, execution proof, capability state, or vehicle-specific OEM technical evidence, do not answer in prose: call the best justified advertised tool or tools now. Nothing has executed in this turn, so a draft reporting work as done -- acquired, retrieved, saved, attached, reconciled, updated, or complete -- and any specific finding it credits to that work are unsupported no matter how confident they read: call the tool that would actually do it instead of accepting the draft. If the draft is a casual, conceptual, or general answer, or already states a truthful unresolved boundary and no tool is needed, output exactly NO_TOOL_NEEDED; an active conversation subject is memory and is never by itself a reason to call a tool. Never run a mutation to test or demonstrate capability. Reason from meaning and evidence contracts, not keyword rules."""
 NO_TOOL_SELF_CHECK_FALLBACK = (
     "I can’t verify the withheld draft from the available evidence, so I’m not "
@@ -78,6 +113,9 @@ def no_tool_self_check_reserve_tokens(max_draft_tokens: int) -> int:
     return (
         max(0, int(max_draft_tokens))
         + prompt_mod.estimate_tokens(NO_TOOL_SELF_CHECK_MESSAGE)
+        + prompt_mod.estimate_tokens(
+            BACKGROUND_REVIEW_PREFIX.format(record="x" * prompt_mod.BACKGROUND_CONTEXT_MAX_CHARS)
+        )
         + 24
     )
 
@@ -102,6 +140,8 @@ class TurnMetrics:
     rounds: int = 0
     tools_selected: list[str] = field(default_factory=list)
     evidence_ids: list[str] = field(default_factory=list)
+    deferred_calls: int = 0
+    context_shrinks: int = 0
 
     def absorb(self, event: dict[str, Any]) -> None:
         usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
@@ -129,6 +169,8 @@ class TurnMetrics:
             "generation_ms": round(self.generation_ms),
             "tools_selected": list(self.tools_selected),
             "evidence_ids": sorted(set(self.evidence_ids))[:40],
+            "deferred_calls": self.deferred_calls,
+            "context_shrinks": self.context_shrinks,
         }
         summary.update(extra)
         return summary
@@ -141,6 +183,7 @@ async def model_owned_no_tool_self_check(
     draft: str,
     *,
     metrics: Optional[TurnMetrics] = None,
+    background: Optional[str] = None,
 ) -> NoToolSelfCheckResult:
     """Let the same model accept its draft or select evidence tools once.
 
@@ -150,10 +193,25 @@ async def model_owned_no_tool_self_check(
     until that decision is made.
     """
 
+    instruction = NO_TOOL_SELF_CHECK_MESSAGE
+    background_text = " ".join(str(background or "").split())[
+        : prompt_mod.BACKGROUND_CONTEXT_MAX_CHARS
+    ]
+    if background_text:
+        # Structured truth from Core's records leads the review, and the model
+        # answers one specific question about its own draft. Live acceptance on
+        # 2026-09-11 showed the generic checklist with this fact appended at
+        # the end accepted "the sweep completed, all 16 attached" 5 of 5 times
+        # while the record said it was still running.
+        instruction = (
+            BACKGROUND_REVIEW_PREFIX.format(record=background_text)
+            + " "
+            + NO_TOOL_SELF_CHECK_MESSAGE
+        )
     review_messages = [
         *messages,
         {"role": "assistant", "content": draft},
-        {"role": "user", "content": NO_TOOL_SELF_CHECK_MESSAGE},
+        {"role": "user", "content": instruction},
     ]
     checker_text = ""
     tool_calls: list[dict[str, Any]] = []
@@ -261,6 +319,8 @@ ARTIFACT_FOR_TOOL = {
     "list_directory": "directory",
     "search_files": "file_search",
     "web_research_current": "web_research",
+    "adas_map_sweep": "adas_map_sweep",
+    "adas_map_sweep_status": "adas_map_sweep",
     "delegate_research": "research_findings",
     "capability_search": "capabilities",
     "website_preview_generate": "website_preview",
@@ -1236,6 +1296,26 @@ def tool_result_for_model(name: str, result: Any) -> Any:
     12K string slice can create malformed JSON and wastes context the model
     needs for its final explanation.
     """
+    if name == "scrapex_adas_map":
+        from ..services.scrapex import adas_map_result_for_model
+
+        return adas_map_result_for_model(result)
+    if name == "stage_action" and isinstance(result, dict):
+        from ..services.scrapex import adas_map_result_for_model
+
+        staged = dict(result)
+        if staged.get("executed_via") == "scrapex_adas_map":
+            staged["execution"] = adas_map_result_for_model(staged.get("execution"))
+        read = staged.get("repair_order_read")
+        if isinstance(read, dict):
+            # The full exact read renders on the card and binds evidence from
+            # the unprojected result; the model needs identity and status.
+            staged["repair_order_read"] = {
+                key: read.get(key)
+                for key in ("status", "evidence_id", "repair_order", "message")
+                if key in read
+            }
+        return staged
     if name != "website_preview_generate" or not isinstance(result, dict):
         return result
     projected = {
@@ -1489,6 +1569,9 @@ def artifacts_for_result(name: str, result: Any) -> list[tuple[str, dict[str, An
         if stage in {"staged", "read_failed"} and isinstance(read, dict):
             cards.append(("calibration_iq_ro", read))
         execution = result.get("execution")
+        if result.get("executed_via") == "adas_map_sweep" and isinstance(execution, dict):
+            cards.append(("adas_map_sweep", execution))
+            return cards
         if stage in {"executed", "not_executed"} and isinstance(execution, dict):
             via = result.get("executed_via")
             if via in _CALIBRATION_IQ_OPERATOR_TOOLS:
@@ -1557,6 +1640,91 @@ def image_failure_summary(result: Any) -> str:
             "image success card is being claimed."
         )
     return "Image generation failed. No verified generated image is being claimed."
+
+
+
+def _guard_message_tokens(message: dict[str, Any]) -> int:
+    content = str(message.get("content") or "")
+    ratio = (
+        GUARD_JSON_CHARS_PER_TOKEN
+        if message.get("role") == "tool"
+        else prompt_mod.CHARS_PER_TOKEN
+    )
+    tokens = int(len(content) / ratio) + 8
+    calls = message.get("tool_calls")
+    if calls:
+        tokens += int(
+            len(json.dumps(calls, ensure_ascii=False, default=str))
+            / GUARD_JSON_CHARS_PER_TOKEN
+        )
+    return tokens
+
+
+def _shrink_tool_content(content: str, cap: int) -> str:
+    try:
+        value = json.loads(content)
+    except (TypeError, ValueError):
+        return json.dumps({"truncated_for_context": True, "preview": content[: max(0, cap - 60)]})
+    bounded = _bounded_tool_result_json(value, max_chars=cap)
+    try:
+        json.loads(bounded)
+    except (TypeError, ValueError):
+        return json.dumps(
+            {"truncated_for_context": True, "preview": bounded[: max(0, cap - 60)]}
+        )
+    return bounded
+
+
+def fit_messages_to_window(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    context_tokens: int,
+    reserve_tokens: int,
+) -> int:
+    """Shrink this request's tool results, largest first, until it fits.
+
+    History packing budgets the turn's starting prompt, but tool results added
+    during the turn were never re-budgeted: eight full ADAS Map results alone
+    were 25,448 of 32,768 tokens on 2026-09-11. This keeps every model call
+    inside the window by structurally shortening tool result contents in place
+    (valid JSON, list items trimmed with explicit omitted counts). Returns the
+    number of messages shortened.
+    """
+
+    budget = (
+        int(context_tokens)
+        - int(reserve_tokens)
+        - prompt_mod.estimate_tool_catalog_tokens(tools or [])
+    )
+    total = sum(_guard_message_tokens(message) for message in messages)
+    if total <= budget:
+        return 0
+    shrunk = 0
+    tool_messages = [message for message in messages if message.get("role") == "tool"]
+    for cap in _GUARD_SHRINK_STEPS:
+        for message in sorted(
+            tool_messages,
+            key=lambda item: len(str(item.get("content") or "")),
+            reverse=True,
+        ):
+            content = str(message.get("content") or "")
+            if len(content) <= cap:
+                continue
+            before = _guard_message_tokens(message)
+            message["content"] = _shrink_tool_content(content, cap)
+            total -= before - _guard_message_tokens(message)
+            shrunk += 1
+            if total <= budget:
+                return shrunk
+    if total > budget:
+        log.warning(
+            "Request still exceeds the context budget after shrinking tool results "
+            "(%d estimated tokens, budget %d)",
+            total,
+            budget,
+        )
+    return shrunk
 
 
 class Orchestrator:
@@ -1728,6 +1896,12 @@ class Orchestrator:
         candidate -> review -> at most one regeneration -> final review ->
         tiny fail-closed line chosen from structural verification state.
         """
+        fit_messages_to_window(
+            messages,
+            [],
+            context_tokens=int(getattr(self.settings, "context_tokens", 32_768)),
+            reserve_tokens=int(getattr(self.settings, "max_response_tokens", 1_536)) + 1_500,
+        )
         state = _calibration_iq_structural_verification_state(
             operator_results, work_prep_results
         )
@@ -1871,6 +2045,14 @@ class Orchestrator:
         tools = self._model_tools(
             role, calibration_iq_evidence, scrapex_evidence, unlocked_tool_names
         )
+        from ..services import adas_map_sweep as adas_map_sweep_svc
+
+        background = adas_map_sweep_svc.latest_context_line(
+            self.store, effective_context.get("user_id")
+        )
+        background_for_user = adas_map_sweep_svc.latest_context_line(
+            self.store, effective_context.get("user_id"), for_model=False
+        )
         messages = prompt_mod.build_messages(
             self.router,
             history,
@@ -1879,6 +2061,7 @@ class Orchestrator:
             active_subject=active_subject,
             tools=reserve_tools,
             extra_input_reserve_tokens=no_tool_self_check_reserve,
+            background=background,
         )
         artifacts: list[dict] = []
         full_text = ""
@@ -2129,18 +2312,33 @@ class Orchestrator:
         # invocation touches the handler; later identical requests reuse that
         # result instead of re-running it and re-rendering its card.
         read_only_call_cache: dict[tuple[str, str], Any] = {}
+        repeat_only_round = False
         for round_index in range(MAX_TOOL_ROUNDS + 1):
-            synthesis_only = round_index == MAX_TOOL_ROUNDS
+            synthesis_only = round_index == MAX_TOOL_ROUNDS or repeat_only_round
             if synthesis_only:
                 # Six tool-bearing model rounds are allowed. The extra model
                 # call exists only so the sixth result can become a truthful
                 # user-facing answer; no schema is advertised and no seventh
-                # tool request can reach the gateway.
-                log.warning("Tool loop hit the %d-round cap", MAX_TOOL_ROUNDS)
+                # tool request can reach the gateway. A round that only
+                # repeated reads already answered this turn ends tool use the
+                # same way: re-reading cannot produce new evidence within one
+                # turn (live acceptance showed "continue" polling a running
+                # sweep's status until the cap).
+                if repeat_only_round:
+                    log.info("Tool round only repeated answered reads; synthesizing")
+                else:
+                    log.warning("Tool loop hit the %d-round cap", MAX_TOOL_ROUNDS)
                 round_tools: list[dict] = []
                 round_messages = [
                     *messages,
-                    {"role": "user", "content": FINAL_SYNTHESIS_MESSAGE},
+                    {
+                        "role": "user",
+                        "content": (
+                            REPEAT_ONLY_SYNTHESIS_MESSAGE
+                            if repeat_only_round and round_index < MAX_TOOL_ROUNDS
+                            else FINAL_SYNTHESIS_MESSAGE
+                        ),
+                    },
                 ]
             else:
                 tools = self._model_tools(
@@ -2165,6 +2363,12 @@ class Orchestrator:
             sealed_round_tokens: list[dict] = []
 
             metrics.rounds += 1
+            metrics.context_shrinks += fit_messages_to_window(
+                round_messages,
+                round_tools,
+                context_tokens=int(getattr(self.settings, "context_tokens", 32_768)),
+                reserve_tokens=int(getattr(self.settings, "max_response_tokens", 1_536)) + 64,
+            )
             async for event in self.client.stream(round_messages, tools=round_tools):
                 if event["type"] == "content":
                     round_text += event["text"]
@@ -2178,12 +2382,15 @@ class Orchestrator:
                 elif event["type"] == "usage":
                     metrics.absorb(event)
 
+            deferred_calls: list[dict] = []
             if len(tool_calls) > MAX_TOOL_CALLS_PER_ROUND:
                 log.warning(
-                    "Model requested %d tools in one round; executing the first %d",
+                    "Model requested %d tools in one round; executing the first %d "
+                    "and returning the rest to the model as not run",
                     len(tool_calls),
                     MAX_TOOL_CALLS_PER_ROUND,
                 )
+                deferred_calls = tool_calls[MAX_TOOL_CALLS_PER_ROUND:]
                 tool_calls = tool_calls[:MAX_TOOL_CALLS_PER_ROUND]
 
             synthesis_boundary_failed = bool(
@@ -2200,6 +2407,7 @@ class Orchestrator:
                 # emitted beside it. Protected result guards below still get
                 # first refusal; ordinary turns receive the bounded boundary.
                 tool_calls = []
+                deferred_calls = []
                 round_text = ""
                 sealed_round_tokens = []
 
@@ -2214,13 +2422,16 @@ class Orchestrator:
                     tools,
                     round_text,
                     metrics=metrics,
+                    background=background,
                 )
                 if self_check.tool_calls:
                     # The first draft and internal review prompt are temporary
                     # review context. Keep only the model-owned tool decision in
                     # the normal protocol history; neither checker prose nor the
                     # unsupported draft reaches the user or persisted chat.
-                    tool_calls = list(self_check.tool_calls)[:MAX_TOOL_CALLS_PER_ROUND]
+                    selected_calls = list(self_check.tool_calls)
+                    tool_calls = selected_calls[:MAX_TOOL_CALLS_PER_ROUND]
+                    deferred_calls = selected_calls[MAX_TOOL_CALLS_PER_ROUND:]
                     round_text = ""
                     sealed_round_tokens = []
                 elif self_check.accept_draft:
@@ -2229,8 +2440,18 @@ class Orchestrator:
                     full_text += round_text
                     break
                 else:
-                    yield {"type": "token", "text": NO_TOOL_SELF_CHECK_FALLBACK}
-                    full_text += NO_TOOL_SELF_CHECK_FALLBACK
+                    # Fail closed. When Core holds a background-work record,
+                    # its own structured status line is the truthful answer;
+                    # the review rejected a draft about exactly that work.
+                    fallback = (
+                        " ".join(str(background_for_user).split())[
+                            : prompt_mod.BACKGROUND_CONTEXT_MAX_CHARS
+                        ]
+                        if background_for_user
+                        else NO_TOOL_SELF_CHECK_FALLBACK
+                    )
+                    yield {"type": "token", "text": fallback}
+                    full_text += fallback
                     break
 
             # Model-first boundary: a Calibration IQ turn no longer forfeits
@@ -2309,27 +2530,32 @@ class Orchestrator:
             if not tool_calls:
                 break
 
-            # Record the assistant's tool-call turn so the model sees its own
-            # request alongside the result on the next pass.
+            # Record the assistant's full tool-call turn -- including calls
+            # deferred past the per-round limit -- so the model sees exactly
+            # what it asked for alongside every result on the next pass.
+            for i, c in enumerate([*tool_calls, *deferred_calls]):
+                if not c.get("id"):
+                    c["id"] = f"call_{round_index}_{i}"
             messages.append(
                 {
                     "role": "assistant",
                     "content": round_text or "",
                     "tool_calls": [
                         {
-                            "id": c.get("id") or f"call_{round_index}_{i}",
+                            "id": c["id"],
                             "type": "function",
                             "function": {
                                 "name": c["name"],
                                 "arguments": c["arguments"],
                             },
                         }
-                        for i, c in enumerate(tool_calls)
+                        for c in [*tool_calls, *deferred_calls]
                     ],
                 }
             )
 
             paused = False
+            repeated_calls = 0
             for i, call in enumerate(tool_calls):
                 try:
                     args = json.loads(call["arguments"] or "{}")
@@ -2392,6 +2618,8 @@ class Orchestrator:
                 ):
                     if ev["type"] == "approval":
                         paused = True
+                    if ev.get("type") == "tool_result" and ev.get("deduplicated"):
+                        repeated_calls += 1
                     if (
                         calibration_iq_staging_enabled
                         and call.get("name") == "calibration_iq_ro"
@@ -2587,6 +2815,23 @@ class Orchestrator:
                     # and may themselves mutate state.
                     break
 
+            repeat_only_round = bool(
+                tool_calls
+                and not deferred_calls
+                and not paused
+                and repeated_calls == len(tool_calls)
+            )
+            if deferred_calls and not paused:
+                metrics.deferred_calls += len(deferred_calls)
+                for call in deferred_calls:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "name": str(call.get("name") or ""),
+                            "content": json.dumps(DEFERRED_CALL_RESULT),
+                        }
+                    )
             calibration_iq_evidence = next_calibration_iq_evidence
             scrapex_evidence = next_scrapex_evidence
             if paused:
@@ -2713,6 +2958,11 @@ class Orchestrator:
         is_dedupeable = (callable(tier_fn) and tier_fn(name) == "read_only") or (
             _is_pure_research_ro_call(name, args)
         )
+        if call_cache is not None and not is_dedupeable:
+            # A mutation (or any non-read tool) invalidates reads cached earlier
+            # in this turn: re-reading an RO after close_ro or add_calibration
+            # must return the fresh state, never the cached pre-mutation one.
+            call_cache.clear()
         if call_cache is not None and is_dedupeable:
             try:
                 canonical_args = json.dumps(args, sort_keys=True, default=str)
@@ -2721,7 +2971,27 @@ class Orchestrator:
             dedupe_key = (name, canonical_args)
             if dedupe_key in call_cache:
                 cached_result = call_cache[dedupe_key]
-                feed(cached_result)
+                # Tell the model this is a repeat: live acceptance showed it
+                # re-reading the same status until the round cap, expecting
+                # the answer to change within one turn.
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": name,
+                        "content": _bounded_tool_result_json(
+                            {
+                                "deduplicated": True,
+                                "note": (
+                                    "The same read already returned this earlier in this "
+                                    "turn; repeating it will not change the answer. "
+                                    "Answer from it now."
+                                ),
+                                "result": tool_result_for_model(name, cached_result),
+                            }
+                        ),
+                    }
+                )
                 yield {
                     "type": "tool_result",
                     "name": name,

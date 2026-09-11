@@ -7,6 +7,10 @@
  * they're spotted rather than guessing ahead of real evidence.
  */
 const DOMAIN_TERM_CORRECTIONS = [
+  // Observed 2026-09-11: "missing a dash map" for "missing ADAS Map". Only the
+  // two-word phrase is corrected; a bare "a dash" (a dash cam) is left alone.
+  { pattern: /\ba\s+dash\s+map\b/gi, replacement: "ADAS Map" },
+  { pattern: /\ba\s+dash\s+si\b/gi, replacement: "ADAS SI" },
   { pattern: /\bass\s+si\b/gi, replacement: "ADAS SI" },
   { pattern: /\bass\s+map\b/gi, replacement: "ADAS Map" },
   { pattern: /\bass\b/gi, replacement: "ADAS" },

@@ -284,10 +284,21 @@ async def test_one_model_round_has_a_hard_tool_call_limit(tmp_path):
 
     assert len(calls) == 8
     assert [args["shop"] for _, args in calls] == [f"shop-{index}" for index in range(8)]
+    # Calls past the per-round limit are never dropped silently: the model's
+    # own request stays intact and each extra call gets a "not run" result,
+    # so it knows to ask again instead of reporting all twelve as done.
     assistant_call = next(
         message for message in client.messages[1] if message.get("tool_calls")
     )
-    assert len(assistant_call["tool_calls"]) == 8
+    assert len(assistant_call["tool_calls"]) == 12
+    deferred = [
+        json.loads(message["content"])
+        for message in client.messages[1]
+        if message.get("role") == "tool"
+        and message["tool_call_id"] in {f"call-{index}" for index in range(8, 12)}
+    ]
+    assert len(deferred) == 4
+    assert all(item["status"] == "not_run" and item["executed"] is False for item in deferred)
     store.close()
 
 

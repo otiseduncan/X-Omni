@@ -201,3 +201,23 @@ test("delegated research findings render a provenance-first card", async () => {
   assert.match(cards, /finding\?\.page \? ` · p\.\$\{finding\.page\}` : ""/);
   assert.match(cards, /rel="noreferrer noopener"/);
 });
+
+test("ADAS Map sweep results render grouped by outcome and reload on background updates", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/FieldCards.jsx", import.meta.url),
+    "utf8",
+  );
+  const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
+
+  assert.match(cards, /adas_map_sweep:\s*AdasMapSweepCard/);
+  assert.match(cards, /export function AdasMapSweepCard/);
+  // Finished sweeps list every outcome group the service reports; a running
+  // sweep shows per-RO ScrapeX progress, never a completed claim.
+  assert.match(cards, /groups\.map\(\(group, index\)/);
+  assert.match(cards, /data\.missing_after/);
+  assert.match(cards, /of \$\{progress\.total\} processed/);
+  assert.match(cards, /waiting_for_sign_in: "Waiting for ADAS Map sign-in"/);
+  // The sweep posts its result from a background task; an open chat re-reads.
+  assert.match(app, /case "conversation_updated":[\s\S]*?reconcile\(\)/);
+});
+

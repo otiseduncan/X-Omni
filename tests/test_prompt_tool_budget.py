@@ -104,13 +104,17 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # stage_action enum, its operation glossary, and the 11-value status enum
     # are the remainder and are what let llama.cpp's grammar constrain those
     # fields. The old 33-tool reserve was ~12,300 exact tokens.
-    assert metrics["advertised_tools"]["catalog_tokens"] < 2_350
-    assert metrics["advertised_tools"]["catalog_chars"] < 8_200
-    # Static system prompt, measured: 4,474 chars, estimator 1,279, exact ~910.
-    assert metrics["base_system"]["chars"] < 4_700
-    assert metrics["base_system"]["tokens"] < 1_350
-    assert metrics["total_input_used_tokens"] < 3_700
-    assert metrics["remaining_normal_turn_tokens"] > 27_000
+    # The ADAS Map sweep contract (sweep_adas_maps, query_ciq adas_map_sweep)
+    # added about 1,000 chars on 2026-09-11.
+    assert metrics["advertised_tools"]["catalog_tokens"] < 2_650
+    assert metrics["advertised_tools"]["catalog_chars"] < 9_200
+    # Static system prompt, measured with the voice-dictation sentence: 4,831 chars, ~1,381 estimator tokens.
+    assert metrics["base_system"]["chars"] < 5_000
+    assert metrics["base_system"]["tokens"] < 1_430
+    # Measured 2026-09-11 with the sweep contract and phase enums: 4,003
+    # estimator tokens total (exact: 992 system + ~2,481 permanent tools).
+    assert metrics["total_input_used_tokens"] < 4_200
+    assert metrics["remaining_normal_turn_tokens"] > 26_800
 
 
 def test_budget_reserve_covers_permanent_plus_largest_unlockable_set() -> None:
@@ -125,7 +129,7 @@ def test_budget_reserve_covers_permanent_plus_largest_unlockable_set() -> None:
     assert set(reserve_names[len(PERMANENT_TOOLS):]) <= discoverable_names
     reserve_tokens = prompt.estimate_tool_catalog_tokens(reserve)
     permanent_tokens = prompt.estimate_tool_catalog_tokens(registry.permanent_catalog())
-    assert permanent_tokens < reserve_tokens < 6_500
+    assert permanent_tokens < reserve_tokens < 7_000
     # The full reachable catalog is much larger than what any single turn can
     # see: discovery is what keeps the permanent prompt small.
     reachable_tokens = prompt.estimate_tool_catalog_tokens(_reachable_catalog())
@@ -345,4 +349,5 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
         + metrics["turn_context"]["tokens"]
     )
     assert abs(metrics["fixed_prompt"]["tokens"] - summed_sections) <= 2
-    assert metrics["remaining_normal_turn_tokens"] >= 25_000
+    # Measured 2026-09-11 after the ADAS Map sweep contract: 24,985.
+    assert metrics["remaining_normal_turn_tokens"] >= 24_700

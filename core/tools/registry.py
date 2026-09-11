@@ -60,6 +60,7 @@ VALID_POLICY_TIERS = frozenset({
 
 _CALIBRATION_IQ_CONTEXT_KEY = "__xomni_invocation"
 _SCRAPEX_CONTEXT_KEY = "__xomni_invocation"
+SWEEP_TOOLS = frozenset({"adas_map_sweep", "adas_map_sweep_status"})
 _CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY = "__xomni_work_prep_context"
 _CALIBRATION_IQ_APPROVAL_BINDING_KEY = "__xomni_write_binding"
 _AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY = "__xomni_actor"
@@ -3108,6 +3109,33 @@ TOOL_SCHEMAS: dict[str, dict] = {
 
 # The permanent model-facing surface. Concrete handlers stay registered under
 # their own names; the gateway expands these before authorization/execution.
+TOOL_SCHEMAS["adas_map_sweep"] = {
+    "description": (
+        "Start a background ADAS Map sweep: Calibration IQ inventory for the scope, "
+        "ScrapeX exact batches of the missing ROs, one retry for needs_operator, a "
+        "per-RO Calibration IQ re-check, and a result card plus push notification "
+        "in this conversation. Returns immediately; started is not complete."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "phases": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(meta.CIQ_PHASE_VALUES)},
+                "minItems": 1,
+                "maxItems": 10,
+                "uniqueItems": True,
+            },
+            "shop": {"type": "string"},
+        },
+        "required": [],
+    },
+}
+TOOL_SCHEMAS["adas_map_sweep_status"] = {
+    "description": "Progress or results of the latest background ADAS Map sweep.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
 TOOL_SCHEMAS.update(meta.meta_tool_schemas())
 
 
@@ -4167,6 +4195,9 @@ class Registry:
         }:
             args = dict(args)
             args.pop(_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY, None)
+        if name in SWEEP_TOOLS:
+            args = dict(args)
+            args.pop(_SCRAPEX_CONTEXT_KEY, None)
         tier = self.tier(name)
 
         if name == "calibration_iq_update" and not self.profile_allows_tool(name):
@@ -4314,6 +4345,15 @@ class Registry:
         if name == "automotive_knowledge_capture":
             handler_args = dict(args)
             handler_args[_AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY] = user_id or "local-dev"
+        if name in SWEEP_TOOLS:
+            handler_args = dict(args)
+            handler_args[_SCRAPEX_CONTEXT_KEY] = self._calibration_iq_invocation_context(
+                conversation_id=conversation_id,
+                tool_call_id=tool_call_id,
+                message_id=message_id,
+                user_id=user_id,
+                role=role,
+            )
         if name == "scrapex_adas_map":
             handler_args = dict(args)
             handler_args[_SCRAPEX_CONTEXT_KEY] = self._calibration_iq_invocation_context(
@@ -4455,6 +4495,34 @@ class Registry:
                     "execution": execution,
                 },
                 status="succeeded",
+            )
+
+        if operation == "sweep_adas_maps":
+            sweep_args: dict[str, Any] = {}
+            if args.get("phases") not in (None, "", []):
+                sweep_args["phases"] = args.get("phases")
+            shop = _calibration_iq_nonempty(args.get("shop"))
+            if shop:
+                sweep_args["shop"] = shop
+            execution = await self.invoke(
+                "adas_map_sweep",
+                sweep_args,
+                message_id=message_id,
+                **common,
+            )
+            started = isinstance(execution, dict) and execution.get("executed") is True
+            return record(
+                {
+                    "stage": "started" if started else "not_started",
+                    "executed": started,
+                    "mutated": started,
+                    "operation": operation,
+                    "executed_via": "adas_map_sweep",
+                    "execution": execution,
+                },
+                status="succeeded" if started or (
+                    isinstance(execution, dict) and execution.get("success") is True
+                ) else "failed",
             )
 
         identity_args: dict[str, Any] = {}

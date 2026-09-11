@@ -1269,6 +1269,86 @@ export function ResearchFindingsCard({ data }) {
   );
 }
 
+/* ---------------- ADAS Map sweep (background job) ---------------- */
+
+const SWEEP_STATE_LABELS = {
+  running: "Running",
+  waiting_for_sign_in: "Waiting for ADAS Map sign-in",
+  completed: "Finished",
+  failed: "Stopped",
+  already_running: "Already running",
+  nothing_missing: "Nothing missing",
+  authentication_required: "Sign-in required",
+};
+
+export function AdasMapSweepCard({ data }) {
+  const status = data?.status || "unknown";
+  const scope = data?.scope || "the active board";
+  const groups = Array.isArray(data?.groups) ? data.groups : [];
+  const ros = Array.isArray(data?.ros) ? data.ros : [];
+  const progress = data?.progress || null;
+  const total = data?.target_count ?? progress?.total ?? 0;
+  const finished = status === "completed";
+  const tone =
+    status === "failed" || status === "authentication_required" || status === "waiting_for_sign_in"
+      ? "warn"
+      : undefined;
+  const meta = finished
+    ? `${data?.attached_count ?? 0} of ${total} attached`
+    : progress
+      ? `${progress.finished} of ${progress.total} processed`
+      : SWEEP_STATE_LABELS[status] || status;
+  return (
+    <Card icon={Layers} title={`ADAS Map sweep · ${scope}`} meta={meta} tone={tone}>
+      <p className="card-note">
+        <strong>{SWEEP_STATE_LABELS[status] || status}.</strong> {data?.message || ""}
+      </p>
+      {finished && typeof data?.missing_after === "number" ? (
+        <p className="card-note">
+          Calibration IQ now shows {data.missing_after} missing in {scope}.
+        </p>
+      ) : null}
+      {finished
+        ? groups.map((group, index) => (
+            <details
+              className="field-hit"
+              key={group.outcome}
+              open={index === 0 && group.outcome !== "attached"}
+            >
+              <summary>
+                <strong>{group.label}</strong>
+                <span className="field-page">{group.count}</span>
+              </summary>
+              {(group.ros || []).map((ro) => (
+                <div className="field-row" key={`${group.outcome}-${ro.ro_number}`}>
+                  <strong>{ro.ro_number}</strong>
+                  <span className="field-topics">
+                    {[ro.vehicle, ro.phase ? `Phase ${ro.phase}` : null].filter(Boolean).join(" · ")}
+                  </span>
+                  {ro.reason ? <em className="card-note">{String(ro.reason).slice(0, 200)}</em> : null}
+                </div>
+              ))}
+            </details>
+          ))
+        : ros.length > 0 ? (
+            <details className="field-alts">
+              <summary>{ros.length} RO{ros.length === 1 ? "" : "s"} in this sweep</summary>
+              {ros.map((ro) => (
+                <div className="field-row" key={ro.ro_number}>
+                  <strong>{ro.ro_number}</strong>
+                  <span className="field-topics">
+                    {[ro.vehicle, ro.phase ? `Phase ${ro.phase}` : null].filter(Boolean).join(" · ")}
+                  </span>
+                  <em className="field-meta">{String(ro.scrapex_state || "pending").replace(/_/g, " ")}</em>
+                </div>
+              ))}
+            </details>
+          ) : null}
+      {data?.note ? <p className="card-note">{data.note}</p> : null}
+    </Card>
+  );
+}
+
 export const FIELD_CARDS = {
   adas_si_document: AdasDocumentCard,
   adas_si_results: AdasResultsCard,
@@ -1285,4 +1365,5 @@ export const FIELD_CARDS = {
   scrapex: ScrapeXCard,
   automotive_knowledge: AutomotiveKnowledgeCard,
   research_findings: ResearchFindingsCard,
+  adas_map_sweep: AdasMapSweepCard,
 };

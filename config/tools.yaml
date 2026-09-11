@@ -330,6 +330,20 @@ tools:
       exact ADAS Map provenance and Calibration IQ reconciliation; authentication
       boundaries apply only to the ADAS Map work-browser profile.
 
+  adas_map_sweep:
+    tier: operator_authorized
+    description: >-
+      Background ADAS Map sweep for a phase/shop scope: CIQ inventory, ScrapeX
+      exact batches of the missing ROs, one needs_operator retry, per-RO CIQ
+      re-check, result card and push notification. Reached through stage_action
+      sweep_adas_maps; not advertised directly in the daily profile.
+
+  adas_map_sweep_status:
+    tier: read_only
+    description: >-
+      Progress or results of the latest ADAS Map sweep. Reached through
+      query_ciq kind=adas_map_sweep.
+
   scrapex_start_native:
     tier: operator_authorized
     description: "Start ScrapeX's local server when unreachable, then verify it answers."

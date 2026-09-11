@@ -206,6 +206,76 @@ TAHOE = {
 }
 REPAIR_ORDERS = (CAMRY, TAHOE)
 
+# Mirrors this morning's real phases 1-8 inventory (2026-09-11).
+SWEEP_MISSING = [
+    {"ro_number": ro, "repair_order_id": f"id-{ro}", "vehicle": vehicle, "phase": phase, "adas_map_status": "not_found"}
+    for ro, vehicle, phase in (
+        ("2400911797", "2025 Kia K4 EX FWD", "4"),
+        ("2400911793", "2014 GMC Acadia SLE1", "6"),
+        ("2400711905", "2021 Kia Sorento EX", "1"),
+        ("2400711898", "2021 Dodge Durango", "1"),
+        ("2400711884", "2025 Toyota Corolla LE", "1"),
+        ("2400711899", "2024 Honda Accord Hybrid", "1"),
+        ("2400711891", "2018 Honda Fit LX", "1"),
+        ("2400711896", "2022 Nissan Sentra SV", "1"),
+        ("2400711886", "2007 Infiniti M35 RWD", "1"),
+        ("2400711902", "2025 Kia K4 LX FWD", "1"),
+        ("2400711901", "2021 Honda Civic Hatchback", "1"),
+        ("2400711883", "2020 Nissan Altima SL", "1"),
+        ("2400711847", "2009 Honda Civic Sedan", "1"),
+        ("2400711880", "2015 Lexus ES 350", "1"),
+        ("2400711897", "2019 Honda Accord Sedan", "1"),
+        ("2400711846", "2020 Chrysler Voyager LXI", "7"),
+    )
+]
+
+
+def _sweep_group(outcome: str, label: str, ros: list[str], reason: str | None = None) -> dict[str, Any]:
+    by_ro = {row["ro_number"]: row for row in SWEEP_MISSING}
+    return {
+        "outcome": outcome,
+        "label": label,
+        "count": len(ros),
+        "ros": [
+            {
+                "ro_number": ro,
+                "vehicle": by_ro[ro]["vehicle"],
+                "phase": by_ro[ro]["phase"],
+                **({"reason": reason} if reason else {}),
+            }
+            for ro in ros
+        ],
+    }
+
+
+SWEEP_FINISHED = {
+    "service": "X Omni",
+    "action": "adas_map_sweep_status",
+    "sweep_id": "sweep-fixture-1",
+    "status": "completed",
+    "success": True,
+    "executed": True,
+    "verified": True,
+    "work_complete": True,
+    "scope": "phases 1-8",
+    "target_count": 16,
+    "attached_count": 8,
+    "counts": {"attached": 8, "not_in_adas_map": 5, "page_would_not_open": 2, "requirements_unverified": 1},
+    "groups": [
+        _sweep_group("attached", "Attached", ["2400911797", "2400711899", "2400711891", "2400711896", "2400711883", "2400711880", "2400711897", "2400711902"]),
+        _sweep_group("not_in_adas_map", "Not in ADAS Map yet", ["2400711905", "2400711898", "2400711886", "2400711901", "2400711847"], "ADAS Map lookup returned 'no_ro_match_visible'."),
+        _sweep_group("page_would_not_open", "In ADAS Map, but the page would not open", ["2400711884", "2400711846"], "ADAS Map lookup returned 'view_not_found'."),
+        _sweep_group("requirements_unverified", "Found, but requirements could not be verified", ["2400911793"], "ADAS Map details returned 'requirements_unparsed'."),
+    ],
+    "missing_after": 8,
+    "retried_count": 1,
+    "message": (
+        "ADAS Map sweep for phases 1-8 is done: 8 of 16 attached. Of the rest, 5 not in "
+        "ADAS Map yet, 2 in ADAS Map but the page would not open, and 1 found but the "
+        "requirements could not be verified. Calibration IQ now shows 8 missing in phases 1-8."
+    ),
+}
+
 
 def ro_result(ro: dict[str, Any], *, version: int | None = None) -> dict[str, Any]:
     current = ro["version"] if version is None else version
@@ -294,6 +364,7 @@ class FixtureBackends:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.research_calls: list[tuple[str, dict[str, Any]]] = []
+        self.store: Any = None
 
     def _record(self, name: str, args: dict[str, Any]) -> None:
         self.calls.append((name, deepcopy(args)))
@@ -336,6 +407,34 @@ class FixtureBackends:
     async def calibration_iq_work_prep(self, args: dict[str, Any]) -> dict[str, Any]:
         self._record("calibration_iq_work_prep", args)
         mode = str(args.get("mode") or "")
+        if mode == "adas_map_inventory":
+            phases = [str(value) for value in (args.get("phases") or [])]
+            rows = [
+                row
+                for row in SWEEP_MISSING
+                if not phases or row["phase"] in phases
+            ]
+            scope = f"phases {', '.join(phases)}" if phases else "the active board"
+            return {
+                "status": "verified",
+                "mode": "adas_map_inventory",
+                "success": True,
+                "verified": True,
+                "read_only": True,
+                "scrapex_called": False,
+                "evidence_id": "ciq-adas-map-inventory-1",
+                "phase_scope": phases or ["active"],
+                "queue_count": 90,
+                "adas_map_present_count": 90 - len(rows),
+                "adas_map_missing_count": len(rows),
+                "adas_map_unverified_count": 0,
+                "missing_repair_orders": rows,
+                "unverified_repair_orders": [],
+                "message": (
+                    f"Calibration IQ ADAS Map inventory completed for {scope}: "
+                    f"{len(rows)} missing, {90 - len(rows)} present, 0 unverified."
+                ),
+            }
         return {
             "mode": mode,
             "status": "verified",
@@ -390,6 +489,122 @@ class FixtureBackends:
             "verified": True,
             "message": "The managed sign-in window is open for the operator.",
         }
+
+    async def adas_map_sweep(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._record("adas_map_sweep", {k: v for k, v in args.items() if not k.startswith("__")})
+        phases = [str(value) for value in (args.get("phases") or [])]
+        rows = [row for row in SWEEP_MISSING if not phases or row["phase"] in phases]
+        scope = f"phases {', '.join(phases)}" if phases else "the active board"
+        if self.store is not None:
+            # Persist what the real service persists so the next turn's
+            # background-work context reflects a running sweep.
+            from core.services import adas_map_sweep as sweep_svc
+            from datetime import UTC, datetime
+
+            self.store.put_record(
+                sweep_svc.NAMESPACE,
+                "sweep-fixture-1",
+                {
+                    "sweep_id": "sweep-fixture-1",
+                    "user_id": "local-dev",
+                    "state": "running",
+                    "scope_label": scope,
+                    "started_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+                    "targets": [
+                        {"ro_number": row["ro_number"], "scrapex_state": "pending", "finished": False}
+                        for row in rows
+                    ],
+                },
+                user_id="local-dev",
+            )
+        return {
+            "service": "X Omni",
+            "action": "adas_map_sweep",
+            "sweep_id": "sweep-fixture-1",
+            "status": "running",
+            "success": True,
+            "executed": True,
+            "verified": True,
+            "work_complete": False,
+            "scope": scope,
+            "target_count": len(rows),
+            "estimated_minutes": 10,
+            "ros": [
+                {"ro_number": row["ro_number"], "vehicle": row["vehicle"], "phase": row["phase"], "scrapex_state": "pending"}
+                for row in rows
+            ],
+            "message": (
+                f"Started the ADAS Map sweep for {scope}: {len(rows)} ROs are missing a "
+                "map. ScrapeX is acquiring and attaching them in the background, and the "
+                "results will be posted in this chat in about 10 minutes. Nothing is "
+                "attached yet."
+            ),
+        }
+
+    async def adas_map_sweep_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Reads the same stored record the turn context reads, as production does."""
+
+        self._record("adas_map_sweep_status", {})
+        record = self._sweep_record()
+        if record is None:
+            return {
+                "service": "X Omni",
+                "action": "adas_map_sweep_status",
+                "status": "no_sweep",
+                "success": True,
+                "message": "No ADAS Map sweep has been started yet.",
+            }
+        if record.get("state") == "completed":
+            return deepcopy(SWEEP_FINISHED)
+        targets = record.get("targets") or []
+        finished = sum(1 for target in targets if target.get("finished"))
+        return {
+            "service": "X Omni",
+            "action": "adas_map_sweep_status",
+            "sweep_id": "sweep-fixture-1",
+            "status": "running",
+            "success": True,
+            "executed": True,
+            "verified": True,
+            "work_complete": False,
+            "scope": record.get("scope_label"),
+            "target_count": len(targets),
+            "progress": {"finished": finished, "total": len(targets)},
+            "scrapex_complete_so_far": 0,
+            "message": (
+                f"The ADAS Map sweep for {record.get('scope_label')} is running: {finished} of "
+                f"{len(targets)} ROs processed. Nothing is final until it finishes and each RO "
+                "is re-checked in Calibration IQ. Reading this again now will not show more "
+                "progress; the result posts to this chat when it finishes."
+            ),
+        }
+
+    def _sweep_record(self) -> dict[str, Any] | None:
+        if self.store is None:
+            return None
+        from core.services import adas_map_sweep as sweep_svc
+
+        record = self.store.get_record(sweep_svc.NAMESPACE, "sweep-fixture-1", user_id="local-dev")
+        return record if isinstance(record, dict) else None
+
+    def finish_sweep(self) -> None:
+        """What the real background job does when ScrapeX and CIQ re-checks finish."""
+
+        record = self._sweep_record()
+        if record is None:
+            return
+        from core.services import adas_map_sweep as sweep_svc
+        from datetime import UTC, datetime
+
+        record.update(
+            {
+                "state": "completed",
+                "scope_label": "phases 1-8",
+                "finished_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+                "result": {"target_count": 16, "counts": dict(SWEEP_FINISHED["counts"])},
+            }
+        )
+        self.store.put_record(sweep_svc.NAMESPACE, "sweep-fixture-1", record, user_id="local-dev")
 
     async def get_calendar(self, args: dict[str, Any]) -> dict[str, Any]:
         self._record("get_calendar", args)
@@ -502,6 +717,35 @@ def _operation(operation: str, **extra: Any) -> ArgValidator:
     return validate
 
 
+def _inventory(phases: set[str] | None = None) -> ArgValidator:
+    def validate(arguments: dict[str, Any]) -> None:
+        assert arguments.get("mode") == "adas_map_inventory", f"mode: {arguments!r}"
+        supplied = {str(value) for value in (arguments.get("phases") or [])}
+        if phases is None:
+            assert not supplied, f"no phases were named, but the call scoped {sorted(supplied)}"
+        else:
+            assert supplied == phases, f"phases: expected {sorted(phases)}, got {sorted(supplied)}"
+    return validate
+
+
+def _sweep(
+    phases: set[str] | None = None,
+    *,
+    at_least: set[str] | None = None,
+    at_most: set[str] | None = None,
+) -> ArgValidator:
+    def validate(arguments: dict[str, Any]) -> None:
+        assert arguments.get("operation") == "sweep_adas_maps", f"operation: {arguments!r}"
+        supplied = {str(value) for value in (arguments.get("phases") or [])}
+        if phases is not None:
+            assert supplied == phases, f"phases: expected {sorted(phases)}, got {sorted(supplied)}"
+        if at_least is not None:
+            assert at_least <= supplied, f"phases {sorted(supplied)} miss {sorted(at_least - supplied)}"
+        if at_most is not None:
+            assert supplied <= at_most, f"phases {sorted(supplied)} exceed {sorted(at_most)}"
+    return validate
+
+
 def _all(*validators: ArgValidator) -> ArgValidator:
     def validate(arguments: dict[str, Any]) -> None:
         for validator in validators:
@@ -523,6 +767,9 @@ class Turn:
     forbidden: frozenset[str] = frozenset()
     zero_tools: bool = False
     approval_tool: str | None = None
+    forbidden_operations: frozenset[str] = frozenset()
+    # Advances background state between turns, as the real sweep job does.
+    before_turn: Callable[["FixtureBackends"], None] | None = None
     contracts: frozenset[str] = frozenset()
     answer_contracts: dict[str, str] = field(default_factory=dict)
     subject_after: str | None = None
@@ -557,6 +804,17 @@ NEGATIVE_TRUTH_DESCRIPTIONS = {
         "changed, or attached when no tool ran in this turn."
     ),
     "no_magic_wording": "The answer does not require or teach a special command phrase.",
+    "started_is_not_attached": (
+        "A sweep that only started is never described as having already acquired or "
+        "attached any ADAS Map (completed or past tense). Saying it is running, or that "
+        "ScrapeX is acquiring and attaching them now in the background with results to "
+        "follow, is correct and not a violation."
+    ),
+    "no_premature_sweep_completion": (
+        "Unless a sweep status read in this turn returned status=completed, the response "
+        "never says the sweep finished or that maps were attached; a running sweep is "
+        "described as still running."
+    ),
     "approval_is_not_execution": (
         "Work that paused for approval is described as pending approval, never as "
         "attempted, started, removed, or completed."
@@ -781,6 +1039,168 @@ SCENARIOS: tuple[Scenario, ...] = (
             ),
         ),
     ),
+
+    # ---- Otis's daily ADAS Map routine, in his own words (conversations
+    # 114, 122, 123, 129, 175, 201; 2026-08-23 through 2026-09-11), including
+    # voice-dictation garble. No phrase is special; the model owns meaning.
+    Scenario(
+        "adas_map_count_whole_board",
+        "adas_map_routine",
+        (
+            Turn(
+                "How many ros are missing adas map",
+                calls=(Call("calibration_iq_work_prep", _inventory(None)),),
+                forbidden=frozenset({"stage_action", "delegate_research"}),
+                contracts=frozenset({"no_invented_data"}),
+            ),
+        ),
+    ),
+    Scenario(
+        "adas_map_count_dictation",
+        "adas_map_routine",
+        (
+            Turn(
+                "how many Ro's in calibration IQ are missing a dash map",
+                calls=(Call("calibration_iq_work_prep", _inventory(None)),),
+                forbidden=frozenset({"stage_action", "delegate_research"}),
+                contracts=frozenset({"no_invented_data"}),
+            ),
+        ),
+    ),
+    Scenario(
+        "adas_map_count_named_phases",
+        "adas_map_routine",
+        (
+            Turn(
+                "which ROs are missing ADAS map in phase 5, 6, 7, and 8",
+                calls=(Call("calibration_iq_work_prep", _inventory({"5", "6", "7", "8"})),),
+                forbidden=frozenset({"stage_action", "delegate_research"}),
+                contracts=frozenset({"no_invented_data"}),
+            ),
+        ),
+    ),
+    Scenario(
+        "adas_map_check_and_get_in_one_request",
+        "adas_map_routine",
+        (
+            Turn(
+                "check phase 5 6 7 and 8 and anything that's missing the adas map go and get the missing adas maps",
+                calls=(Call("stage_action", _sweep({"5", "6", "7", "8"})),),
+                forbidden=frozenset({"delegate_research", "calibration_iq_operator"}),
+                forbidden_operations=frozenset({"acquire_adas_map"}),
+                contracts=frozenset({"started_is_not_attached", "no_invented_data"}),
+            ),
+        ),
+    ),
+    Scenario(
+        # Conversation 122 (2026-08-26), both turns verbatim.
+        "adas_map_dictation_get_it",
+        "adas_map_routine",
+        (
+            Turn(
+                "how many cars at Phase 567 or 8 are missing ADAS map",
+                calls=(Call("calibration_iq_work_prep", _inventory({"5", "6", "7", "8"})),),
+                forbidden=frozenset({"stage_action", "delegate_research"}),
+                contracts=frozenset({"no_invented_data"}),
+            ),
+            Turn(
+                "check check plays the size 6 7 and 8 and anything that's missing the adopt and get it",
+                calls=(Call("stage_action", _sweep(at_least={"6", "7", "8"}, at_most={"5", "6", "7", "8"})),),
+                forbidden=frozenset({"delegate_research", "calibration_iq_operator"}),
+                forbidden_operations=frozenset({"acquire_adas_map"}),
+                contracts=frozenset({"started_is_not_attached"}),
+            ),
+        ),
+    ),
+    Scenario(
+        # Conversation 201 (2026-09-11), every turn verbatim.
+        "adas_map_morning_routine",
+        "adas_map_routine",
+        (
+            Turn(
+                "how many Ro's in calibration IQ are missing a dash map",
+                calls=(Call("calibration_iq_work_prep", _inventory(None)),),
+                forbidden=frozenset({"stage_action", "delegate_research"}),
+                contracts=frozenset({"no_invented_data"}),
+            ),
+            Turn(
+                "check phases 1 - 8",
+                calls=(Call("calibration_iq_work_prep", _inventory({str(n) for n in range(1, 9)})),),
+                forbidden=frozenset({"stage_action", "delegate_research"}),
+                contracts=frozenset({"no_invented_data"}),
+            ),
+            Turn(
+                "go get the missing adas maps and attach them to the ros",
+                calls=(Call("stage_action", _sweep({str(n) for n in range(1, 9)})),),
+                forbidden=frozenset({"delegate_research", "calibration_iq_operator"}),
+                forbidden_operations=frozenset({"acquire_adas_map"}),
+                contracts=frozenset({"started_is_not_attached", "no_invented_data"}),
+            ),
+            Turn(
+                # No required tool: the background-work context already says the
+                # sweep is running, so a truthful "still running" answer is fine.
+                # What it must never do is invent a finished result.
+                "continue",
+                forbidden=frozenset({"delegate_research", "calibration_iq_operator"}),
+                forbidden_operations=frozenset({"acquire_adas_map"}),
+                contracts=frozenset({"no_invented_data", "no_premature_sweep_completion"}),
+            ),
+            Turn(
+                # The background job finished between turns; the record Core
+                # keeps now holds the result, and so does the status read.
+                "how'd the maps go?",
+                before_turn=lambda backends: backends.finish_sweep(),
+                forbidden=frozenset({"delegate_research", "stage_action"}),
+                contracts=frozenset({"no_invented_data"}),
+                answer_contracts={
+                    "reports_the_real_outcome": (
+                        "The response says 8 of the 16 ROs got an ADAS Map attached and "
+                        "accounts for the rest as the result reports them (not in ADAS Map "
+                        "yet, page would not open, requirements could not be verified); it "
+                        "does not claim all were attached."
+                    ),
+                },
+            ),
+        ),
+    ),
+    Scenario(
+        "adas_map_count_then_get_those",
+        "adas_map_routine",
+        (
+            Turn(
+                "How many ros are missing adas map",
+                calls=(Call("calibration_iq_work_prep", _inventory(None)),),
+                forbidden=frozenset({"stage_action", "delegate_research"}),
+                contracts=frozenset({"no_invented_data"}),
+            ),
+            Turn(
+                "Go get the adas map for those ros",
+                calls=(Call("stage_action", _sweep(None)),),
+                forbidden=frozenset({"delegate_research", "calibration_iq_operator"}),
+                forbidden_operations=frozenset({"acquire_adas_map"}),
+                contracts=frozenset({"started_is_not_attached"}),
+            ),
+        ),
+    ),
+    Scenario(
+        "adas_map_upload_paraphrase",
+        "adas_map_routine",
+        (
+            Turn(
+                "I just uploaded this morning's ROs. Get their ADAS maps.",
+                calls=(Call("stage_action", _sweep(None)),),
+                alternatives=(
+                    (
+                        Call("calibration_iq_work_prep", _inventory(None)),
+                        Call("stage_action", _sweep(None)),
+                    ),
+                ),
+                forbidden=frozenset({"delegate_research", "calibration_iq_operator"}),
+                forbidden_operations=frozenset({"acquire_adas_map"}),
+                contracts=frozenset({"started_is_not_attached"}),
+            ),
+        ),
+    ),
 )
 
 
@@ -821,6 +1241,7 @@ def build_harness_registry(store: Any, backends: FixtureBackends):
     settings = Settings.load()
     configured_profile_catalog(settings, role="owner", profile="adas_operator")
     registry = Registry(settings.tools_config, store=store, profile="adas_operator")
+    backends.store = store
     for name in (
         "calibration_iq_ro",
         "calibration_iq_summary",
@@ -831,6 +1252,8 @@ def build_harness_registry(store: Any, backends: FixtureBackends):
         "calibration_iq_destructive",
         "scrapex_adas_map",
         "get_calendar",
+        "adas_map_sweep",
+        "adas_map_sweep_status",
     ):
         registry.register(name, getattr(backends, name))
     registry.register("capability_search", builtin.make_capability_search(_Router(), registry))
@@ -1039,6 +1462,17 @@ class LiveHarness:
                 errors.append(problem)
             else:
                 raise ModelProtocolError("; ".join(errors))
+        looped = [
+            item["arguments"].get("operation")
+            for item in result.observed
+            if item["name"] == "stage_action"
+            and item["arguments"].get("operation") in turn.forbidden_operations
+        ]
+        if looped:
+            raise ModelProtocolError(
+                f"forbidden stage_action operation(s) called: {looped}; observed "
+                f"{[item['name'] for item in result.observed]}"
+            )
         if turn.approval_tool:
             if not result.approval or result.approval.get("tool") != turn.approval_tool:
                 raise ModelProtocolError(
@@ -1064,6 +1498,8 @@ class LiveHarness:
         conversation_id = self.store.create_conversation(scenario.name)
         results: list[TurnResult] = []
         for index, turn in enumerate(scenario.turns):
+            if turn.before_turn is not None:
+                turn.before_turn(self.backends)
             result = self.run_turn(conversation_id, turn)
             results.append(result)
             try:
@@ -1205,6 +1641,8 @@ def test_scenarios_reference_only_reachable_tools() -> None:
         "calibration_iq_status",
         "calibration_iq_operator",
         "calibration_iq_destructive",
+        "adas_map_sweep",
+        "adas_map_sweep_status",
     }
     for scenario in SCENARIOS:
         for turn in scenario.turns:

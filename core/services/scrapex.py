@@ -3087,3 +3087,250 @@ async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
         return _contract_failure(
             action, exc, may_mutate=(action not in {"verify", "get_evidence"})
         )
+
+
+
+# ---------------------------------------------------------------------------
+# Background ADAS Map sweep support (core/services/adas_map_sweep.py)
+# ---------------------------------------------------------------------------
+
+# Mirrors ScrapeX's scrapex/db.py: an item is finished once it is complete and
+# CIQ-verified, sits in an attention state, or has used its worker attempts.
+ADAS_MAP_COMPLETE_STATE = "adas_map_complete"
+ADAS_MAP_ATTENTION_STATES = frozenset(
+    {
+        "ro_not_found",
+        "ambiguous_ro",
+        "view_not_found",
+        "view_did_not_navigate",
+        "vin_missing",
+        "requirements_unparsed",
+        "login_required",
+        "needs_operator",
+        "failed",
+    }
+)
+ADAS_MAP_WORKER_MAX_ATTEMPTS = 3
+ADAS_MAP_EXACT_BATCH_LIMIT = 10
+
+
+async def adas_map_ready(settings: Any) -> dict[str, Any] | None:
+    """Start ScrapeX if needed and prove managed ADAS Map sign-in.
+
+    Returns None when a batch may be created. Otherwise returns one
+    structured non-ready result. When sign-in is required the managed sign-in
+    window is opened once, the same handoff acquire_exact uses, and nothing
+    else is created.
+    """
+    action = "adas_map_sweep"
+    try:
+        project_path = Path(
+            getattr(settings, "scrapex_project_path", None) or DEFAULT_PROJECT_PATH
+        )
+        if _project_revision(project_path):
+            startup = await start_native(settings)
+            if startup.get("success") is not True:
+                return {**startup, "action": action}
+        authentication = await _authentication_status(settings, action)
+        if authentication is None:
+            return None
+        opened = await adas_map(settings, {"action": "open_authentication"})
+        if opened.get("success") is True and opened.get("verified") is True:
+            return None
+        return {**opened, "action": action}
+    except ScrapeXRemote as exc:
+        return _remote_failure(action, exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure(action, exc)
+    except ScrapeXContract as exc:
+        return _contract_failure(action, exc, may_mutate=False)
+
+
+async def adas_map_signed_in(settings: Any) -> dict[str, Any]:
+    """Status-only ADAS Map sign-in check. Never opens or focuses a window."""
+    try:
+        authentication = await _authentication_status(settings, "adas_map_status")
+    except (ScrapeXRemote, ScrapeXTransport, ScrapeXContract) as exc:
+        return {"signed_in": None, "message": str(exc)[:300]}
+    if authentication is None:
+        return {"signed_in": True}
+    if authentication.get("status") == "authentication_required":
+        return {"signed_in": False}
+    return {"signed_in": None, "message": str(authentication.get("message") or "")[:300]}
+
+
+def _adas_map_item_view(raw: dict[str, Any]) -> dict[str, Any]:
+    state = str(raw.get("adas_map_state") or "pending").strip() or "pending"
+    try:
+        attempts = int(raw.get("adas_map_attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    current_contract = raw.get("adas_map_contract_version") in (None, 3, "3")
+    ciq_verified = raw.get("ciq_adas_map_verified") in (1, True, "1")
+    complete = bool(
+        current_contract and state == ADAS_MAP_COMPLETE_STATE and ciq_verified
+    )
+    finished = bool(
+        complete
+        or (current_contract and state in ADAS_MAP_ATTENTION_STATES)
+        or attempts >= ADAS_MAP_WORKER_MAX_ATTEMPTS
+    )
+    vehicle = " ".join(
+        str(raw.get(key) or "").strip()
+        for key in ("year", "make", "model")
+        if str(raw.get(key) or "").strip()
+    )
+    return {
+        "ro_number": str(raw.get("ro_number") or "").strip(),
+        "vehicle": vehicle[:120],
+        "adas_map_state": state[:60],
+        "adas_map_attempts": attempts,
+        "adas_map_last_error": str(raw.get("adas_map_last_error") or "")[:300],
+        "ciq_adas_map_verified": ciq_verified,
+        "complete": complete,
+        "finished": finished,
+        "checked_at": str(raw.get("adas_map_checked_at") or "")[:40],
+    }
+
+
+async def adas_map_batch(settings: Any, batch_id: str) -> dict[str, Any]:
+    """Read one ScrapeX batch's worker state and per-RO item states (read-only)."""
+    action = "batch_items"
+    try:
+        bid = _batch_id({"batch_id": batch_id})
+        data = await _request(
+            settings,
+            "GET",
+            f"/api/batches/{quote(bid, safe='')}",
+            timeout=READ_TIMEOUT,
+            may_mutate=False,
+        )
+        if (
+            not isinstance(data, dict)
+            or str(data.get("id") or "") != bid
+            or not isinstance(data.get("items"), list)
+        ):
+            raise ScrapeXContract(
+                "invalid_response",
+                "ScrapeX returned a batch that does not match the requested id.",
+            )
+        items = [
+            _adas_map_item_view(raw)
+            for raw in data["items"]
+            if isinstance(raw, dict)
+        ]
+        return {
+            "service": "ScrapeX",
+            "action": action,
+            "status": "verified",
+            "success": True,
+            "executed": True,
+            "verified": True,
+            "batch_id": bid,
+            "batch_state": str(data.get("state") or "")[:40],
+            "batch_error": str(data.get("last_error") or "")[:300],
+            "items": items,
+            "finished": bool(items) and all(item["finished"] for item in items),
+        }
+    except ScrapeXInput as exc:
+        return _input_failure(action, exc)
+    except ScrapeXRemote as exc:
+        return _remote_failure(action, exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure(action, exc)
+    except ScrapeXContract as exc:
+        return _contract_failure(action, exc, may_mutate=False)
+
+
+def adas_map_result_for_model(result: Any) -> Any:
+    """Compact, truthful projection of an ADAS Map acquisition result for the model.
+
+    The full ScrapeX payload (item rows, raw provenance, readiness, chat
+    document) still reaches the chat card and the durable store. The model
+    only needs the terminal state, identity, CIQ attachment truth, and the
+    requirement labels. Measured 2026-09-11: full results cost the model about
+    3,200 tokens per RO, so eight of them filled most of the 32K window.
+    """
+    if not isinstance(result, dict) or str(result.get("action") or "") not in {
+        "acquire_exact",
+        "process_one",
+    }:
+        # Create/start/pause/sign-in results are small, and create results
+        # carry the data.id that mints same-turn batch evidence: unchanged.
+        return result
+    projected: dict[str, Any] = {
+        key: result.get(key)
+        for key in (
+            "service",
+            "action",
+            "status",
+            "success",
+            "executed",
+            "verified",
+            "work_complete",
+            "authentication_required",
+            "requires_human",
+            "requested_ro_number",
+            "exact_batch_id",
+            "evidence_id",
+        )
+        if key in result
+    }
+    message = result.get("message")
+    if message:
+        projected["message"] = str(message)[:500]
+    error = result.get("error")
+    if isinstance(error, dict):
+        projected["error"] = {
+            key: str(error.get(key))[:300]
+            for key in ("code", "category", "message")
+            if error.get(key)
+        }
+    data = result.get("data")
+    if isinstance(data, dict):
+        view: dict[str, Any] = {
+            key: data.get(key)
+            for key in ("id", "batch_id", "ro_number", "status", "completed")
+            if key in data
+        }
+        item = data.get("item")
+        if isinstance(item, dict):
+            item_view = _adas_map_item_view(item)
+            view["item"] = {
+                key: item_view[key]
+                for key in ("vehicle", "adas_map_state", "adas_map_last_error")
+                if item_view.get(key)
+            }
+            inspection = str(item.get("adas_map_inspection_id") or "").strip()
+            if inspection:
+                view["item"]["inspection_id"] = inspection[:40]
+        provenance = data.get("provenance")
+        if isinstance(provenance, dict):
+            labels: list[str] = []
+            for requirement in provenance.get("requirements") or []:
+                label = (
+                    requirement.get("label") or requirement.get("name")
+                    if isinstance(requirement, dict)
+                    else requirement
+                )
+                if label:
+                    labels.append(str(label)[:120])
+            view["provenance"] = {
+                "requirements_proven": provenance.get("requirements_proven"),
+                "requirements": labels[:12],
+                "ciq_reconciliation_state": provenance.get("ciq_reconciliation_state"),
+            }
+        projected["data"] = view
+    attachment = result.get("ciq_attachment")
+    if isinstance(attachment, dict):
+        projected["ciq_attachment"] = {
+            key: attachment.get(key)
+            for key in ("status", "attached", "research_state", "title", "message")
+            if key in attachment
+        }
+    local = result.get("local_report")
+    if isinstance(local, dict):
+        projected["local_report"] = {
+            key: local.get(key) for key in ("verified", "relative_path") if key in local
+        }
+    return projected

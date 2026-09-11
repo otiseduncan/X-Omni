@@ -1751,6 +1751,43 @@ class Store:
         )
         return payload
 
+    def list_records(
+        self, namespace: str, *, user_id: Optional[str] = None, limit: int = 200,
+    ) -> list[dict]:
+        """Newest-first records in one namespace, for one user or all users.
+
+        Returns ``{"user_id", "id", "payload", "updated_at"}`` rows. ``user_id``
+        None is for Core-owned background work (e.g. resuming a sweep after a
+        restart); every user-facing read passes the owning user.
+        """
+        bounded = max(1, min(int(limit), 1000))
+        if user_id is None:
+            rows = self._query(
+                """
+                SELECT user_id, id, payload_json, updated_at FROM state_records
+                WHERE namespace = ? ORDER BY updated_at DESC, rowid DESC LIMIT ?
+                """,
+                (namespace, bounded),
+            )
+        else:
+            rows = self._query(
+                """
+                SELECT user_id, id, payload_json, updated_at FROM state_records
+                WHERE namespace = ? AND user_id = ?
+                ORDER BY updated_at DESC, rowid DESC LIMIT ?
+                """,
+                (namespace, user_id, bounded),
+            )
+        return [
+            {
+                "user_id": row["user_id"],
+                "id": row["id"],
+                "payload": json.loads(row["payload_json"]),
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
     # ---------- tasks ----------
 
     def add_task(self, title: str, conversation_id: Optional[int] = None,

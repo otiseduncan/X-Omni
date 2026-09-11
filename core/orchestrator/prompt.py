@@ -32,12 +32,12 @@ You are X, Otis Duncan's local 30B ADAS technician and workflow operator. Be con
 """
 
 MODEL_FIRST_CONTRACT = """## How you work
-You interpret ordinary language: intent, references, pronouns, source choice, structured arguments, and final wording. No magic phrasing is required; never demand a restatement when context and tools suffice. Answer general technical, conceptual, or conversational questions directly from your own knowledge with no tool call. Core validates, authorizes, executes, and verifies structured decisions; it does not decide what Otis meant.
+You interpret ordinary language: intent, references, pronouns, source choice, structured arguments, and final wording. No magic phrasing is required; never demand a restatement when context and tools suffice. Otis often dictates by voice, so read through speech-to-text errors using the conversation ("a dash map" or "the adopt" for ADAS Map, "plays" for phase). Talk to him in shop terms, never in internal tool names. Answer general technical, conceptual, or conversational questions directly from your own knowledge with no tool call. Core validates, authorizes, executes, and verifies structured decisions; it does not decide what Otis meant.
 
 Four permanent tools cover daily work:
-- `query_ciq`: every Calibration IQ read (one RO, board counts or lists, a named phase, the ADAS Map inventory, service status). Never changes anything.
+- `query_ciq`: every Calibration IQ read (one RO, board counts or lists, a named phase, the ADAS Map inventory, sweep progress, service status). Never changes anything.
 - `delegate_research`: a bounded worker over the local ADAS SI library, durable knowledge, licensed ALLDATA, and the public OEM web; provenance-bearing findings for any vehicle, RO or not; never changes Calibration IQ.
-- `stage_action`: the only path that changes Calibration IQ or acquires an ADAS Map; fresh exact-RO read, then a staged contract or an executed receipt; destructive operations pause for approval.
+- `stage_action`: the only path that changes Calibration IQ or acquires ADAS Maps; fresh exact-RO read, then a staged contract or an executed receipt; destructive operations pause for approval. One named RO's ADAS Map is `acquire_adas_map`; the missing maps across phases, a shop, or the board are one `sweep_adas_maps` call that runs in the background and posts results to the chat.
 - `capability_search`: unlock uncommon capabilities (calendar, tasks, files, cameras and DVR, ADAS SI documents, ScrapeX reads, service starts) for the rest of the turn.
 Independent calls may run in parallel; dependent calls continue across bounded rounds. A miss, unavailable state, or authentication boundary applies only to that source; do not repeat an unchanged failed call.
 """
@@ -433,16 +433,34 @@ def estimate_tool_catalog_tokens(tools: list[dict[str, Any]]) -> int:
     return estimate_tokens(serialized) if serialized else 0
 
 
+BACKGROUND_CONTEXT_MAX_CHARS = 600
+
+
+def background_block(background: Optional[str]) -> str:
+    text = " ".join(str(background or "").split())[:BACKGROUND_CONTEXT_MAX_CHARS]
+    if not text:
+        return ""
+    return (
+        "## Background work\n"
+        "Core's own record of work running outside this chat turn; it is current as "
+        "of this message.\n" + text
+    )
+
+
 def turn_context_sections(
     history: list[dict],
     active_subject: Optional[dict],
     *,
     subject_max_chars: int = ACTIVE_SUBJECT_CONTEXT_MAX_CHARS,
     artifact_max_chars: int = ARTIFACT_CONTEXT_MAX_CHARS,
+    background: Optional[str] = None,
 ) -> dict[str, str]:
     """The volatile per-turn sections, in their prompt order."""
 
     sections = {"current_time": time_block().strip()}
+    block = background_block(background)
+    if block:
+        sections["background_work"] = block
     subject = _active_subject_context(active_subject, subject_max_chars)
     if subject:
         sections["active_subject"] = subject
@@ -625,6 +643,7 @@ def build_messages(
     active_subject: Optional[dict] = None,
     tools: Optional[list[dict[str, Any]]] = None,
     extra_input_reserve_tokens: int = 0,
+    background: Optional[str] = None,
 ) -> list[dict]:
     """Newest-first packing under the context budget, then reversed.
 
@@ -651,6 +670,9 @@ def build_messages(
         input_token_budget,
     )
     clock = time_block().strip()
+    block = background_block(background)
+    if block:
+        clock = f"{clock}\n\n{block}"
     available_after_system = (
         context_tokens
         - reserve_for_response

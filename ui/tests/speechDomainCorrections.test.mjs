@@ -38,3 +38,12 @@ test("empty and non-matching input pass through unchanged", () => {
     "how many vehicles are in phase 6"
   );
 });
+
+test("the observed 'a dash map' mishearing becomes ADAS Map without touching dash cams", () => {
+  assert.equal(
+    correctDomainVocabulary("how many Ro's in calibration IQ are missing a dash map"),
+    "how many Ro's in calibration IQ are missing ADAS Map",
+  );
+  assert.equal(correctDomainVocabulary("check the a dash SI library"), "check the ADAS SI library");
+  assert.equal(correctDomainVocabulary("pull a dash cam clip"), "pull a dash cam clip");
+});

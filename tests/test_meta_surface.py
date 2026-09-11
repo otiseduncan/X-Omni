@@ -561,7 +561,7 @@ async def test_orchestrator_expands_query_ciq_renders_ro_card_and_reports_metric
     assert metrics["cached_tokens"] == 1800 and metrics["evaluated_tokens"] == 200
     assert metrics["tool_rounds"] == 2
     assert metrics["advertised_tools"] == list(meta.PERMANENT_TOOLS)
-    assert metrics["tool_schema_tokens_estimate"] < 2_350
+    assert metrics["tool_schema_tokens_estimate"] < 2_650
     assert metrics["reserved_tool_schema_tokens_estimate"] > metrics["tool_schema_tokens_estimate"]
     subject = store.get_conversation_subject(conversation_id)
     assert subject["payload"]["ro_number"] == "2400911779"

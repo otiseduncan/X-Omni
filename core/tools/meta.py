@@ -31,6 +31,11 @@ PERMANENT_TOOLS: tuple[str, ...] = (
 # the turn. Bounds the prompt growth a mid-turn discovery can cause.
 MAX_UNLOCKED_TOOLS = 6
 
+# Calibration IQ production phases. Live board 2026-09-11 used 1-8; 9 and 10
+# are allowed. An enum (not a free two-digit pattern) keeps "Phase 567 or 8"
+# from becoming phases "56" and "78", which happened in live acceptance.
+CIQ_PHASE_VALUES = tuple(str(number) for number in range(1, 11))
+
 CIQ_STATUS_VALUES = (
     "NEW_ARRIVAL",
     "NEEDS_TECHNICIAN_REVIEW",
@@ -84,6 +89,7 @@ QUERY_CIQ_KINDS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], dict[str
         {"mode": "adas_map_inventory"},
     ),
     "status": ("calibration_iq_status", (), (), {}),
+    "adas_map_sweep": ("adas_map_sweep_status", (), (), {}),
 }
 
 QUERY_CIQ_SCHEMA: dict[str, Any] = {
@@ -95,8 +101,12 @@ QUERY_CIQ_SCHEMA: dict[str, Any] = {
         "board_list: verified count or bounded rows for a shop/phase/status scope, "
         "finished work excluded unless include_completed. phase_list: one named "
         "phase. ro_requirements: one RO's governing ADAS Map requirements. "
-        "adas_map_inventory: which active ROs have or lack an ADAS Map (never "
-        "ScrapeX). status: service reachability. CIQ state is not OEM proof."
+        "adas_map_inventory: which active ROs have or lack an ADAS Map right now "
+        "(never ScrapeX); use it for any how-many or which-are-missing question. "
+        "adas_map_sweep: only the progress or outcome of the latest background "
+        "sweep (is it done, how did it go); reading it never advances the sweep, "
+        "which continues on its own. It is a past snapshot rather "
+        "than current state. status: service reachability. CIQ state is not OEM proof."
     ),
     "parameters": {
         "type": "object",
@@ -120,7 +130,7 @@ QUERY_CIQ_SCHEMA: dict[str, Any] = {
             },
             "phase": {
                 "type": "string",
-                "pattern": "^[0-9]{1,2}$",
+                "enum": list(CIQ_PHASE_VALUES),
                 "description": "Phase number as digits, e.g. '5' for 'phase five'; only when the request names a phase.",
             },
             "shop": {
@@ -133,11 +143,14 @@ QUERY_CIQ_SCHEMA: dict[str, Any] = {
             },
             "phases": {
                 "type": "array",
-                "items": {"type": "string", "pattern": "^[0-9]{1,2}$"},
+                "items": {"type": "string", "enum": list(CIQ_PHASE_VALUES)},
                 "minItems": 1,
-                "maxItems": 16,
+                "maxItems": 10,
                 "uniqueItems": True,
-                "description": "Explicit phase numbers (digits) for adas_map_inventory.",
+                "description": (
+                    "Phase numbers for adas_map_inventory, only when the request "
+                    "names phases; omit to cover the whole active board."
+                ),
             },
             "finished": {
                 "type": "string",
@@ -182,6 +195,12 @@ def expand_query_ciq(args: Any) -> tuple[str, dict[str, Any]]:
         for field in required
         if args.get(field) in (None, "", [], {})
     ]
+    if missing == ["phase"] and args.get("phases"):
+        raise ValueError(
+            f"query_ciq kind={kind} takes one phase (phase='5'). For several phases "
+            "use kind=adas_map_inventory with phases for ADAS Map presence, or one "
+            "board_count/board_list call per phase."
+        )
     if missing:
         raise ValueError(
             f"query_ciq kind={kind} requires {', '.join(missing)}"
@@ -267,9 +286,12 @@ DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
 
 
 ADAS_MAP_STAGE_OPERATIONS: tuple[str, ...] = (
+    "sweep_adas_maps",
     "acquire_adas_map",
     "open_adas_map_authentication",
 )
+# Operations that address a scope, not one RO: no fresh exact-RO read.
+SCOPE_STAGE_OPERATIONS: frozenset[str] = frozenset({"sweep_adas_maps"})
 
 
 def _operator_branches(tool_name: str) -> list[dict[str, Any]]:
@@ -311,13 +333,18 @@ def stage_action_schema(*, allow_unscoped_creates: bool = False) -> dict[str, An
             "call again with those values to execute (stage=executed carries the "
             "receipt and final snapshot). delete_* operations raise Otis's approval "
             "card when executed; never ask for confirmation in prose instead. "
-            "Whole-RO operations (close_ro, change_status with an explicitly named "
-            "status, hold/resume/reopen, mark_no_calibration_required = the RO "
-            "needs no calibration at all, add_*) take no target_id. One-child "
+            "Whole-RO operations take no target_id: close_ro = the RO's work is "
+            "finished, the normal Complete transition; change_status only when Otis "
+            "names a target status; hold/resume/reopen; mark_no_calibration_required "
+            "= the RO needs no calibration at all; add_*. One-child "
             "operations take target_id plus that child's version: delete_* "
             "removes one calibration/blocker/photo/prerequisite requirement, "
             "complete_/update_/reopen_* change one child's state. "
-            "acquire_adas_map runs ScrapeX for that RO and attaches the document; "
+            "ADAS Maps: acquire_adas_map gets the map for exactly one named RO now "
+            "and attaches it. sweep_adas_maps gets every missing map across a scope "
+            "(named phases/shop, default the whole active board) in one background "
+            "call that posts results to this chat; use it for a list or a scope, "
+            "never for one named RO, and never loop acquire_adas_map over a list. "
             "open_adas_map_authentication opens the managed sign-in after a result "
             "reported authentication_required. Nothing continues automatically "
             "after sign-in; Otis asks again."
@@ -329,6 +356,14 @@ def stage_action_schema(*, allow_unscoped_creates: bool = False) -> dict[str, An
                 "operation": {
                     "type": "string",
                     "enum": list(stage_operations(allow_unscoped_creates=allow_unscoped_creates)),
+                },
+                "phases": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(CIQ_PHASE_VALUES)},
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "uniqueItems": True,
+                    "description": "sweep_adas_maps only: phase numbers named in the request or the inventory it follows.",
                 },
                 "repair_order_id": {
                     "type": "string",

@@ -30,6 +30,7 @@ from .api import routes as core_routes
 from .config import Settings
 from .models.client import ModelClient
 from .models.router import ModelRouter, WorkerSwapError
+from .services import adas_map_sweep as adas_map_sweep_svc
 from .services import adas_si as adas_si_svc
 from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
@@ -39,6 +40,7 @@ from .services import camera_security as camera_security_svc
 from .services import calendar as calendar_svc
 from .services import exterior_camera as exterior_camera_svc
 from .services import image_generation as image_svc
+from .services import live_events as live_events_svc
 from .services import mediamtx_dvr as mediamtx_dvr_svc
 from .services.mediamtx_client import MediaMTXClient, PATH_MAIN
 from .services import onvif_motion as onvif_motion_svc
@@ -248,10 +250,45 @@ def build_app(settings: Settings) -> FastAPI:
     registry.register("adas_si_record_write", lambda a: adas.record_write(a))
     registry.register("adas_si_record_modify", lambda a: adas.record_modify(a))
 
+    live_events = live_events_svc.LiveEvents()
+    adas_map_sweep = adas_map_sweep_svc.AdasMapSweepService(
+        settings,
+        store,
+        publish=live_events.publish,
+    )
+
+    async def guarded_scrapex_adas_map(args: dict) -> dict:
+        # ScrapeX drives one managed browser. While a background sweep owns it,
+        # a separate single-RO acquisition or batch control would compete for
+        # the same window, so it is refused with a structured, truthful result.
+        action = str((args or {}).get("action") or "")
+        if action in {"acquire_exact", "process_one", "start_batch"}:
+            running = adas_map_sweep.running_sweep(None)
+            if running is not None:
+                return {
+                    "service": "ScrapeX",
+                    "action": action,
+                    "status": "sweep_running",
+                    "success": False,
+                    "executed": False,
+                    "verified": False,
+                    "work_complete": False,
+                    "message": (
+                        "An ADAS Map sweep for "
+                        f"{running.get('scope_label')} is using the ADAS Map browser "
+                        "right now, so nothing else was started. Its results will be "
+                        "posted when it finishes; query_ciq kind=adas_map_sweep shows "
+                        "its progress."
+                    ),
+                }
+        return await scrapex_svc.adas_map_with_ciq_attachment(settings, adas, args)
+
     registry.register(
         "scrapex_adas_map",
-        lambda a: scrapex_svc.adas_map_with_ciq_attachment(settings, adas, a),
+        guarded_scrapex_adas_map,
     )
+    registry.register("adas_map_sweep", adas_map_sweep.start)
+    registry.register("adas_map_sweep_status", adas_map_sweep.status)
 
     registry.register("automotive_knowledge_search", automotive_knowledge.search)
     registry.register("automotive_knowledge_read", automotive_knowledge.read)
@@ -385,6 +422,12 @@ def build_app(settings: Settings) -> FastAPI:
             store.audit("worker_start_failed", {"error": str(exc)})
         monitor_task = asyncio.create_task(camera_monitor.run_forever())
         try:
+            resumed = await adas_map_sweep.resume()
+            if resumed:
+                log.info("Resumed %d unfinished ADAS Map sweep(s).", resumed)
+        except Exception:  # noqa: BLE001 - a sweep problem must not block startup
+            log.exception("Could not resume ADAS Map sweeps")
+        try:
             yield
         finally:
             log.info(
@@ -393,6 +436,7 @@ def build_app(settings: Settings) -> FastAPI:
             )
             try:
                 camera_monitor.stop()
+                await adas_map_sweep.shutdown()
                 monitor_task.cancel()
                 await asyncio.gather(monitor_task, return_exceptions=True)
             finally:
@@ -428,6 +472,8 @@ def build_app(settings: Settings) -> FastAPI:
     app.state.image_generation_config = image_config
     app.state.video_generation = video_generation
     app.state.video_generation_config = video_config
+    app.state.live_events = live_events
+    app.state.adas_map_sweep = adas_map_sweep
 
     # Vite dev server runs on 5173 during development. Production serves the
     # built UI from this same origin, where CORS is irrelevant.
@@ -518,7 +564,9 @@ def build_app(settings: Settings) -> FastAPI:
         )
     )
     app.include_router(
-        chat_api.create_router(settings, store, router, client, registry)
+        chat_api.create_router(
+            settings, store, router, client, registry, live_events=live_events
+        )
     )
 
     @app.get("/healthz")

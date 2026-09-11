@@ -34,7 +34,9 @@ SWAP_COMMANDS = {
 SendJson = Callable[[dict], Awaitable[None]]
 
 
-def create_router(settings, store, router_, client, registry) -> APIRouter:
+def create_router(
+    settings, store, router_, client, registry, *, live_events=None
+) -> APIRouter:
     ws_router = APIRouter()
     orchestrator = Orchestrator(router_, client, registry, store, settings)
 
@@ -174,6 +176,15 @@ def create_router(settings, store, router_, client, registry) -> APIRouter:
                 })
 
         router_.subscribe(on_worker_event)
+        # Background work (an ADAS Map sweep finishing) announces changed
+        # conversations here; the UI re-reads the conversation on receipt.
+        unsubscribe_live = (
+            live_events.subscribe(
+                str(session.get("user_id") or "local-dev"), on_worker_event
+            )
+            if live_events is not None
+            else None
+        )
         try:
             await _safe_send(router_.status())
 
@@ -296,6 +307,8 @@ def create_router(settings, store, router_, client, registry) -> APIRouter:
                 with suppress(asyncio.CancelledError):
                     await active_task
             router_.unsubscribe(on_worker_event)
+            if unsubscribe_live is not None:
+                unsubscribe_live()
 
     async def _handle_swap(send_json: SendJson, router_, store, worker) -> None:
         worker = str(worker or "").strip().lower()

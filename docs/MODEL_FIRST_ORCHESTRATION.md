@@ -26,9 +26,9 @@ rereads, provenance, audit, bounded serialization, and terminal media safety.
 
 | Tool | Owns | Expands to |
 |---|---|---|
-| `query_ciq` | every Calibration IQ read: one RO, board count/list, phase list, RO requirements, ADAS Map inventory, service status | `calibration_iq_ro`, `_summary`, `_read`, `_work_prep`, `_status` (pure structural expansion in `Registry.invoke` and the loop) |
+| `query_ciq` | every Calibration IQ read: one RO, board count/list, phase list, RO requirements, ADAS Map inventory, sweep progress, service status | `calibration_iq_ro`, `_summary`, `_read`, `_work_prep`, `_status` (pure structural expansion in `Registry.invoke` and the loop) |
 | `delegate_research` | one research objective over local ADAS SI, durable knowledge, licensed ALLDATA (ScrapeX Navigator, model-driven inside the call), public OEM web; provenance-bearing findings; any vehicle, RO or not; never writes CIQ | `core/services/research_delegate.py` |
-| `stage_action` | the only write path: fresh exact-RO read, then `stage=staged` (current version, valid targets, argument contract) or `stage=executed` (receipt + final snapshot); ADAS Map acquisition | `calibration_iq_operator`, `calibration_iq_destructive` (approval-gated), `scrapex_adas_map`, all through `Registry.invoke` with the exact-RO write binding |
+| `stage_action` | the only write path: fresh exact-RO read, then `stage=staged` (current version, valid targets, argument contract, exact `next_call`) or `stage=executed` (receipt + final snapshot); one-RO ADAS Map acquisition; `sweep_adas_maps` for a scope | `calibration_iq_operator`, `calibration_iq_destructive` (approval-gated), `scrapex_adas_map`, all through `Registry.invoke` with the exact-RO write binding |
 | `capability_search` | ranks the profile's discoverable tools against a structured query and unlocks matches for the rest of the turn | `core/tools/builtin/system.py::make_capability_search` |
 
 Everything else in the `adas_operator` profile (calendar, tasks, files,
@@ -38,8 +38,62 @@ is *discoverable*: advertised only on later rounds of a turn in which
 not in the profile at all; the full maintenance profile still advertises them.
 
 Measured on the live Qwen3-Omni worker on 2026-09-11 through the real chat
-template: the static system prompt is ~875 tokens and the permanent catalog
-~1,980 tokens, against ~1,450 + ~12,300 for the old 33-tool reserve.
+template, after the ADAS Map sweep contract: the static system prompt is 1,009
+tokens and the permanent catalog about 2,511, against ~1,450 + ~12,300 for the
+old 33-tool reserve.
+
+## Background work: the ADAS Map sweep
+
+Getting every missing ADAS Map is a daily routine, and it does not fit inside a
+chat turn: each acquisition takes 15-45 s, each full ScrapeX result cost the
+model ~3,200 tokens, and a chat turn is cancelled when the phone's socket drops.
+So `stage_action` operation `sweep_adas_maps` (scope: named phases and/or
+shop, default the whole active board) starts `core/services/adas_map_sweep.py`
+and returns at once:
+
+1. Calibration IQ `adas_map_inventory` for the scope gives the exact missing
+   ROs (nothing missing: return without touching ScrapeX).
+2. ScrapeX readiness and sign-in are proved; exact batches of at most ten ROs
+   (ScrapeX's limit) run one after another on ScrapeX's own background worker,
+   the same per-item code that saves the PDF, attaches it in Calibration IQ,
+   and reconciles requirements.
+3. ROs that ended in `needs_operator` get one retry batch (both such ROs
+   succeeded on a second try on 2026-09-11; every other failure state
+   repeated identically, so those are reported, not retried).
+4. Each swept RO is re-read in Calibration IQ; only CIQ decides "attached".
+5. Core posts one message with an `adas_map_sweep` card to the originating
+   conversation, sends a Web Push, and publishes `conversation_updated` so an
+   open chat re-reads (`core/services/live_events.py`).
+
+Sweeps persist in `state_records` (namespace `adas_map_sweep`), resume after a
+Core restart, wait for sign-in if it lapses mid-sweep (one push, the window
+opened once, then status-only polling), and refuse a competing single-RO
+acquisition while they own the ADAS Map browser. `query_ciq` kind
+`adas_map_sweep` reads progress or the result.
+
+While a sweep runs, and for 12 hours after it finishes, the turn context
+carries a **Background work** line built from Core's own record. The no-tool
+review leads with that record and asks whether the draft reports an outcome it
+does not contain; if the review rejects a draft without choosing a read, the
+fail-closed answer is the record's own status sentence. Live acceptance showed
+why: without this, "how'd the maps go?" produced "all 16 attached" five times
+out of five while the sweep was still running.
+
+## Turn-loop rules added 2026-09-11
+
+- **No silent drops.** Calls beyond the eight-per-round limit stay in the
+  assistant message and each gets a `not_run` result, so the model asks again.
+- **Context guard.** Before every model call, this turn's tool results are
+  shrunk structurally, largest first, until the request fits the window
+  (JSON results are budgeted at 2.9 chars/token, measured).
+- **Compact acquisition results.** `acquire_exact`/`process_one` results reach
+  the model as a compact projection (status, identity, CIQ attachment truth,
+  requirement labels); the full payload still goes to the card and store.
+- **Repeat-only rounds end tool use.** A round whose calls were all served
+  from the same-turn read cache goes straight to the final answer.
+- **Mutations invalidate the read cache.** After any non-read tool runs, a
+  re-read in the same turn returns fresh state, never the cached pre-mutation
+  result.
 
 ## Prompt layout and the prefix cache
 

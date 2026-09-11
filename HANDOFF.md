@@ -182,3 +182,54 @@ The review's "under 1,500 tokens" target for the permanent schemas is not met: t
 - Frontend: 106 passed. One pre-existing failure on `main` (`fieldCards.test.mjs` asserting dormant SI queue cards removed in 159abe9) was corrected in the test.
 - Vite production build passed.
 - Live acceptance (`tests/test_model_first_live_acceptance.py`, production orchestrator against the live Qwen3-Omni worker on 8131, fixture business results): **8 of 8 scenarios passed in 48 s**, including the five-turn agency sequence: exact RO read on the short form (`11779 in Warner Robins`), a general ultrasonic-sensor question answered with zero tools while the RO subject was active, research for a 2023 Camry without an RO through `delegate_research`, a reflector follow-up answered from the finding with no tool, and "go back to that RO" resolving the subject and reading it fresh. Also passed: shop/phase count paraphrase, staged-then-executed `close_ro` with a verified receipt, `delete_calibration` pausing on a `calibration_iq_destructive` approval without executing, ADAS Map acquisition reporting the sign-in boundary without claiming a start, research with ALLDATA excluded, calendar via `capability_search` then `get_calendar`, and an informational readiness question that stayed read-only. Per-turn prefix-cache hit rates in the run were 85-98% (for example 9,980 cached vs 1,010 evaluated tokens on the three-call destructive turn); whole multi-call turns completed in 1.4-6.3 s.
+
+## Daily ADAS Map sweep (2026-09-11, afternoon)
+
+Otis asks X for the same routine every morning after uploading new ROs: find
+every active RO missing an ADAS Map, get them, attach them, and say what could
+not be done. The morning run failed because Core ran 8 of the 19 acquisitions
+X requested and dropped 11 without telling it; the eight results alone were
+25,448 of the 32,768-token window; and a chat turn dies when the phone's socket
+drops. Evidence: `logs/launcher/core-20260911-051028.err.log` ("Model requested
+19 tools in one round; executing the first 8") and conversation 201.
+
+### What changed
+
+- `stage_action` operation `sweep_adas_maps` starts a persisted background job
+  (`core/services/adas_map_sweep.py`); `query_ciq` kind `adas_map_sweep` reads
+  it. Details and rationale: `docs/MODEL_FIRST_ORCHESTRATION.md`.
+- ScrapeX adapter: `adas_map_ready`, status-only `adas_map_signed_in`,
+  read-only `adas_map_batch`, and a compact model projection for acquisition
+  results. The sweep uses the existing validated `create_exact_batch` and
+  `start_batch` actions.
+- Turn loop: deferred calls return `not_run`; a context guard keeps every model
+  call inside the window; repeat-only rounds end tool use; mutations
+  invalidate the same-turn read cache; the no-tool review leads with Core's
+  background-work record and falls back to it.
+- Phase fields are an enum of 1-10 ("Phase 567 or 8" had become phases 56 and
+  78). The `query_ciq` inventory is the current-state read; the sweep kind is
+  explicitly a past snapshot.
+- Prompt: Otis dictates by voice; read through transcription errors and talk
+  in shop terms, never tool names. Speech layer: the observed "a dash map"
+  becomes "ADAS Map".
+- UI: `AdasMapSweepCard`; `conversation_updated` makes an open chat re-read.
+
+### Verification
+
+- Backend 1,050 passed, 1 skipped; UI 108 passed; Vite build passed.
+- Live acceptance, production orchestrator against the live Qwen3-Omni worker
+  with fixture business results: 16 scenarios including eight built from
+  Otis's own requests (conversations 114, 122, 123, 129, 175, 201, verbatim,
+  dictation errors included). Final full-suite runs: 16/16, 16/16, 16/16. The
+  four-turn morning routine passed 6/6 after the background-work fix (0/5
+  before it). Mutation scenarios (close, destructive approval, sign-in
+  boundary) passed 18/18 after restoring the close_ro meaning.
+- Read-only live checks against production: the batch reader parsed this
+  morning's real ScrapeX batches; per-RO Calibration IQ checks were correct;
+  a sweep of fully covered phase 3 returned "nothing missing" without touching
+  ScrapeX.
+- Not yet exercised: a real sweep that acquires. At verification time the
+  ScrapeX ADAS Map session was signed out and the active board had 45 ROs
+  missing a map (141 active). The first real sweep will open the sign-in
+  window and report that sign-in is required; after signing in, ask again.
+
