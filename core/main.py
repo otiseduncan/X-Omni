@@ -43,6 +43,7 @@ from .services import mediamtx_dvr as mediamtx_dvr_svc
 from .services.mediamtx_client import MediaMTXClient, PATH_MAIN
 from .services import onvif_motion as onvif_motion_svc
 from .services import research as research_svc
+from .services import research_delegate as research_delegate_svc
 from .services import scrapex as scrapex_svc
 from .services import video_generation as video_svc
 from .services import website as website_svc
@@ -254,6 +255,23 @@ def build_app(settings: Settings) -> FastAPI:
 
     registry.register("automotive_knowledge_search", automotive_knowledge.search)
     registry.register("automotive_knowledge_read", automotive_knowledge.read)
+
+    # --- permanent model-facing surface ---
+    # query_ciq and stage_action are gateway composites implemented inside
+    # Registry.invoke (they expand to the concrete Calibration IQ handlers
+    # above), so only the two real handlers are registered here.
+    registry.register(
+        "capability_search",
+        builtin.make_capability_search(router, registry),
+    )
+    registry.register(
+        "delegate_research",
+        research_delegate_svc.make_delegate_research(
+            settings,
+            adas_search=lambda a: adas.model_search(a),
+            knowledge_search=automotive_knowledge.search,
+        ),
+    )
 
     def automotive_knowledge_capture(args: dict) -> dict:
         payload = dict(args)

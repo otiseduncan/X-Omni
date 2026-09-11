@@ -226,10 +226,20 @@ def test_capability_catalog_reports_real_tools_and_known_limits(tmp_path):
     assert any(item["name"] == "image attachments" for item in result["not_wired"])
 
 
-def test_capability_catalog_reports_staged_pruned_ciq_write_surface() -> None:
+def test_capability_catalog_reports_the_meta_surface_not_raw_ciq_writes() -> None:
+    from core.main import configured_profile_catalog
+
+    configured_profile_catalog(
+        SimpleNamespace(tools_config="config/tools.yaml", tool_profile="adas_operator")
+    )
     registry = Registry("config/tools.yaml", profile="adas_operator")
     for name in (
         "assistant_capabilities_read",
+        "query_ciq",
+        "stage_action",
+        "delegate_research",
+        "capability_search",
+        "get_calendar",
         "calibration_iq_operator",
         "calibration_iq_destructive",
     ):
@@ -244,25 +254,67 @@ def test_capability_catalog_reports_staged_pruned_ciq_write_surface() -> None:
     initially_advertised = {
         item["function"]["name"] for item in registry.model_tools()
     }
-    assert "calibration_iq_operator" not in initially_advertised
-    assert "calibration_iq_destructive" not in initially_advertised
+    assert initially_advertised == {
+        "query_ciq", "stage_action", "delegate_research", "capability_search",
+    }
 
     result = builtin.make_assistant_capabilities(router, registry)({})
     tools = {item["name"]: item for item in result["tools"]}
-    assert tools["calibration_iq_operator"]["turn_availability"] == (
-        "after_verified_same_turn_exact_ro"
+    # The raw write tools are not part of the profile; stage_action is the
+    # write path and it is reported as an ordinary available capability.
+    assert "calibration_iq_operator" not in tools
+    assert "calibration_iq_destructive" not in tools
+    assert tools["stage_action"]["status"] == "available"
+    assert tools["get_calendar"]["turn_availability"] == "advertised_normally"
+
+
+def test_capability_search_ranks_and_unlocks_discoverable_tools() -> None:
+    from core.main import configured_profile_catalog
+    from core.tools.meta import MAX_UNLOCKED_TOOLS
+
+    configured_profile_catalog(
+        SimpleNamespace(tools_config="config/tools.yaml", tool_profile="adas_operator")
     )
-    assert tools["calibration_iq_operator"]["unavailable_operations"] == [
-        "create_ro",
-        "create_location",
+    registry = Registry("config/tools.yaml", profile="adas_operator")
+    for item in registry.profile_catalog():
+        registry.register(item["function"]["name"], lambda _args: {})
+    router = SimpleNamespace(active_name="omni", configs={})
+    search = builtin.make_capability_search(router, registry)
+
+    calendar = search({"query": "calendar appointments"})
+    assert calendar["catalog_is_execution_proof"] is False
+    assert calendar["unlocked_tools"][0] == "get_calendar"
+    assert "create_calendar_event" in calendar["unlocked_tools"]
+    assert len(calendar["unlocked_tools"]) <= MAX_UNLOCKED_TOOLS
+    assert all(item["name"] in calendar["unlocked_tools"] or not item["unlocked_this_turn"] for item in calendar["tools"])
+    assert "query_ciq" not in calendar["available_names"]
+    assert calendar["permanent_tools"] == [
+        "query_ciq", "delegate_research", "stage_action", "capability_search",
     ]
-    assert "does not expose unscoped top-level creates" in tools[
-        "calibration_iq_operator"
-    ]["description"]
-    assert tools["calibration_iq_destructive"]["requires_approval"] is True
-    assert "explicit full maintenance profile" in result[
-        "normal_profile_create_tradeoff"
-    ]
+
+    footage = search({"query": "camera footage"})
+    assert "camera_footage" in footage["unlocked_tools"]
+    # The raw Calibration IQ write tools are never discoverable.
+    assert "calibration_iq_operator" not in footage["available_names"]
+    assert "calibration_iq_destructive" not in footage["available_names"]
+
+    everything = search({})
+    assert everything["unlocked_tools"] == []
+    assert set(everything["available_names"]) == set(
+        item["function"]["name"] for item in registry.discoverable_catalog()
+    )
+    assert search({"query": "zzz-nothing-matches"})["unlocked_tools"] == []
+
+    # What capability_search reports as unlocked is exactly what the gateway
+    # will advertise on the next round.
+    advertised = {
+        item["function"]["name"]
+        for item in registry.model_tools(unlocked=calendar["unlocked_tools"])
+    }
+    assert advertised == {
+        "query_ciq", "delegate_research", "stage_action", "capability_search",
+        *calendar["unlocked_tools"],
+    }
 
 
 def test_task_mutations_are_approval_gated_and_status_update_is_real(tmp_path):

@@ -148,3 +148,37 @@ Not yet proved and must stay labeled as such:
 One non-fatal Windows `WinError 10054` Proactor callback was logged during expected Coder load polling; the swap completed healthy and it did not recur on the Omni return. Treat it as diagnostic noise unless it repeats outside lifecycle turnover.
 
 The shared-node Tailscale contract is now explicit: `https://omega.<tailnet>.ts.net/` (port 443) proxies Calibration IQ on loopback 8084, while `https://omega.<tailnet>.ts.net:8443/` proxies X Omni on loopback 8100. `scripts\tailscale-serve.ps1` changes only 8443 and deliberately preserves Calibration IQ's 443 handler. Re-check live Serve status before relying on it because external routing state can drift.
+
+## Permanent meta-tool surface and cache-stable prompt (2026-09-11)
+
+Root-cause review of the three-model architecture analysis confirmed two
+orchestration defects and one measured performance defect; all three are fixed
+on this branch. Backend handlers, evidence binding, approvals, receipts, and
+cards are unchanged.
+
+### What changed
+
+- **No forced tool choice.** `no_tool_self_check_requires_tool = active_subject is not None` made the model-owned no-tool review run with `tool_choice="required"` for the rest of any conversation that had ever looked up an RO (the subject is never cleared). Every casual or conceptual answer after one RO lookup was withheld and replaced by a forced tool pick. Removed; the review still runs, unforced, and its instruction states that an active subject is memory, not a reason to call a tool. The static architecture test now rejects any `"required"` tool choice in the loop.
+- **Permanent surface of four meta-tools.** The `adas_operator` profile declares `permanent: [query_ciq, delegate_research, stage_action, capability_search]`. `query_ciq` expands structurally to the five Calibration IQ read handlers; `stage_action` performs a fresh exact-RO read inside the gateway, returns a staged contract (current version, valid target ids, argument schema) or executes the concrete `calibration_iq_operator` / `calibration_iq_destructive` / `scrapex_adas_map` call under the existing exact-RO write binding, approval, and receipt rules; `delegate_research` is a bounded worker over ADAS SI, durable knowledge, the licensed ALLDATA Navigator (model-driven inside the call), and the public OEM web for any vehicle with or without an RO; `capability_search` ranks the profile's discoverable tools and unlocks matches for the rest of the turn. The raw CIQ read/write tools are no longer in the daily profile (the full profile keeps them). Approvals raised inside `stage_action` bind to the concrete protected tool.
+- **Cache-stable prompt layout.** The clock, active subject, and stored artifacts moved from the first system message into a turn-context message placed after the history and before the newest user message. The Qwen3-Omni template renders the tool catalog right after the first system message, so the catalog and earlier history now stay in llama.cpp's prefix cache across turns.
+- **Turn metrics.** The model client surfaces llama.cpp's `usage`/`timings`; the orchestrator logs one `turn metrics` line per turn (prompt/cached/evaluated tokens, prefill and generation time, model calls, rounds, tools selected, unlocked tools, evidence ids, active subject) and attaches it to the `done` event.
+- **Live acceptance harness rewritten** (`tests/test_model_first_live_acceptance.py`). It now drives the production `Orchestrator` against the real worker with fixture handlers registered under the concrete tool names, so expansion, staging, approvals, discovery, the unforced review, and the truth review are the real code paths. Scenarios cover the five-turn agency sequence (exact RO, zero-tool general question, research without an RO, research follow-up, return to the subject), count paraphrase, staged-then-executed close, destructive approval, ADAS Map sign-in boundary, research with a source exclusion, capability discovery, and read-only containment.
+
+### Measured on the live worker (llama-server b9906, Qwen3-Omni 30B, real chat template)
+
+| Measure | Before | After |
+|---|---|---|
+| Static system prompt | ~1,450 exact tokens (7,045 chars) | 907 exact tokens (4,474 chars) |
+| Advertised tool catalog, round 0 | ~7,100 exact tokens (31 tools); ~12,300 reserved (33) | ~2,120 exact tokens (4 tools); ~6,960 reserved incl. six unlockable |
+| Next-turn prompt processing after a one-minute clock change | 12,324 tokens re-evaluated, 4.7 s (16,336 / 6.7 s with 4K history) | 30 tokens re-evaluated, 0.1 s |
+
+The review's "under 1,500 tokens" target for the permanent schemas is not met: the 55-operation `stage_action` enum with its one-line operation glossary and the 11-value status enum are the remainder and are what let llama.cpp's grammar constrain those fields.
+
+**Grammar order matters.** llama.cpp emits object properties in schema order and cannot revisit an earlier one. Probed live: with `shop` declared before `phase`, the model skipped the shop on a board question and then pushed "Perry" into `q` or invented a status; with `shop` before `repair_order_id`, it dropped the shop on a short RO form. `query_ciq` therefore declares `kind, repair_order_id, phase, shop, ...` with `status` last, which measured 4/4 correct on four paraphrases at temperatures 0.1 and 0.4. Treat property order as part of the contract and probe it live when changing a permanent schema.
+
+### Verification
+
+- Backend: 1024 passed, 1 skipped (the opt-in live suite) after the change; the same suite was 1058/1 skipped before, with the difference being the old 9.5K-line harness's offline tests replaced by the new module's.
+- Frontend: 106 passed. One pre-existing failure on `main` (`fieldCards.test.mjs` asserting dormant SI queue cards removed in 159abe9) was corrected in the test.
+- Vite production build passed.
+- Live acceptance (`tests/test_model_first_live_acceptance.py`, production orchestrator against the live Qwen3-Omni worker on 8131, fixture business results): **8 of 8 scenarios passed in 48 s**, including the five-turn agency sequence: exact RO read on the short form (`11779 in Warner Robins`), a general ultrasonic-sensor question answered with zero tools while the RO subject was active, research for a 2023 Camry without an RO through `delegate_research`, a reflector follow-up answered from the finding with no tool, and "go back to that RO" resolving the subject and reading it fresh. Also passed: shop/phase count paraphrase, staged-then-executed `close_ro` with a verified receipt, `delete_calibration` pausing on a `calibration_iq_destructive` approval without executing, ADAS Map acquisition reporting the sign-in boundary without claiming a start, research with ALLDATA excluded, calendar via `capability_search` then `get_calendar`, and an informational readiness question that stayed read-only. Per-turn prefix-cache hit rates in the run were 85-98% (for example 9,980 cached vs 1,010 evaluated tokens on the three-call destructive turn); whole multi-call turns completed in 1.4-6.3 s.

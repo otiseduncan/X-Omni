@@ -23,6 +23,8 @@ from typing import Any, Awaitable, Callable, Optional
 
 import yaml
 
+from . import meta
+
 log = logging.getLogger("xomni.tools")
 
 _SECRET_KEY_RE = re.compile(
@@ -3104,6 +3106,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
 }
 
+# The permanent model-facing surface. Concrete handlers stay registered under
+# their own names; the gateway expands these before authorization/execution.
+TOOL_SCHEMAS.update(meta.meta_tool_schemas())
+
 
 TEST_USER_TOOLS = {
     "get_weather",
@@ -3130,6 +3136,12 @@ class Registry:
         self.active_profile = str(configured_profile or "").strip() or None
         self.profile_description = ""
         self._profile_tools: frozenset[str] | None = None
+        # A profile may declare a small *permanent* surface (the tools the
+        # model always sees); every other profile tool is discoverable and
+        # unlockable within a turn through capability_search. None means the
+        # whole profile is advertised, which is how the full profile behaves.
+        self.permanent_tools: frozenset[str] | None = None
+        self.permanent_order: tuple[str, ...] = ()
         if self.active_profile is not None:
             profiles = raw.get("profiles") or {}
             entry = profiles.get(self.active_profile)
@@ -3160,6 +3172,29 @@ class Registry:
                 raise ValueError(
                     f"Tool profile {self.active_profile!r} must declare a tool list or '*'"
                 )
+            permanent = entry.get("permanent")
+            if permanent is not None:
+                if not (
+                    isinstance(permanent, list)
+                    and permanent
+                    and all(isinstance(name, str) and name.strip() for name in permanent)
+                ):
+                    raise ValueError(
+                        f"Tool profile {self.active_profile!r} permanent surface must be a "
+                        "non-empty list of tool names"
+                    )
+                permanent_names = frozenset(name.strip() for name in permanent)
+                reachable = (
+                    set(self.policy) if self._profile_tools is None else set(self._profile_tools)
+                )
+                unknown = sorted(permanent_names - reachable)
+                if unknown:
+                    raise ValueError(
+                        f"Tool profile {self.active_profile!r} permanent surface names tools "
+                        f"outside the profile: {', '.join(unknown)}"
+                    )
+                self.permanent_tools = permanent_names
+                self.permanent_order = tuple(name.strip() for name in permanent)
         self.roots: list[Path] = [Path(r).resolve() for r in (raw.get("roots") or [])]
         self.write_roots: list[Path] = [
             Path(r).resolve() for r in (raw.get("write_roots") or [])
@@ -3167,8 +3202,16 @@ class Registry:
         self.store = store
         self._handlers: dict[str, Callable[..., Any]] = {}
 
+    # Gateway composites: implemented by Registry.invoke itself (expansion to
+    # the concrete Calibration IQ handlers), so they need no registered handler
+    # to be advertised or invoked.
+    COMPOSITE_TOOLS = frozenset({"query_ciq", "stage_action"})
+
     def register(self, name: str, handler: Callable[..., Any]) -> None:
         self._handlers[name] = handler
+
+    def is_implemented(self, name: str) -> bool:
+        return name in self._handlers or name in self.COMPOSITE_TOOLS
 
     def tier(self, name: str) -> str:
         entry = self.policy.get(name)
@@ -3191,9 +3234,11 @@ class Registry:
     def profile_catalog(self, role: str = "owner") -> list[dict]:
         """Configured profile schemas without requiring live service handlers.
 
-        This read-only catalog is suitable for model-level fixture harnesses and
-        budget inspection. Runtime model calls use :meth:`model_tools`, which
-        additionally requires an implemented handler.
+        This is the *reachable* catalog: everything the profile lets the model
+        call, permanent or discoverable. It suits model-level fixture harnesses
+        and budget inspection. Runtime model calls use :meth:`model_tools`,
+        which additionally requires an implemented handler and applies the
+        permanent/unlocked surface.
         """
 
         out = []
@@ -3202,6 +3247,8 @@ class Registry:
                 continue
             if not self.profile_allows_tool(name) or self.tier(name) == "blocked":
                 continue
+            if name == "stage_action" and self.active_profile != "adas_operator":
+                schema = meta.stage_action_schema(allow_unscoped_creates=True)
             out.append({
                 "type": "function",
                 "function": {
@@ -3212,6 +3259,77 @@ class Registry:
             })
         return out
 
+    def is_permanent_tool(self, name: str) -> bool:
+        return self.permanent_tools is None or name in self.permanent_tools
+
+    def _surface_order(self, catalog: list[dict]) -> list[dict]:
+        """Permanent tools first, in their declared order, then the rest by name.
+
+        A stable order is what keeps the rendered tool catalog byte-identical
+        across turns so the worker's prefix cache stays warm.
+        """
+
+        if self.permanent_tools is None:
+            return catalog
+        rank = {name: index for index, name in enumerate(self.permanent_order)}
+        return sorted(
+            catalog,
+            key=lambda item: (
+                (0, rank[item["function"]["name"]])
+                if item["function"]["name"] in rank
+                else (1, item["function"]["name"])
+            ),
+        )
+
+    def permanent_catalog(self, role: str = "owner") -> list[dict]:
+        """The schemas every model round advertises."""
+
+        return self._surface_order([
+            item
+            for item in self.profile_catalog(role)
+            if self.is_permanent_tool(item["function"]["name"])
+        ])
+
+    def discoverable_catalog(self, role: str = "owner") -> list[dict]:
+        """Profile tools that capability_search can unlock for one turn.
+
+        Raw Calibration IQ write tools are never discoverable in a profile with
+        a permanent surface: stage_action is the only model-facing write path.
+        """
+
+        if self.permanent_tools is None:
+            return []
+        return [
+            item
+            for item in self.profile_catalog(role)
+            if not self.is_permanent_tool(item["function"]["name"])
+            and item["function"]["name"] not in CALIBRATION_IQ_STAGED_WRITE_TOOLS
+        ]
+
+    def budget_reserve_tools(self, role: str = "owner") -> list[dict]:
+        """Catalog to budget history against: permanent plus the largest unlockable set.
+
+        A mid-turn capability_search can add up to ``meta.MAX_UNLOCKED_TOOLS``
+        schemas to later rounds. Reserving the largest such set up front keeps
+        every round of the turn inside the context window.
+        """
+
+        if self.permanent_tools is None:
+            return self.profile_catalog(role)
+        discoverable = sorted(
+            self.discoverable_catalog(role),
+            key=lambda item: len(json.dumps(item, separators=(",", ":"))),
+            reverse=True,
+        )
+        return [*self.permanent_catalog(role), *discoverable[: meta.MAX_UNLOCKED_TOOLS]]
+
+    def unlockable_tool_names(self, role: str = "owner") -> frozenset[str]:
+        return frozenset(
+            item["function"]["name"]
+            for item in self.discoverable_catalog(role)
+            if self.is_implemented(item["function"]["name"])
+        )
+
     def model_tools(
         self,
         role: str = "owner",
@@ -3220,22 +3338,35 @@ class Registry:
         scrapex_evidence: Optional[ScrapeXTurnEvidence] = None,
         gate_calibration_iq_writes: bool = True,
         gate_scrapex_batch_ids: bool = True,
+        unlocked: Optional[Any] = None,
     ) -> list[dict]:
         """OpenAI-format tool list for whatever is actually allowed and
         implemented right now. Blocked tools are never advertised -- the
         model shouldn't waste turns asking for something it can't have.
 
-        The normal ADAS profile stages both Calibration IQ write tools behind
-        prior-round exact-RO evidence. Opaque ScrapeX batch-id branches likewise
-        require a verified prior-round list/create result. Gate overrides are
-        reserved for capability reporting and context-budget calculation; they
-        never bypass invocation validation.
+        With a permanent surface, only the permanent tools plus any names
+        ``unlocked`` by a same-turn capability_search are advertised. The full
+        profile keeps its staged Calibration IQ write gating: both CIQ write
+        tools appear only after prior-round exact-RO evidence, and opaque
+        ScrapeX batch-id branches require a verified prior-round result. Gate
+        overrides are reserved for capability reporting and context-budget
+        calculation; they never bypass invocation validation.
         """
         catalog = [
             item
             for item in self.profile_catalog(role)
-            if item["function"]["name"] in self._handlers
+            if self.is_implemented(item["function"]["name"])
         ]
+        if self.permanent_tools is not None:
+            unlocked_names = {
+                str(name) for name in (unlocked or ())
+            } - set(self.permanent_tools) - set(CALIBRATION_IQ_STAGED_WRITE_TOOLS)
+            catalog = self._surface_order([
+                item
+                for item in catalog
+                if self.is_permanent_tool(item["function"]["name"])
+                or item["function"]["name"] in unlocked_names
+            ])
         if gate_calibration_iq_writes and self.active_profile == "adas_operator":
             catalog = calibration_iq_catalog_for_turn(
                 catalog, calibration_iq_evidence
@@ -3245,21 +3376,34 @@ class Registry:
         return catalog
 
     def capability_catalog(self, role: str = "owner") -> list[dict]:
-        """Configured/implemented capabilities, including staged write tools.
+        """Every configured/implemented capability, permanent or discoverable.
 
         This is for truthful capability reporting, not model execution. The
         normal profile keeps staged tools visible as capabilities while using
         the same pruned action grammar that will be exposed after an exact read.
         """
 
-        catalog = self.model_tools(
-            role,
-            gate_calibration_iq_writes=False,
-            gate_scrapex_batch_ids=False,
-        )
+        catalog = [
+            item
+            for item in self.profile_catalog(role)
+            if self.is_implemented(item["function"]["name"])
+        ]
         if self.active_profile == "adas_operator":
             return calibration_iq_normal_profile_catalog(catalog)
         return catalog
+
+    def expand_model_call(self, name: str, args: Any) -> tuple[str, dict[str, Any]]:
+        """Map a model-facing meta call to the concrete tool it stands for.
+
+        ``query_ciq`` is a pure structural expansion. Composite capabilities
+        (stage_action, delegate_research, capability_search) keep their own
+        name because their result shape is theirs. A ValueError here reaches
+        the model as an ordinary tool error.
+        """
+
+        if name == "query_ciq":
+            return meta.expand_query_ciq(args)
+        return name, (args if isinstance(args, dict) else {})
 
     def check_path(self, raw: str, *, write: bool = False) -> Path:
         """Resolve and confine to an allowed root. Resolution happens before
@@ -4069,6 +4213,33 @@ class Registry:
                 )
             raise ToolBlocked(f"'{name}' is blocked by policy and cannot run.")
 
+        if name == "query_ciq":
+            # Structural expansion only: the concrete read tool then passes
+            # through this same gateway with its own policy tier.
+            concrete_name, concrete_args = meta.expand_query_ciq(args)
+            return await self.invoke(
+                concrete_name,
+                concrete_args,
+                approved,
+                message_id,
+                conversation_id=conversation_id,
+                tool_call_id=tool_call_id,
+                user_id=user_id,
+                role=role,
+                calibration_iq_evidence=calibration_iq_evidence,
+                scrapex_evidence=scrapex_evidence,
+            )
+        if name == "stage_action":
+            return await self._invoke_stage_action(
+                args,
+                message_id=message_id,
+                conversation_id=conversation_id,
+                tool_call_id=tool_call_id,
+                user_id=user_id,
+                role=role,
+                tier=tier,
+            )
+
         # This structured provenance check is independent of model advertising,
         # policy tier, approval, and backend validation. It must run before an
         # approval can be created or a handler can observe the request.
@@ -4213,6 +4384,190 @@ class Registry:
                 },
             )
         return result
+
+    async def _invoke_stage_action(
+        self,
+        args: Any,
+        *,
+        message_id: Optional[int],
+        conversation_id: Optional[int],
+        tool_call_id: Optional[str],
+        user_id: Optional[str],
+        role: str,
+        tier: str,
+    ) -> dict[str, Any]:
+        """Fresh exact-RO read, then a staged contract or a bound execution.
+
+        Every mutation still runs through :meth:`invoke` for its concrete tool,
+        so policy tiers, the exact-RO write binding, approvals for destructive
+        operations, receipts, and audit logging are exactly what they were for
+        a direct call. The only thing the model no longer has to carry is the
+        full write grammar in every prompt.
+        """
+
+        if not isinstance(args, dict):
+            raise ToolError("stage_action arguments must be an object.")
+        operation = str(args.get("operation") or "").strip()
+        allow_unscoped_creates = self.active_profile != "adas_operator"
+        if operation not in meta.stage_operations(
+            allow_unscoped_creates=allow_unscoped_creates
+        ):
+            raise ToolError(f"{operation or 'operation'} is not a stageable operation.")
+        log_args = self.log_args("stage_action", args)
+
+        def record(result: dict[str, Any], *, status: str) -> dict[str, Any]:
+            if self.store:
+                self.store.log_tool_call(
+                    message_id,
+                    "stage_action",
+                    log_args,
+                    self.log_result("stage_action", result),
+                    approved_by=(
+                        "operator_authorized" if tier == "operator_authorized" else "auto"
+                    ),
+                    conversation_id=conversation_id,
+                    tool_call_id=tool_call_id,
+                    status=status,
+                )
+            return result
+
+        common = dict(
+            conversation_id=conversation_id,
+            tool_call_id=tool_call_id,
+            user_id=user_id,
+            role=role,
+        )
+
+        if operation == "open_adas_map_authentication":
+            execution = await self.invoke(
+                "scrapex_adas_map",
+                {"action": "open_authentication"},
+                message_id=message_id,
+                **common,
+            )
+            return record(
+                {
+                    "stage": "executed",
+                    "executed": True,
+                    "mutated": False,
+                    "operation": operation,
+                    "executed_via": "scrapex_adas_map",
+                    "execution": execution,
+                },
+                status="succeeded",
+            )
+
+        identity_args: dict[str, Any] = {}
+        repair_order_id = _calibration_iq_nonempty(args.get("repair_order_id"))
+        if not repair_order_id:
+            raise ToolError(
+                "stage_action needs repair_order_id: the RO exactly as Otis named it "
+                "(full number, id, or 5-digit short form plus shop)."
+            )
+        identity_args["repair_order_id"] = repair_order_id
+        shop = _calibration_iq_nonempty(args.get("shop"))
+        if shop:
+            identity_args["shop"] = shop
+        read = await self.invoke(
+            "calibration_iq_ro",
+            identity_args,
+            message_id=message_id,
+            **common,
+        )
+        evidence = calibration_iq_evidence_from_result(
+            "calibration_iq_ro",
+            read,
+            conversation_id=int(conversation_id or 0),
+            message_id=int(message_id or 0),
+            source_tool_call_id=str(tool_call_id or ""),
+        )
+        if evidence is None or not evidence.verified:
+            return record(
+                {
+                    "stage": "read_failed",
+                    "executed": False,
+                    "mutated": False,
+                    "operation": operation,
+                    "repair_order_read": read,
+                    "message": (
+                        "The exact RO could not be verified fresh, so nothing was staged "
+                        "or changed."
+                    ),
+                },
+                status="failed",
+            )
+        summary = meta._repair_order_summary(read) if isinstance(read, dict) else {}
+
+        if operation == "acquire_adas_map":
+            ro_number = _calibration_iq_nonempty(summary.get("ro_number")) or repair_order_id
+            acquire_args: dict[str, Any] = {"action": "acquire_exact", "ro_number": ro_number}
+            scope = _calibration_iq_nonempty(args.get("source_scope"))
+            if scope:
+                acquire_args["source_scope"] = scope
+            execution = await self.invoke(
+                "scrapex_adas_map",
+                acquire_args,
+                message_id=message_id,
+                **common,
+            )
+            executed = isinstance(execution, dict) and execution.get("executed") is True
+            payload: dict[str, Any] = {
+                "stage": "executed" if executed else "not_executed",
+                "executed": executed,
+                "mutated": executed,
+                "operation": operation,
+                "executed_via": "scrapex_adas_map",
+                "repair_order": summary,
+                "execution": execution,
+            }
+            if isinstance(execution, dict) and (
+                execution.get("authentication_required") is True
+                or execution.get("requires_human") is True
+            ):
+                payload["reporting_note"] = (
+                    "Authentication boundary: no ADAS Map was acquired, started, "
+                    "queued, or attached, and nothing continues automatically after "
+                    "sign-in. Report that managed-browser sign-in is required and "
+                    "that Otis should ask again once signed in."
+                )
+            return record(payload, status="succeeded" if executed else "failed")
+
+        kind, payload = meta.plan_stage_action(
+            args,
+            read,
+            allow_unscoped_creates=allow_unscoped_creates,
+        )
+        if kind == "staged":
+            staged = dict(payload)
+            staged["repair_order_read"] = read
+            staged["message"] = (
+                "Nothing changed. Call stage_action again with next_call (exact "
+                "repair_order_id, target_id, expected_version, and arguments) to "
+                "execute. Destructive operations raise Otis's approval card when "
+                "executed; do not ask for confirmation in prose."
+            )
+            return record(staged, status="succeeded")
+        concrete_tool, concrete_args = payload
+        execution = await self.invoke(
+            concrete_tool,
+            concrete_args,
+            message_id=message_id,
+            calibration_iq_evidence=evidence,
+            **common,
+        )
+        executed = isinstance(execution, dict) and execution.get("executed") is True
+        return record(
+            {
+                "stage": "executed",
+                "executed": executed,
+                "mutated": executed,
+                "operation": operation,
+                "executed_via": concrete_tool,
+                "repair_order": summary,
+                "execution": execution,
+            },
+            status="succeeded" if executed else "failed",
+        )
 
     async def resolve_approval(
         self,

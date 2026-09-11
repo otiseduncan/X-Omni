@@ -117,15 +117,24 @@ async def test_knowledge_tools_are_statically_advertised_and_safely_tiered(tmp_p
     app = build_app(_settings(tmp_path))
     registry = app.state.registry
     try:
-        advertised = {
-            item["function"]["name"] for item in registry.model_tools("owner")
-        }
-        assert {
+        knowledge_tools = {
             "automotive_knowledge_search",
             "automotive_knowledge_read",
             "automotive_knowledge_capture",
-        } <= advertised
+        }
+        # Discoverable in the daily profile: unlocked for a turn by
+        # capability_search, and advertised exactly then.
+        assert knowledge_tools <= registry.unlockable_tool_names("owner")
+        assert knowledge_tools.isdisjoint(
+            item["function"]["name"] for item in registry.model_tools("owner")
+        )
+        advertised = {
+            item["function"]["name"]
+            for item in registry.model_tools("owner", unlocked=sorted(knowledge_tools))
+        }
+        assert knowledge_tools <= advertised
         assert "automotive_knowledge_lifecycle" not in advertised
+        assert "automotive_knowledge_lifecycle" not in registry.unlockable_tool_names("owner")
         assert registry.profile_allows_tool("automotive_knowledge_lifecycle") is False
         assert "automotive_knowledge_review" not in advertised
         assert registry.tier("automotive_knowledge_search") == "read_only"

@@ -1199,6 +1199,76 @@ export function AutomotiveKnowledgeCard({ data }) {
   );
 }
 
+/* ---------------- Delegated research findings ---------------- */
+
+const RESEARCH_SOURCE_LABELS = {
+  adas_si: "ADAS SI",
+  automotive_knowledge: "Durable knowledge",
+  alldata: "ALLDATA",
+  web: "Public OEM web",
+};
+
+export function ResearchFindingsCard({ data }) {
+  const findings = Array.isArray(data?.findings) ? data.findings : [];
+  const ledger = Array.isArray(data?.source_ledger) ? data.source_ledger : [];
+  const objective = data?.objective || "Research";
+  const vehicle = data?.vehicle?.label;
+  const tone = data?.verified ? undefined : data?.authentication_required ? "warn" : "warn";
+  const meta = `${findings.length} finding${findings.length === 1 ? "" : "s"} · ${ledger.filter((row) => row?.attempted).length} source${ledger.filter((row) => row?.attempted).length === 1 ? "" : "s"} checked`;
+  return (
+    <Card icon={BookOpen} title="Research" meta={meta} tone={tone}>
+      <p className="card-note">
+        <strong>{objective}</strong>
+        {vehicle ? ` · ${vehicle}` : ""}
+      </p>
+      <div className="research-source-ledger" aria-label="Research source verification">
+        {ledger.map((row, index) => (
+          <div className="research-source-row" key={`${row?.source || "source"}-${index}`}>
+            <span>{RESEARCH_SOURCE_LABELS[row?.source] || row?.source}</span>
+            <strong>
+              {row?.verified
+                ? "verified"
+                : row?.attempted === false
+                  ? "not attempted"
+                  : row?.status === "error"
+                    ? "error"
+                    : "no verified finding"}
+            </strong>
+            {row?.reason ? <em className="card-note">{String(row.reason).slice(0, 200)}</em> : null}
+          </div>
+        ))}
+      </div>
+      {data?.authentication_required ? (
+        <p className="card-note">
+          ALLDATA needs an interactive sign-in before it can be searched; nothing was claimed from it.
+        </p>
+      ) : null}
+      {findings.length === 0 ? (
+        <p className="card-note">{data?.message || "No verified finding in the sources checked."}</p>
+      ) : null}
+      {findings.map((finding, index) => (
+        <details className="field-hit" key={`${finding?.source}-${index}`} open={index === 0}>
+          <summary>
+            <strong>{finding?.title || RESEARCH_SOURCE_LABELS[finding?.source] || "Finding"}</strong>
+            <span className="field-page">
+              {RESEARCH_SOURCE_LABELS[finding?.source] || finding?.source}
+              {finding?.page ? ` · p.${finding.page}` : ""}
+            </span>
+          </summary>
+          {finding?.excerpt ? <pre className="pre field-excerpt">{finding.excerpt}</pre> : null}
+          {finding?.url ? (
+            <a className="field-link" href={finding.url} target="_blank" rel="noreferrer noopener">
+              <ExternalLink size={12} /> Source
+            </a>
+          ) : null}
+          {finding?.relative_path ? <p className="card-note">{finding.relative_path}</p> : null}
+          {finding?.record_id ? <p className="card-note">record {finding.record_id}</p> : null}
+        </details>
+      ))}
+    </Card>
+  );
+}
+
 export const FIELD_CARDS = {
   adas_si_document: AdasDocumentCard,
   adas_si_results: AdasResultsCard,
@@ -1214,4 +1284,5 @@ export const FIELD_CARDS = {
   research_provider: ResearchProviderCard,
   scrapex: ScrapeXCard,
   automotive_knowledge: AutomotiveKnowledgeCard,
+  research_findings: ResearchFindingsCard,
 };

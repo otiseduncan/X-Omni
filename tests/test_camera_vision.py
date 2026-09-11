@@ -51,8 +51,15 @@ def test_camera_request_is_truthful_and_does_not_claim_capture():
 def test_camera_request_is_available_in_the_default_and_full_profile_without_prompt_routing():
     normal_registry = Registry("config/tools.yaml")
     normal_registry.register("camera_request", camera.make_camera_request())
-    normal_advertised = {
+    # Discoverable in the daily profile: advertised once capability_search
+    # unlocks it for the turn, never permanently.
+    assert "camera_request" in normal_registry.unlockable_tool_names()
+    assert "camera_request" not in {
         item["function"]["name"] for item in normal_registry.model_tools()
+    }
+    normal_advertised = {
+        item["function"]["name"]
+        for item in normal_registry.model_tools(unlocked=["camera_request"])
     }
     assert "camera_request" in normal_advertised
 

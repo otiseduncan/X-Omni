@@ -10,12 +10,16 @@ from core.config import ROOT, Settings
 from core.main import configured_profile_catalog
 from core.orchestrator.prompt import prompt_budget_metrics, system_prompt
 from core.orchestrator.loop import no_tool_self_check_reserve_tokens
+from core.tools.meta import PERMANENT_TOOLS, stage_operations
 from core.tools.registry import (
     CALIBRATION_IQ_ADD_CALIBRATION_OPERATIONS,
+    CALIBRATION_IQ_DESTRUCTIVE_OPERATIONS,
     CALIBRATION_IQ_OTHER_RO_UNVERSIONED_OPERATIONS,
     CALIBRATION_IQ_RESEARCH_RO_OPERATIONS,
+    CALIBRATION_IQ_ROUTINE_OPERATIONS,
     CALIBRATION_IQ_STAGED_WRITE_TOOLS,
     CALIBRATION_IQ_WORKSPACE_DOCUMENT_RO_OPERATIONS,
+    TOOL_SCHEMAS,
     NeedsApproval,
     Registry,
     ToolBlocked,
@@ -25,7 +29,8 @@ from core.tools.registry import (
 
 
 POLICY_PATH = ROOT / "config" / "tools.yaml"
-EXPECTED_ADAS_TOOLS = {
+PERMANENT = set(PERMANENT_TOOLS)
+DISCOVERABLE_ADAS_TOOLS = {
     "get_calendar",
     "create_calendar_event",
     "list_tasks",
@@ -47,18 +52,23 @@ EXPECTED_ADAS_TOOLS = {
     "automotive_knowledge_search",
     "automotive_knowledge_read",
     "automotive_knowledge_capture",
-    "calibration_iq_status",
     "calibration_iq_start_native",
-    "calibration_iq_summary",
-    "calibration_iq_read",
-    "calibration_iq_ro",
-    "calibration_iq_operator",
-    "calibration_iq_destructive",
-    "calibration_iq_work_prep",
     "scrapex_status",
     "scrapex_start_native",
     "scrapex_read",
     "scrapex_adas_map",
+}
+EXPECTED_ADAS_TOOLS = PERMANENT | DISCOVERABLE_ADAS_TOOLS
+# Reachable only through the meta surface (query_ciq / stage_action expand to
+# them inside the gateway) or through the explicit full maintenance profile.
+META_WRAPPED_CIQ_TOOLS = {
+    "calibration_iq_status",
+    "calibration_iq_summary",
+    "calibration_iq_read",
+    "calibration_iq_ro",
+    "calibration_iq_work_prep",
+    "calibration_iq_operator",
+    "calibration_iq_destructive",
 }
 NON_ADAS_NORMAL_TOOLS = {
     "get_weather",
@@ -99,44 +109,79 @@ def _omni_router() -> SimpleNamespace:
     )
 
 
+def _registered(profile: str = "adas_operator") -> Registry:
+    configured_profile_catalog(_settings())
+    registry = Registry(POLICY_PATH, profile=profile)
+    for item in registry.profile_catalog():
+        registry.register(item["function"]["name"], lambda _args: {})
+    return registry
+
+
+def _names(catalog: list[dict]) -> set[str]:
+    return {item["function"]["name"] for item in catalog}
+
+
 def test_adas_operator_is_the_configured_default_profile() -> None:
     raw = yaml.safe_load(POLICY_PATH.read_text(encoding="utf-8"))
-    configured = set(raw["profiles"]["adas_operator"]["tools"])
+    entry = raw["profiles"]["adas_operator"]
+    configured = set(entry["tools"])
 
     assert raw["default_profile"] == "adas_operator"
+    assert entry["permanent"] == list(PERMANENT_TOOLS)
     assert configured == EXPECTED_ADAS_TOOLS
     assert configured.isdisjoint(NON_ADAS_NORMAL_TOOLS)
+    assert configured.isdisjoint(META_WRAPPED_CIQ_TOOLS)
 
 
 def test_production_profile_catalog_is_read_only_and_handler_independent() -> None:
     adas_catalog = configured_profile_catalog(_settings())
     full_catalog = configured_profile_catalog(_settings(), profile="full")
-    adas_names = {item["function"]["name"] for item in adas_catalog}
-    full_names = {item["function"]["name"] for item in full_catalog}
+    adas_names = _names(adas_catalog)
+    full_names = _names(full_catalog)
 
     assert adas_names == EXPECTED_ADAS_TOOLS
-    assert len(adas_catalog) == 33
-    assert len(full_catalog) == 52
+    assert len(adas_catalog) == 30
+    assert len(full_catalog) == 56
     assert NON_ADAS_NORMAL_TOOLS <= full_names
+    assert META_WRAPPED_CIQ_TOOLS <= full_names
+    assert PERMANENT <= full_names
 
 
-def test_profile_filters_advertising_without_changing_gateway_policy() -> None:
-    # Populate service-owned schemas through the same read-only production
-    # catalog path used by the acceptance/budget harness.
-    configured_profile_catalog(_settings())
-    registry = Registry(POLICY_PATH, profile="adas_operator")
-    for item in registry.profile_catalog():
-        registry.register(item["function"]["name"], lambda _args: {})
+def test_permanent_surface_is_advertised_and_discovery_unlocks_the_rest() -> None:
+    registry = _registered()
 
-    initial_names = {
-        item["function"]["name"] for item in registry.model_tools()
-    }
-    assert initial_names == EXPECTED_ADAS_TOOLS - CALIBRATION_IQ_STAGED_WRITE_TOOLS
-    assert {
-        item["function"]["name"]
-        for item in registry.model_tools(gate_calibration_iq_writes=False)
-    } == EXPECTED_ADAS_TOOLS
+    assert _names(registry.model_tools()) == PERMANENT
+    assert _names(registry.permanent_catalog()) == PERMANENT
+    assert _names(registry.discoverable_catalog()) == DISCOVERABLE_ADAS_TOOLS
+    assert registry.unlockable_tool_names() == frozenset(DISCOVERABLE_ADAS_TOOLS)
 
+    unlocked = registry.model_tools(unlocked=["get_calendar", "camera_footage"])
+    assert _names(unlocked) == PERMANENT | {"get_calendar", "camera_footage"}
+    # Permanent tools always come first so the cached prefix stays stable.
+    assert [item["function"]["name"] for item in unlocked][:4] == list(PERMANENT_TOOLS)
+
+    # Raw write tools can never be unlocked, even by name; stage_action owns them.
+    for raw_write in CALIBRATION_IQ_STAGED_WRITE_TOOLS:
+        registry.register(raw_write, lambda _args: {})
+    assert _names(registry.model_tools(unlocked=list(CALIBRATION_IQ_STAGED_WRITE_TOOLS))) == PERMANENT
+    # Unknown names are ignored rather than advertised.
+    assert _names(registry.model_tools(unlocked=["not_a_tool"])) == PERMANENT
+    # Budget overrides do not widen the advertised surface either.
+    assert _names(
+        registry.model_tools(gate_calibration_iq_writes=False, gate_scrapex_batch_ids=False)
+    ) == PERMANENT
+
+
+def test_full_profile_keeps_staged_write_gating_without_a_permanent_surface() -> None:
+    registry = _registered(profile="full")
+    assert registry.permanent_tools is None
+    assert registry.discoverable_catalog() == []
+
+    initial = _names(registry.model_tools())
+    # The full maintenance profile never staged its raw write tools; it
+    # advertises everything, including the meta surface, at all times.
+    assert CALIBRATION_IQ_STAGED_WRITE_TOOLS <= initial
+    assert PERMANENT <= initial
     evidence = calibration_iq_evidence_from_result(
         "calibration_iq_ro",
         {
@@ -153,18 +198,8 @@ def test_profile_filters_advertising_without_changing_gateway_policy() -> None:
         source_tool_call_id="exact-ro-call",
     )
     unlocked = registry.model_tools(calibration_iq_evidence=evidence)
-    assert {item["function"]["name"] for item in unlocked} == EXPECTED_ADAS_TOOLS
-    operator = next(
-        item for item in unlocked
-        if item["function"]["name"] == "calibration_iq_operator"
-    )
-    advertised_operations = set().union(*(
-        set(branch["properties"]["operation"]["enum"])
-        for branch in operator["function"]["parameters"]["properties"]
-        ["actions"]["items"]["oneOf"]
-    ))
-    assert advertised_operations.isdisjoint({"create_ro", "create_location"})
-    assert registry.profile_allows_tool("video_generate") is False
+    assert CALIBRATION_IQ_STAGED_WRITE_TOOLS <= _names(unlocked)
+    assert registry.profile_allows_tool("video_generate") is True
     assert registry.tier("video_generate") == "confirm_required"
     assert registry.tier("calibration_iq_destructive") == "confirm_required"
 
@@ -189,10 +224,6 @@ async def test_calibration_iq_update_is_blocked_under_the_default_profile() -> N
 
 
 async def test_calibration_iq_update_reaches_its_normal_gate_under_the_full_profile() -> None:
-    # The full maintenance profile still advertises this legacy tool, so the
-    # quarantine guard must not fire there -- it should reach the tool's own
-    # ordinary confirm_required approval gate instead of being blocked as
-    # "retired".
     registry = Registry(POLICY_PATH, profile="full")
     registry.register("calibration_iq_update", lambda _args: {"success": True})
     assert registry.profile_allows_tool("calibration_iq_update") is True
@@ -202,10 +233,8 @@ async def test_calibration_iq_update_reaches_its_normal_gate_under_the_full_prof
 
 
 def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> None:
-    configured_profile_catalog(_settings())
-    registry = Registry(POLICY_PATH, profile="adas_operator")
-    for item in registry.profile_catalog():
-        registry.register(item["function"]["name"], lambda _args: {})
+    registry = _registered()
+    scrapex = ["scrapex_read", "scrapex_adas_map"]
 
     def action_branches(catalog: list[dict], tool_name: str) -> set[str]:
         function = next(
@@ -218,7 +247,7 @@ def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> Non
             for branch in function["parameters"]["oneOf"]
         }
 
-    initial = registry.model_tools()
+    initial = registry.model_tools(unlocked=scrapex)
     assert action_branches(initial, "scrapex_read") == {
         "list_batches",
         "preview_ciq_queue",
@@ -229,7 +258,7 @@ def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> Non
         "create_exact_batch",
         "create_phase_batch",
     }
-    for tool_name in ("scrapex_read", "scrapex_adas_map"):
+    for tool_name in scrapex:
         parameters = next(
             item["function"]["parameters"]
             for item in initial
@@ -254,7 +283,7 @@ def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> Non
         source_tool_call_id="list-call",
     )
     assert evidence is not None
-    unlocked = registry.model_tools(scrapex_evidence=evidence)
+    unlocked = registry.model_tools(scrapex_evidence=evidence, unlocked=scrapex)
     assert action_branches(unlocked, "scrapex_read") == {
         "list_batches",
         "preview_ciq_queue",
@@ -271,13 +300,6 @@ def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> Non
         "start_batch",
         "pause_batch",
     }
-    full_for_budget = registry.model_tools(gate_scrapex_batch_ids=False)
-    assert action_branches(full_for_budget, "scrapex_read") == action_branches(
-        unlocked, "scrapex_read"
-    )
-    assert action_branches(full_for_budget, "scrapex_adas_map") == action_branches(
-        unlocked, "scrapex_adas_map"
-    )
 
 
 def test_unknown_or_malformed_profiles_fail_closed(tmp_path) -> None:
@@ -298,6 +320,23 @@ def test_unknown_or_malformed_profiles_fail_closed(tmp_path) -> None:
     with pytest.raises(ValueError, match="unconfigured tools"):
         Registry(malformed)
 
+    outside = tmp_path / "outside.yaml"
+    outside.write_text(
+        "default_profile: narrow\n"
+        "profiles:\n"
+        "  narrow:\n"
+        "    permanent: [list_tasks]\n"
+        "    tools: [get_weather]\n"
+        "roots: []\n"
+        "write_roots: []\n"
+        "tools:\n"
+        "  get_weather: {tier: read_only}\n"
+        "  list_tasks: {tier: read_only}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="outside the profile"):
+        Registry(outside)
+
 
 def test_settings_can_select_an_explicit_maintenance_profile(monkeypatch) -> None:
     monkeypatch.setenv("XOMNI_TOOL_PROFILE", "full")
@@ -306,77 +345,82 @@ def test_settings_can_select_an_explicit_maintenance_profile(monkeypatch) -> Non
 
 def test_normal_prompt_is_concise_and_free_of_capability_micro_routing() -> None:
     prompt = system_prompt(_omni_router())
+    folded = prompt.casefold()
 
-    # camera_footage's range_narrowed coverage-honesty rule grew this
-    # slightly; the ADAS_SOURCE_ROLES vetting-snapshot bullet grew it again;
-    # the WORKING_CONTEXT short-RO-number speaking rule grew it once more;
-    # the WORKING_CONTEXT new-subject-always-refetches rule (fixing X
-    # repeating stale RO context across a shop/number change) grew it once
-    # more. Ceiling moved with it, not toward zero headroom.
-    assert len(prompt) < 7_300
-    assert "model-first and tool contract" in prompt.casefold()
-    assert "adas source roles" in prompt.casefold()
-    assert "mutations require a direct current-turn command" in prompt.casefold()
-    assert "demonstration requests never authorize one" in prompt.casefold()
-    assert "use `assistant_capabilities_read`" in prompt
-    assert "exact-number list match is a thin row" in prompt.casefold()
-    assert "current_calibration_detail_included=false" in prompt
-    assert "ciq state is not oem proof" in prompt.casefold()
-    assert "adas_map_inventory" in prompt
-    assert "never scrapex" in prompt.casefold()
-    assert "before any schema-versioned write" in prompt.casefold()
-    assert "close_ro` is the normal whole-ro finished/complete transition" in prompt.casefold()
-    assert "change_status` is only for an explicitly named target status" in prompt.casefold()
-    assert "complete_calibration` only for an explicit child-state request" in prompt.casefold()
-    assert "when otis asks" not in prompt.casefold()
-    for tool_name in NON_ADAS_NORMAL_TOOLS:
+    assert len(prompt) < 4_700
+    assert "## right now" not in folded
+    for tool in PERMANENT_TOOLS:
+        assert f"`{tool}`" in prompt
+    assert "answer general technical, conceptual, or conversational questions directly" in folded
+    assert "mutations require a direct current-turn command" in folded
+    assert "a turn that executed nothing has done nothing" in folded
+    assert "ciq state is not oem proof" in folded
+    assert "is a fresh identification" in folded
+    assert "close_ro` is the normal whole-ro finished/complete transition" in folded
+    assert "change_status` is only for an explicitly named target status" in folded
+    assert "speak ro numbers back the way otis named them" in folded
+    assert "when otis asks" not in folded
+    for tool_name in NON_ADAS_NORMAL_TOOLS | META_WRAPPED_CIQ_TOOLS | DISCOVERABLE_ADAS_TOOLS:
         assert tool_name not in prompt
 
 
-def test_read_status_and_exact_resource_descriptions_expose_distinct_contracts() -> None:
+def test_meta_tool_descriptions_expose_distinct_contracts() -> None:
     catalog = {
         item["function"]["name"]: item["function"]["description"]
         for item in configured_profile_catalog(_settings())
     }
 
-    assert "alldata_service_information" not in catalog
-    assert "research_provider_setup" not in catalog
-    assert "service_information_research" not in catalog
-    adas_map_description = catalog["scrapex_adas_map"].casefold()
-    scrapex_status_description = catalog["scrapex_status"].casefold()
-    work_prep_description = catalog["calibration_iq_work_prep"].casefold()
-    assert "adas map requirement reports only" in adas_map_description
-    assert "never opens alldata" in adas_map_description
-    assert "not alldata status" in scrapex_status_description
-    assert "service-information" in work_prep_description
-    assert "dormant" in work_prep_description
-    assert "adas_map_inventory" in work_prep_description
-    assert "never calls scrapex" in work_prep_description
-    assert "not a read path for current calibration iq state" in adas_map_description
-
-    assert "Primary read for whether X is configured and permitted" in catalog[
-        "assistant_capabilities_read"
-    ]
-    assert "performs no business action" in catalog["assistant_capabilities_read"]
-    assert "model-worker and GPU health only" in catalog["system_status"]
-    assert "Collection/list read" in catalog["calibration_iq_read"]
-    assert "exact RO-number q" in catalog["calibration_iq_read"]
-    assert "Exact-resource read" in catalog["calibration_iq_ro"]
-    assert "not OEM trigger" in catalog["calibration_iq_ro"]
-    assert "WRITE only for a direct current-turn command" in catalog[
-        "calibration_iq_operator"
-    ]
-    assert "change_status is only for an explicitly named target status" in catalog[
-        "calibration_iq_operator"
-    ]
+    for name in META_WRAPPED_CIQ_TOOLS | NON_ADAS_NORMAL_TOOLS:
+        assert name not in catalog
+    query = catalog["query_ciq"].casefold()
+    research = catalog["delegate_research"].casefold()
+    stage = catalog["stage_action"].casefold()
+    search = catalog["capability_search"].casefold()
+    assert "reads never change anything" in query
+    assert "adas_map_inventory" in query
+    assert "never scrapex" in query
+    assert "never changes calibration iq" in research
+    assert "with or without an ro" in research
+    assert "exclude_sources" in research
+    assert "only way to change calibration iq" in stage
+    assert "stage=staged" in stage
+    assert "raise otis's approval card when executed" in stage
+    assert "take no target_id" in stage
+    assert "nothing continues automatically after sign-in" in stage
+    assert "acquire_adas_map" in stage
+    assert "callable for the rest of this turn" in search
+    assert "catalog presence is not execution proof" in search
 
 
-def test_production_profile_catalog_exposes_disjoint_unversioned_action_families() -> None:
-    operator = next(
-        item["function"]
+def test_stage_action_lists_every_operator_operation_without_the_grammar() -> None:
+    catalog = {
+        item["function"]["name"]: item["function"]
         for item in configured_profile_catalog(_settings())
-        if item["function"]["name"] == "calibration_iq_operator"
+    }
+    operations = set(catalog["stage_action"]["parameters"]["properties"]["operation"]["enum"])
+
+    assert operations == set(stage_operations())
+    assert {"create_ro", "create_location"}.isdisjoint(operations)
+    assert set(CALIBRATION_IQ_DESTRUCTIVE_OPERATIONS) <= operations
+    assert set(CALIBRATION_IQ_ROUTINE_OPERATIONS) - {"create_ro", "create_location"} <= operations
+    assert {"acquire_adas_map", "open_adas_map_authentication"} <= operations
+    encoded = json.dumps(catalog["stage_action"], separators=(",", ":"))
+    operator_encoded = json.dumps(TOOL_SCHEMAS["calibration_iq_operator"], separators=(",", ":"))
+    assert len(encoded) < 3_300
+    assert len(encoded) * 4 < len(operator_encoded)
+
+    full_catalog = {
+        item["function"]["name"]: item["function"]
+        for item in configured_profile_catalog(_settings(), profile="full")
+    }
+    full_operations = set(
+        full_catalog["stage_action"]["parameters"]["properties"]["operation"]["enum"]
     )
+    assert {"create_ro", "create_location"} <= full_operations
+
+
+def test_operator_schema_still_exposes_disjoint_unversioned_action_families() -> None:
+    operator = TOOL_SCHEMAS["calibration_iq_operator"]
     branches = operator["parameters"]["properties"]["actions"]["items"]["oneOf"]
 
     def operations_for(expected: set[str]) -> dict:
@@ -416,7 +460,8 @@ def test_production_profile_catalog_exposes_disjoint_unversioned_action_families
 
 
 def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
-    tools = configured_profile_catalog(_settings())
+    registry = _registered()
+    tools = registry.permanent_catalog()
     active_subject = {
         "version": 7,
         "source_tool_name": "calibration_iq_ro",
@@ -456,47 +501,29 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
         history=history,
     )
 
-    # camera_footage's range_narrowed coverage-honesty rule grew this
-    # slightly; the ADAS_SOURCE_ROLES vetting-snapshot bullet grew it again;
-    # the WORKING_CONTEXT short-RO-number speaking rule grew it once more;
-    # the WORKING_CONTEXT new-subject-always-refetches rule grew it once
-    # more. Ceilings moved with it, not toward zero headroom.
-    assert metrics["base_system"]["chars"] < 7_300
-    assert metrics["base_system"]["tokens"] < 2_100
+    # Measured 2026-09-11: 4,474 chars, estimator 1,279 tokens, exact ~910.
+    assert metrics["base_system"]["chars"] < 4_700
+    assert metrics["base_system"]["tokens"] < 1_350
     assert metrics["active_working_context"]["chars"] > 0
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
     assert metrics["stored_artifact_context"]["chars"] <= 8_000
-    assert metrics["advertised_tools"]["count"] == 33
-    # The active CIQ operator schema retains repair-scope and trigger
-    # justification while dormant SI bookkeeping is removed. The
-    # calibration_iq_ro `shop` parameter (short-RO-number resolution) and
-    # anti-copy warnings on `repair_order_id`/`shop`
-    # (never copy an identifier from the Active conversation subject block
-    # into a fresh call) grew it once more. The single-owner ScrapeX v3
-    # handoff descriptions and the scrapex_adas_map auth-before-batch
-    # guidance grew the catalog again. Ceilings moved with them, not
-    # toward zero headroom.
-    assert metrics["advertised_tools"]["catalog_chars"] < 47_200
-    assert metrics["advertised_tools"]["catalog_tokens"] < 13_600
-    # Visibility ceiling with regression headroom; the independent remaining
-    # context floor below is the authoritative 32K safety contract. The
-    # new-subject-always-refetches WORKING_CONTEXT rule and the active-
-    # subject/tool-schema anti-copy warnings moved this floor down once more,
-    # and the ScrapeX v3 single-owner handoff plus auth-before-batch guidance
-    # moved it once more still.
-    assert metrics["total_input_used_tokens"] < 16_000
+    assert metrics["advertised_tools"]["count"] == 4
+    # Measured 2026-09-11: 7,815 chars, estimator 2,233 tokens, exact Qwen3
+    # tokens ~2,150 (the 55-operation stage_action enum and its glossary are
+    # most of it), down from ~12,300 exact tokens for the old 33-tool reserve.
+    assert metrics["advertised_tools"]["catalog_chars"] < 8_200
+    assert metrics["advertised_tools"]["catalog_tokens"] < 2_350
+    assert metrics["total_input_used_tokens"] < 4_600
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
-    assert metrics["remaining_normal_turn_tokens"] > 13_400
+    assert metrics["remaining_normal_turn_tokens"] > 25_000
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",
         "truth_and_authorization",
         "working_context",
-        "adas_source_roles",
         "operator_truth",
         "active_worker",
-        "current_time",
     }
 
 
@@ -508,8 +535,6 @@ def test_research_attach_cannot_request_a_file_and_a_folder_at_once() -> None:
     express rather than only caught after dispatch.
     """
     from jsonschema import Draft202012Validator
-
-    from core.tools.registry import TOOL_SCHEMAS
 
     schema = TOOL_SCHEMAS["calibration_iq_operator"]["parameters"]
     Draft202012Validator.check_schema(schema)

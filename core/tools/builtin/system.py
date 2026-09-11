@@ -422,3 +422,82 @@ def make_task_tools(store):
         return {**task, "status": status}
 
     return list_tasks, add_task, update_task_status
+
+
+def make_capability_search(router, registry):
+    """In-turn discovery for capabilities outside the permanent surface.
+
+    The model supplies a structured ``query``; this ranks the profile's
+    discoverable tools by token overlap with their own names/descriptions and
+    reports which of them the orchestrator will advertise for the rest of the
+    turn. It performs no business action and proves nothing about health.
+    """
+
+    from ...tools import meta as meta_mod
+
+    def capability_search(args: dict) -> dict:
+        query = str((args or {}).get("query") or "").strip()[:200]
+        try:
+            discoverable = registry.discoverable_catalog()
+        except AttributeError:
+            discoverable = []
+        is_implemented = getattr(registry, "is_implemented", None)
+        if not callable(is_implemented):
+            handlers = set(getattr(registry, "_handlers", {}))
+            is_implemented = handlers.__contains__
+        ranked: list[tuple[int, dict]] = []
+        for item in discoverable:
+            function = item["function"]
+            name = function["name"]
+            score = meta_mod.score_capability(query, name, function.get("description", ""))
+            ranked.append((score, item))
+        if query:
+            matches = [item for score, item in sorted(
+                ranked, key=lambda pair: (-pair[0], pair[1]["function"]["name"])
+            ) if score > 0]
+        else:
+            matches = [item for _score, item in ranked]
+        unlocked = [
+            item["function"]["name"]
+            for item in matches
+            if is_implemented(item["function"]["name"])
+        ][: meta_mod.MAX_UNLOCKED_TOOLS] if query else []
+        tools = []
+        for item in matches[: 12 if query else 40]:
+            function = item["function"]
+            name = function["name"]
+            requires_approval = registry.tier(name) == "confirm_required"
+            tools.append(
+                {
+                    "name": name,
+                    "status": "approval_required" if requires_approval else "available",
+                    "requires_approval": requires_approval,
+                    "unlocked_this_turn": name in unlocked,
+                    "description": str(function.get("description") or "")[:360],
+                }
+            )
+        permanent = []
+        try:
+            permanent = [item["function"]["name"] for item in registry.permanent_catalog()]
+        except AttributeError:
+            pass
+        return {
+            "delivery": "existing_chat_stream",
+            "catalog_is_execution_proof": False,
+            "query": query,
+            "active_worker": getattr(router, "active_name", None),
+            "permanent_tools": permanent,
+            "tools": tools,
+            "unlocked_tools": unlocked,
+            "available_names": sorted(
+                item["function"]["name"] for item in discoverable
+            ),
+            "note": (
+                "Unlocked tools are callable on the next round of this turn only."
+                if unlocked
+                else "No tool unlocked; refine the query or use a listed name."
+            ),
+            "not_wired": [],
+        }
+
+    return capability_search

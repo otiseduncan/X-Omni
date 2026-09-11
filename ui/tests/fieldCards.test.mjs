@@ -81,22 +81,14 @@ test("calibration_iq_work_prep is wired to a dedicated card, not silently droppe
     1,
   );
 
-  // Every mode from calibration_iq_work_prep.py's TOOL_SCHEMAS enum must
-  // route somewhere -- a missing case would fall through to whatever the
-  // default renders, silently showing the wrong shape.
+  // Every active mode from calibration_iq_work_prep.py's TOOL_SCHEMAS enum
+  // must route somewhere -- a missing case would fall through to whatever the
+  // default renders, silently showing the wrong shape. The SI queue modes
+  // (queue_list/queue_next) are dormant and their cards were removed with the
+  // rest of the dormant CIQ SI surface.
   assert.match(cards, /case "phase_list":/);
-  assert.match(cards, /case "queue_list":/);
-  assert.match(cards, /case "queue_next":/);
   assert.match(cards, /case "ro_requirements":/);
-
-  // queue_list is the read-only replay of the persisted weekly-readiness SI
-  // queue -- it must distinguish missing (confirmed gap) from unverified
-  // (couldn't be proven either way), not conflate the two.
-  assert.match(cards, /function WorkPrepQueueListCard/);
-  assert.match(cards, /item\.category === "missing"/);
-  assert.match(cards, /missing_count/);
-  assert.match(cards, /unverified_count/);
-  assert.match(cards, /\["no_active_queue",\s*"queue_stale",\s*"context_missing"\]/);
+  assert.doesNotMatch(cards, /case "queue_list":/);
 
   // phase_list shares calibration_iq_read's exact result shape (see
   // calibration_iq_work_prep.py's _phase_list: `{"mode": "phase_list",
@@ -190,4 +182,22 @@ test("Calibration IQ card CSS protects 360, 390, and 430 pixel layouts", async (
   assert.match(styles, /\.ro-pill\.done\s*\{/);
   assert.match(styles, /\.ciq-incomplete\s*\{[\s\S]*?color:\s*var\(--warning\);/);
   assert.match(styles, /@media \(max-width:\s*430px\)[\s\S]*?\.ciq-count\s*\{[\s\S]*?flex-wrap:\s*wrap;/);
+});
+
+test("delegated research findings render a provenance-first card", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/FieldCards.jsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(cards, /research_findings:\s*ResearchFindingsCard/);
+  assert.match(cards, /export function ResearchFindingsCard/);
+  // Every source the worker touched is listed with its verification state,
+  // and an ALLDATA sign-in boundary is stated instead of claimed as a result.
+  assert.match(cards, /research-source-ledger/);
+  assert.match(cards, /no verified finding/);
+  assert.match(cards, /needs an interactive sign-in/);
+  assert.match(cards, /RESEARCH_SOURCE_LABELS\[finding\?\.source\]/);
+  assert.match(cards, /finding\?\.page \? ` · p\.\$\{finding\.page\}` : ""/);
+  assert.match(cards, /rel="noreferrer noopener"/);
 });

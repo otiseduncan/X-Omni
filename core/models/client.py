@@ -136,6 +136,12 @@ class ModelClient:
 
         pending: dict[int, dict] = {}
         timeout = httpx.Timeout(15.0, read=600.0, write=60.0, pool=15.0)
+        # llama.cpp reports prompt/cache/generation timings on its final
+        # streamed chunk. They are surfaced as one trailing "usage" event so
+        # the orchestrator can measure real per-turn cost (prompt tokens,
+        # cached prefix, evaluated tokens, prefill and generation time).
+        usage: Optional[dict[str, Any]] = None
+        timings: Optional[dict[str, Any]] = None
 
         # trust_env=False -- a stray HTTP_PROXY/ALL_PROXY must never
         # hijack a 127.0.0.1 request.
@@ -152,8 +158,16 @@ class ModelClient:
                         continue
                     try:
                         chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(chunk, dict):
+                        if isinstance(chunk.get("usage"), dict):
+                            usage = chunk["usage"]
+                        if isinstance(chunk.get("timings"), dict):
+                            timings = chunk["timings"]
+                    try:
                         delta = chunk["choices"][0].get("delta", {})
-                    except (json.JSONDecodeError, KeyError, IndexError):
+                    except (KeyError, IndexError, TypeError):
                         continue
                     text = delta.get("content")
                     if text:
@@ -170,6 +184,12 @@ class ModelClient:
             call = pending[idx]
             if call["name"]:
                 yield {"type": "tool_call", **call}
+        if usage is not None or timings is not None:
+            yield {
+                "type": "usage",
+                "usage": usage or {},
+                "timings": timings or {},
+            }
 
     async def complete(self, messages: list[dict], max_tokens: int = 320,
                        temperature: float = 0.1) -> str:

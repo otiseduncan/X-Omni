@@ -20,8 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ..state.db import WebsiteRevisionConflict
@@ -57,8 +58,7 @@ TOOL_ROUND_CAP_FALLBACK = (
 )
 
 NO_TOOL_SELF_CHECK_ACCEPT = "NO_TOOL_NEEDED"
-NO_TOOL_SELF_CHECK_MESSAGE = """Internal final-answer evidence check; this is not a new user request. Review the withheld draft against the original request, current structured context, advertised tool contracts, and returned evidence. If a safe answer requires current or live business state, execution proof, capability state, or vehicle-specific OEM technical evidence, do not answer in prose: call the best justified advertised tool or tools now. Nothing has executed in this turn, so a draft reporting work as done -- acquired, retrieved, saved, attached, reconciled, updated, or complete -- and any specific finding it credits to that work are unsupported no matter how confident they read: call the tool that would actually do it instead of accepting the draft. If the draft is a casual or general answer, or already states a truthful unresolved boundary and no tool is needed, output exactly NO_TOOL_NEEDED. Never run a mutation to test or demonstrate capability. Reason from meaning and evidence contracts, not keyword rules."""
-NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE = """Internal active-context evidence check; this is not a new user request. A trusted active working subject exists, so do not accept or repeat the withheld draft and do not output NO_TOOL_NEEDED. Select the best justified advertised tool now to refresh or establish the authoritative evidence needed for the original request. The model owns which advertised capability fits; never mutate merely to test or demonstrate capability. Reason from the structured subject, full request, evidence contracts, and tool schemas, not keyword rules."""
+NO_TOOL_SELF_CHECK_MESSAGE = """Internal final-answer evidence check; this is not a new user request. Review the withheld draft against the original request, current structured context, advertised tool contracts, and returned evidence. If a safe answer requires current or live business state, execution proof, capability state, or vehicle-specific OEM technical evidence, do not answer in prose: call the best justified advertised tool or tools now. Nothing has executed in this turn, so a draft reporting work as done -- acquired, retrieved, saved, attached, reconciled, updated, or complete -- and any specific finding it credits to that work are unsupported no matter how confident they read: call the tool that would actually do it instead of accepting the draft. If the draft is a casual, conceptual, or general answer, or already states a truthful unresolved boundary and no tool is needed, output exactly NO_TOOL_NEEDED; an active conversation subject is memory and is never by itself a reason to call a tool. Never run a mutation to test or demonstrate capability. Reason from meaning and evidence contracts, not keyword rules."""
 NO_TOOL_SELF_CHECK_FALLBACK = (
     "I can’t verify the withheld draft from the available evidence, so I’m not "
     "presenting it as established."
@@ -77,12 +77,61 @@ def no_tool_self_check_reserve_tokens(max_draft_tokens: int) -> int:
 
     return (
         max(0, int(max_draft_tokens))
-        + max(
-            prompt_mod.estimate_tokens(NO_TOOL_SELF_CHECK_MESSAGE),
-            prompt_mod.estimate_tokens(NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE),
-        )
+        + prompt_mod.estimate_tokens(NO_TOOL_SELF_CHECK_MESSAGE)
         + 24
     )
+
+
+@dataclass
+class TurnMetrics:
+    """Real per-turn cost, read from llama.cpp's own timings.
+
+    ``cached_tokens`` is the prefix the server reused, ``evaluated_tokens``
+    what it actually prefilled. Their ratio is the direct measure of whether
+    the prompt layout keeps the tool catalog and history cache-warm.
+    """
+
+    started: float
+    model_calls: int = 0
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    evaluated_tokens: int = 0
+    prompt_ms: float = 0.0
+    generated_tokens: int = 0
+    generation_ms: float = 0.0
+    rounds: int = 0
+    tools_selected: list[str] = field(default_factory=list)
+    evidence_ids: list[str] = field(default_factory=list)
+
+    def absorb(self, event: dict[str, Any]) -> None:
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        timings = event.get("timings") if isinstance(event.get("timings"), dict) else {}
+        self.model_calls += 1
+        self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
+        self.cached_tokens += int(timings.get("cache_n") or 0)
+        self.evaluated_tokens += int(timings.get("prompt_n") or 0)
+        self.prompt_ms += float(timings.get("prompt_ms") or 0.0)
+        self.generated_tokens += int(
+            timings.get("predicted_n") or usage.get("completion_tokens") or 0
+        )
+        self.generation_ms += float(timings.get("predicted_ms") or 0.0)
+
+    def summary(self, **extra: Any) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "total_latency_ms": round((time.perf_counter() - self.started) * 1000),
+            "model_calls": self.model_calls,
+            "tool_rounds": self.rounds,
+            "prompt_tokens": self.prompt_tokens,
+            "cached_tokens": self.cached_tokens,
+            "evaluated_tokens": self.evaluated_tokens,
+            "prompt_ms": round(self.prompt_ms),
+            "generated_tokens": self.generated_tokens,
+            "generation_ms": round(self.generation_ms),
+            "tools_selected": list(self.tools_selected),
+            "evidence_ids": sorted(set(self.evidence_ids))[:40],
+        }
+        summary.update(extra)
+        return summary
 
 
 async def model_owned_no_tool_self_check(
@@ -91,33 +140,33 @@ async def model_owned_no_tool_self_check(
     tools: list[dict[str, Any]],
     draft: str,
     *,
-    require_tool: bool = False,
+    metrics: Optional[TurnMetrics] = None,
 ) -> NoToolSelfCheckResult:
-    """Let the same model accept its draft or select evidence tools once."""
+    """Let the same model accept its draft or select evidence tools once.
 
-    review_instruction = (
-        NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE
-        if require_tool
-        else NO_TOOL_SELF_CHECK_MESSAGE
-    )
+    The review is never forced: ``tool_choice`` stays automatic, so a casual
+    or conceptual answer survives even while an active subject exists. The
+    model owns whether evidence is needed; Core only withholds the draft
+    until that decision is made.
+    """
+
     review_messages = [
         *messages,
         {"role": "assistant", "content": draft},
-        {"role": "user", "content": review_instruction},
+        {"role": "user", "content": NO_TOOL_SELF_CHECK_MESSAGE},
     ]
     checker_text = ""
     tool_calls: list[dict[str, Any]] = []
-    stream_kwargs: dict[str, Any] = {"tools": tools}
-    if require_tool:
-        stream_kwargs["tool_choice"] = "required"
-    async for event in client.stream(review_messages, **stream_kwargs):
+    async for event in client.stream(review_messages, tools=tools):
         if event.get("type") == "content":
             checker_text += str(event.get("text") or "")
         elif event.get("type") == "tool_call":
             tool_calls.append(event)
+        elif event.get("type") == "usage" and metrics is not None:
+            metrics.absorb(event)
     return NoToolSelfCheckResult(
         accept_draft=(
-            not require_tool and bool(draft.strip()) and not tool_calls
+            bool(draft.strip()) and not tool_calls
             and checker_text.strip() == NO_TOOL_SELF_CHECK_ACCEPT
         ),
         tool_calls=tuple(tool_calls),
@@ -212,6 +261,8 @@ ARTIFACT_FOR_TOOL = {
     "list_directory": "directory",
     "search_files": "file_search",
     "web_research_current": "web_research",
+    "delegate_research": "research_findings",
+    "capability_search": "capabilities",
     "website_preview_generate": "website_preview",
     "camera_request": "camera_request",
     "exterior_camera_request": "exterior_camera_request",
@@ -1422,6 +1473,35 @@ def artifact_type_for_tool(name: str, result: Any) -> Optional[str]:
     return "generated_image" if verified else "image_generation_status"
 
 
+def artifacts_for_result(name: str, result: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Cards to render for one tool result.
+
+    A stage_action result is a composite: the fresh exact-RO read renders as
+    the ordinary RO card while it is staged, and the concrete execution result
+    renders as the receipt (or ScrapeX) card once it ran. Everything else
+    keeps its one-card mapping.
+    """
+
+    if name == "stage_action" and isinstance(result, dict):
+        cards: list[tuple[str, dict[str, Any]]] = []
+        stage = result.get("stage")
+        read = result.get("repair_order_read")
+        if stage in {"staged", "read_failed"} and isinstance(read, dict):
+            cards.append(("calibration_iq_ro", read))
+        execution = result.get("execution")
+        if stage in {"executed", "not_executed"} and isinstance(execution, dict):
+            via = result.get("executed_via")
+            if via in _CALIBRATION_IQ_OPERATOR_TOOLS:
+                cards.append(("calibration_iq_receipt", execution))
+            elif via == "scrapex_adas_map":
+                cards.append(("scrapex", execution))
+        return cards
+    card_type = artifact_type_for_tool(name, result)
+    if card_type and isinstance(result, dict):
+        return [(card_type, result)]
+    return []
+
+
 def video_failure_summary(result: Any) -> str:
     """Return fixed, receipt-grounded prose for a failed protected video run."""
     if not isinstance(result, dict):
@@ -1486,6 +1566,57 @@ class Orchestrator:
         self.registry = registry
         self.store = store
         self.settings = settings
+
+    def _expand_model_call(self, name: str, args: Any) -> tuple[str, dict[str, Any]]:
+        expand = getattr(self.registry, "expand_model_call", None)
+        if callable(expand):
+            return expand(name, args)
+        return name, (args if isinstance(args, dict) else {})
+
+    def _model_tools(
+        self,
+        role: str,
+        calibration_iq_evidence: Optional[CalibrationIQTurnEvidence],
+        scrapex_evidence: Optional[ScrapeXTurnEvidence],
+        unlocked: set[str],
+    ) -> list[dict[str, Any]]:
+        """Advertised catalog for one round; tolerant of lightweight test registries."""
+
+        try:
+            return self.registry.model_tools(
+                role,
+                calibration_iq_evidence=calibration_iq_evidence,
+                scrapex_evidence=scrapex_evidence,
+                unlocked=sorted(unlocked),
+            )
+        except TypeError:
+            pass
+        try:
+            return self.registry.model_tools(
+                role,
+                calibration_iq_evidence=calibration_iq_evidence,
+                scrapex_evidence=scrapex_evidence,
+            )
+        except TypeError:
+            return self.registry.model_tools()
+
+    def _budget_reserve_tools(self, role: str) -> list[dict[str, Any]]:
+        """Largest catalog a turn may expose, for history budgeting only."""
+
+        reserve = getattr(self.registry, "budget_reserve_tools", None)
+        if callable(reserve):
+            try:
+                return reserve(role)
+            except TypeError:
+                pass
+        try:
+            return self.registry.model_tools(
+                role,
+                gate_calibration_iq_writes=False,
+                gate_scrapex_batch_ids=False,
+            )
+        except TypeError:
+            return self.registry.model_tools()
 
     def _persist_website_turn(
         self,
@@ -1723,7 +1854,6 @@ class Orchestrator:
             not approved_tool
             and getattr(self.client, "supports_no_tool_self_check", False)
         )
-        no_tool_self_check_requires_tool = active_subject is not None
         no_tool_self_check_reserve = (
             no_tool_self_check_reserve_tokens(self.settings.max_response_tokens)
             if no_tool_self_check_enabled
@@ -1732,24 +1862,15 @@ class Orchestrator:
         # An approval continuation reports the already executed protected call;
         # it cannot mint a fresh staged-write unlock and chain another mutation.
         calibration_iq_staging_enabled = not bool(approved_tool)
-        try:
-            # Reserve the largest catalog this turn may expose. The first model
-            # round receives the staged catalog, while a verified exact-RO read
-            # can unlock CIQ writes for a later round without overrunning context.
-            reserve_tools = self.registry.model_tools(
-                role,
-                gate_calibration_iq_writes=False,
-                gate_scrapex_batch_ids=False,
-            )
-            tools = self.registry.model_tools(
-                role,
-                calibration_iq_evidence=calibration_iq_evidence,
-                scrapex_evidence=scrapex_evidence,
-            )
-        except TypeError:
-            # Lightweight test registries expose the original zero-argument
-            # shape; the production Registry always accepts the role.
-            reserve_tools = tools = self.registry.model_tools()
+        # Names a same-turn capability_search unlocked; advertised on later
+        # rounds of this turn only. History is budgeted against the largest
+        # catalog the turn may expose so an unlock cannot overrun the context.
+        unlocked_tool_names: set[str] = set()
+        metrics = TurnMetrics(started=time.perf_counter())
+        reserve_tools = self._budget_reserve_tools(role)
+        tools = self._model_tools(
+            role, calibration_iq_evidence, scrapex_evidence, unlocked_tool_names
+        )
         messages = prompt_mod.build_messages(
             self.router,
             history,
@@ -2022,16 +2143,12 @@ class Orchestrator:
                     {"role": "user", "content": FINAL_SYNTHESIS_MESSAGE},
                 ]
             else:
-                try:
-                    tools = self.registry.model_tools(
-                        role,
-                        calibration_iq_evidence=calibration_iq_evidence,
-                        scrapex_evidence=scrapex_evidence,
-                    )
-                except TypeError:
-                    # Backward-compatible lightweight registries retain their
-                    # original fixed catalog.
-                    pass
+                tools = self._model_tools(
+                    role,
+                    calibration_iq_evidence,
+                    scrapex_evidence,
+                    unlocked_tool_names,
+                )
                 round_tools = tools
                 round_messages = messages
             # Evidence returned during this round cannot authorize another
@@ -2047,6 +2164,7 @@ class Orchestrator:
             round_text = ""
             sealed_round_tokens: list[dict] = []
 
+            metrics.rounds += 1
             async for event in self.client.stream(round_messages, tools=round_tools):
                 if event["type"] == "content":
                     round_text += event["text"]
@@ -2057,6 +2175,8 @@ class Orchestrator:
                     sealed_round_tokens.append({"type": "token", "text": event["text"]})
                 elif event["type"] == "tool_call":
                     tool_calls.append(event)
+                elif event["type"] == "usage":
+                    metrics.absorb(event)
 
             if len(tool_calls) > MAX_TOOL_CALLS_PER_ROUND:
                 log.warning(
@@ -2093,7 +2213,7 @@ class Orchestrator:
                     messages,
                     tools,
                     round_text,
-                    require_tool=no_tool_self_check_requires_tool,
+                    metrics=metrics,
                 )
                 if self_check.tool_calls:
                     # The first draft and internal review prompt are temporary
@@ -2219,6 +2339,34 @@ class Orchestrator:
                     args = {}
 
                 call_id = call.get("id") or f"call_{round_index}_{i}"
+                requested_name = str(call.get("name") or "")
+                try:
+                    expanded_name, args = self._expand_model_call(requested_name, args)
+                except ValueError as exc:
+                    # A malformed meta call is an ordinary tool error the model
+                    # can correct on the next round; nothing ran.
+                    error_payload = {"status": "error", "message": str(exc)}
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "name": requested_name,
+                            "content": _bounded_tool_result_json(error_payload),
+                        }
+                    )
+                    yield {"type": "tool_start", "name": requested_name, "args": args}
+                    yield {
+                        "type": "tool_result",
+                        "name": requested_name,
+                        "result": error_payload,
+                    }
+                    continue
+                call = {**call, "name": expanded_name}
+                metrics.tools_selected.append(
+                    requested_name
+                    if requested_name == expanded_name
+                    else f"{requested_name}->{expanded_name}"
+                )
                 is_website_call = call.get("name") == "website_preview_generate"
                 calibration_iq_evidence_for_call = call_calibration_iq_evidence
                 if call.get("name") in _CALIBRATION_IQ_OPERATOR_TOOLS:
@@ -2240,6 +2388,7 @@ class Orchestrator:
                     call_cache=read_only_call_cache,
                     calibration_iq_evidence=calibration_iq_evidence_for_call,
                     scrapex_evidence=call_scrapex_evidence,
+                    requested_as=requested_name,
                 ):
                     if ev["type"] == "approval":
                         paused = True
@@ -2344,6 +2493,50 @@ class Orchestrator:
                         last_web_research_result = (
                             web_result if isinstance(web_result, dict) else {"ok": False}
                         )
+                    if ev.get("type") == "tool_result" and isinstance(ev.get("result"), dict):
+                        hook_result = ev["result"]
+                        if call.get("name") == "stage_action":
+                            # The composite carried its own fresh exact-RO read
+                            # and, when it executed, the concrete operator
+                            # result. Feed both into the same evidence, subject,
+                            # and truth-review paths a direct call would use.
+                            stage_read = hook_result.get("repair_order_read")
+                            if calibration_iq_staging_enabled and isinstance(stage_read, dict):
+                                next_calibration_iq_evidence = calibration_iq_evidence_from_result(
+                                    "calibration_iq_ro",
+                                    stage_read,
+                                    conversation_id=conversation_id,
+                                    message_id=int(effective_context.get("message_id") or 0),
+                                    source_tool_call_id=call_id,
+                                    previous=next_calibration_iq_evidence,
+                                )
+                            if (
+                                hook_result.get("stage") == "executed"
+                                and hook_result.get("executed_via") in _CALIBRATION_IQ_OPERATOR_TOOLS
+                            ):
+                                execution = hook_result.get("execution")
+                                last_calibration_iq_operator_result = (
+                                    execution
+                                    if isinstance(execution, dict)
+                                    else {"status": "unverified_result"}
+                                )
+                                calibration_iq_operator_results.append(
+                                    last_calibration_iq_operator_result
+                                )
+                        elif call.get("name") == "capability_search":
+                            unlocked = hook_result.get("unlocked_tools")
+                            if isinstance(unlocked, list):
+                                unlocked_tool_names.update(
+                                    str(item) for item in unlocked if isinstance(item, str)
+                                )
+                        for evidence_key in ("evidence_id", "evidence_ids"):
+                            evidence_value = hook_result.get(evidence_key)
+                            if isinstance(evidence_value, str):
+                                metrics.evidence_ids.append(evidence_value)
+                            elif isinstance(evidence_value, list):
+                                metrics.evidence_ids.extend(
+                                    str(item) for item in evidence_value if isinstance(item, str)
+                                )
                     if is_website_call:
                         sealed_events.append(ev)
                         if ev.get("type") == "tool_result":
@@ -2433,11 +2626,33 @@ class Orchestrator:
         if len(history) <= 1 and full_text:
             self.store.touch_conversation(conversation_id, title=user_message[:60])
 
+        subject_payload = (
+            active_subject.get("payload") if isinstance(active_subject, dict) else None
+        )
+        turn_metrics = metrics.summary(
+            conversation_id=conversation_id,
+            worker=self.router.active_name,
+            history_messages=len(history),
+            advertised_tools=[item["function"]["name"] for item in tools],
+            tool_schema_tokens_estimate=prompt_mod.estimate_tool_catalog_tokens(tools),
+            reserved_tool_schema_tokens_estimate=prompt_mod.estimate_tool_catalog_tokens(
+                reserve_tools
+            ),
+            unlocked_tools=sorted(unlocked_tool_names),
+            active_subject=(
+                subject_payload.get("resource_id")
+                if isinstance(subject_payload, dict)
+                else None
+            ),
+        )
+        log.info("turn metrics %s", json.dumps(turn_metrics, default=str))
+
         yield {
             "type": "done",
             "message_id": message_id,
             "worker": self.router.active_name,
             "artifacts": artifacts,
+            "metrics": turn_metrics,
         }
 
     async def _execute(
@@ -2453,8 +2668,12 @@ class Orchestrator:
         call_cache: Optional[dict[tuple[str, str], Any]] = None,
         calibration_iq_evidence: Optional[CalibrationIQTurnEvidence] = None,
         scrapex_evidence: Optional[ScrapeXTurnEvidence] = None,
+        requested_as: Optional[str] = None,
     ) -> AsyncIterator[dict]:
-        yield {"type": "tool_start", "name": name, "args": args}
+        start_event: dict[str, Any] = {"type": "tool_start", "name": name, "args": args}
+        if requested_as and requested_as != name:
+            start_event["requested_as"] = requested_as
+        yield start_event
 
         def feed(payload: Any) -> None:
             messages.append(
@@ -2546,16 +2765,20 @@ class Orchestrator:
                 feed(payload)
                 yield {"type": "tool_result", "name": name, "result": payload}
                 return
+            # A composite (stage_action) raises the approval for the concrete
+            # protected tool it expanded to; the approval must bind and later
+            # execute that tool, never the wrapper name.
+            approval_tool = getattr(pending, "tool_name", None) or name
             approval_id = self.store.create_approval(
-                name,
+                approval_tool,
                 pending.summary,
-                {"name": name, "args": pending.tool_args},
+                {"name": approval_tool, "args": pending.tool_args},
                 conversation_id=conversation_id,
                 session_id=str(context["session_id"]),
                 user_id=str(context["user_id"]),
                 message_id=int(context["message_id"]),
                 tool_call_id=call_id,
-                logged_args=self.registry.log_args(name, args),
+                logged_args=self.registry.log_args(approval_tool, args),
             )
             record = self.store.get_approval(approval_id) or {}
             public_record = self.registry.public_approval(record)
@@ -2601,7 +2824,7 @@ class Orchestrator:
             )
             approval = {
                 "id": approval_id,
-                "tool": public_record.get("tool", name),
+                "tool": public_record.get("tool", approval_tool),
                 "summary": public_record.get("summary", f"Run {name}"),
                 "args": public_record.get("args", {}),
                 "status": record.get("status", "pending"),
@@ -2655,9 +2878,8 @@ class Orchestrator:
         if dedupe_key is not None and call_cache is not None:
             call_cache[dedupe_key] = result
 
-        card_type = artifact_type_for_tool(name, result)
-        if card_type and isinstance(result, dict):
-            artifact = {"type": card_type, "data": result}
+        for card_type, card_data in artifacts_for_result(name, result):
+            artifact = {"type": card_type, "data": card_data}
             artifacts.append(artifact)
             yield {"type": "artifact", "artifact": artifact}
 
@@ -2672,6 +2894,27 @@ class Orchestrator:
     ) -> None:
         """Persist only a subject proven by one non-cached authoritative result."""
         if not hasattr(self.store, "set_conversation_subject"):
+            return
+        if name == "stage_action" and isinstance(result, dict):
+            read = result.get("repair_order_read")
+            if isinstance(read, dict):
+                self._track_active_subject(
+                    conversation_id=conversation_id,
+                    name="calibration_iq_ro",
+                    result=read,
+                    call_id=call_id,
+                    invocation_context=invocation_context,
+                )
+            execution = result.get("execution")
+            via = result.get("executed_via")
+            if via in _CALIBRATION_IQ_OPERATOR_TOOLS and isinstance(execution, dict):
+                self._track_active_subject(
+                    conversation_id=conversation_id,
+                    name=str(via),
+                    result=execution,
+                    call_id=call_id,
+                    invocation_context=invocation_context,
+                )
             return
         try:
             # Local import avoids a package-load cycle: services import the

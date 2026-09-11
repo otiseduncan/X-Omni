@@ -1447,8 +1447,11 @@ def test_exterior_camera_tool_is_read_only_inline_and_starts_nothing():
     handler = exterior_camera.make_exterior_camera_request(service)
     normal_registry = Registry("config/tools.yaml")
     normal_registry.register("exterior_camera_request", handler)
+    # Discoverable in the daily profile, advertised once unlocked for a turn.
+    assert "exterior_camera_request" in normal_registry.unlockable_tool_names()
     assert "exterior_camera_request" in {
-        item["function"]["name"] for item in normal_registry.model_tools()
+        item["function"]["name"]
+        for item in normal_registry.model_tools(unlocked=["exterior_camera_request"])
     }
 
     registry = Registry("config/tools.yaml", profile="full")

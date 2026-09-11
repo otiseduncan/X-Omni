@@ -18,13 +18,34 @@ class FakeRouter:
         return self._config
 
 
+def context_message(messages: list[dict]) -> dict:
+    """The volatile turn-context message: after history, before the newest user turn."""
+    candidates = [
+        message
+        for message in messages
+        if message["role"] == "system" and message["content"].startswith("## Right now")
+    ]
+    assert len(candidates) == 1, [message["content"][:40] for message in messages]
+    return candidates[0]
+
+
+def dialogue(messages: list[dict]) -> list[str]:
+    return [
+        message["content"]
+        for message in messages[1:]
+        if not (message["role"] == "system" and message["content"].startswith("## Right now"))
+    ]
+
+
 def stored_payload(messages: list[dict]) -> dict:
+    content = context_message(messages)["content"]
     match = re.search(
         r"<stored_artifacts_json>(.*?)</stored_artifacts_json>",
-        messages[0]["content"],
+        content,
         flags=re.S,
     )
-    assert match, messages[0]["content"]
+    assert match, content
+    assert "<stored_artifacts_json>" not in messages[0]["content"]
     return json.loads(match.group(1))
 
 
@@ -55,9 +76,9 @@ def test_rehydrates_prior_cards_as_concise_structured_context_across_worker_swap
     ]
     assert all(item["message_id"] == 2 and item["worker"] == "omni" for item in payload["items"])
     assert payload["items"][1]["data"]["content"] == "bounded file evidence"
-    assert [message["content"] for message in messages[1:]] == [
-        "Check my day.", "Here is the saved result."
-    ]
+    assert dialogue(messages) == ["Check my day.", "Here is the saved result."]
+    # The last message is the assistant's, so the context message trails it.
+    assert messages[-1]["content"].startswith("## Right now")
 
 
 def test_omits_approval_receipts_and_redacts_or_drops_unsafe_bodies():
@@ -98,7 +119,7 @@ def test_omits_approval_receipts_and_redacts_or_drops_unsafe_bodies():
     assert "abcdefghijklmnopqrstuvwxyz123456" not in rendered
     assert "approval_request" not in rendered
     assert "execution_receipt" not in rendered
-    assert "</stored_artifacts_json> useful line" not in messages[0]["content"]
+    assert "</stored_artifacts_json> useful line" not in context_message(messages)["content"]
     shell = payload["items"][0]["data"]
     assert shell["command"]["omitted"] is True
     assert shell["stdout"]["omitted"] is True
@@ -198,5 +219,8 @@ def test_artifact_context_respects_total_prompt_budget():
     messages = prompt.build_messages(FakeRouter(), history, 2_800, 400)
 
     total = sum(prompt.estimate_tokens(message["content"]) + 8 for message in messages)
-    assert total <= 2_800 - 400 + 8
-    assert len(messages[0]["content"]) < len(prompt.system_prompt(FakeRouter())) + prompt.ARTIFACT_CONTEXT_MAX_CHARS + 500
+    # The static system and the turn-context messages each carry the +8
+    # per-message allowance that history packing already accounts for.
+    assert total <= 2_800 - 400 + 16
+    assert messages[0]["content"] == prompt.system_prompt(FakeRouter())
+    assert len(context_message(messages)["content"]) < prompt.ARTIFACT_CONTEXT_MAX_CHARS + 500

@@ -2063,10 +2063,14 @@ async def test_loop_revokes_indeterminate_batch_before_later_sibling_call(
         "user",
         "Continue the already selected ScrapeX batches.",
     )
+    # The full profile advertises the ScrapeX tools on every round, which is
+    # what this loop-level batch-id staging test inspects. Under the daily
+    # profile they are discoverable-only; the staging gate itself applies to
+    # both profiles.
     registry = Registry(
         ROOT / "config" / "tools.yaml",
         store=store,
-        profile="adas_operator",
+        profile="full",
     )
     read_calls: list[dict[str, Any]] = []
     map_calls: list[dict[str, Any]] = []

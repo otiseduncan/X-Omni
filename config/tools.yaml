@@ -20,13 +20,24 @@ default_profile: adas_operator
 
 profiles:
   adas_operator:
-    # Runtime staging hides both CIQ write schemas until a verified exact-RO
-    # result is returned earlier in the same turn. create_ro and create_location
-    # share the batch operator but cannot be authorized by an unrelated existing
-    # RO, so their action branches stay available only in the explicit `full`
-    # maintenance profile. No implementation or full-profile capability is deleted.
-    description: "Daily ADAS technician, research, and staged Calibration IQ operator surface."
+    # The model permanently sees four meta-tools. Every other tool listed
+    # below stays reachable but is advertised only after a same-turn
+    # capability_search unlocks it. The raw Calibration IQ write tools are not
+    # in this profile at all: stage_action is the only model-facing write path
+    # and expands to them inside the gateway, where the exact-RO write binding,
+    # approvals, and receipts still apply. create_ro and create_location cannot
+    # be bound to an existing RO, so they stay in the explicit `full` profile.
+    description: "Daily ADAS technician surface: query_ciq, delegate_research, stage_action, capability_search."
+    permanent:
+      - query_ciq
+      - delegate_research
+      - stage_action
+      - capability_search
     tools:
+      - query_ciq
+      - delegate_research
+      - stage_action
+      - capability_search
       - get_calendar
       - create_calendar_event
       - list_tasks
@@ -48,14 +59,7 @@ profiles:
       - automotive_knowledge_search
       - automotive_knowledge_read
       - automotive_knowledge_capture
-      - calibration_iq_status
       - calibration_iq_start_native
-      - calibration_iq_summary
-      - calibration_iq_read
-      - calibration_iq_ro
-      - calibration_iq_operator
-      - calibration_iq_destructive
-      - calibration_iq_work_prep
       - scrapex_status
       - scrapex_start_native
       - scrapex_read
@@ -91,6 +95,29 @@ write_roots:
 # identity paths. Adding one of those beneath a root never makes it readable.
 
 tools:
+  # ---- Permanent model-facing surface (see profiles.adas_operator.permanent) ----
+  query_ciq:
+    tier: read_only
+    description: "One contract for every Calibration IQ read; the gateway expands it to the exact-RO, board, phase, inventory, or status handler."
+
+  delegate_research:
+    tier: operator_authorized
+    description: >-
+      Bounded multi-source research worker: local ADAS SI, durable knowledge,
+      licensed ALLDATA Navigator, public OEM web. Never writes to Calibration IQ;
+      preserve=true captures verified evidence into ADAS SI.
+
+  stage_action:
+    tier: operator_authorized
+    description: >-
+      Fresh exact-RO read, then a staged contract or a bound execution through
+      the concrete Calibration IQ operator/destructive or ScrapeX acquisition
+      tools, each under its own tier, binding, approval, and receipt rules.
+
+  capability_search:
+    tier: read_only
+    description: "Rank and unlock discoverable profile tools for the rest of the current turn."
+
   get_weather:
     tier: read_only
     description: "Current conditions and 7-day forecast for the saved location."

@@ -103,14 +103,21 @@ async def test_calibration_iq_read_is_selected_by_model_not_prerouted(tmp_path):
 
 
 def test_normal_ciq_board_tools_do_not_advertise_si_filters():
+    from core.tools.registry import TOOL_SCHEMAS
+
     registry = Registry("config/tools.yaml", profile="adas_operator")
     tools = {
         item["function"]["name"]: item["function"]["parameters"]
         for item in registry.profile_catalog()
     }
 
-    assert "si_attached" not in tools["calibration_iq_summary"]["properties"]
-    assert "si_attached" not in tools["calibration_iq_read"]["properties"]
+    # The board reads reach the model only through query_ciq now; neither the
+    # meta contract nor the concrete schemas carry the dormant SI filter.
+    assert "si_attached" not in tools["query_ciq"]["properties"]
+    assert "si_attached" not in TOOL_SCHEMAS["calibration_iq_summary"]["parameters"]["properties"]
+    assert "si_attached" not in TOOL_SCHEMAS["calibration_iq_read"]["parameters"]["properties"]
+    assert "calibration_iq_summary" not in tools
+    assert "calibration_iq_read" not in tools
     assert "alldata_service_information" not in tools
     assert "research_provider_setup" not in tools
 

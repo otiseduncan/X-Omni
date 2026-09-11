@@ -11,7 +11,6 @@ from core.orchestrator.loop import (
     NO_TOOL_SELF_CHECK_ACCEPT,
     NO_TOOL_SELF_CHECK_FALLBACK,
     NO_TOOL_SELF_CHECK_MESSAGE,
-    NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE,
     Orchestrator,
     model_owned_no_tool_self_check,
 )
@@ -106,6 +105,8 @@ async def test_first_round_unsupported_draft_is_replaced_by_model_selected_tool(
         }
 
     registry.register("calibration_iq_ro", exact_ro)
+    for meta_name in ("query_ciq", "delegate_research", "stage_action", "capability_search"):
+        registry.register(meta_name, lambda _args: {})
 
     class Client:
         supports_no_tool_self_check = True
@@ -123,24 +124,23 @@ async def test_first_round_unsupported_draft_is_replaced_by_model_selected_tool(
                 }
                 return
             if self.calls == 2:
-                assert tool_choice == "required"
-                assert messages[-1]["content"] == NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE
-                assert any(
-                    item["function"]["name"] == "calibration_iq_ro"
-                    for item in tools
-                )
-                assert not any(
-                    item["function"]["name"] in {
-                        "calibration_iq_operator",
-                        "calibration_iq_destructive",
-                    }
-                    for item in tools
-                )
+                # The review is model-owned and never forced, even with an
+                # active subject: tool_choice stays automatic and the model
+                # itself decides fresh evidence is needed.
+                assert tool_choice is None
+                assert messages[-1]["content"] == NO_TOOL_SELF_CHECK_MESSAGE
+                advertised = {item["function"]["name"] for item in tools}
+                assert "query_ciq" in advertised
+                assert advertised.isdisjoint({
+                    "calibration_iq_ro",
+                    "calibration_iq_operator",
+                    "calibration_iq_destructive",
+                })
                 yield {
                     "type": "tool_call",
                     "id": "self-check-exact-ro",
-                    "name": "calibration_iq_ro",
-                    "arguments": json.dumps({"repair_order_id": "ro-1"}),
+                    "name": "query_ciq",
+                    "arguments": json.dumps({"kind": "ro", "repair_order_id": "ro-1"}),
                 }
                 return
             encoded = json.dumps(messages)
@@ -224,15 +224,20 @@ async def test_casual_no_tool_draft_passes_after_one_bounded_review(tmp_path) ->
 
 
 @pytest.mark.asyncio
-async def test_active_context_required_review_cannot_sentinel_or_auto_select_mutation(
+async def test_active_subject_never_forces_a_tool_and_a_casual_draft_survives(
     tmp_path,
 ) -> None:
-    store = Store(tmp_path / "self-check-required.sqlite")
-    conversation_id = store.create_conversation("active RO")
+    """The user's core case: an RO was looked up earlier, then a general
+    question ("How does an ultrasonic parking sensor calculate distance?")
+    is asked. The persisted subject is memory, not a gate: the review runs
+    unforced, the model keeps its answer, and no tool runs."""
+
+    store = Store(tmp_path / "self-check-advisory.sqlite")
+    conversation_id = store.create_conversation("active RO then general question")
     user_message_id = store.add_message(
         conversation_id,
         "user",
-        "Give me the answer for this active work item.",
+        "How does an ultrasonic parking sensor calculate distance?",
     )
     store.set_conversation_subject(
         conversation_id,
@@ -253,6 +258,10 @@ async def test_active_context_required_review_cannot_sentinel_or_auto_select_mut
         return {"status": "verified"}
 
     registry.register("calibration_iq_operator", mutation)
+    for meta_name in ("query_ciq", "delegate_research", "stage_action", "capability_search"):
+        registry.register(meta_name, lambda _args: {})
+
+    draft = "It times an ultrasonic pulse's echo and halves the round trip at the speed of sound."
 
     class Client:
         supports_no_tool_self_check = True
@@ -260,12 +269,13 @@ async def test_active_context_required_review_cannot_sentinel_or_auto_select_mut
 
         async def stream(self, messages, tools=None, *, tool_choice=None):
             self.calls += 1
+            assert tool_choice is None
             if self.calls == 1:
-                assert tool_choice is None
-                yield {"type": "content", "text": "Unsupported active-state claim."}
+                yield {"type": "content", "text": draft}
                 return
-            assert tool_choice == "required"
-            assert messages[-1]["content"] == NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE
+            assert messages[-1]["content"] == NO_TOOL_SELF_CHECK_MESSAGE
+            # The subject rides in the turn context, but nothing tells the
+            # model it must call a tool because of it.
             assert not any(
                 item["function"]["name"] in {
                     "calibration_iq_operator",
@@ -273,15 +283,14 @@ async def test_active_context_required_review_cannot_sentinel_or_auto_select_mut
                 }
                 for item in tools
             )
-            # Even if a model/server violates required tool choice, Core fails
-            # closed. It never fabricates a read or mutation on the model's behalf.
             yield {"type": "content", "text": NO_TOOL_SELF_CHECK_ACCEPT}
 
+    client = Client()
     events = [
         event
-        async for event in _orchestrator(Client(), registry, store).run_turn(
+        async for event in _orchestrator(client, registry, store).run_turn(
             conversation_id,
-            "Give me the answer for this active work item.",
+            "How does an ultrasonic parking sensor calculate distance?",
             approval_context={
                 "session_id": "local:local-dev",
                 "user_id": "local-dev",
@@ -294,9 +303,13 @@ async def test_active_context_required_review_cannot_sentinel_or_auto_select_mut
     final_text = "".join(
         event["text"] for event in events if event.get("type") == "token"
     )
-    assert final_text == NO_TOOL_SELF_CHECK_FALLBACK
+    assert client.calls == 2
+    assert final_text == draft
     assert mutation_calls == []
     assert not any(event.get("type") == "tool_start" for event in events)
+    done = next(event for event in events if event.get("type") == "done")
+    assert done["metrics"]["active_subject"] == "ro-1"
+    assert done["metrics"]["tools_selected"] == []
     store.close()
 
 
@@ -369,8 +382,7 @@ def test_no_tool_review_forbids_accepting_a_draft_that_reports_work_as_done() ->
     accept_index = message.index(NO_TOOL_SELF_CHECK_ACCEPT.casefold())
     executed_index = message.index("nothing has executed in this turn")
     assert executed_index < accept_index
-
-    # The forced-review variant already refuses the draft outright, so it must
-    # keep saying so rather than deferring to the model's own judgement.
-    required = NO_TOOL_SELF_CHECK_REQUIRED_MESSAGE.casefold()
-    assert "do not accept or repeat the withheld draft" in required
+    # And the review must say plainly that an active subject is memory, not a
+    # reason to call a tool -- the coercion that made every casual answer
+    # after one RO lookup get replaced by a forced tool pick.
+    assert "active conversation subject is memory" in message

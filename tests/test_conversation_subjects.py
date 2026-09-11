@@ -247,13 +247,19 @@ def test_prompt_receives_subject_as_bounded_json_without_rewriting_user_text():
         active_subject=active,
     )
     assert messages[-1] == {"role": "user", "content": user_text}
-    assert messages[0]["content"].count("<active_subject_json>") == 1
-    assert messages[0]["content"].count("</active_subject_json>") == 1
-    assert "never-render-this-secret-value" not in messages[0]["content"]
-    assert "\\u003c/active_subject_json\\u003e" in messages[0]["content"]
+    # The subject rides in the volatile turn-context message placed right
+    # before the newest user turn; the static system message never carries it.
+    assert "<active_subject_json>" not in messages[0]["content"]
+    context = messages[-2]
+    assert context["role"] == "system"
+    assert context["content"].startswith("## Right now")
+    assert context["content"].count("<active_subject_json>") == 1
+    assert context["content"].count("</active_subject_json>") == 1
+    assert "never-render-this-secret-value" not in context["content"]
+    assert "\\u003c/active_subject_json\\u003e" in context["content"]
     match = re.search(
         r"<active_subject_json>(.*?)</active_subject_json>",
-        messages[0]["content"],
+        context["content"],
         flags=re.S,
     )
     assert match
@@ -283,11 +289,14 @@ def test_active_subject_survives_history_truncation_and_total_budget_is_bounded(
         active_subject=active,
         tools=tools,
     )
-    assert len(messages) == 1
-    assert "ro-persisted" in messages[0]["content"]
-    packed_tokens = prompt.estimate_tokens(messages[0]["content"]) + sum(
+    # Oversized history is dropped; the static system and the turn context
+    # (carrying the durable subject) always survive.
+    assert [message["role"] for message in messages] == ["system", "system"]
+    assert "ro-persisted" not in messages[0]["content"]
+    assert "ro-persisted" in messages[1]["content"]
+    packed_tokens = sum(
         prompt.estimate_tokens(message["content"]) + 8
-        for message in messages[1:]
+        for message in messages
     )
     total = (
         packed_tokens
@@ -358,8 +367,11 @@ async def test_orchestrator_persists_verified_subject_and_injects_it_next_turn(t
     # The third model round is the second user turn. The durable subject is in
     # trusted system context while the user's natural wording is unchanged.
     second_turn_messages = client.messages[2]
-    assert "<active_subject_json>" in second_turn_messages[0]["content"]
-    assert "2400911777" in second_turn_messages[0]["content"]
+    assert "<active_subject_json>" not in second_turn_messages[0]["content"]
+    context = second_turn_messages[-2]
+    assert context["role"] == "system"
+    assert "<active_subject_json>" in context["content"]
+    assert "2400911777" in context["content"]
     assert second_turn_messages[-1] == {"role": "user", "content": follow_up}
     assert store.get_conversation_subject(conversation_id)["version"] == 1
     store.close()

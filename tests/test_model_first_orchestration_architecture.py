@@ -10,9 +10,11 @@ LOOP = ROOT / "core" / "orchestrator" / "loop.py"
 
 SEMANTIC_ROUTING_PATHS = (
     LOOP,
+    ROOT / "core" / "tools" / "meta.py",
     SERVICES / "calibration_iq_work_prep.py",
     SERVICES / "research_auto_acquire.py",
     SERVICES / "research_calibration_route.py",
+    SERVICES / "research_delegate.py",
     SERVICES / "research_task_continuity.py",
     SERVICES / "research_workflow.py",
 )
@@ -262,28 +264,30 @@ def test_production_orchestration_has_no_casual_semantic_tool_router() -> None:
     )
 
 
-def test_required_no_tool_review_is_gated_only_by_trusted_active_subject() -> None:
-    tree = ast.parse(LOOP.read_text(encoding="utf-8"), filename=str(LOOP))
-    assignments = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name)
-            and target.id == "no_tool_self_check_requires_tool"
-            for target in node.targets
-        )
-    ]
+def test_no_tool_review_is_never_forced_by_the_active_subject() -> None:
+    """The active subject is advisory memory, never a control-flow gate.
 
-    assert len(assignments) == 1
-    assert ast.dump(assignments[0].value, include_attributes=False) == ast.dump(
-        ast.Compare(
-            left=ast.Name(id="active_subject", ctx=ast.Load()),
-            ops=[ast.IsNot()],
-            comparators=[ast.Constant(value=None)],
-        ),
-        include_attributes=False,
-    )
+    Before 2026-09-11 a persisted subject made the no-tool review run with
+    ``tool_choice="required"`` for the rest of the conversation, so every
+    casual or conceptual answer after one RO lookup was withheld and replaced
+    by a forced tool pick. The orchestrator must never request a forced tool
+    choice on the model's behalf.
+    """
+
+    tree = ast.parse(LOOP.read_text(encoding="utf-8"), filename=str(LOOP))
+    forced = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and node.value == "required"
+    ]
+    assert forced == [], f"loop.py forces tool_choice='required' at lines {forced}"
+    gates = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and node.id in {"no_tool_self_check_requires_tool", "require_tool"}
+    ]
+    assert gates == [], f"loop.py still carries a forced-review gate at lines {gates}"
 
 
 def test_semantic_router_guard_rejects_count_membership_choose_tool() -> None:
