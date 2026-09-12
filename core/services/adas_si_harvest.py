@@ -49,6 +49,10 @@ PICKER_URL = "https://my.alldata.com/repair/#/select-vehicle"
 QUICK_REFERENCE = "ADAS Quick Reference"
 
 MAX_VEHICLES = 25
+MAX_PHASES = 12
+# One RO read per row is enough to name the vehicle; the board is read at
+# this width per phase.
+PHASE_ROW_LIMIT = 100
 MAX_DEPTH = 3
 # A page with nothing below it is a document however short: Honda's rear
 # camera procedure is 742 characters, its LaneWatch programming 452. Length
@@ -99,7 +103,7 @@ _BODY_OR_DRIVE = frozenset({
     "sedan", "coupe", "hatchback", "wagon", "convertible", "cabriolet",
     "fwd", "rwd", "awd", "4wd", "2wd", "4matic", "quattro", "hybrid",
 })
-_MAKE_ALIASES = {"nissan-datsun": "Nissan"}
+_MAKE_ALIASES = {"nissan-datsun": "Nissan", "benz": "Mercedes-Benz"}
 # Makes ALLDATA prints as two words. Without these "2020 Mercedes Benz E 350"
 # reads as a Mercedes named "Benz E".
 _TWO_WORD_MAKES = {
@@ -275,6 +279,175 @@ class AdasSiHarvestService:
             return None
         return str(((created.get("data") or {}).get("id")) or "") or None
 
+    # ----------------------------------------------------------- scope
+    async def vehicles_in_phases(self, phases: list[str]) -> list[dict[str, Any]]:
+        """The distinct vehicles on the Calibration IQ board for these phases.
+
+        Calibration IQ names a vehicle with its trim attached -- "2023 Honda
+        Accord Sedan EX w/Continuously Variable Transmissi", truncated by the
+        board's own column -- so the label is reduced to the year, make and
+        model the picker actually offers. Several ROs share one vehicle, and
+        one capture serves them all, so the list is deduplicated.
+        """
+        from . import calibration_iq
+
+        seen: dict[str, dict[str, Any]] = {}
+        for phase in phases:
+            result = await calibration_iq.read_repair_orders(
+                self.settings, {"phase": phase, "limit": PHASE_ROW_LIMIT}
+            )
+            if result.get("status") != "verified":
+                log.warning(
+                    "Calibration IQ phase %s unavailable: %s", phase, result.get("status")
+                )
+                continue
+            for row in result.get("rows") or []:
+                label = _clean(row.get("Vehicle"))
+                if not label:
+                    continue
+                target = vehicle_target(label)
+                if not (target.get("make") and target.get("model")):
+                    continue
+                # Calibration IQ carries the trim -- "Palisade SEL",
+                # "Palisade Limited AWD", "Accord Sedan EX" -- and ALLDATA's
+                # model list does not. Keyed on the trim, two ROs on the same
+                # vehicle become two vehicles and get captured twice. The
+                # first word is the model ALLDATA offers; option matching is
+                # anchored at the start, so "ES" still finds "ES 350" and
+                # "7" finds "7 Series".
+                target["model"] = target["model"].split()[0]
+                key = f"{target['year']} {target['make']} {target['model']}".casefold()
+                entry = seen.setdefault(
+                    key,
+                    {
+                        "label": f"{target['year']} {target['make']} {target['model']}",
+                        "target": target,
+                        "repair_orders": [],
+                    },
+                )
+                ro = _clean(row.get("RO"))
+                if ro and ro not in entry["repair_orders"]:
+                    entry["repair_orders"].append(ro)
+        return list(seen.values())
+
+    # ----------------------------------------------------------- selection
+    async def _combobox(self, task_id: str, wanted: str) -> Optional[str]:
+        """The ref of the Year, Make or Model control, whatever it now reads.
+
+        Each control shows its placeholder until something is chosen and its
+        chosen value afterwards, so it cannot be found by a fixed name.
+        Position among the comboboxes is what identifies it.
+        """
+        page = await self._settle(task_id)
+        boxes = [
+            element for element in (page.get("elements") or [])
+            if element.get("role") == "combobox"
+        ]
+        index = {"year": 0, "make": 1, "model": 2}.get(wanted.casefold())
+        if index is None or len(boxes) <= index:
+            return None
+        return str(boxes[index].get("ref") or "")
+
+    async def _options(self, task_id: str) -> list[tuple[str, str]]:
+        page = await self._settle(task_id)
+        return [
+            (str(element.get("ref") or ""), _clean(element.get("name")))
+            for element in (page.get("elements") or [])
+            if element.get("role") == "option" and _clean(element.get("name"))
+        ]
+
+    @staticmethod
+    def _best_option(options: list[tuple[str, str]], wanted: str) -> Optional[tuple[str, str]]:
+        """Exact, then prefix, then containment -- never a blind first choice.
+
+        ALLDATA lists "Accord Sedan" and "Accord Coupe" for an Accord, and
+        "Elantra (CN7) VIN KMH" beside "Elantra (CN7A) VIN 5NP". Anything not
+        anchored at the start of the name is a different vehicle.
+        """
+        target = _clean(wanted).casefold()
+        if not target:
+            return None
+        for ref, name in options:
+            if name.casefold() == target:
+                return ref, name
+        for ref, name in options:
+            if name.casefold().startswith(target):
+                return ref, name
+        for ref, name in options:
+            if target in name.casefold():
+                return ref, name
+        return None
+
+    async def _pick(self, task_id: str, control: str, wanted: str) -> Optional[str]:
+        """Open one picker control and choose a value from what it lists."""
+        ref = await self._combobox(task_id, control)
+        if not ref:
+            return None
+        await self._click(task_id, ref, settle=1.6)
+        choice = self._best_option(await self._options(task_id), wanted)
+        if not choice:
+            # Leave the list closed so the next control is reachable.
+            await self._click(task_id, ref, settle=1.0)
+            return None
+        await self._click(task_id, choice[0], settle=2.2)
+        return choice[1]
+
+    async def select_vehicle(self, task_id: str, target: dict[str, Any]) -> dict[str, Any]:
+        """Select any vehicle through the picker's Year/Make/Model cascade.
+
+        Recent Vehicles only covers what has already been worked on. The
+        cascade reaches everything, and it makes ALLDATA's make taxonomy
+        readable instead of guessed: if the model is absent under "Hyundai",
+        the make list also holds "Hyundai Truck", and the model list under it
+        answers the question directly.
+
+        The search box is not used: typing a VIN or a name into it does
+        nothing without a submit control that carries no accessible name or
+        role, so it cannot be reached by ref at all.
+        """
+        year = str(target.get("year") or "")
+        make = _clean(target.get("make"))
+        model = _clean(target.get("model"))
+        if not (year and make and model):
+            return {"selected": False, "reason": "year, make and model are all required"}
+
+        await self._open(task_id, PICKER_URL, settle=3.0)
+        if not await self._pick(task_id, "year", year):
+            return {"selected": False, "reason": f"year {year} was not offered"}
+
+        for candidate in (make, f"{make} Truck"):
+            chosen_make = await self._pick(task_id, "make", candidate)
+            if not chosen_make:
+                continue
+            chosen_model = await self._pick(task_id, "model", model)
+            if chosen_model:
+                page = await self._settle(task_id)
+                # Some vehicles need an engine before the page resolves.
+                if "/vehicle/" not in _clean(page.get("url")):
+                    options = await self._options(task_id)
+                    if options:
+                        await self._click(task_id, options[0][0], settle=2.5)
+                        page = await self._settle(task_id)
+                label = (
+                    _clean(page.get("title"))
+                    .replace("Vehicle Information - ", "")
+                    .replace(" - ALLDATA Collision", "")
+                    .strip()
+                )
+                if "/vehicle/" in _clean(page.get("url")):
+                    return {
+                        "selected": True, "vehicle": label,
+                        "make_used": chosen_make, "model_used": chosen_model,
+                    }
+            # Wrong shelf: reopen the picker and try the other make.
+            await self._open(task_id, PICKER_URL, settle=2.5)
+            await self._pick(task_id, "year", year)
+
+        return {
+            "selected": False,
+            "reason": f"{year} {make} {model} was not offered under {make} or {make} Truck",
+        }
+
     # ----------------------------------------------------------- discovery
     async def discover(
         self,
@@ -306,7 +479,9 @@ class AdasSiHarvestService:
         if text_length >= DOCUMENT_CHARS:
             found.append({"title": title or name, "url": url, "chars": text_length})
 
-    async def documents_for(self, task_id: str, label: str) -> tuple[str, list[dict[str, Any]]]:
+    async def documents_for(
+        self, task_id: str, label: str, target: Optional[dict[str, Any]] = None
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Every ADAS procedure document reachable for one Recent Vehicle."""
         page = await self._open(task_id, PICKER_URL, settle=3.0)
         tokens = [token for token in _clean(label).casefold().split() if token]
@@ -317,8 +492,15 @@ class AdasSiHarvestService:
                 ref = str(element.get("ref") or "")
                 break
         if not ref:
-            return "", []
-        page = await self._click(task_id, ref, settle=3.0)
+            if target is None:
+                return "", []
+            # Not previously worked on: reach it through the cascade instead.
+            chosen = await self.select_vehicle(task_id, target)
+            if not chosen.get("selected"):
+                return "", []
+            page = await self._settle(task_id)
+        else:
+            page = await self._click(task_id, ref, settle=3.0)
         vehicle = (
             _clean(page.get("title"))
             .replace("Vehicle Information - ", "")
@@ -366,20 +548,34 @@ class AdasSiHarvestService:
         }
 
     # ----------------------------------------------------------- run
-    async def _run(self, run_id: str, labels: list[str]) -> None:
+    async def _run(self, run_id: str, requests: list[dict[str, Any]]) -> None:
         record = self._runs[run_id]
         try:
-            for label in labels:
-                task_id = await self._new_task(vehicle_target(label), "adas quick reference")
+            if record.get("phases"):
+                found = await self.vehicles_in_phases(record["phases"])
+                record["vehicles_from_phases"] = len(found)
+                requests = found[:MAX_VEHICLES]
+                record["requested"] = [item["label"] for item in requests]
+                if len(found) > MAX_VEHICLES:
+                    record["truncated"] = (
+                        f"{len(found)} vehicles are on the board for these phases; "
+                        f"the first {MAX_VEHICLES} were taken."
+                    )
+            for request in requests:
+                label = request["label"]
+                task_id = await self._new_task(request["target"], "adas quick reference")
                 if not task_id:
                     record["vehicles"].append(
                         {"requested": label, "vehicle": label, "found": 0, "filed": 0,
                          "documents": [], "error": "could not start a Navigator task"}
                     )
                     continue
-                vehicle, documents = await self.documents_for(task_id, label)
+                vehicle, documents = await self.documents_for(
+                    task_id, label, request["target"]
+                )
                 entry: dict[str, Any] = {
                     "requested": label,
+                    "repair_orders": request.get("repair_orders") or [],
                     "vehicle": vehicle or label,
                     "found": len(documents),
                     "filed": 0,
@@ -387,7 +583,7 @@ class AdasSiHarvestService:
                 }
                 record["vehicles"].append(entry)
                 if not vehicle:
-                    entry["error"] = "not in ALLDATA Recent Vehicles"
+                    entry["error"] = "ALLDATA does not list this vehicle"
                     continue
                 target = vehicle_target(vehicle)
                 for document in documents:
@@ -424,13 +620,26 @@ class AdasSiHarvestService:
         args = dict(args or {})
         raw = args.get("vehicles")
         labels = [_clean(item) for item in raw if _clean(item)] if isinstance(raw, list) else []
-        if not labels:
+        raw_phases = args.get("phases")
+        phases = (
+            [p for p in (_clean(item) for item in raw_phases) if p]
+            if isinstance(raw_phases, list)
+            else []
+        )
+        if labels and phases:
+            return {
+                "executed": False,
+                "success": False,
+                "reason": "Give either vehicles or phases, not both.",
+            }
+        if not labels and not phases:
             return {
                 "executed": False,
                 "success": False,
                 "reason": (
-                    "vehicles is required: the ALLDATA Recent Vehicles labels to "
-                    "harvest, for example '2021 Honda Civic'."
+                    "vehicles or phases is required: vehicle labels such as "
+                    "'2021 Honda Civic', or Calibration IQ phases such as "
+                    "['1','2','3'] to take every vehicle on those phases."
                 ),
             }
         if len(labels) > MAX_VEHICLES:
@@ -438,6 +647,12 @@ class AdasSiHarvestService:
                 "executed": False,
                 "success": False,
                 "reason": f"At most {MAX_VEHICLES} vehicles per harvest; {len(labels)} were given.",
+            }
+        if len(phases) > MAX_PHASES:
+            return {
+                "executed": False,
+                "success": False,
+                "reason": f"At most {MAX_PHASES} phases per harvest; {len(phases)} were given.",
             }
 
         async with self._start_lock:
@@ -452,19 +667,25 @@ class AdasSiHarvestService:
                 "run_id": run_id,
                 "state": "running",
                 "requested": labels,
+                "phases": phases,
                 "completed": 0,
                 "filed": 0,
                 "vehicles": [],
                 "started_at": self.clock().isoformat(),
             }
-            self._tasks[run_id] = asyncio.create_task(self._run(run_id, labels))
+            requests = [
+                {"label": label, "target": vehicle_target(label), "repair_orders": []}
+                for label in labels
+            ]
+            self._tasks[run_id] = asyncio.create_task(self._run(run_id, requests))
 
         return {
             "executed": True,
             "success": True,
             "run_id": run_id,
             "state": "running",
-            "vehicles_requested": len(labels),
+            "vehicles_requested": len(labels) or None,
+            "phases": phases or None,
             "note": (
                 "Running in the background; ask for adas_si_harvest_status. "
                 "Started is not complete."
@@ -487,6 +708,9 @@ class AdasSiHarvestService:
             "run_id": record.get("run_id"),
             "state": record.get("state"),
             "requested": len(record.get("requested") or []),
+            "phases": record.get("phases") or None,
+            "vehicles_from_phases": record.get("vehicles_from_phases"),
+            "truncated": record.get("truncated"),
             "completed": record.get("completed"),
             "filed": record.get("filed"),
             "started_at": record.get("started_at"),
@@ -495,6 +719,7 @@ class AdasSiHarvestService:
             "vehicles": [
                 {
                     "vehicle": entry.get("vehicle"),
+                    "repair_orders": entry.get("repair_orders") or [],
                     "found": entry.get("found"),
                     "filed": entry.get("filed"),
                     "error": entry.get("error"),

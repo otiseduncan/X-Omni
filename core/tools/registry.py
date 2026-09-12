@@ -3217,10 +3217,11 @@ TOOL_SCHEMAS["adas_map_sweep"] = {
 TOOL_SCHEMAS["adas_si_harvest"] = {
     "description": (
         "Start a background ADAS service-information harvest from ALLDATA: for each "
-        "named vehicle, open its ADAS Quick Reference, follow every ADAS component "
-        "to its calibration procedures, and file each one into ADAS SI as a verified "
-        "PDF with provenance. Vehicles are named as they appear in ALLDATA's Recent "
-        "Vehicles list. Returns immediately; started is not complete."
+        "vehicle, open its ADAS Quick Reference, follow every ADAS component to its "
+        "calibration procedures, and file each one into ADAS SI as a verified PDF "
+        "with provenance. Give either explicit vehicle labels, or Calibration IQ "
+        "phases to take every vehicle on those phases. Returns immediately; started "
+        "is not complete."
     ),
     "parameters": {
         "type": "object",
@@ -3232,12 +3233,23 @@ TOOL_SCHEMAS["adas_si_harvest"] = {
                 "minItems": 1,
                 "maxItems": 25,
                 "description": (
-                    "ALLDATA Recent Vehicles labels, for example '2021 Honda Civic' "
-                    "or '2021 Hyundai Truck Palisade'."
+                    "Vehicle labels, for example '2021 Honda Civic'. Any vehicle "
+                    "ALLDATA carries can be reached, not only recently used ones."
+                ),
+            },
+            "phases": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 12},
+                "minItems": 1,
+                "maxItems": 12,
+                "description": (
+                    "Calibration IQ phases, for example ['1','2','3']. Every "
+                    "distinct vehicle on those phases is harvested; ROs sharing a "
+                    "vehicle are served by one capture. Use instead of vehicles."
                 ),
             },
         },
-        "required": ["vehicles"],
+        "required": [],
     },
 }
 TOOL_SCHEMAS["adas_si_harvest_status"] = {
