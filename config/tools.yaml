@@ -236,6 +236,9 @@ tools:
       report or OE service information. Use that summary for document-type
       counts; parsed_document_count in the top-level summary is unrelated
       (filename-identity readability only) and must not be used for that.
+      Refreshes new root-folder drops and reports recent_additions and storage_refresh.
+      For new documents or this morning's additions, use its arrival-time filters;
+      old ADAS Map sweeps and vehicle search results cannot prove recent additions.
 
   adas_si_open:
     tier: read_only

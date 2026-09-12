@@ -37,10 +37,11 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
@@ -208,6 +209,18 @@ def describe_document(source_root: Path, path: Path) -> dict[str, Any]:
         "platform_code": None, "topic": None,
         "application_parsed": False, "parse_confidence": "none",
     }
+    try:
+        top_directory = path.resolve().relative_to(source_root.resolve()).parts[0]
+    except (ValueError, IndexError):
+        top_directory = ""
+    if top_directory.casefold() == adas_storage.REFERENCE_DIRNAME.casefold():
+        descriptor["storage_class"] = "reference"
+    elif top_directory.casefold() == adas_storage.NEEDS_REVIEW_DIRNAME.casefold():
+        descriptor["storage_class"] = "needs_review"
+    elif top_directory.casefold() == adas_storage.ADAS_MAP_DIRNAME.casefold():
+        descriptor["storage_class"] = "adas_map_report"
+    else:
+        descriptor["storage_class"] = "service_information"
     path_identity = adas_storage.canonical_vehicle_identity(source_root, path)
 
     def _finish() -> dict[str, Any]:
@@ -283,11 +296,20 @@ class SourceInventory:
 
     def documents(self) -> list[dict]:
         paths = self._walk()
-        key = tuple((str(p), p.stat().st_mtime_ns if p.exists() else 0) for p in paths)
+        existing: list[tuple[Path, int]] = []
+        for path in paths:
+            try:
+                existing.append((path, path.stat().st_mtime_ns))
+            except OSError:
+                # A background filing pass can move a newly dropped root PDF
+                # between the walk and stat. It will appear at its canonical
+                # path on the next inventory rather than breaking this read.
+                continue
+        key = tuple((str(path), mtime) for path, mtime in existing)
         if self._cache is not None and key == self._cache_key:
             return self._cache
         docs = []
-        for p in paths:
+        for p, _mtime in existing:
             d = describe_document(self.source_root, p)
             d["_path"] = p
             docs.append(d)
@@ -345,6 +367,10 @@ class SourceInventory:
         docs = [{k: v for k, v in d.items() if k != "_path"} for d in self.documents()]
         parsed = [d for d in docs if d["application_parsed"]]
         unparsed = [d["title"] for d in docs if not d["application_parsed"]]
+        storage_counts: dict[str, int] = {}
+        for document in docs:
+            storage_class = str(document.get("storage_class") or "unknown")
+            storage_counts[storage_class] = storage_counts.get(storage_class, 0) + 1
 
         groups: dict[tuple, list[dict]] = {}
         for d in parsed:
@@ -376,10 +402,17 @@ class SourceInventory:
                 "vehicle_application_count": len(applications),
                 "parsed_document_count": len(docs) - len(unparsed),
                 "unparsed_document_count": len(unparsed),
+                "reference_document_count": storage_counts.get("reference", 0),
+                "needs_review_document_count": storage_counts.get("needs_review", 0),
+                "root_drop_count": sum(
+                    1 for document in docs if len(Path(document["relative_path"]).parts) == 1
+                ),
             },
             "evidence_contract": {
                 "authoritative_records_only": True,
                 "do_not_infer_records_from_counts": True,
+                "recent_additions_are_arrival_evidence": True,
+                "search_results_are_not_arrival_evidence": True,
             },
             "applications": applications,
             "unparsed_documents": unparsed,
@@ -417,22 +450,9 @@ class AdasSI:
     def __init__(self, source_root: Path, cache_path: Path):
         self.source_root = Path(source_root).resolve()
         self.cache_path = Path(cache_path).resolve()
-        self.storage_migration = (
-            adas_storage.migrate_library_once(
-                self.source_root,
-                self.cache_path,
-                describe_document,
-            )
-            if adas_storage.is_authoritative_runtime_root(self.source_root)
-            else {
-                "moved": 0,
-                "unresolved": [],
-                "paths": {},
-                "skipped_non_authoritative_root": True,
-            }
-        )
         self.managed_root = self.source_root / MANAGED_DIRNAME
         self.inventory = SourceInventory(self.source_root)
+        self._refresh_lock = threading.Lock()
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.cache_path) as db:
             db.executescript(
@@ -440,6 +460,10 @@ class AdasSI:
                 "  path TEXT, page INTEGER, text TEXT, source_mtime_ns INTEGER,"
                 "  PRIMARY KEY(path, page));"
                 "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
+                "CREATE TABLE IF NOT EXISTS document_arrivals("
+                "  path TEXT PRIMARY KEY, first_seen_at TEXT NOT NULL,"
+                "  filesystem_created_at TEXT, original_name TEXT NOT NULL,"
+                "  last_seen_at TEXT NOT NULL, classification_json TEXT);"
             )
             current = db.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
@@ -450,9 +474,264 @@ class AdasSI:
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (CACHE_SCHEMA_VERSION,),
             )
+        self.storage_migration = self.refresh_library(organize_root=True)
 
     def available(self) -> bool:
         return self.inventory.available()
+
+    @staticmethod
+    def _parse_arrival_boundary(value: Any, field: str) -> Optional[datetime]:
+        if value in (None, ""):
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an ISO 8601 timestamp with a UTC offset") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"{field} must include a UTC offset")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _filesystem_created_at(path: Path) -> Optional[str]:
+        # On Windows st_ctime is the file creation time. POSIX st_ctime is a
+        # metadata-change clock and must not be mislabeled as an arrival time.
+        if os.name != "nt":
+            return None
+        try:
+            return datetime.fromtimestamp(path.stat().st_ctime, timezone.utc).isoformat()
+        except OSError:
+            return None
+
+    def _record_arrivals(self, paths: list[Path]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            (
+                str(path.resolve()),
+                now,
+                self._filesystem_created_at(path),
+                path.name,
+                now,
+            )
+            for path in paths
+            if path.is_file()
+        ]
+        if not rows:
+            return
+        with sqlite3.connect(self.cache_path) as db:
+            db.executemany(
+                "INSERT OR IGNORE INTO document_arrivals("
+                "path,first_seen_at,filesystem_created_at,original_name,last_seen_at"
+                ") VALUES(?,?,?,?,?)",
+                rows,
+            )
+            db.executemany(
+                "UPDATE document_arrivals SET last_seen_at=? WHERE path=?",
+                [(now, row[0]) for row in rows],
+            )
+
+    def _classify_root_document(self, path: Path) -> dict[str, Any]:
+        from .adas_si_classifier import classify_root_pdf
+
+        pages = self._pages(path)
+        classification = classify_root_pdf(path, pages)
+        if classification.get("storage_class") != "needs_review":
+            return classification
+        # Browser-captured spreadsheets compress a whole wide sheet into one
+        # letter-sized image. The normal 2000px search OCR can read procedures
+        # but may miss the small sheet title. Retry only unresolved root drops
+        # at higher resolution so filing gets a fair, bounded second look.
+        try:
+            from .adas_ocr import ocr_png_bytes
+            from PIL import Image, ImageOps
+
+            rendered = self.render_page(path, 1, width=4000)
+            enhanced = ocr_png_bytes(rendered)
+            enhanced_text = str(enhanced.get("text") or "")
+            if enhanced_text:
+                classification = classify_root_pdf(
+                    path,
+                    [*pages, (10_000, enhanced_text)],
+                )
+            if classification.get("storage_class") == "needs_review":
+                # Wide worksheet captures often leave most of the PDF page
+                # blank. Trim that whitespace and enlarge the left-hand model
+                # table, where the make/model evidence lives.
+                with Image.open(io.BytesIO(rendered)) as opened:
+                    image = opened.convert("RGB")
+                mask = ImageOps.invert(image.convert("L")).point(
+                    lambda value: 255 if value > 12 else 0
+                )
+                bounds = mask.getbbox()
+                if bounds:
+                    image = image.crop(bounds)
+                image = image.crop((0, 0, max(1, int(image.width * 0.6)), image.height))
+                resized_height = max(1, int(4000 * image.height / image.width))
+                image = image.resize((4000, resized_height))
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                focused = ocr_png_bytes(buffer.getvalue())
+                focused_text = str(focused.get("text") or "")
+                if focused_text:
+                    classification = classify_root_pdf(
+                        path,
+                        [*pages, (10_000, enhanced_text), (10_001, focused_text)],
+                    )
+        except Exception as exc:  # noqa: BLE001 - unresolved is an honest outcome
+            log.warning("ADAS SI high-resolution classification failed for %s: %s", path.name, exc)
+        return classification
+
+    def refresh_library(
+        self,
+        *,
+        organize_root: bool = True,
+        reclassify_review: bool = False,
+    ) -> dict[str, Any]:
+        """Discover new PDFs and safely organize authoritative root drops."""
+
+        if not self.available():
+            return {
+                "status": "unavailable",
+                "moved": 0,
+                "unresolved": [],
+                "paths": {},
+            }
+        with self._refresh_lock:
+            before = self.inventory._walk()
+            self._record_arrivals(before)
+            should_organize = bool(
+                organize_root
+                and adas_storage.is_authoritative_runtime_root(self.source_root)
+            )
+            if should_organize:
+                result = adas_storage.migrate_library(
+                    self.source_root,
+                    self.cache_path,
+                    describe_document,
+                    root_classifier=self._classify_root_document,
+                    reclassify_review=reclassify_review,
+                )
+            else:
+                result = {
+                    "moved": 0,
+                    "unresolved": [],
+                    "paths": {},
+                    "classifications": {},
+                    "skipped_non_authoritative_root": True,
+                }
+            self.inventory._cache = None
+            self.inventory._cache_key = None
+            after = self.inventory._walk()
+            self._record_arrivals(after)
+            classifications = result.get("classifications") or {}
+            if classifications:
+                with sqlite3.connect(self.cache_path) as db:
+                    for path, classification in classifications.items():
+                        db.execute(
+                            "UPDATE document_arrivals SET classification_json=? WHERE path=?",
+                            (json.dumps(classification, sort_keys=True), str(path)),
+                        )
+            compact = []
+            for path, classification in classifications.items():
+                item = dict(classification) if isinstance(classification, dict) else {}
+                item.setdefault("relative_path", str(Path(path).relative_to(self.source_root)))
+                compact.append(item)
+            return {
+                "status": "success",
+                "moved_count": int(result.get("moved") or 0),
+                "classified_count": sum(
+                    1 for item in compact if item.get("storage_class") != "needs_review"
+                ),
+                "review_required_count": sum(
+                    1 for item in compact if item.get("storage_class") == "needs_review"
+                ),
+                "unresolved": list(result.get("unresolved") or []),
+                "filed": compact,
+                "policy": result.get("policy") or {},
+                "organize_root": should_organize,
+            }
+
+    def _recent_additions(self, args: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        since = self._parse_arrival_boundary(args.get("added_since"), "added_since")
+        before = self._parse_arrival_boundary(args.get("added_before"), "added_before")
+        if since is None:
+            since = now - timedelta(hours=24)
+        if before is None:
+            before = now + timedelta(seconds=1)
+        if before <= since:
+            raise ValueError("added_before must be later than added_since")
+        raw_limit = args.get("recent_limit", 50)
+        if isinstance(raw_limit, bool):
+            raise ValueError("recent_limit must be an integer from 1 through 100")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("recent_limit must be an integer from 1 through 100") from exc
+        if limit < 1 or limit > 100:
+            raise ValueError("recent_limit must be an integer from 1 through 100")
+
+        with sqlite3.connect(self.cache_path) as db:
+            rows = db.execute(
+                "SELECT path,first_seen_at,filesystem_created_at,original_name,"
+                "classification_json FROM document_arrivals"
+            ).fetchall()
+        selected: list[dict[str, Any]] = []
+        bases: set[str] = set()
+        for raw_path, first_seen, created, original_name, raw_classification in rows:
+            path = Path(str(raw_path))
+            if not path.is_file():
+                continue
+            basis = "filesystem_created_at" if created else "first_seen_at"
+            raw_time = created or first_seen
+            try:
+                arrival = datetime.fromisoformat(str(raw_time)).astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if arrival < since or arrival >= before:
+                continue
+            try:
+                classification = json.loads(raw_classification or "{}")
+            except (TypeError, ValueError):
+                classification = {}
+            descriptor = describe_document(self.source_root, path)
+            selected.append(
+                {
+                    "title": classification.get("title") or descriptor["title"],
+                    "relative_path": descriptor["relative_path"],
+                    "original_name": str(original_name),
+                    "arrival_time": arrival.isoformat(),
+                    "time_basis": basis,
+                    "storage_class": classification.get("storage_class")
+                    or descriptor.get("storage_class"),
+                    "classification_confidence": classification.get("confidence"),
+                    "classification_evidence": classification.get("evidence") or [],
+                    "vehicle": classification.get("vehicle"),
+                    "ro_number": classification.get("ro_number"),
+                }
+            )
+            bases.add(basis)
+        selected.sort(key=lambda item: (item["arrival_time"], item["title"]), reverse=True)
+        total = len(selected)
+        if bases == {"filesystem_created_at"}:
+            time_basis = "filesystem_created_at"
+        elif bases == {"first_seen_at"}:
+            time_basis = "first_seen_at"
+        else:
+            time_basis = "mixed" if bases else "none"
+        return {
+            "count": total,
+            "returned_count": min(total, limit),
+            "documents": selected[:limit],
+            "window": {
+                "added_since": since.isoformat(),
+                "added_before": before.isoformat(),
+            },
+            "time_basis": time_basis,
+            "time_basis_note": (
+                "Windows filesystem creation time is used where available; otherwise "
+                "the timestamp means first observed by X Omni, not proven original add time."
+            ),
+        }
 
     # ---------- page extraction ----------
 
@@ -541,6 +820,17 @@ class AdasSI:
     # ---------- public tools ----------
 
     def inventory_read(self, _args: dict | None = None) -> dict[str, Any]:
+        args = _args or {}
+        if not isinstance(args, dict):
+            raise ValueError("ADAS SI inventory arguments must be an object")
+        allowed = {"added_since", "added_before", "recent_limit", "organize_root"}
+        unknown = sorted(str(key) for key in args if key not in allowed)
+        if unknown:
+            raise ValueError(f"unsupported ADAS SI inventory fields: {', '.join(unknown)}")
+        organize_root = args.get("organize_root", True)
+        if not isinstance(organize_root, bool):
+            raise ValueError("organize_root must be true or false")
+        storage_refresh = self.refresh_library(organize_root=organize_root)
         snap = self.inventory.snapshot()
         snap["managed_path"] = str(self.managed_root)
         snap["cache_path"] = str(self.cache_path)
@@ -556,6 +846,8 @@ class AdasSI:
         for key in ("status", "authoritative_path", "summary", "evidence_contract"):
             if key in snap:
                 ordered[key] = snap[key]
+        ordered["recent_additions"] = self._recent_additions(args)
+        ordered["storage_refresh"] = storage_refresh
         ordered["artifact_kind_summary"] = self._artifact_kind_summary()
         for key, value in snap.items():
             if key not in ordered:
@@ -809,6 +1101,8 @@ class AdasSI:
                 "specific_facts_traceable_to_results": True,
                 "do_not_infer_missing_records": True,
                 "matched_source_is_not_a_no_result": True,
+                "proves_document_arrival_time": False,
+                "use_adas_si_inventory_for_new_or_recent_documents": True,
             },
         }
 
@@ -1051,6 +1345,11 @@ class AdasSI:
                 for a in alternatives
             ],
             "source": "ADAS SI",
+            "evidence_contract": {
+                "proves_document_contents": True,
+                "proves_document_arrival_time": False,
+                "use_adas_si_inventory_for_new_or_recent_documents": True,
+            },
         }
 
     # ---------- direct file operations ----------

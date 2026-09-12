@@ -241,22 +241,46 @@ def context_line(
 
 
 def latest_context_line(
-    store: Any, user_id: Optional[str], *, for_model: bool = True
+    store: Any,
+    user_id: Optional[str],
+    *,
+    for_model: bool = True,
+    conversation_id: Optional[int] = None,
+    include_completed: bool = True,
 ) -> Optional[str]:
-    """Context line for the user's latest sweep, or None. Never raises.
+    """Context line for the matching latest sweep, or None. Never raises.
 
     ``for_model=False`` returns the same structured status without the
     model-directed reading instruction, for text shown to Otis.
     """
 
     try:
-        rows = store.list_records(NAMESPACE, user_id=user_id, limit=1)
+        rows = store.list_records(
+            NAMESPACE,
+            user_id=user_id,
+            limit=50 if conversation_id is not None else 1,
+        )
     except Exception:  # noqa: BLE001 - lightweight test stores have no records
         return None
-    if not rows or not isinstance(rows[0].get("payload"), dict):
+    record = None
+    for row in rows or []:
+        payload = row.get("payload") if isinstance(row, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        if conversation_id is not None:
+            try:
+                if int(payload.get("conversation_id")) != int(conversation_id):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if not include_completed and str(payload.get("state") or "") == "completed":
+            continue
+        record = payload
+        break
+    if record is None:
         return None
     try:
-        return context_line(rows[0]["payload"], for_model=for_model)
+        return context_line(record, for_model=for_model)
     except Exception:  # noqa: BLE001
         log.warning("could not render sweep context", exc_info=True)
         return None

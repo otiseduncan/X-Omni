@@ -272,13 +272,43 @@ export function AdasInventoryCard({ data }) {
     );
   }
   const s = data.summary || {};
+  const recent = data.recent_additions || {};
+  const refresh = data.storage_refresh || {};
+  const recentDocuments = Array.isArray(recent.documents) ? recent.documents : [];
   return (
     <Card icon={Layers} title="ADAS SI library" meta={`${s.document_count} documents`}>
       <div className="kv">
         <div><span>Documents</span><strong>{s.document_count}</strong></div>
         <div><span>Vehicles</span><strong>{s.vehicle_application_count}</strong></div>
         <div><span>Unparsed</span><strong>{s.unparsed_document_count}</strong></div>
+        <div><span>New in window</span><strong>{recent.count ?? 0}</strong></div>
+        <div><span>Filed now</span><strong>{refresh.moved_count ?? 0}</strong></div>
+        <div><span>Needs review</span><strong>{s.needs_review_document_count ?? 0}</strong></div>
       </div>
+      {recentDocuments.length > 0 && (
+        <details className="field-alts" style={{ marginTop: 9 }} open>
+          <summary>Recent additions</summary>
+          <div className="field-apps">
+            {recentDocuments.map((document) => (
+              <div key={document.relative_path} className="field-row">
+                <strong>{document.title}</strong>
+                <span className="field-topics">
+                  {document.storage_class === "adas_map_report"
+                    ? `ADAS Map${document.ro_number ? ` · RO ${document.ro_number}` : ""}`
+                    : document.storage_class === "reference"
+                      ? "Reference"
+                      : document.storage_class === "needs_review"
+                        ? "Needs review"
+                        : "Service information"}
+                </span>
+              </div>
+            ))}
+          </div>
+          {recent.time_basis_note && (
+            <p className="card-note" style={{ marginTop: 8 }}>{recent.time_basis_note}</p>
+          )}
+        </details>
+      )}
       <details className="field-alts" style={{ marginTop: 9 }}>
         <summary>Vehicle coverage</summary>
         <div className="field-apps">

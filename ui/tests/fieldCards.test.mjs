@@ -28,6 +28,20 @@ test("Calibration IQ status and phase presentation stays truthful", () => {
   assert.equal(calibrationPhaseBreakdown("unspecified", 1), "1 no phase");
 });
 
+test("ADAS SI inventory shows recent arrivals and filing outcomes", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/FieldCards.jsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(cards, /data\.recent_additions/);
+  assert.match(cards, /Recent additions/);
+  assert.match(cards, /New in window/);
+  assert.match(cards, /Filed now/);
+  assert.match(cards, /Needs review/);
+  assert.match(cards, /document\.storage_class === "adas_map_report"/);
+});
+
 test("Calibration IQ cards expose summary, list, empty, error, and incomplete states", async () => {
   const cards = await readFile(
     new URL("../src/components/cards/FieldCards.jsx", import.meta.url),
@@ -220,4 +234,3 @@ test("ADAS Map sweep results render grouped by outcome and reload on background 
   // The sweep posts its result from a background task; an open chat re-reads.
   assert.match(app, /case "conversation_updated":[\s\S]*?reconcile\(\)/);
 });
-

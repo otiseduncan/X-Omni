@@ -94,6 +94,7 @@ BACKGROUND_REVIEW_PREFIX = (
     "kind=adas_map_sweep now and answer from what it returns."
 )
 NO_TOOL_SELF_CHECK_MESSAGE = """Internal final-answer evidence check; this is not a new user request. Review the withheld draft against the original request, current structured context, advertised tool contracts, and returned evidence. If a safe answer requires current or live business state, execution proof, capability state, or vehicle-specific OEM technical evidence, do not answer in prose: call the best justified advertised tool or tools now. Nothing has executed in this turn, so a draft reporting work as done -- acquired, retrieved, saved, attached, reconciled, updated, or complete -- and any specific finding it credits to that work are unsupported no matter how confident they read: call the tool that would actually do it instead of accepting the draft. If the draft is a casual, conceptual, or general answer, or already states a truthful unresolved boundary and no tool is needed, output exactly NO_TOOL_NEEDED; an active conversation subject is memory and is never by itself a reason to call a tool. Never run a mutation to test or demonstrate capability. Reason from meaning and evidence contracts, not keyword rules."""
+ADAS_SI_POST_TOOL_SELF_CHECK_MESSAGE = """Internal ADAS SI evidence check; this is not a new user request. Review the withheld draft against the original request and the tool results returned in this turn. An ADAS SI search or open result proves only that a matching document exists and what it contains; it does not prove when documents arrived, which documents are new, or what was filed from the root folder. If the draft makes any new/recent/arrival or root-filing claim without an adas_si_inventory result containing recent_additions and storage_refresh, call adas_si_inventory with the requested time window now. Otherwise output exactly NO_TOOL_NEEDED. Do not repeat a search and do not infer arrival from conversation history, document counts, or an ADAS Map sweep."""
 NO_TOOL_SELF_CHECK_FALLBACK = (
     "I can’t verify the withheld draft from the available evidence, so I’m not "
     "presenting it as established."
@@ -112,7 +113,10 @@ def no_tool_self_check_reserve_tokens(max_draft_tokens: int) -> int:
 
     return (
         max(0, int(max_draft_tokens))
-        + prompt_mod.estimate_tokens(NO_TOOL_SELF_CHECK_MESSAGE)
+        + max(
+            prompt_mod.estimate_tokens(NO_TOOL_SELF_CHECK_MESSAGE),
+            prompt_mod.estimate_tokens(ADAS_SI_POST_TOOL_SELF_CHECK_MESSAGE),
+        )
         + prompt_mod.estimate_tokens(
             BACKGROUND_REVIEW_PREFIX.format(record="x" * prompt_mod.BACKGROUND_CONTEXT_MAX_CHARS)
         )
@@ -184,6 +188,7 @@ async def model_owned_no_tool_self_check(
     *,
     metrics: Optional[TurnMetrics] = None,
     background: Optional[str] = None,
+    instruction_override: Optional[str] = None,
 ) -> NoToolSelfCheckResult:
     """Let the same model accept its draft or select evidence tools once.
 
@@ -193,11 +198,11 @@ async def model_owned_no_tool_self_check(
     until that decision is made.
     """
 
-    instruction = NO_TOOL_SELF_CHECK_MESSAGE
+    instruction = instruction_override or NO_TOOL_SELF_CHECK_MESSAGE
     background_text = " ".join(str(background or "").split())[
         : prompt_mod.BACKGROUND_CONTEXT_MAX_CHARS
     ]
-    if background_text:
+    if background_text and instruction_override is None:
         # Structured truth from Core's records leads the review, and the model
         # answers one specific question about its own draft. Live acceptance on
         # 2026-09-11 showed the generic checklist with this fact appended at
@@ -2048,10 +2053,10 @@ class Orchestrator:
         from ..services import adas_map_sweep as adas_map_sweep_svc
 
         background = adas_map_sweep_svc.latest_context_line(
-            self.store, effective_context.get("user_id")
-        )
-        background_for_user = adas_map_sweep_svc.latest_context_line(
-            self.store, effective_context.get("user_id"), for_model=False
+            self.store,
+            effective_context.get("user_id"),
+            conversation_id=conversation_id,
+            include_completed=False,
         )
         messages = prompt_mod.build_messages(
             self.router,
@@ -2313,6 +2318,8 @@ class Orchestrator:
         # result instead of re-running it and re-rendering its card.
         read_only_call_cache: dict[tuple[str, str], Any] = {}
         repeat_only_round = False
+        executed_tool_names: set[str] = set()
+        adas_si_post_tool_review_done = False
         for round_index in range(MAX_TOOL_ROUNDS + 1):
             synthesis_only = round_index == MAX_TOOL_ROUNDS or repeat_only_round
             if synthesis_only:
@@ -2411,18 +2418,30 @@ class Orchestrator:
                 round_text = ""
                 sealed_round_tokens = []
 
-            if (
+            adas_si_post_tool_review = bool(
                 no_tool_self_check_enabled
-                and round_index == 0
+                and not adas_si_post_tool_review_done
                 and not tool_calls
+                and executed_tool_names.intersection({"adas_si_search", "adas_si_open"})
+                and "adas_si_inventory" not in executed_tool_names
+            )
+            if no_tool_self_check_enabled and not tool_calls and (
+                round_index == 0 or adas_si_post_tool_review
             ):
+                if adas_si_post_tool_review:
+                    adas_si_post_tool_review_done = True
                 self_check = await model_owned_no_tool_self_check(
                     self.client,
                     messages,
                     tools,
                     round_text,
                     metrics=metrics,
-                    background=background,
+                    background=None if adas_si_post_tool_review else background,
+                    instruction_override=(
+                        ADAS_SI_POST_TOOL_SELF_CHECK_MESSAGE
+                        if adas_si_post_tool_review
+                        else None
+                    ),
                 )
                 if self_check.tool_calls:
                     # The first draft and internal review prompt are temporary
@@ -2440,16 +2459,11 @@ class Orchestrator:
                     full_text += round_text
                     break
                 else:
-                    # Fail closed. When Core holds a background-work record,
-                    # its own structured status line is the truthful answer;
-                    # the review rejected a draft about exactly that work.
-                    fallback = (
-                        " ".join(str(background_for_user).split())[
-                            : prompt_mod.BACKGROUND_CONTEXT_MAX_CHARS
-                        ]
-                        if background_for_user
-                        else NO_TOOL_SELF_CHECK_FALLBACK
-                    )
+                    # A malformed/rejected review proves only that the draft
+                    # cannot be released. It does not prove the current user
+                    # asked about an unrelated background record, so never
+                    # substitute an ADAS Map sweep as their answer.
+                    fallback = NO_TOOL_SELF_CHECK_FALLBACK
                     yield {"type": "token", "text": fallback}
                     full_text += fallback
                     break
@@ -2588,6 +2602,7 @@ class Orchestrator:
                     }
                     continue
                 call = {**call, "name": expanded_name}
+                executed_tool_names.add(expanded_name)
                 metrics.tools_selected.append(
                     requested_name
                     if requested_name == expanded_name

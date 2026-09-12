@@ -3,6 +3,8 @@
 Operator rules:
 - Service information is organized by Year / Make / Model.
 - ADAS Map evidence is organized by repair order.
+- Multi-vehicle tools and requirement matrices are organized under Reference.
+- Unresolved root drops are moved to Needs Review without inventing identity.
 
 The migration is deliberately conservative. It moves a source only when its
 identity can be proven from an existing artifact-catalog row, a structured
@@ -22,7 +24,9 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 ADAS_MAP_DIRNAME = "ADAS Map"
-_STORAGE_LOCK = threading.Lock()
+REFERENCE_DIRNAME = "Reference"
+NEEDS_REVIEW_DIRNAME = "Needs Review"
+_STORAGE_LOCK = threading.RLock()
 _MIGRATED_ROOTS: set[str] = set()
 
 _RO_RE = re.compile(r"^\d{6,20}$")
@@ -101,6 +105,24 @@ def adas_map_directory(source_root: Path, ro_number: object) -> Path:
 def adas_map_pdf_path(source_root: Path, ro_number: object) -> Path:
     ro = str(ro_number or "").strip()
     return adas_map_directory(source_root, ro) / f"{ro} ADAS Map.pdf"
+
+
+def reference_pdf_path(
+    source_root: Path,
+    *,
+    category: object,
+    group: object,
+    filename: object,
+) -> Path:
+    raw_name = Path(str(filename or "Reference.pdf")).name
+    stem = safe_component(Path(raw_name).stem, "Reference", maximum=120)
+    return (
+        Path(source_root).resolve()
+        / REFERENCE_DIRNAME
+        / safe_component(category, "General", maximum=80)
+        / safe_component(group, "General", maximum=80)
+        / f"{stem}.pdf"
+    )
 
 
 def _sidecar_path(pdf_path: Path) -> Path:
@@ -239,6 +261,21 @@ def _invalidate_derived_paths(cache_path: Path, moved: dict[str, str]) -> None:
                         "DELETE FROM artifact_catalog WHERE path IN (?,?)",
                         (old_path, new_path),
                     )
+                if "ocr_pages" in tables:
+                    # OCR is expensive for image-only reference sheets. The
+                    # bytes and mtime do not change during a same-volume move,
+                    # so retain the reading layer under its new canonical path.
+                    db.execute("DELETE FROM ocr_pages WHERE path=?", (new_path,))
+                    db.execute(
+                        "UPDATE ocr_pages SET path=? WHERE path=?",
+                        (new_path, old_path),
+                    )
+                if "document_arrivals" in tables:
+                    db.execute("DELETE FROM document_arrivals WHERE path=?", (new_path,))
+                    db.execute(
+                        "UPDATE document_arrivals SET path=? WHERE path=?",
+                        (new_path, old_path),
+                    )
     except sqlite3.Error:
         # Both tables are derived caches and can be rebuilt from the PDFs.
         return
@@ -255,10 +292,12 @@ def _remove_empty_parents(start: Path, root: Path) -> None:
         current = current.parent
 
 
-def migrate_library(
+def _migrate_library_unlocked(
     source_root: Path,
     cache_path: Path,
     descriptor_resolver: Callable[[Path, Path], dict[str, Any]],
+    root_classifier: Optional[Callable[[Path], dict[str, Any]]] = None,
+    reclassify_review: bool = False,
 ) -> dict[str, Any]:
     root = Path(source_root).resolve()
     if not root.is_dir():
@@ -269,12 +308,15 @@ def migrate_library(
             "policy": {
                 "service_information": "<Year>/<Make>/<Model>",
                 "adas_map": "ADAS Map/<RO>",
+                "reference": "Reference/<Category>/<Group>",
+                "unresolved": "Needs Review",
             },
         }
 
     catalog = _catalog_rows(cache_path)
     moved: dict[str, str] = {}
     unresolved: list[str] = []
+    classifications: dict[str, dict[str, Any]] = {}
 
     for source in sorted(root.rglob("*.pdf"), key=lambda p: str(p).casefold()):
         try:
@@ -286,7 +328,11 @@ def migrate_library(
         if relative.parts[0].casefold() in {
             "_xomni_managed",
             "_xomni_backups",
+            REFERENCE_DIRNAME.casefold(),
         }:
+            continue
+        in_review = relative.parts[0].casefold() == NEEDS_REVIEW_DIRNAME.casefold()
+        if in_review and not reclassify_review:
             continue
         if relative.parts[0].casefold() == ADAS_MAP_DIRNAME.casefold():
             continue
@@ -295,8 +341,15 @@ def migrate_library(
         catalog_row = catalog.get(str(source.resolve()), {})
         ro_number = _ro_identity(source, sidecar, catalog_row)
 
+        classification: dict[str, Any] = {}
         if ro_number:
             destination = adas_map_pdf_path(root, ro_number)
+            classification = {
+                "storage_class": "adas_map_report",
+                "ro_number": ro_number,
+                "confidence": "high",
+                "evidence": ["repair order in filename, catalog, or sidecar"],
+            }
         else:
             # A Year/Make/Model path is already canonical SI only after the
             # file has been ruled out as ADAS Map evidence.
@@ -312,15 +365,50 @@ def migrate_library(
                     descriptor = {}
                 if isinstance(descriptor, dict) and descriptor.get("application_parsed"):
                     vehicle = normalize_vehicle_identity(descriptor)
-            if vehicle is None:
+            if vehicle is not None:
+                destination = (
+                    service_information_directory(
+                        root, vehicle, *_legacy_suffix(source)
+                    )
+                    / source.name
+                )
+                classification = {
+                    "storage_class": "service_information",
+                    "vehicle": vehicle,
+                    "confidence": "supported",
+                }
+            elif (len(relative.parts) == 1 or in_review) and root_classifier is not None:
+                try:
+                    candidate = root_classifier(source)
+                except Exception:
+                    candidate = {}
+                classification = candidate if isinstance(candidate, dict) else {}
+                storage_class = str(classification.get("storage_class") or "")
+                if storage_class == "adas_map_report" and _RO_RE.fullmatch(
+                    str(classification.get("ro_number") or "")
+                ):
+                    destination = adas_map_pdf_path(root, classification["ro_number"])
+                elif storage_class == "reference":
+                    destination = reference_pdf_path(
+                        root,
+                        category=classification.get("category"),
+                        group=classification.get("group"),
+                        filename=classification.get("filename") or source.name,
+                    )
+                else:
+                    if in_review:
+                        unresolved.append(relative.as_posix())
+                        continue
+                    destination = root / NEEDS_REVIEW_DIRNAME / source.name
+                    classification = {
+                        **classification,
+                        "storage_class": "needs_review",
+                        "confidence": "unresolved",
+                    }
+                    unresolved.append((Path(NEEDS_REVIEW_DIRNAME) / source.name).as_posix())
+            else:
                 unresolved.append(relative.as_posix())
                 continue
-            destination = (
-                service_information_directory(
-                    root, vehicle, *_legacy_suffix(source)
-                )
-                / source.name
-            )
 
         destination = _unique_target(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +422,10 @@ def migrate_library(
         except FileNotFoundError:
             continue
         moved[old_abs] = str(destination.resolve())
+        classifications[str(destination.resolve())] = {
+            **classification,
+            "relative_path": destination.resolve().relative_to(root).as_posix(),
+        }
 
         source_sidecar = _sidecar_path(source)
         if source_sidecar.is_file():
@@ -356,11 +448,33 @@ def migrate_library(
         "moved": len(moved),
         "unresolved": unresolved,
         "paths": moved,
+        "classifications": classifications,
         "policy": {
             "service_information": "<Year>/<Make>/<Model>",
             "adas_map": "ADAS Map/<RO>",
+            "reference": "Reference/<Category>/<Group>",
+            "unresolved": "Needs Review",
         },
     }
+
+
+def migrate_library(
+    source_root: Path,
+    cache_path: Path,
+    descriptor_resolver: Callable[[Path, Path], dict[str, Any]],
+    root_classifier: Optional[Callable[[Path], dict[str, Any]]] = None,
+    reclassify_review: bool = False,
+) -> dict[str, Any]:
+    """Serialize physical filing across every service instance in this process."""
+
+    with _STORAGE_LOCK:
+        return _migrate_library_unlocked(
+            source_root,
+            cache_path,
+            descriptor_resolver,
+            root_classifier=root_classifier,
+            reclassify_review=reclassify_review,
+        )
 
 
 def is_authoritative_runtime_root(source_root: Path) -> bool:
@@ -384,6 +498,8 @@ def migrate_library_once(
     source_root: Path,
     cache_path: Path,
     descriptor_resolver: Callable[[Path, Path], dict[str, Any]],
+    root_classifier: Optional[Callable[[Path], dict[str, Any]]] = None,
+    reclassify_review: bool = False,
 ) -> dict[str, Any]:
     root = Path(source_root).resolve()
     if not root.is_dir():
@@ -402,6 +518,12 @@ def migrate_library_once(
                 "paths": {},
                 "already_checked": True,
             }
-        result = migrate_library(root, cache_path, descriptor_resolver)
+        result = migrate_library(
+            root,
+            cache_path,
+            descriptor_resolver,
+            root_classifier=root_classifier,
+            reclassify_review=reclassify_review,
+        )
         _MIGRATED_ROOTS.add(key)
         return result

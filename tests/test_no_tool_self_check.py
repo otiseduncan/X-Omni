@@ -8,6 +8,7 @@ import pytest
 
 from core.models.client import ModelClient
 from core.orchestrator.loop import (
+    ADAS_SI_POST_TOOL_SELF_CHECK_MESSAGE,
     NO_TOOL_SELF_CHECK_ACCEPT,
     NO_TOOL_SELF_CHECK_FALLBACK,
     NO_TOOL_SELF_CHECK_MESSAGE,
@@ -175,6 +176,100 @@ async def test_first_round_unsupported_draft_is_replaced_by_model_selected_tool(
     assert "Unsupported draft" not in final_text
     assert final_text == "The verified current RO is 2400911667 at version 7."
     assert store.get_messages(conversation_id)[-1]["content"] == final_text
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_search_result_cannot_be_recast_as_recent_inventory(tmp_path) -> None:
+    store = Store(tmp_path / "self-check-adas-si.sqlite")
+    conversation_id = store.create_conversation("recent ADAS SI")
+    user_message_id = store.add_message(
+        conversation_id, "user", "What documents were added this morning?"
+    )
+    registry = Registry("config/tools.yaml", store=store, profile="adas_operator")
+    calls: list[str] = []
+
+    def search(_args):
+        calls.append("adas_si_search")
+        return {
+            "status": "success",
+            "results": [{"title": "2017 Toyota Camry Radar"}],
+            "evidence_contract": {"proves_document_arrival_time": False},
+        }
+
+    def inventory(_args):
+        calls.append("adas_si_inventory")
+        return {
+            "status": "success",
+            "recent_additions": {
+                "count": 20,
+                "documents": [{"title": "Honda Acura ADAS Calibration Requirements"}],
+            },
+            "storage_refresh": {"moved_count": 20},
+        }
+
+    registry.register("adas_si_search", search)
+    registry.register("adas_si_inventory", inventory)
+    for name in ("delegate_research", "capability_search"):
+        registry.register(name, lambda _args: {})
+
+    class Client:
+        supports_no_tool_self_check = True
+        calls = 0
+
+        async def stream(self, messages, tools=None, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "type": "tool_call",
+                    "id": "wrong-search",
+                    "name": "adas_si_search",
+                    "arguments": json.dumps({"question": "new documents"}),
+                }
+            elif self.calls == 2:
+                yield {
+                    "type": "content",
+                    "text": "The 2017 Toyota Camry Radar document was added this morning.",
+                }
+            elif self.calls == 3:
+                assert messages[-1]["content"] == ADAS_SI_POST_TOOL_SELF_CHECK_MESSAGE
+                yield {
+                    "type": "tool_call",
+                    "id": "correct-inventory",
+                    "name": "adas_si_inventory",
+                    "arguments": json.dumps(
+                        {
+                            "added_since": "2026-09-12T00:00:00-04:00",
+                            "added_before": "2026-09-12T12:00:00-04:00",
+                        }
+                    ),
+                }
+            else:
+                yield {
+                    "type": "content",
+                    "text": "The inventory verifies 20 additions this morning.",
+                }
+
+    events = [
+        event
+        async for event in _orchestrator(Client(), registry, store).run_turn(
+            conversation_id,
+            "What documents were added this morning?",
+            approval_context={
+                "session_id": "local:local-dev",
+                "user_id": "local-dev",
+                "role": "owner",
+                "message_id": user_message_id,
+            },
+        )
+    ]
+
+    final_text = "".join(
+        event["text"] for event in events if event.get("type") == "token"
+    )
+    assert calls == ["adas_si_search", "adas_si_inventory"]
+    assert final_text == "The inventory verifies 20 additions this morning."
+    assert "Camry Radar" not in final_text
     store.close()
 
 

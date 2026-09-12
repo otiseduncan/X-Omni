@@ -2149,11 +2149,26 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "adas_si_inventory": {
         "description": (
-            "Inventory ADAS SI documents and covered vehicle applications. Returns "
+            "Refresh and inventory the actual ADAS SI source library, including root-folder "
+            "drops, recent additions, classification and filing results. For new/recent "
+            "documents use this tool, not a vehicle search or an ADAS Map/RO sweep. "
+            "Use added_since and added_before for a requested local-time window such as "
+            "this morning. Report the returned timestamp basis honestly; first observed "
+            "is not proof of when a file was originally added. Returns "
             "artifact_kind_summary for authoritative document-type counts; "
             "summary.parsed_document_count measures readable identity only, not type."
         ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "added_since": {"type": "string", "description": "Inclusive ISO 8601 timestamp with UTC offset for the start of the arrival window."},
+                "added_before": {"type": "string", "description": "Exclusive ISO 8601 timestamp with UTC offset for the end of the arrival window."},
+                "recent_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                "organize_root": {"type": "boolean", "default": True, "description": "Apply the library's automatic safe filing policy to root-folder drops with supported classification; unresolved files remain visible."},
+            },
+            "required": [],
+        },
     },
     "adas_si_open": {
         "description": (

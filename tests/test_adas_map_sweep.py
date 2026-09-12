@@ -833,6 +833,7 @@ async def test_latest_context_line_reads_the_users_latest_sweep(tmp_path):
         {
             "sweep_id": "s1",
             "user_id": "local-dev",
+            "conversation_id": 42,
             "state": "running",
             "scope_label": "the active board",
             "started_at": "2026-09-11T09:20:00+00:00",
@@ -841,12 +842,18 @@ async def test_latest_context_line_reads_the_users_latest_sweep(tmp_path):
         user_id="local-dev",
     )
     assert "still running" in sweep_mod.latest_context_line(store, "local-dev")
+    assert "still running" in sweep_mod.latest_context_line(
+        store, "local-dev", conversation_id=42
+    )
+    assert sweep_mod.latest_context_line(
+        store, "local-dev", conversation_id=41
+    ) is None
     assert sweep_mod.latest_context_line(SimpleNamespace(), "local-dev") is None
     store.close()
 
 
 @pytest.mark.asyncio
-async def test_rejected_draft_during_a_sweep_falls_back_to_cores_own_record(tmp_path):
+async def test_rejected_draft_during_a_sweep_never_replaces_the_request_with_sweep_text(tmp_path):
     from core.orchestrator.loop import Orchestrator
 
     store = Store(tmp_path / "fallback.sqlite")
@@ -858,6 +865,7 @@ async def test_rejected_draft_during_a_sweep_falls_back_to_cores_own_record(tmp_
         {
             "sweep_id": "s1",
             "user_id": "local-dev",
+            "conversation_id": conversation_id,
             "state": "running",
             "scope_label": "phases 1-8",
             "started_at": "2026-09-11T09:20:00+00:00",
@@ -900,7 +908,7 @@ async def test_rejected_draft_during_a_sweep_falls_back_to_cores_own_record(tmp_
         )
     ]
     text = "".join(event["text"] for event in events if event.get("type") == "token")
-    assert text.startswith("ADAS Map sweep for phases 1-8 is still running")
-    assert "1 of 2 ROs processed" in text
+    assert text == "I can’t verify the withheld draft from the available evidence, so I’m not presenting it as established."
+    assert "ADAS Map sweep" not in text
     assert "all maps are attached" not in text
     store.close()

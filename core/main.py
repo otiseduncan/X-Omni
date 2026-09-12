@@ -112,6 +112,25 @@ def _sweep_abandoned_attachments(settings: Settings, store) -> int:
     return len(stale)
 
 
+async def _refresh_adas_si_forever(adas: adas_si_svc.AdasSI) -> None:
+    """Continuously discover and file PDFs dropped into the live library root."""
+
+    while True:
+        await asyncio.sleep(30)
+        try:
+            result = await asyncio.to_thread(adas.refresh_library, organize_root=True)
+            if result.get("moved_count"):
+                log.info(
+                    "ADAS SI filed %d new root document(s); %d need review.",
+                    result["moved_count"],
+                    result.get("review_required_count", 0),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - discovery must not stop Core
+            log.exception("ADAS SI background refresh failed")
+
+
 def build_app(settings: Settings) -> FastAPI:
     settings.audio_tmp.mkdir(parents=True, exist_ok=True)
 
@@ -452,6 +471,7 @@ def build_app(settings: Settings) -> FastAPI:
             log.error("Could not start default worker: %s", exc)
             store.audit("worker_start_failed", {"error": str(exc)})
         monitor_task = asyncio.create_task(camera_monitor.run_forever())
+        adas_refresh_task = asyncio.create_task(_refresh_adas_si_forever(adas))
         try:
             resumed = await adas_map_sweep.resume()
             if resumed:
@@ -477,7 +497,12 @@ def build_app(settings: Settings) -> FastAPI:
                 camera_monitor.stop()
                 await adas_map_sweep.shutdown()
                 monitor_task.cancel()
-                await asyncio.gather(monitor_task, return_exceptions=True)
+                adas_refresh_task.cancel()
+                await asyncio.gather(
+                    monitor_task,
+                    adas_refresh_task,
+                    return_exceptions=True,
+                )
             finally:
                 try:
                     await exterior_camera.shutdown()
