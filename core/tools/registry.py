@@ -1822,6 +1822,36 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": ["path"],
         },
     },
+    "read_attachment": {
+        "description": (
+            "Read further into a file the operator attached in this conversation. "
+            "The message already quotes the beginning of each attachment; call this "
+            "only when the answer is past that excerpt, using the attachment id shown "
+            "in the message and an offset in characters."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "attachment_id": {
+                    "type": "integer",
+                    "description": "Attachment id shown in the chat message.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Character offset to read from. 0 is the start.",
+                },
+                "search": {
+                    "type": "string",
+                    "description": (
+                        "Optional literal text to find. When given, reading starts "
+                        "at the first match at or after offset."
+                    ),
+                },
+            },
+            "required": ["attachment_id"],
+        },
+    },
     "list_directory": {
         "description": "List a directory. Only paths inside allowed roots.",
         "parameters": {
@@ -4389,6 +4419,17 @@ class Registry:
                     role=role,
                 )
             )
+        if name == "read_attachment":
+            if isinstance(conversation_id, bool) or not isinstance(conversation_id, int):
+                raise ToolBlocked(
+                    "Reading an attachment must be bound to the active conversation."
+                )
+            handler_args = dict(args)
+            # Authoritative binding. The model names an attachment id, never
+            # the conversation it is read from, so it cannot reach a file
+            # attached to a different conversation.
+            handler_args["conversation_id"] = conversation_id
+            handler_args["user_id"] = user_id
         if name == "website_preview_generate" and args.get("operation") == "update_latest":
             if isinstance(conversation_id, bool) or not isinstance(conversation_id, int):
                 raise ToolBlocked(

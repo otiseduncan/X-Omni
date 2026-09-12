@@ -144,6 +144,11 @@ class Settings:
     vapid_private_key: str = ""
     vapid_subject: str = ""
 
+    # Operator file attachments. Originals are stored content-addressed here
+    # with their extracted text beside them, so the same file re-attached
+    # costs nothing and `read_attachment` can page through a long document.
+    attachment_dir: Path = Path("data") / "attachments"
+
     # Background exterior-camera monitoring
     camera_snapshot_dir: Path = Path("data") / "camera-snapshots"
     camera_monitor_interval_seconds: int = 60
@@ -270,6 +275,9 @@ class Settings:
             vapid_public_key=vapid_public_key,
             vapid_private_key=vapid_private_key,
             vapid_subject=os.getenv("XOMNI_VAPID_SUBJECT", "mailto:otiseduncan@gmail.com").strip(),
+            attachment_dir=Path(
+                os.getenv("XOMNI_ATTACHMENT_DIR", str(ROOT / "data" / "attachments"))
+            ),
             camera_snapshot_dir=Path(
                 os.getenv("XOMNI_CAMERA_SNAPSHOT_DIR", str(ROOT / "data" / "camera-snapshots"))
             ),

@@ -908,6 +908,149 @@ class Store:
             out.append(d)
         return out
 
+    # ---------- attachments ----------
+
+    def add_attachment(
+        self,
+        *,
+        user_id: str,
+        filename: str,
+        kind: str,
+        mime: str,
+        extension: str,
+        sha256: str,
+        byte_count: int,
+        extraction_method: str,
+        extracted_chars: int = 0,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        page_count: Optional[int] = None,
+        truncated: bool = False,
+        note: Optional[str] = None,
+    ) -> int:
+        """Record one uploaded attachment. Unbound until a message sends it."""
+        return self._exec(
+            """
+            INSERT INTO attachments
+                (user_id, filename, kind, mime, extension, sha256, byte_count,
+                 width, height, page_count, extraction_method, extracted_chars,
+                 truncated, note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                user_id, filename, kind, mime, extension, sha256, int(byte_count),
+                width, height, page_count, extraction_method, int(extracted_chars),
+                1 if truncated else 0, note,
+            ),
+        ).lastrowid
+
+    def get_attachment(
+        self, attachment_id: int, *, user_id: Optional[str] = None
+    ) -> Optional[dict]:
+        if user_id is not None:
+            row = self._one(
+                "SELECT * FROM attachments WHERE id = ? AND user_id = ?",
+                (attachment_id, user_id),
+            )
+        else:
+            row = self._one("SELECT * FROM attachments WHERE id = ?", (attachment_id,))
+        if row is None:
+            return None
+        record = dict(row)
+        record["truncated"] = bool(record.get("truncated"))
+        return record
+
+    def bind_attachments(
+        self,
+        attachment_ids: list[int],
+        *,
+        conversation_id: int,
+        message_id: int,
+        user_id: str,
+    ) -> list[dict]:
+        """Attach previously uploaded files to the message that sent them.
+
+        Binding is single-use and owner-scoped in one transaction: a row that
+        another message already claimed, or that belongs to someone else, is
+        skipped rather than re-bound, so an attachment cannot be replayed into
+        a second conversation by resending its id.
+        """
+        wanted = [
+            int(value)
+            for value in (attachment_ids or [])
+            if isinstance(value, int) and not isinstance(value, bool)
+        ]
+        if not wanted:
+            return []
+        bound: list[dict] = []
+        with self._lock:
+            try:
+                for attachment_id in wanted:
+                    cursor = self.conn.execute(
+                        """
+                        UPDATE attachments
+                           SET conversation_id = ?, message_id = ?
+                         WHERE id = ? AND user_id = ? AND message_id IS NULL
+                        """,
+                        (conversation_id, message_id, attachment_id, user_id),
+                    )
+                    if cursor.rowcount != 1:
+                        continue
+                    row = self.conn.execute(
+                        "SELECT * FROM attachments WHERE id = ?", (attachment_id,)
+                    ).fetchone()
+                    if row is not None:
+                        record = dict(row)
+                        record["truncated"] = bool(record.get("truncated"))
+                        bound.append(record)
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        return bound
+
+    def list_conversation_attachments(self, conversation_id: int) -> list[dict]:
+        rows = self._query(
+            "SELECT * FROM attachments WHERE conversation_id = ? ORDER BY id ASC",
+            (conversation_id,),
+        )
+        records = []
+        for row in rows:
+            record = dict(row)
+            record["truncated"] = bool(record.get("truncated"))
+            records.append(record)
+        return records
+
+    def delete_unbound_attachments(self, *, older_than_hours: int = 24) -> list[dict]:
+        """Remove abandoned uploads -- files chosen but never actually sent."""
+        rows = self._query(
+            """
+            SELECT * FROM attachments
+             WHERE message_id IS NULL
+               AND created_at < datetime('now', ?)
+            """,
+            (f"-{max(1, int(older_than_hours))} hours",),
+        )
+        stale = [dict(row) for row in rows]
+        if stale:
+            self._exec(
+                "DELETE FROM attachments WHERE id IN (%s)"
+                % ",".join("?" for _ in stale),
+                tuple(int(record["id"]) for record in stale),
+            )
+        return stale
+
+    def attachment_sha_in_use(self, sha256: str, *, excluding_id: int) -> bool:
+        """Whether another row still references the same stored bytes.
+
+        Storage is content-addressed, so deleting one row must not delete a
+        blob a different attachment is still pointing at.
+        """
+        return self._one(
+            "SELECT 1 FROM attachments WHERE sha256 = ? AND id != ? LIMIT 1",
+            (str(sha256), int(excluding_id)),
+        ) is not None
+
     # ---------- conversation subject ----------
 
     @staticmethod
@@ -1155,6 +1298,39 @@ class Store:
                 _now_iso() if status in {"succeeded", "failed", "denied", "expired", "blocked"} else None,
             ),
         ).lastrowid
+
+    def list_conversation_tool_calls(
+        self, conversation_id: int, limit: int = 2_000
+    ) -> list[dict]:
+        """Every tool call logged against one conversation, oldest first.
+
+        Transcript export uses this: when a conversation went wrong, what X
+        actually ran is usually the part worth examining, and it is not
+        visible in the message text alone.
+        """
+        rows = self._query(
+            """
+            SELECT id, message_id, tool_name, args_json, result_json, status,
+                   approval_id, created_at, completed_at
+              FROM tool_calls
+             WHERE conversation_id = ?
+             ORDER BY id ASC
+             LIMIT ?
+            """,
+            (conversation_id, int(limit)),
+        )
+        calls = []
+        for row in rows:
+            call = dict(row)
+            for field in ("args_json", "result_json"):
+                raw = call.pop(field)
+                key = field.removesuffix("_json")
+                try:
+                    call[key] = json.loads(raw) if raw else None
+                except json.JSONDecodeError:
+                    call[key] = raw
+            calls.append(call)
+        return calls
 
     # ---------- approvals ----------
 

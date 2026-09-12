@@ -37,6 +37,7 @@ DISCOVERABLE_ADAS_TOOLS = {
     "add_task",
     "update_task_status",
     "read_file",
+    "read_attachment",
     "list_directory",
     "search_files",
     "assistant_capabilities_read",
@@ -140,8 +141,10 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
     full_names = _names(full_catalog)
 
     assert adas_names == EXPECTED_ADAS_TOOLS
-    assert len(adas_catalog) == 30
-    assert len(full_catalog) == 58
+    # Length as well as names: the set comparison above would not notice the
+    # same tool being advertised to the model twice.
+    assert len(adas_catalog) == len(EXPECTED_ADAS_TOOLS)
+    assert len(full_catalog) == len(full_names) == 59
     assert NON_ADAS_NORMAL_TOOLS <= full_names
     assert META_WRAPPED_CIQ_TOOLS <= full_names
     assert PERMANENT <= full_names

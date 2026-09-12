@@ -258,6 +258,23 @@ def _ocr_png(png_bytes: bytes) -> dict[str, Any]:
     }
 
 
+def ocr_png_bytes(png_bytes: bytes) -> dict[str, Any]:
+    """OCR one rendered page image. Public entry point for callers outside
+    the ADAS SI cache path (operator file attachments), which render their own
+    pages and keep no per-document page cache."""
+    return _ocr_png(png_bytes)
+
+
+def usable_native_text(text: str) -> bool:
+    """Whether a PDF page's embedded text is real text rather than scan noise."""
+    return _usable_native_text(text)
+
+
+def usable_ocr_text(text: str, confidence: Optional[float]) -> bool:
+    """Whether an OCR pass is good enough to prefer over the native text."""
+    return _usable_ocr_text(text, confidence)
+
+
 def _ensure_cache(adas: Any) -> None:
     if getattr(adas, "_xomni_ocr_cache_ready", False):
         return

@@ -17,6 +17,7 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
@@ -31,6 +32,7 @@ from .config import Settings
 from .models.client import ModelClient
 from .models.router import ModelRouter, WorkerSwapError
 from .services import adas_map_sweep as adas_map_sweep_svc
+from .services import attachments as attachments_svc
 from .services import adas_si as adas_si_svc
 from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
@@ -82,6 +84,32 @@ def configured_profile_catalog(
         profile=profile or getattr(settings, "tool_profile", None),
     )
     return registry.profile_catalog(role)
+
+
+def _sweep_abandoned_attachments(settings: Settings, store) -> int:
+    """Delete uploads that were chosen in the composer but never sent.
+
+    Storage is content-addressed, so a blob is only removed once no remaining
+    row points at the same digest -- re-attaching an identical file must not
+    delete the copy an earlier message is still showing.
+    """
+    stale = store.delete_unbound_attachments(older_than_hours=24)
+    directory = Path(settings.attachment_dir)
+    for record in stale:
+        if store.attachment_sha_in_use(record["sha256"], excluding_id=record["id"]):
+            continue
+        try:
+            blob, sidecar = attachments_svc.storage_paths(
+                directory, str(record["sha256"]), str(record["extension"])
+            )
+        except attachments_svc.AttachmentError:
+            continue
+        for path in (blob, sidecar):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.warning("Could not remove abandoned attachment file %s", path.name)
+    return len(stale)
 
 
 def build_app(settings: Settings) -> FastAPI:
@@ -162,6 +190,9 @@ def build_app(settings: Settings) -> FastAPI:
 
     # --- wire tool handlers ---
     registry.register("read_file", builtin.make_read_file(registry))
+    registry.register(
+        "read_attachment", attachments_svc.make_read_attachment(settings, store)
+    )
     registry.register("list_directory", builtin.make_list_directory(registry))
     registry.register("search_files", builtin.make_search_files(registry))
     registry.register("write_file", builtin.make_write_file(registry))
@@ -427,6 +458,14 @@ def build_app(settings: Settings) -> FastAPI:
                 log.info("Resumed %d unfinished ADAS Map sweep(s).", resumed)
         except Exception:  # noqa: BLE001 - a sweep problem must not block startup
             log.exception("Could not resume ADAS Map sweeps")
+        try:
+            swept = await asyncio.to_thread(
+                _sweep_abandoned_attachments, settings, store
+            )
+            if swept:
+                log.info("Removed %d abandoned attachment upload(s).", swept)
+        except Exception:  # noqa: BLE001 - housekeeping must not block startup
+            log.exception("Could not sweep abandoned attachment uploads")
         try:
             yield
         finally:

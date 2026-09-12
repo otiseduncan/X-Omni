@@ -44,6 +44,7 @@ profiles:
       - add_task
       - update_task_status
       - read_file
+      - read_attachment
       - list_directory
       - search_files
       - assistant_capabilities_read
@@ -141,6 +142,10 @@ tools:
   read_file:
     tier: read_only
     description: "Read a text file inside an allowed root."
+
+  read_attachment:
+    tier: read_only
+    description: "Read further into a file the operator attached in this conversation."
 
   list_directory:
     tier: read_only

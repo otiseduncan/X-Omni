@@ -18,11 +18,13 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, SecretStr, ValidationError
 
 from ..models.router import WorkerSwapError
+from ..services import attachments as attachments_svc
 from ..services import camera as camera_svc
 from ..services import calendar as calendar_svc
 from ..services import calibration_iq as calibration_iq_svc
 from ..services import camera_monitoring as camera_monitoring_svc
 from ..services import exterior_camera as exterior_camera_svc
+from ..services import transcript as transcript_svc
 from ..services.image_generation import ImageGenerationError, generated_image_path
 from ..services.video_generation import (
     VideoGenerationError,
@@ -356,6 +358,246 @@ def create_router(
     async def messages(conversation_id: int, session: dict = Depends(require_session)):
         require_conversation(conversation_id, session)
         return store.get_messages(conversation_id, user_id=user_id(session))
+
+    @api.get("/conversations/{conversation_id}/export")
+    async def export_conversation(
+        conversation_id: int,
+        format: str = "markdown",
+        download: bool = True,
+        session: dict = Depends(require_session),
+    ):
+        """Export one whole conversation as a portable transcript.
+
+        This exists so a conversation that went wrong is not a dead end: the
+        operator can carry the full exchange -- including tool calls and
+        attachments -- to another assistant for examination, instead of being
+        able only to abandon it and start over.
+        """
+        require_conversation(conversation_id, session)
+        requested = str(format or "markdown").strip().lower()
+        if requested in {"md", "markdown"}:
+            requested = "markdown"
+        if requested not in {"markdown", "json"}:
+            raise HTTPException(400, "Export format must be 'markdown' or 'json'.")
+
+        history = store.get_messages(conversation_id, limit=10_000, user_id=user_id(session))
+        conversations = store.list_conversations(limit=500, user_id=user_id(session))
+        meta = next(
+            (item for item in conversations if int(item.get("id", 0)) == conversation_id),
+            {"id": conversation_id},
+        )
+        attachment_rows = (
+            store.list_conversation_attachments(conversation_id)
+            if hasattr(store, "list_conversation_attachments")
+            else []
+        )
+        tool_calls = (
+            store.list_conversation_tool_calls(conversation_id)
+            if hasattr(store, "list_conversation_tool_calls")
+            else []
+        )
+        rendered = transcript_svc.export(
+            meta, history, attachment_rows, tool_calls, fmt=requested
+        )
+        filename = transcript_svc.export_filename(meta, requested)
+        store.audit("conversation_exported", {
+            "conversation_id": conversation_id,
+            "format": requested,
+            "messages": len(history),
+        })
+        disposition = "attachment" if download else "inline"
+        return Response(
+            content=rendered.encode("utf-8"),
+            media_type=(
+                "application/json; charset=utf-8"
+                if requested == "json"
+                else "text/markdown; charset=utf-8"
+            ),
+            headers={
+                "Content-Disposition": f'{disposition}; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    # ---------- attachments ----------
+
+    async def _store_attachment(raw: bytes, filename: object, session: dict) -> dict:
+        """Validate, extract, persist, and record one uploaded file."""
+        try:
+            accepted = attachments_svc.accept(raw, filename)
+        except attachments_svc.AttachmentError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        swap_info = None
+        if accepted.kind == attachments_svc.KIND_IMAGE:
+            # An image only becomes readable once a vision worker has read it.
+            # Swapping costs 15-20s, so the caller is told it happened.
+            if not router_.supports_vision():
+                try:
+                    swap_info = await router_.ensure_capability(vision=True)
+                except WorkerSwapError as exc:
+                    raise HTTPException(503, str(exc)) from exc
+            if not router_.supports_vision():
+                raise HTTPException(
+                    503, "The active model worker cannot read images."
+                )
+            try:
+                extracted = await attachments_svc.describe_image(router_, accepted)
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(
+                    504, "Reading the image timed out before anything was saved."
+                ) from exc
+            except attachments_svc.AttachmentError as exc:
+                raise HTTPException(502, str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001
+                log.exception("attachment image reading failed")
+                raise HTTPException(
+                    502, f"Reading the image failed: {type(exc).__name__}."
+                ) from exc
+        else:
+            try:
+                extracted = await attachments_svc.extract_async(accepted)
+            except attachments_svc.AttachmentError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001
+                log.exception("attachment extraction failed")
+                raise HTTPException(
+                    502, f"Reading '{accepted.filename}' failed: {type(exc).__name__}."
+                ) from exc
+
+        try:
+            await asyncio.to_thread(
+                attachments_svc.write_attachment,
+                Path(settings.attachment_dir),
+                accepted,
+                extracted,
+            )
+        except OSError as exc:
+            log.exception("could not persist attachment")
+            raise HTTPException(507, "The attachment could not be stored.") from exc
+
+        attachment_id = store.add_attachment(
+            user_id=user_id(session),
+            filename=accepted.filename,
+            kind=accepted.kind,
+            mime=accepted.mime,
+            extension=accepted.extension,
+            sha256=accepted.sha256,
+            byte_count=accepted.byte_count,
+            extraction_method=extracted.method,
+            extracted_chars=len(extracted.text),
+            width=accepted.width,
+            height=accepted.height,
+            page_count=extracted.page_count,
+            truncated=extracted.truncated,
+            note=extracted.note,
+        )
+        record = store.get_attachment(attachment_id, user_id=user_id(session))
+        store.audit("attachment_uploaded", {
+            "attachment_id": attachment_id,
+            "filename": accepted.filename,
+            "kind": accepted.kind,
+            "bytes": accepted.byte_count,
+            "sha256": accepted.sha256,
+            "extraction_method": extracted.method,
+            "extracted_chars": len(extracted.text),
+            "truncated": extracted.truncated,
+            "worker_swapped": swap_info is not None,
+        })
+        preview, _ = attachments_svc.excerpt(extracted.text, 600)
+        return {
+            "ok": True,
+            "attachment": attachments_svc.artifact(record)["data"],
+            "preview": preview,
+            "swapped": swap_info,
+        }
+
+    @api.post("/attachments")
+    async def upload_attachment(
+        request: Request,
+        file: UploadFile = File(...),
+        session: dict = Depends(require_session),
+    ):
+        """Accept one file, read it now, and hold it until a message sends it.
+
+        Reading happens here rather than at send time so the operator sees
+        immediately whether X could actually make sense of the file -- a
+        scanned PDF that OCR cannot read is worth knowing about before the
+        message goes out, not after.
+        """
+        require_exact_origin(
+            request, "Attachments must be uploaded from the X Omni origin."
+        )
+        raw = await file.read(attachments_svc.MAX_ATTACHMENT_BYTES + 1)
+        if len(raw) > attachments_svc.MAX_ATTACHMENT_BYTES:
+            raise HTTPException(
+                413,
+                f"The attachment exceeds the "
+                f"{attachments_svc.MAX_ATTACHMENT_BYTES // (1024 * 1024)} MiB limit.",
+            )
+        return await _store_attachment(raw, file.filename, session)
+
+    @api.get("/attachments/{attachment_id}")
+    async def download_attachment(
+        attachment_id: int,
+        download: bool = False,
+        session: dict = Depends(require_session),
+    ):
+        """Serve the original bytes back to the operator who uploaded them."""
+        record = store.get_attachment(attachment_id, user_id=user_id(session))
+        if record is None:
+            raise HTTPException(404, "Attachment not found.")
+        try:
+            blob_path, _ = attachments_svc.storage_paths(
+                Path(settings.attachment_dir),
+                str(record["sha256"]),
+                str(record["extension"]),
+            )
+        except attachments_svc.AttachmentError as exc:
+            raise HTTPException(404, "Attachment not found.") from exc
+        if not blob_path.is_file():
+            raise HTTPException(404, "The stored attachment file is missing.")
+        disposition = "attachment" if download else "inline"
+        safe_name = attachments_svc.safe_filename(record["filename"]).replace('"', "")
+        return FileResponse(
+            blob_path,
+            media_type=str(record["mime"]),
+            headers={
+                "Content-Disposition": f'{disposition}; filename="{safe_name}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @api.get("/attachments/{attachment_id}/text")
+    async def attachment_text(
+        attachment_id: int,
+        offset: int = 0,
+        limit: int = attachments_svc.MAX_READ_CHARS,
+        session: dict = Depends(require_session),
+    ):
+        """Page through what X actually read out of an attachment."""
+        record = store.get_attachment(attachment_id, user_id=user_id(session))
+        if record is None:
+            raise HTTPException(404, "Attachment not found.")
+        text = await asyncio.to_thread(
+            attachments_svc.read_extracted_text,
+            Path(settings.attachment_dir),
+            str(record["sha256"]),
+            str(record["extension"]),
+        )
+        start = max(0, int(offset))
+        span = max(1, min(int(limit), attachments_svc.MAX_READ_CHARS))
+        window = text[start:start + span]
+        return {
+            "ok": True,
+            "attachment_id": attachment_id,
+            "filename": record["filename"],
+            "offset": start,
+            "returned_chars": len(window),
+            "total_chars": len(text),
+            "has_more": start + len(window) < len(text),
+            "text": window,
+        }
 
     @api.get("/generated-images/{filename}")
     async def generated_image(filename: str, session: dict = Depends(require_session)):

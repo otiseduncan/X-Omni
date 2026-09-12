@@ -167,6 +167,29 @@ export function useConversationContinuity({ enabled }) {
     }
   }, [loadMessages, push, restoreLatest]);
 
+  /**
+   * Open a specific past conversation and make it the active one.
+   *
+   * Unlike restoreLatest(), this does not merge live optimistic entries: the
+   * operator is deliberately leaving the current thread, so the stored
+   * history of the requested conversation is the whole truth about it.
+   */
+  const openConversation = useCallback(async (id) => {
+    const numericId = Number(id);
+    if (!Number.isFinite(numericId)) throw new Error("Invalid conversation identifier.");
+    const request = ++requestRef.current;
+    setRestoring(true);
+    try {
+      adoptConversation(numericId);
+      setItems([]);
+      const restored = await loadMessages(numericId);
+      if (request !== requestRef.current) return null;
+      return { id: numericId, messages: restored.length };
+    } finally {
+      if (request === requestRef.current) setRestoring(false);
+    }
+  }, [adoptConversation, loadMessages]);
+
   const createConversation = useCallback(async () => {
     const response = await fetch("/api/conversations", {
       method: "POST",
@@ -193,5 +216,6 @@ export function useConversationContinuity({ enabled }) {
     restoring,
     reconcile,
     createConversation,
+    openConversation,
   };
 }

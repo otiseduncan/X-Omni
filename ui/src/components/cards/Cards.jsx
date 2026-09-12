@@ -15,6 +15,7 @@ import {
   FolderOpen,
   Globe2,
   LayoutTemplate,
+  Paperclip,
   Plus,
   Search,
   Sparkles,
@@ -1250,6 +1251,91 @@ function CameraObservationCard({ data }) {
   );
 }
 
+/* One file Otis attached. The card is provenance, not content: it says what
+   the file is, how X read it, and whether that reading was complete, and it
+   links back to the original bytes. The text X actually extracted is shown
+   with the message itself, not duplicated here. */
+function AttachmentCard({ data }) {
+  const attachmentId = data?.id;
+  const filename = displayText(data?.filename, "attachment");
+  const isImage = data?.kind === "image";
+  const href = attachmentId ? `/api/attachments/${encodeURIComponent(attachmentId)}` : "";
+
+  const facts = [
+    ["Type", displayText(data?.kind_label)],
+    ["Size", displayText(data?.size_label)],
+    ["Pages", data?.page_count ? String(data.page_count) : ""],
+    [
+      "Dimensions",
+      data?.width && data?.height ? `${data.width} × ${data.height}` : "",
+    ],
+    ["Read by", displayText(data?.extraction_method).replace(/_/g, " ")],
+    [
+      "Text extracted",
+      Number.isFinite(Number(data?.extracted_chars))
+        ? `${Number(data.extracted_chars).toLocaleString()} characters`
+        : "",
+    ],
+    ["SHA-256", displayText(data?.sha256)],
+  ].filter(([, value]) => value !== "");
+
+  return (
+    <details className={`card inline-disclosure attachment-card${data?.truncated ? " is-warning" : ""}`}>
+      <summary className="disclosure-summary" aria-label={`Attached file ${filename}`}>
+        <Paperclip size={14} aria-hidden="true" />
+        <span className="disclosure-copy">
+          <strong>{filename}</strong>
+          <small>
+            {[displayText(data?.kind_label), displayText(data?.size_label)]
+              .filter(Boolean)
+              .join(" · ")}
+            {data?.truncated ? " · only partly read" : ""}
+          </small>
+        </span>
+        <ChevronDown className="disclosure-chevron" size={15} aria-hidden="true" />
+      </summary>
+      <div className="disclosure-body attachment-card-body">
+        {isImage && href && (
+          <a href={href} target="_blank" rel="noreferrer noopener">
+            <img className="attachment-thumb" src={href} alt={`Attached image ${filename}`} />
+          </a>
+        )}
+
+        {data?.note && <p className="attachment-note">{data.note}</p>}
+
+        {data?.truncated && (
+          <p className="attachment-note">
+            X read only the beginning of this file into the conversation. It can
+            read further on request.
+          </p>
+        )}
+
+        {facts.length > 0 && (
+          <dl className="camera-provenance" aria-label="Attachment details">
+            {facts.map(([label, value]) => (
+              <div key={label}>
+                <dt>{label}</dt>
+                <dd>{value}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+
+        {href && (
+          <div className="attachment-links">
+            <a className="attachment-link" href={href} target="_blank" rel="noreferrer noopener">
+              <Eye size={13} /> open
+            </a>
+            <a className="attachment-link" href={`${href}?download=true`}>
+              <Download size={13} /> download
+            </a>
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
 function imageReceiptMatches(data, receipt) {
   const digest = displayText(data?.sha256);
   const imageUrl = displayText(data?.image_url);
@@ -1853,6 +1939,7 @@ const REGISTRY = {
   camera_request: CameraRequestCard,
   exterior_camera_request: ExteriorCameraRequestCard,
   camera_observation: CameraObservationCard,
+  attachment: AttachmentCard,
   camera_event_history: CameraEventHistoryCard,
   camera_snapshot: CameraSnapshotCard,
   camera_motion_clip: CameraMotionClipCard,
