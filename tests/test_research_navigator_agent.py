@@ -1129,3 +1129,41 @@ async def test_the_same_rejected_extract_is_not_submitted_forever(monkeypatch):
     assert "verification_after_extract" in context
     assert "REPEATED MISTAKE" in context
 
+
+@pytest.mark.asyncio
+async def test_the_receipt_names_the_action_it_closes(monkeypatch):
+    """Half of every live budget went to re-issuing clicks that had worked.
+
+    On an SPA a click often leaves url and title untouched, so a receipt that
+    echoed only those read as "nothing happened" and the model sent the same
+    ref again. The receipt now names what was carried out and says not to
+    repeat it.
+    """
+    navigator = _FakeNavigator(bulky=True)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([[("click", {"ref": "f24e983"})], None])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai Truck", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    tool_messages = [
+        m for m in client.messages_seen[-1] if m.get("role") == "tool"
+    ]
+    assert tool_messages
+    payload = json.loads(tool_messages[-1]["content"])
+    assert payload["executed"] is True
+    assert payload["completed_action"] == "click f24e983"
+    assert "Do not send it again" in payload["do_not_repeat"]
+    # Still a receipt, not a second copy of the page.
+    assert "elements" not in payload
+    assert "page_text" not in payload
+

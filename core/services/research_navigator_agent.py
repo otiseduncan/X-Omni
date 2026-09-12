@@ -513,7 +513,12 @@ def _action_digest(
     return f"{head} -> {outcome}: {where}".rstrip()[:_DIGEST_CHAR_CAP]
 
 
-def _tool_receipt(result: Any) -> dict[str, Any]:
+def _tool_receipt(
+    result: Any,
+    *,
+    action: str = "",
+    args: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """What the tool role carries now that the observation lives in one place.
 
     The full observation rides in exactly one message per turn -- the visual
@@ -526,8 +531,30 @@ def _tool_receipt(result: Any) -> dict[str, Any]:
         return {"error": "The navigator returned no usable result."}
     if result.get("error"):
         return {"error": result["error"]}
+    # Name the action that just happened and say it is finished. On an SPA
+    # the url and title frequently do not move when a click opens a panel or
+    # a menu, and a receipt that only echoed those read as "nothing
+    # happened": across every live run on 2026-09-12 the model re-issued
+    # almost every click it had just made successfully, spending about half
+    # of each budget on duplicates. The refreshed page arrives in the very
+    # next message, so the receipt's job is to close the action, not to
+    # describe the page.
+    performed = " ".join(
+        part
+        for part in (
+            action,
+            str((args or {}).get("ref") or ""),
+        )
+        if part
+    ).strip()
     receipt: dict[str, Any] = {
         "executed": True,
+        "completed_action": performed or action or "action",
+        "do_not_repeat": (
+            f"'{performed}' has already been carried out. Do not send it again. "
+            "The refreshed page state follows in the next message -- read it and "
+            "choose your NEXT action from it."
+        ),
         "url": result.get("url"),
         "title": result.get("title"),
     }
@@ -1027,9 +1054,14 @@ async def run_navigator_search(
             messages.append({
                 "role": "tool",
                 "tool_call_id": wire_call["id"],
-                "content": json.dumps(_tool_receipt(result), default=str)[
-                    :_TOOL_RESULT_CHAR_BACKSTOP
-                ],
+                "content": json.dumps(
+                    _tool_receipt(
+                        result,
+                        action=action,
+                        args={k: v for k, v in args.items() if k != "action"},
+                    ),
+                    default=str,
+                )[:_TOOL_RESULT_CHAR_BACKSTOP],
             })
 
         if latest_visual_summary is not None and not model_called_done:
