@@ -63,7 +63,13 @@ def test_x_omni_launcher_source_is_single_clean_script() -> None:
     # grep that belongs to deploy-local (asserted there). What remains is
     # named features and strict process-identity verification, which must not
     # be compressed away to satisfy a byte count.
-    assert len(script) < 18_500
+    # 18,500 -> 18,700 on 2026-09-12 for two launch failures found the same
+    # day, both already trimmed to their shortest honest form: a git warning
+    # aborting the launch because ErrorActionPreference Stop treats native
+    # stderr as terminating, and a held mutex returning exit 0 in silence so
+    # every later launch did nothing while reporting success. Neither is a
+    # feature; both are the script failing to start the app.
+    assert len(script) < 18_700
     assert script.count("function Get-SourceRevision") == 1
     assert script.count("function Get-PortOwner") == 1
     assert "^[0-9a-fA-F]{40}$" in script
@@ -296,3 +302,27 @@ def test_installer_creates_a_real_desktop_shortcut_with_app_icon() -> None:
     assert "WScript.Shell" in installer
     assert "X Omni.lnk" in installer
     assert "x-omni.ico" in installer
+
+
+def test_a_launch_that_cannot_run_says_so_instead_of_reporting_success():
+    """Two ways the launcher failed to start the app while looking fine.
+
+    2026-09-12: a launcher whose error dialog was still open held the
+    single-instance mutex, and the next launch hit `if (-not $hasMutex) {
+    return }` -- exit 0, no window, no log line, no restart. Three deploys in
+    a row appeared to succeed and changed nothing. Separately, git's routine
+    "CRLF will be replaced by LF" notice aborted a launch outright, because
+    ErrorActionPreference Stop makes any native stderr terminating even when
+    it is redirected to $null.
+    """
+
+    script = (ROOT / "scripts" / "launch-x-omni.ps1").read_text(encoding="utf-8")
+
+    # The mutex guard must report, not return quietly.
+    assert "if (-not $hasMutex) { return }" not in script
+    assert "Another X Omni launch is still open" in script
+
+    # The merge check reads git's exit code, not its stderr.
+    merge_check = script.split("function Assert-NoMergeConflicts", 1)[1].split("\nfunction ", 1)[0]
+    assert "$ErrorActionPreference = 'Continue'" in merge_check
+    assert "diff-filter=U" in merge_check

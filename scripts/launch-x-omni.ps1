@@ -69,10 +69,9 @@ function Get-SourceRevision {
 }
 
 function Assert-NoMergeConflicts {
-    # With ErrorActionPreference Stop a native command writing to stderr
-    # raises NativeCommandError even for a warning and even with 2>$null: on
-    # 2026-09-12 git's routine "CRLF will be replaced by LF" notice aborted
-    # the launch. Only git's exit code decides this check.
+    # ErrorActionPreference Stop turns any native stderr into a terminating
+    # error, even with 2>$null: git's routine "CRLF will be replaced by LF"
+    # notice aborted a launch. Only git's exit code decides this check.
     $unmerged = @(& {
         $ErrorActionPreference = 'Continue'
         & git -C $root diff --name-only --diff-filter=U 2>$null
@@ -308,7 +307,11 @@ function Invoke-UiRebuild {
 
 try {
     $hasMutex = $mutex.WaitOne(0)
-    if (-not $hasMutex) { return }
+    # A launcher still showing its error dialog holds this mutex; returning 0
+    # in silence made every later launch do nothing while reporting success.
+    if (-not $hasMutex) {
+        throw 'Another X Omni launch is still open. Close its window, then launch again.'
+    }
 
     if (-not (Test-Path -LiteralPath $startScript)) {
         throw "X Omni's start script is missing: $startScript"
