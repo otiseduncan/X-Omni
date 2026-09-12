@@ -104,6 +104,13 @@ def system_prompt(router) -> str:
 # under-estimating the budget costs a little history, over-estimating it
 # gets the request rejected by the server mid-conversation.
 CHARS_PER_TOKEN = 3.5
+# Per-message framing the model adds around every message (role markers and
+# separators). The history packing loop charges this for each message it
+# keeps, so budget arithmetic must also charge it for the two messages that
+# are always present -- the static system prompt and the turn-context block --
+# or the packed turn can exceed the context window by exactly that framing.
+PER_MESSAGE_OVERHEAD_TOKENS = 8
+ALWAYS_PRESENT_MESSAGE_OVERHEAD = 2 * PER_MESSAGE_OVERHEAD_TOKENS
 
 # Persisted cards are useful evidence on later turns, but they must not turn
 # the prompt into a second database.  The global cap is roughly 2.3K tokens,
@@ -680,7 +687,7 @@ def build_messages(
         - tool_token_reserve
         - estimate_tokens(base_system)
         - estimate_tokens(clock)
-        - 8
+        - ALWAYS_PRESENT_MESSAGE_OVERHEAD
     )
 
     context_parts: list[str] = [clock]
@@ -724,13 +731,13 @@ def build_messages(
         - tool_token_reserve
         - estimate_tokens(base_system)
         - estimate_tokens(context_content)
-        - 8
+        - ALWAYS_PRESENT_MESSAGE_OVERHEAD
     )
 
     kept: list[dict] = []
     for msg in reversed(history):
         content = msg.get("content") or ""
-        cost = estimate_tokens(content) + 8
+        cost = estimate_tokens(content) + PER_MESSAGE_OVERHEAD_TOKENS
         if cost > budget:
             break
         budget -= cost

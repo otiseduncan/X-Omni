@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Cpu,
+  History,
   KeyRound,
   Loader2,
   LogIn,
   Mic,
+  Paperclip,
   Plus,
   Send,
   Settings2,
@@ -15,8 +17,10 @@ import {
 } from "lucide-react";
 
 import AuthPanel from "./components/AuthPanel.jsx";
+import AttachmentTray from "./components/AttachmentTray.jsx";
 import Avatar from "./components/Avatar.jsx";
 import ApprovalCard from "./components/ApprovalCard.jsx";
+import HistoryPanel from "./components/HistoryPanel.jsx";
 import DashboardRail from "./components/DashboardRail.jsx";
 import VoicePanel from "./components/VoicePanel.jsx";
 import ToolRail from "./components/ToolRail.jsx";
@@ -39,6 +43,12 @@ import {
   terminalMediaWorkload,
   updateApproval,
 } from "./lib/conversationTimeline.js";
+import {
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  splitAttachmentBlocks,
+  tooLarge,
+  uploadAttachment,
+} from "./lib/attachments.js";
 import { settledWorkerHealth } from "./lib/workerState.js";
 import "./styles/theme.css";
 import "./styles/app.css";
@@ -163,12 +173,14 @@ export default function App() {
     items,
     setItems,
     push,
+    conversationId,
     conversationIdRef,
     adoptConversation,
     ready: historyReady,
     restoring,
     reconcile,
     createConversation,
+    openConversation,
   } = continuity;
   const [streaming, setStreaming] = useState("");
   const [thinking, setThinking] = useState(false);
@@ -185,6 +197,11 @@ export default function App() {
   const [voicePanelOpen, setVoicePanelOpen] = useState(false);
   const [accountPanelOpen, setAccountPanelOpen] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  // Files staged in the composer. Each is uploaded and read by Core as soon
+  // as it is chosen, so `status` here tracks that read, not the send.
+  const [attachEntries, setAttachEntries] = useState([]);
+  const [dragging, setDragging] = useState(false);
 
   const streamRef = useRef(null);
   const followStreamRef = useRef(true);
@@ -192,6 +209,9 @@ export default function App() {
   const lastExecutionReceiptRef = useRef(null);
   const cameraCaptureActiveRef = useRef(false);
   const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const attachKeyRef = useRef(0);
+  const dragDepthRef = useRef(0);
   const ttsOnRef = useRef(false);
   ttsOnRef.current = ttsOn;
 
@@ -516,21 +536,146 @@ export default function App() {
     if (el && followStreamRef.current) el.scrollTop = el.scrollHeight;
   }, [items, streaming, thinking, activeTool]);
 
+  /* ---------- attachments ----------
+
+     A chosen file is uploaded immediately and read by Core straight away, so
+     the tray can report "X read 12 pages" or "OCR found nothing" before the
+     message is ever sent. Only files that finished reading are sent. */
+
+  const uploadEntry = useCallback(async (key, file) => {
+    try {
+      const result = await uploadAttachment(file);
+      const record = result.attachment || {};
+      setAttachEntries((entries) =>
+        entries.map((entry) =>
+          entry.key === key
+            ? {
+                ...entry,
+                status: "ready",
+                id: record.id,
+                kind: record.kind,
+                bytes: record.bytes,
+                pageCount: record.page_count,
+                truncated: Boolean(record.truncated),
+                note: record.note || "",
+                preview: result.preview || "",
+              }
+            : entry
+        )
+      );
+      if (result.swapped) {
+        push({
+          kind: "system",
+          text: "Switched to a vision-capable model to read that image.",
+        });
+      }
+    } catch (error) {
+      setAttachEntries((entries) =>
+        entries.map((entry) =>
+          entry.key === key
+            ? { ...entry, status: "error", error: error.message }
+            : entry
+        )
+      );
+    }
+  }, [push]);
+
+  const addFiles = useCallback((fileList) => {
+    const chosen = Array.from(fileList || []).filter(Boolean);
+    if (!chosen.length) return;
+
+    setAttachEntries((entries) => {
+      const room = MAX_ATTACHMENTS_PER_MESSAGE - entries.length;
+      if (room <= 0) {
+        push({
+          kind: "error",
+          text: `A message carries at most ${MAX_ATTACHMENTS_PER_MESSAGE} files.`,
+        });
+        return entries;
+      }
+      if (chosen.length > room) {
+        push({
+          kind: "error",
+          text: `Only the first ${room} file(s) were attached; a message carries at most ${MAX_ATTACHMENTS_PER_MESSAGE}.`,
+        });
+      }
+
+      const staged = chosen.slice(0, room).map((file) => {
+        const key = `attach-${++attachKeyRef.current}`;
+        const entry = {
+          key,
+          file,
+          filename: file.name || "attachment",
+          bytes: file.size,
+          kind: (file.type || "").startsWith("image/") ? "image" : undefined,
+          status: tooLarge(file) ? "error" : "uploading",
+          error: tooLarge(file) ? "Larger than the 32 MB limit." : "",
+        };
+        if (entry.status === "uploading") uploadEntry(key, file);
+        return entry;
+      });
+      return [...entries, ...staged];
+    });
+  }, [push, uploadEntry]);
+
+  const removeAttachment = useCallback((key) => {
+    setAttachEntries((entries) => entries.filter((entry) => entry.key !== key));
+  }, []);
+
+  const retryAttachment = useCallback((key) => {
+    setAttachEntries((entries) => {
+      const target = entries.find((entry) => entry.key === key);
+      if (target?.file && !tooLarge(target.file)) uploadEntry(key, target.file);
+      return entries.map((entry) =>
+        entry.key === key && entry.file && !tooLarge(entry.file)
+          ? { ...entry, status: "uploading", error: "" }
+          : entry
+      );
+    });
+  }, [uploadEntry]);
+
+  const attachmentsUploading = attachEntries.some(
+    (entry) => entry.status === "uploading"
+  );
+  const readyAttachmentIds = attachEntries
+    .filter((entry) => entry.status === "ready" && entry.id)
+    .map((entry) => entry.id);
+
   function sendMessage(text) {
     const body = String(text ?? draft).trim();
-    if (!body || thinking || swapping) return;
+    // A message may be files alone -- a photo of a label with no question is
+    // still a request -- but never an empty send.
+    if ((!body && !readyAttachmentIds.length) || thinking || swapping) return;
+    if (attachmentsUploading) {
+      push({ kind: "error", text: "Wait for X to finish reading the attached files." });
+      return;
+    }
+
     const ok = send({
       type: "message",
       conversation_id: conversationIdRef.current,
       text: body,
+      attachment_ids: readyAttachmentIds,
     });
     if (!ok) {
       push({ kind: "error", text: "Not connected to X Omni Core." });
       return;
     }
     followStreamRef.current = true;
-    push({ kind: "user", text: body });
+    push({
+      kind: "user",
+      text: body,
+      attachments: attachEntries
+        .filter((entry) => entry.status === "ready")
+        .map((entry) => ({
+          id: entry.id,
+          filename: entry.filename,
+          kind: entry.kind,
+          bytes: entry.bytes,
+        })),
+    });
     setDraft("");
+    setAttachEntries([]);
     setThinking(true);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }
@@ -731,6 +876,27 @@ export default function App() {
     }
   }
 
+  async function openPastConversation(id) {
+    if (thinking || swapping) {
+      push({ kind: "error", text: "Stop the current response before switching conversations." });
+      return;
+    }
+    setHistoryOpen(false);
+    try {
+      await openConversation(id);
+      streamingRef.current = "";
+      setStreaming("");
+      setThinking(false);
+      setActiveTool(null);
+      // Staged files belong to the message being composed, not to the
+      // conversation being opened. Carrying them across would attach them
+      // somewhere they were never meant to go.
+      setAttachEntries([]);
+    } catch (error) {
+      push({ kind: "error", text: `Could not open that conversation: ${error.message}` });
+    }
+  }
+
   async function newConversation() {
     if (creatingConversation || thinking || swapping) return;
     setCreatingConversation(true);
@@ -812,6 +978,12 @@ export default function App() {
           onLoggedOut={handleLoggedOut}
         />
       )}
+      <HistoryPanel
+        open={historyOpen}
+        activeId={conversationId}
+        onOpenConversation={openPastConversation}
+        onClose={() => setHistoryOpen(false)}
+      />
 
       <header className="topbar">
         <div className="brand">
@@ -860,6 +1032,15 @@ export default function App() {
 
           <button
             className="icon-btn"
+            onClick={() => setHistoryOpen(true)}
+            title="Past conversations"
+            aria-label="Open past conversations"
+          >
+            <History size={17} />
+          </button>
+
+          <button
+            className="icon-btn"
             onClick={newConversation}
             title="New conversation"
             aria-label="Start a new conversation"
@@ -901,11 +1082,38 @@ export default function App() {
 
       <main
         className="stream"
+        data-dropping={dragging ? "true" : undefined}
         ref={streamRef}
         onScroll={(event) => {
           followStreamRef.current = isNearChatBottom(event.currentTarget);
         }}
+        onDragEnter={(event) => {
+          if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
+          event.preventDefault();
+          dragDepthRef.current += 1;
+          setDragging(true);
+        }}
+        onDragOver={(event) => {
+          if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
+          event.preventDefault();
+        }}
+        onDragLeave={() => {
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+          if (dragDepthRef.current === 0) setDragging(false);
+        }}
+        onDrop={(event) => {
+          if (!event.dataTransfer?.files?.length) return;
+          event.preventDefault();
+          dragDepthRef.current = 0;
+          setDragging(false);
+          addFiles(event.dataTransfer.files);
+        }}
       >
+        {dragging && (
+          <div className="drop-hint">
+            <Paperclip size={16} /> Drop files to attach them to your next message
+          </div>
+        )}
         {items.length === 0 && !streaming && (
           <div className="empty-state">
             {restoring ? (
@@ -922,12 +1130,24 @@ export default function App() {
         )}
 
         {items.map((item) => {
-          if (item.kind === "user")
+          if (item.kind === "user") {
+            const { text: typed, blocks } = splitAttachmentBlocks(item.text);
             return (
               <div className="msg user" key={item.key}>
-                {item.text}
+                {typed}
+                {blocks.map((block, index) => (
+                  <details className="msg-attachment" key={`${item.key}-a${index}`}>
+                    <summary>
+                      <Paperclip size={12} aria-hidden="true" />
+                      <span>{block.filename}</span>
+                      <small>{block.descriptor}</small>
+                    </summary>
+                    <pre className="msg-attachment-text">{block.body}</pre>
+                  </details>
+                ))}
               </div>
             );
+          }
           if (item.kind === "assistant")
             return (
               <div className="msg assistant" key={item.key}>
@@ -1006,7 +1226,35 @@ export default function App() {
       </main>
 
       <div>
+        <AttachmentTray
+          entries={attachEntries}
+          onRemove={removeAttachment}
+          onRetry={retryAttachment}
+        />
+
         <div className="composer">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            hidden
+            onChange={(event) => {
+              addFiles(event.target.files);
+              // Reset so choosing the same file twice still fires onChange.
+              event.target.value = "";
+            }}
+          />
+
+          <button
+            className="mic-btn"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={swapping || !connected || restoring}
+            aria-label="Attach files"
+            title="Attach a file — image, PDF, Word, Excel, or text"
+          >
+            <Paperclip size={18} />
+          </button>
+
           <button
             className={`mic-btn${voice.recording ? " recording" : ""}`}
             onClick={voice.toggle}
@@ -1048,6 +1296,14 @@ export default function App() {
                 if (!responseActive) sendMessage();
               }
             }}
+            onPaste={(event) => {
+              // A screenshot pasted from the clipboard is the fastest way to
+              // show X something; let ordinary text paste through untouched.
+              const files = Array.from(event.clipboardData?.files || []);
+              if (!files.length) return;
+              event.preventDefault();
+              addFiles(files);
+            }}
           />
 
           <button
@@ -1055,7 +1311,11 @@ export default function App() {
             onClick={responseActive ? stopResponse : () => sendMessage()}
             disabled={responseActive
               ? !connected
-              : !draft.trim() || swapping || !connected || restoring}
+              : (!draft.trim() && !readyAttachmentIds.length) ||
+                attachmentsUploading ||
+                swapping ||
+                !connected ||
+                restoring}
             aria-label={responseActive ? "Stop response" : "Send message"}
             title={responseActive ? "Stop response" : "Send message"}
           >

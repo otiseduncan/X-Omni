@@ -40,7 +40,13 @@ test("stream updates follow only near the bottom and sending returns to the live
     /onScroll=\{\(event\) => \{\s*followStreamRef\.current = isNearChatBottom\(event\.currentTarget\);/
   );
 
+  // The optimistic user message may carry attachments, so match the push
+  // itself rather than one exact argument spelling. What matters is the
+  // order: following resumes before the message renders.
   const resume = source.indexOf("followStreamRef.current = true;");
-  const optimisticMessage = source.indexOf('push({ kind: "user", text: body });', resume);
-  assert.ok(resume >= 0 && optimisticMessage > resume, "a successful send must resume following before render");
+  const optimisticMessage = source.slice(resume).search(/push\(\{\s*\n?\s*kind: "user",/);
+  assert.ok(
+    resume >= 0 && optimisticMessage > 0,
+    "a successful send must resume following before render"
+  );
 });

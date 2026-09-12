@@ -61,6 +61,39 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
 
+-- Files the operator attached in chat. A row is created by the upload
+-- endpoint before any message exists, then bound to the user message that
+-- actually sent it; an unbound row is an abandoned upload and is swept.
+-- Bytes live on disk under the attachment directory, named by sha256, with
+-- the full extracted text beside them. Only a bounded excerpt of that text
+-- goes into the message content, so a long document cannot flood context.
+CREATE TABLE IF NOT EXISTS attachments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id   INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id        INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    filename          TEXT NOT NULL,
+    kind              TEXT NOT NULL
+                        CHECK (kind IN ('image','pdf','text','docx','xlsx')),
+    mime              TEXT NOT NULL,
+    extension         TEXT NOT NULL,
+    sha256            TEXT NOT NULL,
+    byte_count        INTEGER NOT NULL,
+    width             INTEGER,
+    height            INTEGER,
+    page_count        INTEGER,
+    extraction_method TEXT NOT NULL,
+    extracted_chars   INTEGER NOT NULL DEFAULT 0,
+    truncated         INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0,1)),
+    note              TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_conversation
+    ON attachments(conversation_id, id);
+CREATE INDEX IF NOT EXISTS idx_attachments_pending
+    ON attachments(user_id, created_at) WHERE message_id IS NULL;
+
 -- Structured, conversation-scoped working subject. This is context for the
 -- model, not a text-rewrite rule: authoritative tool results update the row,
 -- and prompt assembly may expose the compact JSON on later turns.

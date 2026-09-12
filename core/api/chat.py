@@ -2,7 +2,7 @@
 X Omni -- chat WebSocket.
 
 Client sends:
-    {"type":"message","conversation_id":N|null,"text":"..."}
+    {"type":"message","conversation_id":N|null,"text":"...","attachment_ids":[N]}
     {"type":"stop","conversation_id":N|null}
     {"type":"approve","approval_id":"...","approved":true}
     {"type":"swap","worker":"omni"|"coder"}
@@ -16,12 +16,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..models.router import WorkerSwapError
 from ..orchestrator.loop import Orchestrator
+from ..services import attachments as attachments_svc
 from .auth import session_from_websocket
 
 log = logging.getLogger("xomni.chat")
@@ -32,6 +34,52 @@ SWAP_COMMANDS = {
 }
 
 SendJson = Callable[[dict], Awaitable[None]]
+
+
+def _attachment_ids(value: object) -> list[int]:
+    """Validate the client's attachment id list without trusting its shape."""
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ValueError("attachment_ids must be a list of attachment identifiers.")
+    if len(value) > attachments_svc.MAX_ATTACHMENTS_PER_MESSAGE:
+        raise ValueError(
+            f"A message carries at most "
+            f"{attachments_svc.MAX_ATTACHMENTS_PER_MESSAGE} attachments."
+        )
+    ids: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError("Each attachment identifier must be an integer.")
+        if item <= 0:
+            raise ValueError("Each attachment identifier must be positive.")
+        if item not in ids:
+            ids.append(item)
+    return ids
+
+
+def _prepare_attachments(
+    store, attachment_ids: list[int], owner_id: str, directory: Path
+) -> list[tuple[dict, str]]:
+    """Resolve each attachment to its record and its chat text block.
+
+    Ownership and single-use are checked here, before anything is written, so
+    a message is never persisted claiming a file it could not actually send.
+    """
+    prepared: list[tuple[dict, str]] = []
+    for attachment_id in attachment_ids:
+        record = store.get_attachment(attachment_id, user_id=owner_id)
+        if record is None:
+            raise ValueError(f"Attachment {attachment_id} does not exist.")
+        if record.get("message_id") is not None:
+            raise ValueError(
+                f"'{record.get('filename')}' was already sent in an earlier message."
+            )
+        text = attachments_svc.read_extracted_text(
+            directory, str(record["sha256"]), str(record["extension"])
+        )
+        prepared.append((record, attachments_svc.message_block(record, text)))
+    return prepared
 
 
 def create_router(
@@ -233,7 +281,14 @@ def create_router(
                     continue
 
                 text = str(data.get("text") or "").strip()
-                if not text:
+                try:
+                    attachment_ids = _attachment_ids(data.get("attachment_ids"))
+                except ValueError as exc:
+                    await _safe_send({"type": "error", "message": str(exc)})
+                    continue
+                # A message carrying files needs no typed text: sending a
+                # photo of a label and asking nothing is a real request.
+                if not text and not attachment_ids:
                     continue
 
                 conversation_id = data.get("conversation_id")
@@ -263,7 +318,9 @@ def create_router(
 
                 # Manual routing override. Deterministic on purpose -- the
                 # model does not get to decide when to spend 15-20 seconds.
-                lowered = text.lower()
+                # A slash command is a routing instruction, never a caption
+                # for files, so it is only honoured on a text-only message.
+                lowered = text.lower() if not attachment_ids else ""
                 if (
                     session.get("role") != "owner"
                     and any(lowered.startswith(command) for command in SWAP_COMMANDS)
@@ -289,10 +346,53 @@ def create_router(
                 if command and not text:
                     continue
 
-                user_message_id = store.add_message(conversation_id, "user", text)
+                owner_id = str(session.get("user_id") or "local-dev")
+                try:
+                    prepared = _prepare_attachments(
+                        store, attachment_ids, owner_id, Path(settings.attachment_dir)
+                    )
+                except ValueError as exc:
+                    await _safe_send({"type": "error", "message": str(exc)})
+                    continue
+
+                # The stored message carries the attachment text, so history
+                # replay and context packing see the files without re-reading
+                # anything from disk.
+                stored_text = attachments_svc.compose_message(
+                    text, [block for _, block in prepared]
+                )
+                user_message_id = store.add_message(
+                    conversation_id,
+                    "user",
+                    stored_text,
+                    artifacts=[
+                        attachments_svc.artifact(record) for record, _ in prepared
+                    ],
+                )
+                if prepared:
+                    bound = store.bind_attachments(
+                        [int(record["id"]) for record, _ in prepared],
+                        conversation_id=conversation_id,
+                        message_id=user_message_id,
+                        user_id=owner_id,
+                    )
+                    if len(bound) != len(prepared):
+                        # Only reachable if a concurrent send claimed the same
+                        # upload. The message still stands; say so rather than
+                        # leave a silent mismatch in the record.
+                        log.warning(
+                            "bound %s of %s attachments for message %s",
+                            len(bound), len(prepared), user_message_id,
+                        )
+                        await _safe_send({
+                            "type": "error",
+                            "message": "Some attachments were already sent in "
+                                       "another message and were not re-attached.",
+                        })
+
                 await _safe_send({"type": "thinking"})
                 _start_active(
-                    _run_message_turn(conversation_id, text, user_message_id),
+                    _run_message_turn(conversation_id, stored_text, user_message_id),
                     "response",
                 )
 
