@@ -67,6 +67,18 @@ ADAS_MAP_ACTIONS = frozenset(
         "pause_batch",
     }
 )
+# Creating a ScrapeX batch and starting it are two separate endpoints, and
+# nothing in ScrapeX ever starts a batch on its own. A create_* call therefore
+# leaves a batch at "pending" forever unless the caller also runs start_batch
+# -- which the sweep (core/services/adas_map_sweep.py) and acquire_exact do,
+# and the model never did. On 2026-09-12 X answered "go get the ADAS map
+# reports" with create_phase_batch, was told it succeeded as "queued", and
+# reported the acquisition as running; 135 such batches had accumulated since
+# 2026-08-22 with no runner ever touching them. These two actions stay in the
+# handler for the internal callers above and are refused when the call
+# carries the model invocation context.
+BATCH_MINTING_ACTIONS = frozenset({"create_exact_batch", "create_phase_batch"})
+MODEL_ADAS_MAP_ACTIONS = ADAS_MAP_ACTIONS - BATCH_MINTING_ACTIONS
 SOURCE_SCOPES = frozenset({"active", "all", "terminal"})
 
 # --- ScrapeX Navigator: bounded browser observation/action turns -----------
@@ -228,27 +240,28 @@ SCRAPEX_READ_SCHEMA: dict[str, Any] = {
 
 SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
     "description": (
-        "Acquire or process ADAS Map requirement reports only; this is an execution/"
-        "acquisition tool, not a read path for current Calibration IQ state. Never call "
-        "it merely to answer whether CIQ already has an ADAS Map, which ROs are missing "
-        "one, or counts by phase/shop. This tool never opens ALLDATA and never retrieves "
-        "OEM service-information procedures. For one exact RO that the "
-        "user wants an ADAS Map acquired now, prefer acquire_exact: it starts ScrapeX "
-        "if needed, verifies "
-        "managed-browser sign-in before any batch exists, creates the exact one-RO "
-        "batch, processes that RO synchronously, verifies the canonical ADAS Map PDF, "
-        "and attaches that document to the matching Calibration IQ RO before the "
-        "X-facing workflow reports completion. If sign-in is needed, acquire_exact "
-        "opens the managed sign-in window itself and returns authentication_required "
-        "with no batch created; report that and repeat the same acquire_exact after "
-        "the operator signs in, instead of manual create/start/process/pause steps. "
-        "process_one requires an observed exact batch_id. After create_exact_batch or "
-        "create_phase_batch, copy result.data.id exactly; never copy evidence_id. "
-        "open_authentication is a parameterless browser-opening human handoff for the "
-        "ADAS Map work browser only, used after status reports authentication_required "
-        "or when the user explicitly asks to sign in to ADAS Map. It never signs in to "
-        "ALLDATA; ALLDATA sign-in belongs to research_provider_setup. Queued or started "
-        "is not completed."
+        "Low-level ScrapeX ADAS Map controls for ONE already-named RO or an existing "
+        "observed batch. Not the way to get the missing ADAS Maps for phases, a shop, "
+        "a list of ROs, or the board: that is the permanent stage_action tool with "
+        "operation sweep_adas_maps, which creates the batches, starts ScrapeX's "
+        "worker, retries, re-checks Calibration IQ, and posts the result to the chat. "
+        "This tool cannot create a phase or list batch; a batch that is merely "
+        "created is never run by anything. Never call it to answer whether CIQ has an "
+        "ADAS Map, which ROs are missing one, or counts by phase/shop; never for "
+        "ALLDATA or OEM procedures. For one exact RO that the user wants acquired now, "
+        "acquire_exact starts ScrapeX if needed, verifies managed-browser sign-in "
+        "before any batch exists, creates and processes the one-RO batch "
+        "synchronously, verifies the canonical ADAS Map PDF, and attaches it to the "
+        "matching Calibration IQ RO. If sign-in is needed it opens the managed sign-in "
+        "window itself and returns authentication_required with no batch created; "
+        "report that and repeat the same acquire_exact after the operator signs in. "
+        "process_one, start_batch and pause_batch require a batch_id observed in this "
+        "turn from list_batches or a bound read: copy result.data.id exactly; never "
+        "copy evidence_id. open_authentication is a parameterless browser-opening "
+        "human handoff for the ADAS Map work browser only, used after status reports "
+        "authentication_required or when the user explicitly asks to sign in to ADAS "
+        "Map. It never signs in to ALLDATA; ALLDATA sign-in belongs to "
+        "research_provider_setup. Queued or started is not completed."
     ),
     "parameters": {
         "type": "object",
@@ -286,53 +299,9 @@ SCRAPEX_ADAS_MAP_SCHEMA: dict[str, Any] = {
                 },
                 "required": ["action", "ro_number"],
             },
-            {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "const": "create_exact_batch",
-                        "description": "Create one bounded batch for exact RO numbers.",
-                    },
-                    "name": {"type": "string", "maxLength": MAX_NAME_CHARS},
-                    "ro_numbers": {
-                        "type": "array",
-                        "items": {"type": "string", "maxLength": MAX_RO_CHARS},
-                        "minItems": 1,
-                        "maxItems": 10,
-                    },
-                    "source_scope": {
-                        "type": "string",
-                        "enum": sorted(SOURCE_SCOPES),
-                    },
-                },
-                "required": ["action", "ro_numbers"],
-            },
-            {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "const": "create_phase_batch",
-                        "description": "Create one bounded batch for exact CIQ phases.",
-                    },
-                    "name": {"type": "string", "maxLength": MAX_NAME_CHARS},
-                    "phases": {
-                        "type": "array",
-                        "items": {"type": "string", "maxLength": MAX_PHASE_CHARS},
-                        "minItems": 1,
-                        "maxItems": 10,
-                    },
-                    "shop": {"type": "string", "maxLength": MAX_SHOP_CHARS},
-                    "source_scope": {
-                        "type": "string",
-                        "enum": sorted(SOURCE_SCOPES),
-                    },
-                },
-                "required": ["action", "phases"],
-            },
+            # create_exact_batch and create_phase_batch are deliberately absent:
+            # see BATCH_MINTING_ACTIONS. They remain handler actions for the
+            # sweep and acquire_exact, never model-facing branches.
             {
                 "type": "object",
                 "additionalProperties": False,
@@ -2120,6 +2089,22 @@ async def adas_map(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
     """Perform one explicitly selected ScrapeX ADAS Map control operation."""
     action = "adas_map"
     try:
+        # The registry stamps every model-originated call with the invocation
+        # context; the sweep and acquire_exact call this function directly and
+        # carry no such key. Only the model is refused the batch-minting
+        # actions, because only the model fails to start what it creates.
+        requested = str((args or {}).get("action") or "").strip()
+        if _INVOCATION_CONTEXT_KEY in (args or {}) and requested in BATCH_MINTING_ACTIONS:
+            return _failure(
+                requested,
+                "use_stage_action",
+                f"{requested} only creates a ScrapeX batch; nothing ever starts "
+                "one that was merely created, so it would sit at pending forever. "
+                "Nothing was created. For the missing ADAS Maps across phases, a "
+                "shop, a list, or the board use stage_action with operation "
+                "sweep_adas_maps; for one named RO use acquire_exact.",
+                work_complete=False,
+            )
         clean = _clean_args(args)
         action_value = _text(clean.get("action"), "action", maximum=40)
         assert action_value is not None

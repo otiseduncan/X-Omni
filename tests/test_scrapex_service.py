@@ -444,8 +444,6 @@ def test_adas_map_schema_uses_complete_action_specific_branches() -> None:
     valid_arguments = [
         {"action": "open_authentication"},
         {"action": "acquire_exact", "ro_number": "9000000009"},
-        {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
-        {"action": "create_phase_batch", "phases": ["5", "6"]},
         {
             "action": "process_one",
             "batch_id": "batch-9",
@@ -461,6 +459,11 @@ def test_adas_map_schema_uses_complete_action_specific_branches() -> None:
         {"action": "open_authentication", "batch_id": "batch-9"},
         {"action": "acquire_exact"},
         {"action": "acquire_exact", "ro_number": "9000000009", "batch_id": "batch-9"},
+        # Batch-minting actions have no model-facing branch at all: a created
+        # batch is never started by anything, so the model could only ever
+        # mint dead "queued" successes with them.
+        {"action": "create_exact_batch", "ro_numbers": ["9000000009"]},
+        {"action": "create_phase_batch", "phases": ["5", "6"]},
         {
             "action": "create_exact_batch",
             "ro_numbers": ["9000000009"],
@@ -481,11 +484,16 @@ def test_adas_map_schema_uses_complete_action_specific_branches() -> None:
         assert not validator.is_valid(arguments), arguments
 
     branches = parameters["oneOf"]
-    assert len(branches) == len(scrapex.ADAS_MAP_ACTIONS)
+    assert len(branches) == len(scrapex.MODEL_ADAS_MAP_ACTIONS)
     assert all(branch["additionalProperties"] is False for branch in branches)
     assert {branch["properties"]["action"]["const"] for branch in branches} == (
-        scrapex.ADAS_MAP_ACTIONS
+        scrapex.MODEL_ADAS_MAP_ACTIONS
     )
+    # The handler still knows the minting actions for the sweep and
+    # acquire_exact; the schema the model sees must not.
+    assert scrapex.BATCH_MINTING_ACTIONS == {"create_exact_batch", "create_phase_batch"}
+    assert scrapex.BATCH_MINTING_ACTIONS < scrapex.ADAS_MAP_ACTIONS
+    assert not (scrapex.BATCH_MINTING_ACTIONS & scrapex.MODEL_ADAS_MAP_ACTIONS)
     assert "allOf" not in parameters
 
 
@@ -2225,3 +2233,84 @@ def test_scrapex_staging_contract_has_no_conversational_text_input() -> None:
         assert parameter_names.isdisjoint(
             {"message", "request_text", "user_message", "user_text", "utterance"}
         )
+
+
+# --------------------------------------------------------------- batch minting
+#
+# 2026-09-12: X answered "go get the ADAS map reports" with create_phase_batch.
+# ScrapeX creates and starts batches through two separate endpoints and never
+# starts one on its own, so the batch sat at pending forever while X reported
+# the acquisition as running -- the 136th such batch since 2026-08-22.
+
+
+@pytest.mark.asyncio
+async def test_model_originated_batch_minting_is_refused_before_any_network(monkeypatch):
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"id": "should-never-exist"})
+
+    _install_transport(monkeypatch, handler)
+    for arguments in (
+        {
+            "action": "create_phase_batch",
+            "phases": ["1", "3", "4"],
+            "shop": "Warner Robins",
+            "__xomni_invocation": {"conversation_id": 7, "message_id": 9},
+        },
+        {
+            "action": "create_exact_batch",
+            "ro_numbers": ["2400711884"],
+            "__xomni_invocation": {"conversation_id": 7, "message_id": 9},
+        },
+    ):
+        result = await scrapex.adas_map(FakeSettings(), arguments)
+        assert result["status"] == "use_stage_action", result
+        assert result["success"] is False
+        assert result["executed"] is False
+        assert result["verified"] is False
+        assert result["work_complete"] is False
+        assert "sweep_adas_maps" in result["error"]["message"]
+        assert "Nothing was created" in result["error"]["message"]
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_internal_callers_still_mint_exact_batches_without_the_invocation_key(
+    monkeypatch,
+):
+    # The sweep and acquire_exact call adas_map() directly and are the
+    # callers that also start what they create; they must keep working.
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/api/adas-map/status"):
+            return httpx.Response(
+                200, json={"active": True, "authenticated": True, "url": None, "title": "ADAS"}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "batch-internal",
+                "state": "pending",
+                "requested_ro_numbers": ["2400711884"],
+                "source_scope": "all",
+                "items": [
+                    {"id": "item-1", "batch_id": "batch-internal", "ro_number": "2400711884"}
+                ],
+                "readiness": {"ready": False, "total": 1, "adas_map_unresolved": 1},
+            },
+        )
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.adas_map(
+        FakeSettings(),
+        {"action": "create_exact_batch", "ro_numbers": ["2400711884"]},
+    )
+    assert result["status"] == "queued", result
+    assert result["success"] is True
+    assert result["data"]["id"] == "batch-internal"
+    assert any(path.endswith("/api/batches/from-ciq/exact") for path in seen)

@@ -339,11 +339,12 @@ SCRAPEX_ID_BOUND_READ_ACTIONS = frozenset({
     "batch_exceptions",
     "batch_item",
 })
+# create_exact_batch / create_phase_batch are not model-facing: a created
+# batch is never started by anything, so the model minting one produced dead
+# "queued" successes. See scrapex.BATCH_MINTING_ACTIONS.
 SCRAPEX_ID_FREE_ADAS_MAP_ACTIONS = frozenset({
     "open_authentication",
     "acquire_exact",
-    "create_exact_batch",
-    "create_phase_batch",
 })
 SCRAPEX_ID_BOUND_ADAS_MAP_ACTIONS = frozenset({
     "process_one",

@@ -255,11 +255,11 @@ def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> Non
         "list_batches",
         "preview_ciq_queue",
     }
+    # No create_* branch before or after evidence: a batch the model creates
+    # is never started by anything, so those actions are not model-facing.
     assert action_branches(initial, "scrapex_adas_map") == {
         "open_authentication",
         "acquire_exact",
-        "create_exact_batch",
-        "create_phase_batch",
     }
     for tool_name in scrapex:
         parameters = next(
@@ -297,8 +297,6 @@ def test_scrapex_catalog_stages_opaque_id_actions_until_verified_result() -> Non
     assert action_branches(unlocked, "scrapex_adas_map") == {
         "open_authentication",
         "acquire_exact",
-        "create_exact_batch",
-        "create_phase_batch",
         "process_one",
         "start_batch",
         "pause_batch",
