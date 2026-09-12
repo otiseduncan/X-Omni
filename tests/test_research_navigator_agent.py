@@ -197,6 +197,198 @@ class _ScriptedClient:
             }
 
 
+async def _no_sleep(_seconds: float) -> None:
+    return None
+
+
+def test_system_prompt_prefers_alldata_ymme_search_without_make_aliases() -> None:
+    prompt = research_navigator_agent._system_prompt(
+        {"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        "front radar calibration target distance",
+    )
+
+    assert "Search by Year, Make, Model, Engine, or VIN" in prompt
+    assert "let ALLDATA resolve its own make taxonomy" in prompt
+    assert "do not invent or hardcode make aliases" in prompt
+
+
+@pytest.mark.asyncio
+async def test_initial_observation_waits_for_rendered_page_before_model_call(
+    monkeypatch,
+) -> None:
+    class _InitialRaceNavigator(_FakeNavigator):
+        def __init__(self):
+            super().__init__()
+            self.observe_count = 0
+
+        async def __call__(self, settings, args):
+            if args.get("action") == "observe":
+                self.calls.append(dict(args))
+                self.observe_count += 1
+                if self.observe_count == 1:
+                    return _navigator_result(
+                        "observe",
+                        status="observed",
+                        data={
+                            "url": "https://my.alldata.com/#/home",
+                            "title": "ALLDATA",
+                            "page_text": "",
+                            "elements": [],
+                        },
+                    )
+            return await super().__call__(settings, args)
+
+    navigator = _InitialRaceNavigator()
+    navigator.verified_after_extract = True
+    monkeypatch.setattr(research_navigator_agent.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient(
+        [
+            [("fill", {"ref": "e1", "text": "2021 Hyundai Palisade"})],
+            [("extract", {})],
+        ]
+    )
+
+    result = await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    assert result["verified"] is True
+    assert navigator.observe_count == 2
+    first_model_input = json.dumps(client.messages_seen[0])
+    assert "Vehicle Select" in first_model_input
+    assert "e1" in first_model_input
+
+
+@pytest.mark.asyncio
+async def test_empty_initial_page_exits_without_inventing_browser_action(monkeypatch) -> None:
+    class _NeverReadyNavigator(_FakeNavigator):
+        async def __call__(self, settings, args):
+            if args.get("action") == "observe":
+                self.calls.append(dict(args))
+                return _navigator_result(
+                    "observe",
+                    status="observed",
+                    data={
+                        "url": "https://my.alldata.com/#/home",
+                        "title": "ALLDATA",
+                        "page_text": "",
+                        "elements": [],
+                    },
+                )
+            return await super().__call__(settings, args)
+
+    navigator = _NeverReadyNavigator()
+    monkeypatch.setattr(research_navigator_agent.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([[("click", {"ref": "e11"})]])
+
+    result = await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    assert result["status"] == "initial_page_not_ready"
+    assert result["initial_observe_attempts"] == 5
+    assert result["searched"] is False
+    assert client.messages_seen == []
+    assert [call["action"] for call in navigator.calls].count("observe") == 5
+
+
+@pytest.mark.asyncio
+async def test_definitive_stale_ref_failure_supplies_fresh_observation(monkeypatch) -> None:
+    class _StaleRefNavigator(_FakeNavigator):
+        def __init__(self):
+            super().__init__()
+            self.observe_count = 0
+
+        async def __call__(self, settings, args):
+            action = args.get("action")
+            if action == "observe":
+                self.observe_count += 1
+                if self.observe_count > 1:
+                    self.calls.append(dict(args))
+                    return _navigator_result(
+                        "observe",
+                        status="observed",
+                        data={
+                            "url": "https://my.alldata.com/repair/#/select-vehicle",
+                            "title": "Select Vehicle",
+                            "page_text": "Search by Year, Make, Model, Engine, or VIN",
+                            "elements": [
+                                {
+                                    "ref": "e9",
+                                    "role": "searchbox",
+                                    "name": "Search by Year, Make, Model, Engine, or VIN",
+                                }
+                            ],
+                        },
+                    )
+            if action == "fill":
+                self.calls.append(dict(args))
+                return {
+                    "service": "ScrapeX",
+                    "action": "fill",
+                    "status": "invalid_request",
+                    "success": False,
+                    "executed": False,
+                    "verified": False,
+                    "http_status": 422,
+                    "detail": "'e1' is not a ref from the most recent observation.",
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "ScrapeX returned HTTP 422.",
+                    },
+                }
+            return await super().__call__(settings, args)
+
+    navigator = _StaleRefNavigator()
+    navigator.verified_after_extract = True
+    monkeypatch.setattr(research_navigator_agent.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient(
+        [
+            [("fill", {"ref": "e1", "text": "2021 Hyundai Palisade"})],
+            [("extract", {})],
+        ]
+    )
+
+    result = await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    assert result["verified"] is True
+    second_model_input = json.dumps(client.messages_seen[1])
+    assert "fresh observation of the current rendered page" in second_model_input
+    assert "e9" in second_model_input
+    assert "not a ref from the most recent observation" in second_model_input
+    actions = [call["action"] for call in navigator.calls]
+    assert actions[:4] == ["create_task", "observe", "fill", "observe"]
+
+
 @pytest.mark.asyncio
 async def test_happy_path_reaches_verified_via_scrapex_verify_not_model_narration(monkeypatch):
     navigator = _FakeNavigator()
@@ -829,4 +1021,3 @@ def test_an_observation_with_no_scroll_signal_is_not_assumed_to_continue():
     )
 
     assert "page_continues" not in summary
-

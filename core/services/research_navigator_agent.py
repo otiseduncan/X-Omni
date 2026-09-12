@@ -25,6 +25,7 @@ This loop never recomputes browser semantics itself; it only checks the
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -66,6 +67,10 @@ _NAV_ACTIONS = ("observe", "click", "fill", "press", "back", "open", "scroll", "
 # vehicle. Capping the list itself keeps the fed-back JSON always complete.
 MAX_ELEMENTS_FOR_MODEL = 120
 _TOOL_RESULT_CHAR_BACKSTOP = 24_000
+_INITIAL_OBSERVE_ATTEMPTS = 5
+_INITIAL_OBSERVE_DELAY_SECONDS = 0.45
+_FAILED_ACTION_OBSERVE_ATTEMPTS = 4
+_FAILED_ACTION_OBSERVE_DELAY_SECONDS = 0.35
 
 # --- Transcript budget ----------------------------------------------------
 #
@@ -209,6 +214,10 @@ def _system_prompt(target: dict[str, Any], topic: str) -> str:
         "Your final claim is independently checked against the real page. After extract, read the "
         "verification feedback; if it is rejected, correct course instead of declaring success. "
         "If a tool call returns an error, adapt to the observed state rather than repeating it. "
+        "On ALLDATA's vehicle picker, prefer its full-vehicle search box (for example, "
+        "'Search by Year, Make, Model, Engine, or VIN') when that box is visible. Fill it "
+        "with the exact requested year, make, and model and let ALLDATA resolve its own "
+        "make taxonomy; do not invent or hardcode make aliases to drive separate dropdowns. "
         "If the exact vehicle/topic cannot be found after reasonable exploration, call 'done' "
         "and say so plainly instead of guessing."
     )
@@ -384,6 +393,83 @@ def _observation_fingerprint(summary: dict[str, Any]) -> str:
     )
     return json.dumps(
         [summary.get("url"), summary.get("title"), listed], default=str, sort_keys=True
+    )
+
+
+def _observation_ready(summary: dict[str, Any]) -> bool:
+    """Whether ScrapeX has exposed enough rendered state for a real action.
+
+    A Navigator task can be created while its provider page is still settling.
+    The live ALLDATA race returned only the title ``ALLDATA`` with no text or
+    elements; sending that to the model produced invented refs until the turn
+    budget expired. A content page may legitimately have no controls, so page
+    text or a breadcrumb also establishes readiness.
+    """
+
+    elements = summary.get("elements")
+    return bool(
+        (isinstance(elements, list) and elements)
+        or str(summary.get("page_text") or "").strip()
+        or summary.get("breadcrumb")
+    )
+
+
+async def _observe_until_ready(
+    settings: Any,
+    task_id: str,
+    *,
+    attempts: int,
+    delay_seconds: float,
+    previous_fingerprint: Optional[str] = None,
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """Return the newest usable observation after bounded page-settle polling."""
+
+    latest_result: dict[str, Any] = {}
+    latest_summary: dict[str, Any] = {}
+    for attempt in range(1, max(1, attempts) + 1):
+        latest_result = await scrapex_svc.navigator(
+            settings, {"action": "observe", "task_id": task_id}
+        )
+        if not latest_result.get("success"):
+            return latest_result, _observation_summary(latest_result), attempt
+        latest_summary = _observation_summary(latest_result)
+        ready = _observation_ready(latest_summary)
+        changed = (
+            previous_fingerprint is None
+            or _observation_fingerprint(latest_summary) != previous_fingerprint
+        )
+        if ready and changed:
+            return latest_result, latest_summary, attempt
+        if attempt < max(1, attempts):
+            await asyncio.sleep(max(0.0, delay_seconds))
+    return latest_result, latest_summary, max(1, attempts)
+
+
+def _navigator_failure_message(result: dict[str, Any], action: str) -> str:
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    message = str(error.get("message") or f"navigator {action} failed: {result.get('status')}")
+    detail = result.get("detail")
+    if detail not in (None, ""):
+        try:
+            detail_text = json.dumps(detail, default=str, sort_keys=True)
+        except (TypeError, ValueError):
+            detail_text = str(detail)
+        if detail_text and detail_text not in message:
+            message = f"{message} Detail: {detail_text}"
+    return message
+
+
+def _can_refresh_after_failure(result: dict[str, Any]) -> bool:
+    """True only when ScrapeX definitively rejected the requested action."""
+
+    return bool(
+        result.get("success") is False
+        and result.get("executed") is False
+        and result.get("may_have_executed") is not True
+        and (
+            result.get("http_status") in {409, 422}
+            or result.get("status") in {"conflict", "invalid_request"}
+        )
     )
 
 
@@ -612,8 +698,15 @@ async def run_navigator_search(
         }
     task_id = str(created["data"]["id"])
 
-    initial_observation = await scrapex_svc.navigator(
-        settings, {"action": "observe", "task_id": task_id}
+    (
+        initial_observation,
+        initial_summary,
+        initial_observe_attempts,
+    ) = await _observe_until_ready(
+        settings,
+        task_id,
+        attempts=_INITIAL_OBSERVE_ATTEMPTS,
+        delay_seconds=_INITIAL_OBSERVE_DELAY_SECONDS,
     )
     if not initial_observation.get("success"):
         if initial_observation.get("status") == "authentication_required":
@@ -643,7 +736,24 @@ async def run_navigator_search(
             ),
         }
 
-    initial_summary = _observation_summary(initial_observation)
+    if not _observation_ready(initial_summary):
+        return {
+            "status": "initial_page_not_ready",
+            "provider": provider,
+            "attempted": True,
+            "searched": False,
+            "verified": False,
+            "captured": False,
+            "task_id": task_id,
+            "initial_observe_attempts": initial_observe_attempts,
+            "reason": (
+                "The Navigator task started, but its provider page did not expose "
+                "any readable text, breadcrumb, or actionable elements before the "
+                "bounded readiness window ended. No browser action was attempted."
+            ),
+            "navigator": initial_observation,
+        }
+
     initial_screenshot = await _task_screenshot(settings, task_id)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": _system_prompt(target, topic)},
@@ -656,7 +766,14 @@ async def run_navigator_search(
             ),
         },
     ]
-    trace: list[dict[str, Any]] = [{"turn": -1, "action": "observe", "result": _observation_summary(initial_observation)}]
+    trace: list[dict[str, Any]] = [
+        {
+            "turn": -1,
+            "action": "observe",
+            "attempts": initial_observe_attempts,
+            "result": initial_summary,
+        }
+    ]
     stopped_reason = "model_finished"
     last_failed_call: Optional[tuple[str, tuple[tuple[str, Any], ...]]] = None
     repeated_failure_count = 0
@@ -716,6 +833,7 @@ async def run_navigator_search(
         turn_hit_repeat_limit = False
         latest_visual_summary: Optional[dict[str, Any]] = None
         latest_action_args: Optional[tuple[str, dict[str, Any]]] = None
+        latest_visual_is_failure_refresh = False
         for call_index, (call, wire_call) in enumerate(zip(calls, wire_calls)):
             try:
                 args = json.loads(call.get("arguments") or "{}")
@@ -811,9 +929,38 @@ async def run_navigator_search(
                         )
                 else:
                     result = {
-                        "error": (navigator_result.get("error") or {}).get("message")
-                        or f"navigator {action} failed: {navigator_result.get('status')}"
+                        "error": _navigator_failure_message(navigator_result, action)
                     }
+                    # A 409/422 is a definitive rejection: the requested
+                    # action did not execute. The page can still have changed
+                    # while ALLDATA was settling, which makes every ref from
+                    # the prior observation stale. Re-observe and show that
+                    # fresh state instead of letting one rejection consume
+                    # the remaining model turns. Indeterminate failures never
+                    # enter this path.
+                    if _can_refresh_after_failure(navigator_result):
+                        (
+                            refreshed,
+                            refreshed_summary,
+                            refresh_attempts,
+                        ) = await _observe_until_ready(
+                            settings,
+                            task_id,
+                            attempts=_FAILED_ACTION_OBSERVE_ATTEMPTS,
+                            delay_seconds=_FAILED_ACTION_OBSERVE_DELAY_SECONDS,
+                            previous_fingerprint=previous_fingerprint,
+                        )
+                        if refreshed.get("success") and _observation_ready(
+                            refreshed_summary
+                        ):
+                            latest_visual_summary = refreshed_summary
+                            latest_action_args = (
+                                f"observe after rejected {action}",
+                                {"attempts": refresh_attempts},
+                            )
+                            latest_visual_is_failure_refresh = True
+                            result["fresh_observation_supplied"] = True
+                            result["refresh_attempts"] = refresh_attempts
 
             call_error = (result or {}).get("error") if isinstance(result, dict) else None
             call_signature = (action, tuple(sorted((k, v) for k, v in args.items() if k != "action")))
@@ -860,8 +1007,16 @@ async def run_navigator_search(
             unchanged = fingerprint == previous_fingerprint
             previous_fingerprint = fingerprint
             heading = (
-                "Current rendered browser state after the executed action. "
-                "Reason from this new state and choose the next action yourself."
+                (
+                    "The requested browser action was rejected and did not execute. "
+                    "This is a fresh observation of the current rendered page. Use only "
+                    "refs from this state and choose the next action yourself."
+                )
+                if latest_visual_is_failure_refresh
+                else (
+                    "Current rendered browser state after the executed action. "
+                    "Reason from this new state and choose the next action yourself."
+                )
             )
             if unchanged:
                 # Stated as an observed fact, not a hint about what to click.
