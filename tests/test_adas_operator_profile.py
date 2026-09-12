@@ -144,7 +144,8 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
     # Length as well as names: the set comparison above would not notice the
     # same tool being advertised to the model twice.
     assert len(adas_catalog) == len(EXPECTED_ADAS_TOOLS)
-    assert len(full_catalog) == len(full_names) == 59
+    # 60 since 2026-09-12: adas_target_placement.
+    assert len(full_catalog) == len(full_names) == 60
     assert NON_ADAS_NORMAL_TOOLS <= full_names
     assert META_WRAPPED_CIQ_TOOLS <= full_names
     assert PERMANENT <= full_names
@@ -348,7 +349,9 @@ def test_normal_prompt_is_concise_and_free_of_capability_micro_routing() -> None
     prompt = system_prompt(_omni_router())
     folded = prompt.casefold()
 
-    assert len(prompt) < 5_000
+    # Raised 2026-09-12 with the setup-measurement rule; see the budget note in
+    # test_prompt_tool_budget.py.
+    assert len(prompt) < 5_600
     assert "## right now" not in folded
     for tool in PERMANENT_TOOLS:
         assert f"`{tool}`" in prompt
@@ -506,8 +509,10 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     )
 
     # Measured 2026-09-11 with the voice-dictation sentence: 4,831 chars, ~1,381 estimator tokens.
-    assert metrics["base_system"]["chars"] < 5_000
-    assert metrics["base_system"]["tokens"] < 1_430
+    # Raised 2026-09-12 with the setup-measurement rule; see the budget note in
+    # test_prompt_tool_budget.py.
+    assert metrics["base_system"]["chars"] < 5_600
+    assert metrics["base_system"]["tokens"] < 1_620
     assert metrics["active_working_context"]["chars"] > 0
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
@@ -521,7 +526,12 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     assert metrics["total_input_used_tokens"] < 4_900
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
     # The no-tool review now reserves room for the background-work line.
-    assert metrics["remaining_normal_turn_tokens"] > 24_500
+    # 24,500 -> 24,400 on 2026-09-12. The setup-measurement rule costs ~190
+    # tokens and the prompt was trimmed twice to absorb it; this lands at
+    # 24,497, three short. The guard's substance is that a normal turn keeps
+    # roughly 24.5k of headroom, which still holds -- trimming a safety rule
+    # further to recover three tokens would be the wrong trade.
+    assert metrics["remaining_normal_turn_tokens"] > 24_400
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

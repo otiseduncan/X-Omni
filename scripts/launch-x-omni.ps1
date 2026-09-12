@@ -69,7 +69,17 @@ function Get-SourceRevision {
 }
 
 function Assert-NoMergeConflicts {
-    $unmerged = @(& git -C $root diff --name-only --diff-filter=U 2>$null)
+    # $ErrorActionPreference is Stop for this script, and under that setting a
+    # native command writing anything to stderr raises NativeCommandError --
+    # even when the text is only a warning and even with 2>$null. On
+    # 2026-09-12 git's routine "CRLF will be replaced by LF" notice on a
+    # working-copy file therefore aborted the launch with that warning shown
+    # as the failure. Only git's exit code decides whether this check
+    # succeeded, so stderr is made non-terminating for the call itself.
+    $unmerged = @(& {
+        $ErrorActionPreference = 'Continue'
+        & git -C $root diff --name-only --diff-filter=U 2>$null
+    })
     if ($LASTEXITCODE -ne 0) {
         throw 'X Omni could not inspect the Git working tree for unresolved merges.'
     }

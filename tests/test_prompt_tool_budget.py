@@ -108,12 +108,21 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # added about 1,000 chars on 2026-09-11.
     assert metrics["advertised_tools"]["catalog_tokens"] < 2_650
     assert metrics["advertised_tools"]["catalog_chars"] < 9_200
-    # Static system prompt, measured with the voice-dictation sentence: 4,831 chars, ~1,381 estimator tokens.
-    assert metrics["base_system"]["chars"] < 5_000
-    assert metrics["base_system"]["tokens"] < 1_430
+    # Static system prompt, measured with the voice-dictation sentence: 4,831
+    # chars, ~1,381 estimator tokens. Raised 2026-09-12 by 637 chars for the
+    # setup-measurement rule: X had answered a target placement question from
+    # memory, reading a clear-zone diagram legend as placement data and giving
+    # 16.4 ft where the procedure says 9.84 ft. That rule has to sit in the
+    # static prompt, because its job is to stop an answer that never reaches a
+    # tool. ~190 estimator tokens against a 32k window, and the turn headroom
+    # asserted below still holds.
+    assert metrics["base_system"]["chars"] < 5_600
+    assert metrics["base_system"]["tokens"] < 1_620
     # Measured 2026-09-11 with the sweep contract and phase enums: 4,003
     # estimator tokens total (exact: 992 system + ~2,481 permanent tools).
-    assert metrics["total_input_used_tokens"] < 4_200
+    # 2026-09-12: the setup-measurement rule above carries this to ~4,225. The
+    # turn headroom below is the figure that actually matters and is unchanged.
+    assert metrics["total_input_used_tokens"] < 4_400
     assert metrics["remaining_normal_turn_tokens"] > 26_800
 
 

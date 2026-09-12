@@ -34,6 +34,7 @@ from .models.router import ModelRouter, WorkerSwapError
 from .services import adas_map_sweep as adas_map_sweep_svc
 from .services import attachments as attachments_svc
 from .services import adas_si as adas_si_svc
+from .services import target_placement as target_placement_svc
 from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
 from .services import camera as camera_svc
@@ -295,6 +296,7 @@ def build_app(settings: Settings) -> FastAPI:
     registry.register("adas_si_search", lambda a: adas.model_search(a))
     registry.register("adas_si_open", lambda a: adas.open_document(a))
     registry.register("adas_si_inventory", lambda a: adas.inventory_read(a))
+    registry.register("adas_target_placement", target_placement_svc.solve)
     registry.register("adas_si_records", lambda a: adas.record_list(a))
     registry.register("adas_si_file_write", lambda a: adas.file_write(a))
     registry.register("adas_si_record_write", lambda a: adas.record_write(a))

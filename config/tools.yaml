@@ -240,6 +240,15 @@ tools:
       For new documents or this morning's additions, use its arrival-time filters;
       old ADAS Map sweeps and vehicle search results cannot prove recent additions.
 
+  adas_target_placement:
+    tier: read_only
+    description: >-
+      Solve the string-and-arc target placement construction from dimensions
+      already read out of a specific procedure. Pure arithmetic on caller
+      supplied numbers; it holds no dimensions of its own and refuses to run
+      without the document it read them from. Use it instead of measuring out
+      arcs by hand, never instead of the procedure.
+
   adas_si_open:
     tier: read_only
     description: "Display an ADAS SI document (the real PDF) inline in chat."

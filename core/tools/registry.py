@@ -2170,6 +2170,39 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "required": [],
         },
     },
+    "adas_target_placement": {
+        "description": (
+            "Solve the target placement construction after reading the dimensions "
+            "out of the vehicle's own procedure. It is arithmetic on numbers you "
+            "supply and holds no dimensions of its own, so read the procedure "
+            "first with adas_si_search/adas_si_open, then pass what it states. "
+            "method two_arc takes the two centreline reference marks and the arc "
+            "length struck from each, and returns how far forward to mark the "
+            "centre point and how far to square off each side. method polar takes "
+            "a sensor distance and angle, and needs angle_from because the two "
+            "conventions differ by ninety degrees. source_document is required: a "
+            "placement answer with no cited procedure behind it is not usable, and "
+            "diagram legends for metal-object exclusion zones are not placement "
+            "dimensions. Always report the procedure's own confirmation dimension "
+            "alongside the result."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "method": {"type": "string", "enum": ["two_arc", "polar"]},
+                "near_point_mm": {"type": "number", "description": "two_arc: nearer centreline mark, from the vehicle's front centre point."},
+                "far_point_mm": {"type": "number", "description": "two_arc: further centreline mark, from the same point."},
+                "arc_mm": {"type": "number", "description": "two_arc: string/arc length struck from each mark."},
+                "distance_mm": {"type": "number", "description": "polar: reflector distance from the sensor."},
+                "angle_degrees": {"type": "number", "description": "polar: angle the procedure specifies."},
+                "angle_from": {"type": "string", "enum": ["centreline", "perpendicular"], "description": "polar: which axis the angle opens from, per the procedure's illustration. Never guess."},
+                "source_document": {"type": "string", "minLength": 1, "maxLength": 400, "description": "Required. The procedure these dimensions were read from."},
+                "source_page": {"type": "integer", "minimum": 1, "maximum": 5000},
+            },
+            "required": ["method", "source_document"],
+        },
+    },
     "adas_si_open": {
         "description": (
             "Display an actual ADAS SI PDF inline, optionally at a known page. Supply "
