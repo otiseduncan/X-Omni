@@ -974,7 +974,12 @@ def test_a_cut_off_procedure_page_says_so_and_says_to_scroll():
     assert "CUT SHORT" in note
     assert "31450" in note
     assert "not at the bottom" in note
-    assert "scroll to the bottom" in note.casefold()
+    # It must send the model to read, not to chase the end of the document.
+    # The live Palisade article grew from 15,676px to 18,116px while being
+    # scrolled, so "scroll to the bottom" spent an entire 40-turn budget and
+    # extracted nothing.
+    assert "extract" in note.casefold()
+    assert "do not try to reach the bottom" in note.casefold()
     assert summary["page_text_truncated"] is True
 
 
@@ -1021,3 +1026,72 @@ def test_an_observation_with_no_scroll_signal_is_not_assumed_to_continue():
     )
 
     assert "page_continues" not in summary
+
+
+@pytest.mark.asyncio
+async def test_scrolling_without_reading_is_called_out(monkeypatch):
+    """A working scroll on a lazily-loaded page is its own trap.
+
+    Once scrolling actually moved ALLDATA's container, the model scrolled 40
+    times in a row and never extracted, because the page loads more as you go
+    and its bottom keeps receding. Scrolling is for reading; a run of them
+    with nothing read has to be said out loud.
+    """
+    navigator = _FakeNavigator(bulky=True)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([
+        [("scroll", {"delta_y": 1600})],
+        [("scroll", {"delta_y": 1600})],
+        [("scroll", {"delta_y": 1600})],
+        [("scroll", {"delta_y": 1600})],
+        None,
+    ])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai Truck", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    second = json.dumps(client.messages_seen[1], default=str)
+    last = json.dumps(client.messages_seen[-1], default=str)
+    assert "times in a row" not in second
+    assert "times in a row" in last
+    assert "call extract NOW" in last
+
+
+@pytest.mark.asyncio
+async def test_reading_between_scrolls_resets_the_count(monkeypatch):
+    navigator = _FakeNavigator(bulky=True)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([
+        [("scroll", {"delta_y": 1600})],
+        [("scroll", {"delta_y": 1600})],
+        [("scroll", {"delta_y": 1600})],
+        [("click", {"ref": "e1"})],
+        [("scroll", {"delta_y": 1600})],
+        None,
+    ])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai Truck", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    # The click breaks the run, so the scroll after it is not turn four of a drift.
+    last = json.dumps(client.messages_seen[-1], default=str)
+    assert "times in a row" not in last
+

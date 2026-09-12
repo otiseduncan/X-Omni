@@ -116,6 +116,8 @@ _IMAGE_TOKEN_ESTIMATE = 1_200
 # screenshots.
 _TRANSCRIPT_TOKEN_BUDGET = 22_000
 _DIGEST_CHAR_CAP = 260
+# Three in a row is reading; more than that is drifting.
+_SCROLL_NUDGE_AFTER = 3
 _TRUNCATION_NOTICE = (
     "\n\n[This observation was cut to fit the model's context. What is shown is "
     "complete up to the cut; if what you need is missing, narrow the page with a "
@@ -324,9 +326,12 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
         if more_below:
             parts.append("The viewport is not at the bottom of the page.")
         parts.append(
-            "Content you are looking for may be further down. OEM procedures "
-            "put specifications, target dimensions and distances near the END, "
-            "so scroll to the bottom before concluding this page lacks them."
+            "Content you are looking for may be further down -- OEM procedures "
+            "put specifications, target dimensions and distances near the end. "
+            "Scroll to bring more into view, and call extract the moment what "
+            "you need is on screen. Do NOT try to reach the bottom: this page "
+            "loads more as you scroll, so its end moves and scrolling alone "
+            "never finishes."
         )
         summary["page_continues"] = " ".join(parts)
     return summary
@@ -794,6 +799,12 @@ async def run_navigator_search(
     previous_fingerprint = _observation_fingerprint(initial_summary)
     action_ordinal = 0
     context_degraded = False
+    # A working scroll on a lazily-loaded procedure is its own trap: the live
+    # Palisade article grew from 15,676px to 18,116px while being scrolled, so
+    # "keep going until the bottom" spent all 40 turns and never extracted.
+    # Reading is what scrolling is for; this counts how long it has been since
+    # any reading happened.
+    consecutive_scrolls = 0
 
     for turn in range(max_turns):
         # Bound the transcript before every model call, not after the worker
@@ -876,6 +887,7 @@ async def run_navigator_search(
                     dispatch_args["milliseconds"] = args.get("milliseconds")
                 dispatched = True
                 action_ordinal += 1
+                consecutive_scrolls = consecutive_scrolls + 1 if action == "scroll" else 0
                 navigator_result = await scrapex_svc.navigator(settings, dispatch_args)
                 if navigator_result.get("success"):
                     result = _observation_summary(navigator_result)
@@ -1018,6 +1030,15 @@ async def run_navigator_search(
                     "Reason from this new state and choose the next action yourself."
                 )
             )
+            if consecutive_scrolls >= _SCROLL_NUDGE_AFTER:
+                heading += (
+                    f" You have now scrolled {consecutive_scrolls} times in a row "
+                    "without extracting anything. Scrolling is for reading, and "
+                    "this page keeps loading more, so it has no end to reach. If "
+                    "the procedure content you were sent for is on screen, call "
+                    "extract NOW. If this page is the wrong one, go back and "
+                    "choose a different branch."
+                )
             if unchanged:
                 # Stated as an observed fact, not a hint about what to click.
                 # Three identical scrolls in a row on the live vehicle picker
