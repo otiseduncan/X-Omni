@@ -35,6 +35,23 @@ from ..services import weather as weather_svc
 
 log = logging.getLogger("xomni.routes")
 
+# A bare "transcribe this" prompt makes the audio model spell shop jargon as
+# the nearest common English: "a Das map" and "of dash maps" for ADAS Map,
+# "ROS" for ROs. Naming the vocabulary fixed all three in an A/B against this
+# worker on 2026-09-12 (3/3 wrong before, 3/3 right after). Unlike Chrome's
+# recognizer, which has no vocabulary API at all, this one can simply be told.
+_TRANSCRIPTION_PROMPT = (
+    "Transcribe this audio exactly. Reply with only the transcription text "
+    "and nothing else.\n"
+    "This is an auto collision and ADAS calibration shop. Expect this "
+    "vocabulary, spelled this way: ADAS, ADAS Map, ADAS SI, RO, ROs (repair "
+    "orders), Calibration IQ, ScrapeX, phase 1 through phase 10, VIN, "
+    "calibration, windshield, radar, sweep, acquire, attach, active board.\n"
+    "'ROs' is spoken 'ARE-ohs' - never transcribe it as 'arrows', 'rose' or "
+    "'roof'. 'ADAS' rhymes with 'add-us' - never 'a dash', 'a bath', 'a Das' "
+    "or 'ass'. 'cars' is never 'carbs'."
+)
+
 MAX_EXTERIOR_CAMERA_CONFIG_BYTES = 16 * 1024
 _SAFE_CAMERA_SNAPSHOT_FILENAME_RE = re.compile(r"^\d{9,11}-(?:interval|motion)(?:-\d+)?\.jpg$")
 _SAFE_CAMERA_CLIP_FILENAME_RE = re.compile(r"^motion-\d+\.mp4$")
@@ -1424,9 +1441,7 @@ def create_router(
         messages = [{
             "role": "user",
             "content": [
-                {"type": "text",
-                 "text": "Transcribe this audio exactly. Reply with only the "
-                         "transcription text and nothing else."},
+                {"type": "text", "text": _TRANSCRIPTION_PROMPT},
                 {"type": "input_audio",
                  "input_audio": {"data": encoded, "format": fmt}},
             ],

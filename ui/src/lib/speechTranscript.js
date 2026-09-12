@@ -1,3 +1,8 @@
+import {
+  correctDomainVocabulary,
+  domainTermScore,
+} from "./speechDomainCorrections.js";
+
 function cleanText(value) {
   return String(value || "")
     .trim()
@@ -15,8 +20,32 @@ function isTokenPrefix(candidate, full) {
   );
 }
 
+/**
+ * Chrome ranks its alternatives by generic-English confidence, which is the
+ * wrong yardstick here: "attach them to the arrows" beats "attach them to the
+ * ROs" on that measure every time. When a lower-ranked alternative spells more
+ * shop terms, prefer it. Ties keep Chrome's own order, so this only ever moves
+ * off alternative 0 on positive evidence.
+ */
 function transcriptFromResult(result) {
-  return cleanText(result?.[0]?.transcript);
+  const alternatives = [];
+  const count = Math.min(Number(result?.length) || 0, 5);
+  for (let index = 0; index < count; index += 1) {
+    const text = cleanText(result?.[index]?.transcript);
+    if (text) alternatives.push({ text, index });
+  }
+  if (!alternatives.length) return cleanText(result?.[0]?.transcript);
+
+  let best = alternatives[0];
+  let bestScore = domainTermScore(correctDomainVocabulary(best.text));
+  for (const candidate of alternatives.slice(1)) {
+    const score = domainTermScore(correctDomainVocabulary(candidate.text));
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+  return best.text;
 }
 
 /**

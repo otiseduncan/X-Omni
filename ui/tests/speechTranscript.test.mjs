@@ -127,3 +127,41 @@ test("sequential Web Speech result slots preserve intentional repetition", () =>
     "I I really meant something else"
   );
 });
+
+test("a lower-ranked alternative wins when it spells a shop term the top one missed", () => {
+  // Chrome ranks by generic-English confidence, so "scrape ex" outranks the
+  // product name. Ranking is what catches terms the correction table has no
+  // entry for; where an entry does exist the two alternatives tie and
+  // Chrome's own order is kept, because the correction fixes it downstream.
+  const event = {
+    resultIndex: 0,
+    results: [
+      Object.assign(
+        [
+          { transcript: "run scrape ex on the board" },
+          { transcript: "run ScrapeX on the board" },
+        ],
+        { length: 2, isFinal: true },
+      ),
+    ],
+  };
+  const slots = updateSpeechResultSlots([], event);
+  assert.equal(speechResultSlotsText(slots), "run ScrapeX on the board");
+});
+
+test("alternative 0 is kept when nothing scores higher", () => {
+  const event = {
+    resultIndex: 0,
+    results: [
+      Object.assign(
+        [
+          { transcript: "close the repair order" },
+          { transcript: "close the repair orders" },
+        ],
+        { length: 2, isFinal: true },
+      ),
+    ],
+  };
+  const slots = updateSpeechResultSlots([], event);
+  assert.equal(speechResultSlotsText(slots), "close the repair order");
+});

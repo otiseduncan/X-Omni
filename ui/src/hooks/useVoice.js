@@ -29,13 +29,29 @@ import {
 
 const STT_KEY = "xomni.sttMode";
 const VOICE_KEY = "xomni.voiceName";
-const BROWSER_END_SILENCE_MS = 1800;
+// How long to wait with no new recognizer output before deciding the turn is
+// over. This is NOT a measure of silence in the room -- it counts time since
+// Chrome last emitted a result, and a weak far-field microphone makes Chrome
+// emit results sparsely and hesitate through ordinary pauses. At 1800ms that
+// ended people's turns mid-sentence on the desktop mic and submitted the
+// fragment, which also denied the recognizer the following words it needs to
+// revise earlier ones ("carbs" -> "cars"). Phones, held close to the mouth,
+// rarely tripped it -- which is exactly why the desktop felt so much worse.
+const BROWSER_END_SILENCE_MS = 4500;
+// Once Chrome marks a result final it has committed to that text, so a
+// shorter grace is enough to catch the end of a genuine utterance without
+// making every dictation feel like it hangs afterwards.
+const BROWSER_FINAL_GRACE_MS = 2200;
 const LOCAL_AUDIO_CONSTRAINTS = {
   channelCount: 1,
   echoCancellation: true,
   noiseSuppression: true,
   autoGainControl: true,
 };
+
+/** Android Chrome's continuous mode is the broken one; desktop's is fine. */
+const isAndroidChrome =
+  typeof navigator !== "undefined" && /android/i.test(navigator.userAgent || "");
 
 function readPref(key, fallback) {
   try {
@@ -176,7 +192,7 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
     };
     session.finalize = finalize;
 
-    const requestFinishAfterSilence = () => {
+    const requestFinishAfterSilence = (delayMs = BROWSER_END_SILENCE_MS) => {
       if (!session.active || session.finishing) return;
       if (session.idleTimer != null) window.clearTimeout(session.idleTimer);
       session.idleTimer = window.setTimeout(() => {
@@ -192,7 +208,7 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
         } else {
           finalize();
         }
-      }, BROWSER_END_SILENCE_MS);
+      }, delayMs);
     };
 
     const launch = () => {
@@ -201,10 +217,13 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
       const recognition = new SpeechRecognitionImpl();
       recognitionRef.current = recognition;
       recognition.lang = "en-US";
-      // One mic press is one utterance. Android Chrome does not implement
-      // continuous Web Speech reliably and can emit cumulative final slots;
-      // never enable it or restart automatically from onend.
-      recognition.continuous = false;
+      // Android Chrome does not implement continuous Web Speech reliably and
+      // can emit cumulative final slots, so it stays one-utterance-per-press
+      // there. Desktop Chrome handles continuous correctly, and without it
+      // Chrome ends the turn itself at the first sentence boundary -- no
+      // timer tuning above can rescue a recognizer that has already stopped.
+      // Either way, never restart automatically from onend.
+      recognition.continuous = !isAndroidChrome;
       recognition.interimResults = true;
       recognition.maxAlternatives = 3;
 
@@ -220,7 +239,29 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
           speechResultSlotsText(session.resultSlots)
         );
         cb.current.onInterim?.(session.latestText);
-        requestFinishAfterSilence();
+
+        // An interim result means the speaker is mid-utterance; only a final
+        // one is evidence they finished a thought. Waiting the full window
+        // after interim text is what stops a hesitant recognizer from
+        // cutting someone off between clauses.
+        const results = Array.from(event?.results || []);
+        const newest = results[results.length - 1];
+        requestFinishAfterSilence(
+          newest?.isFinal ? BROWSER_FINAL_GRACE_MS : BROWSER_END_SILENCE_MS
+        );
+      };
+
+      // Chrome's own endpointer is a better judge of "still talking" than any
+      // timer we can run: while it reports speech in progress, nothing should
+      // finalize the turn.
+      recognition.onspeechstart = () => {
+        if (browserSessionRef.current !== session) return;
+        clearTimers();
+      };
+
+      recognition.onspeechend = () => {
+        if (browserSessionRef.current !== session) return;
+        requestFinishAfterSilence(BROWSER_FINAL_GRACE_MS);
       };
 
       recognition.onerror = (event) => {
@@ -319,7 +360,11 @@ export function useVoice({ onTranscript, onSpeakingChange, onError, onInterim })
               `Switched to ${payload.worker} for audio (${payload.swapped.total_swap_s}s).`
             );
           }
-          if (payload.text?.trim()) cb.current.onTranscript?.(payload.text.trim());
+          // The browser path has always run this; the local path never did,
+          // so local-mode transcripts were the only ones reaching the chat
+          // with the shop's vocabulary uncorrected.
+          const localText = correctDomainVocabulary(payload.text || "").trim();
+          if (localText) cb.current.onTranscript?.(localText);
           else cb.current.onError?.("Nothing was transcribed.");
         } catch (err) {
           cb.current.onError?.(String(err.message || err));
