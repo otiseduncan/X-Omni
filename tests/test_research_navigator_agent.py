@@ -747,3 +747,86 @@ async def test_one_oversized_page_is_degraded_rather_than_refused(monkeypatch):
         client.messages_seen[-1], default=str
     )
 
+
+def test_a_cut_off_procedure_page_says_so_and_says_to_scroll():
+    """The last blocker in the 2026-09-12 live Palisade run.
+
+    The ALLDATA article "Front Radar Unit (ADAS) - Repair Procedures" came
+    back as exactly 8000 characters -- ScrapeX's cap -- ending mid-word at
+    "RELATED INFORMATION Parts an". The calibration target distance sits at
+    the bottom of that procedure, so it was absent, and nothing in the
+    observation distinguished "the text ends here" from "the page ends
+    here". The model clicked accordion refs instead of scrolling down.
+    """
+    summary = research_navigator_agent._observation_summary(
+        _navigator_result(
+            "observe",
+            data={
+                "url": "https://my.alldata.com/repair/#/article/62400/component/4037",
+                "title": "Front Radar Unit (ADAS) - Repair Procedures (Distance Sensor)",
+                "page_text": "x" * 8000,
+                "page_text_truncated": True,
+                "page_text_total_chars": 31450,
+                "scroll_position": {
+                    "scroll_y": 0,
+                    "scroll_height": 9400,
+                    "viewport_height": 900,
+                    "at_page_bottom": False,
+                },
+                "elements": [{"ref": "e1", "role": "link", "name": "Parts and Labor"}],
+            },
+        )
+    )
+
+    note = summary["page_continues"]
+    assert "CUT SHORT" in note
+    assert "31450" in note
+    assert "not at the bottom" in note
+    assert "scroll to the bottom" in note.casefold()
+    assert summary["page_text_truncated"] is True
+
+
+def test_a_complete_page_at_the_bottom_gets_no_scroll_note():
+    summary = research_navigator_agent._observation_summary(
+        _navigator_result(
+            "observe",
+            data={
+                "url": "https://my.alldata.com/repair/#/select-vehicle",
+                "title": "ALLDATA Collision - Home",
+                "page_text": "Select Vehicle YMME/VIN Plate",
+                "page_text_truncated": False,
+                "page_text_total_chars": 29,
+                "scroll_position": {
+                    "scroll_y": 0,
+                    "scroll_height": 900,
+                    "viewport_height": 900,
+                    "at_page_bottom": True,
+                },
+                "elements": [{"ref": "e1", "role": "combobox", "name": "Model"}],
+            },
+        )
+    )
+
+    assert "page_continues" not in summary
+
+
+def test_an_observation_with_no_scroll_signal_is_not_assumed_to_continue():
+    """An older ScrapeX, or a failed page.evaluate, sends no scroll_position.
+
+    Absent evidence must not be read as "there is more below" -- that would
+    push the model to scroll every page forever.
+    """
+    summary = research_navigator_agent._observation_summary(
+        _navigator_result(
+            "observe",
+            data={
+                "url": "https://my.alldata.com/repair/",
+                "title": "ALLDATA",
+                "page_text": "short page",
+                "elements": [{"ref": "e1", "role": "link", "name": "Repair"}],
+            },
+        )
+    )
+
+    assert "page_continues" not in summary
+

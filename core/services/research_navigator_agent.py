@@ -89,17 +89,27 @@ _TOOL_RESULT_CHAR_BACKSTOP = 24_000
 # ScrapeX rejects it, so keeping old element maps in context does nothing
 # but offer the model refs it must not use.
 #
-# Measured on that same real JSON, this payload runs ~2.2 characters per
-# token -- opaque refs like "f8e397" tokenize badly -- so the usual ~4
-# chars/token rule of thumb underestimates it by nearly half.
-_CHARS_PER_TOKEN_ESTIMATE = 2.2
+# Two live measurements, not one: the ref-dense vehicle-picker JSON runs
+# ~2.2 characters per token (opaque refs like "f8e397" tokenize badly),
+# while an ALLDATA procedure article -- mostly prose -- runs ~3.4. A single
+# 2.2 calibrated only on the picker over-charged the article by 60%: on
+# 2026-09-12 a 35k-character article page was estimated at 15.9k tokens
+# when the worker actually reported 10.2k, so the backstop below fired and
+# stripped the screenshots from turn 13 onward while 22k of context sat
+# unused -- losing the visual channel exactly where a long procedure needed
+# it. 2.5 sits under both measurements, so it still over-estimates prose
+# while no longer inventing pressure that is not there.
+_CHARS_PER_TOKEN_ESTIMATE = 2.5
 # One annotated JPEG viewport, charged as a flat estimate rather than
 # measured; it is a backstop input, not an accounting record.
 _IMAGE_TOKEN_ESTIMATE = 1_200
-# Leaves room inside 32K for the tool schema, the system prompt, the image,
-# and generation, with headroom for a worker configured smaller than the
-# 32768 in config/workers.json.
-_TRANSCRIPT_TOKEN_BUDGET = 14_000
+# The real ceiling is the worker's 32,768, and one observation plus one
+# image measured 4.1k-10.2k live across 21 turns. At the most pessimistic
+# measured ratio this budget still lands near 27k with the image, system
+# prompt, tool schema and generation counted -- inside the ceiling with
+# margin, and high enough that a long procedure page no longer costs the
+# screenshots.
+_TRANSCRIPT_TOKEN_BUDGET = 22_000
 _DIGEST_CHAR_CAP = 260
 _TRUNCATION_NOTICE = (
     "\n\n[This observation was cut to fit the model's context. What is shown is "
@@ -264,6 +274,15 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
         # This is the semantic content X was previously missing when it had
         # only labels/refs and a screenshot to reason from.
         "page_text": str(data.get("page_text") or ""),
+        # ...and whether that bound actually cut anything, plus where the
+        # viewport sits in the document. A long OEM procedure runs past 8k
+        # and its calibration specifications sit at the bottom, so "the text
+        # ends here" and "the page ends here" have to be distinguishable.
+        # Confirmed live on 2026-09-12: the Palisade front-radar article came
+        # back cut mid-word at exactly 8000 chars and read as complete.
+        "page_text_truncated": data.get("page_text_truncated"),
+        "page_text_total_chars": data.get("page_text_total_chars"),
+        "scroll_position": data.get("scroll_position"),
         "elements": elements,
         "loop_warning": data.get("loop_warning"),
         "backtrack_available": data.get("backtrack_available"),
@@ -272,10 +291,35 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
     if truncated:
         summary["elements_truncated"] = (
             f"Only the first {MAX_ELEMENTS_FOR_MODEL} of "
-            f"{len(data['elements'])} elements are shown. If what you need "
-            "isn't here, narrow the search (e.g. add the trim) rather than "
-            "guessing a ref that isn't in this list."
+            f"{len(data['elements'])} elements are shown. Never guess a ref "
+            "that isn't in this list. If what you need isn't here, scroll to "
+            "bring more of this page into the list, or narrow the page (a "
+            "search, or a more specific menu)."
         )
+
+    # Turn the raw signals into the one sentence that matters. Without this
+    # the model read a procedure cut mid-word at 8000 characters as the whole
+    # procedure, and clicked around the part it could see instead of scrolling
+    # to the specifications at the bottom.
+    position = summary.get("scroll_position") or {}
+    more_below = bool(position) and not position.get("at_page_bottom")
+    if summary.get("page_text_truncated") or more_below:
+        parts = []
+        if summary.get("page_text_truncated"):
+            total = summary.get("page_text_total_chars")
+            parts.append(
+                "The page text above is CUT SHORT"
+                + (f" -- this page holds about {total} characters" if total else "")
+                + " and the rest is not shown here."
+            )
+        if more_below:
+            parts.append("The viewport is not at the bottom of the page.")
+        parts.append(
+            "Content you are looking for may be further down. OEM procedures "
+            "put specifications, target dimensions and distances near the END, "
+            "so scroll to the bottom before concluding this page lacks them."
+        )
+        summary["page_continues"] = " ".join(parts)
     return summary
 
 
