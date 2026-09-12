@@ -60,7 +60,10 @@ VALID_POLICY_TIERS = frozenset({
 
 _CALIBRATION_IQ_CONTEXT_KEY = "__xomni_invocation"
 _SCRAPEX_CONTEXT_KEY = "__xomni_invocation"
-SWEEP_TOOLS = frozenset({"adas_map_sweep", "adas_map_sweep_status"})
+SWEEP_TOOLS = frozenset({
+    "adas_map_sweep", "adas_map_sweep_status",
+    "adas_si_harvest", "adas_si_harvest_status",
+})
 _CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY = "__xomni_work_prep_context"
 _CALIBRATION_IQ_APPROVAL_BINDING_KEY = "__xomni_write_binding"
 _AUTOMOTIVE_KNOWLEDGE_ACTOR_KEY = "__xomni_actor"
@@ -3208,6 +3211,41 @@ TOOL_SCHEMAS["adas_map_sweep"] = {
             },
             "shop": {"type": "string"},
         },
+        "required": [],
+    },
+}
+TOOL_SCHEMAS["adas_si_harvest"] = {
+    "description": (
+        "Start a background ADAS service-information harvest from ALLDATA: for each "
+        "named vehicle, open its ADAS Quick Reference, follow every ADAS component "
+        "to its calibration procedures, and file each one into ADAS SI as a verified "
+        "PDF with provenance. Vehicles are named as they appear in ALLDATA's Recent "
+        "Vehicles list. Returns immediately; started is not complete."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "vehicles": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 4, "maxLength": 80},
+                "minItems": 1,
+                "maxItems": 25,
+                "description": (
+                    "ALLDATA Recent Vehicles labels, for example '2021 Honda Civic' "
+                    "or '2021 Hyundai Truck Palisade'."
+                ),
+            },
+        },
+        "required": ["vehicles"],
+    },
+}
+TOOL_SCHEMAS["adas_si_harvest_status"] = {
+    "description": "Progress or results of the latest background ADAS SI harvest.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"run_id": {"type": "string"}},
         "required": [],
     },
 }

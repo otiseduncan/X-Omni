@@ -32,6 +32,7 @@ from .config import Settings
 from .models.client import ModelClient
 from .models.router import ModelRouter, WorkerSwapError
 from .services import adas_map_sweep as adas_map_sweep_svc
+from .services import adas_si_harvest as adas_si_harvest_svc
 from .services import attachments as attachments_svc
 from .services import adas_si as adas_si_svc
 from .services import target_placement as target_placement_svc
@@ -347,6 +348,10 @@ def build_app(
     registry.register("adas_map_sweep", adas_map_sweep.start)
     registry.register("adas_map_sweep_status", adas_map_sweep.status)
 
+    adas_si_harvest = adas_si_harvest_svc.AdasSiHarvestService(settings, store)
+    registry.register("adas_si_harvest", adas_si_harvest.start)
+    registry.register("adas_si_harvest_status", adas_si_harvest.status)
+
     registry.register("automotive_knowledge_search", automotive_knowledge.search)
     registry.register("automotive_knowledge_read", automotive_knowledge.read)
 
@@ -503,6 +508,7 @@ def build_app(
             try:
                 camera_monitor.stop()
                 await adas_map_sweep.shutdown()
+                await adas_si_harvest.shutdown()
                 monitor_task.cancel()
                 adas_refresh_task.cancel()
                 await asyncio.gather(
