@@ -46,6 +46,9 @@ log = logging.getLogger("xomni.adas_si_harvest")
 NAMESPACE = "adas_si_harvest"
 
 PICKER_URL = "https://my.alldata.com/repair/#/select-vehicle"
+VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")
+# A VIN anywhere inside a repair order payload.
+_VIN_IN_TEXT = re.compile("(?<![A-Z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-Z0-9])")
 QUICK_REFERENCE = "ADAS Quick Reference"
 
 MAX_VEHICLES = 25
@@ -279,6 +282,67 @@ class AdasSiHarvestService:
             return None
         return str(((created.get("data") or {}).get("id")) or "") or None
 
+    # ----------------------------------------------------------- keystrokes
+    async def _type(self, text: str) -> bool:
+        """Send real keypresses to the provider page.
+
+        ALLDATA's vehicle search ignores a value set programmatically: filling
+        the field dispatches one input event and the app never reacts, so the
+        results never appear and its submit control -- which has no accessible
+        name or role, and cannot be addressed by ref -- is the only other way
+        in. Typed character by character, the field behaves exactly as it does
+        for a person and the vehicle resolves on its own.
+        """
+        import httpx
+
+        base = str(getattr(self.settings, "scrapex_base_url", "") or "").rstrip("/")
+        if not base:
+            return False
+        try:
+            async with httpx.AsyncClient(base_url=base, timeout=60, trust_env=False) as client:
+                response = await client.post(
+                    "/api/navigator/providers/alldata/input",
+                    json={"kind": "type", "text": text},
+                )
+                return response.status_code == 200
+        except Exception as exc:  # noqa: BLE001
+            log.warning("keystroke relay unavailable: %s", type(exc).__name__)
+            return False
+
+    async def select_by_vin(self, task_id: str, vin: str) -> dict[str, Any]:
+        """Select the exact vehicle a repair order names, by its VIN.
+
+        A VIN identifies one vehicle including trim and engine, which neither
+        a year/make/model cascade nor ALLDATA's own "<Make> Truck" shelving
+        can do: the board's "2023 Honda Accord Sedan EX w/Continuously
+        Variable Transmissi" resolves to "Accord Sedan L4-1.5L Turbo (L15BE)"
+        without anything being guessed.
+        """
+        vin = _clean(vin).upper()
+        if not VIN_RE.match(vin):
+            return {"selected": False, "reason": f"{vin!r} is not a VIN"}
+        page = await self._open(task_id, PICKER_URL, settle=3.0)
+        boxes = [
+            element for element in (page.get("elements") or [])
+            if element.get("role") == "searchbox"
+        ]
+        if not boxes:
+            return {"selected": False, "reason": "the vehicle search box was not on the picker"}
+        await self._click(task_id, str(boxes[0].get("ref") or ""), settle=1.0)
+        if not await self._type(vin):
+            return {"selected": False, "reason": "could not reach the keystroke relay"}
+        await self.sleep(4.0)
+        page = await self._settle(task_id)
+        if "/vehicle/" not in _clean(page.get("url")):
+            return {"selected": False, "reason": f"ALLDATA did not resolve VIN {vin}"}
+        label = (
+            _clean(page.get("title"))
+            .replace("Vehicle Information - ", "")
+            .replace(" - ALLDATA Collision", "")
+            .strip()
+        )
+        return {"selected": True, "vehicle": label, "vin": vin}
+
     # ----------------------------------------------------------- scope
     async def vehicles_in_phases(self, phases: list[str]) -> list[dict[str, Any]]:
         """The distinct vehicles on the Calibration IQ board for these phases.
@@ -322,13 +386,38 @@ class AdasSiHarvestService:
                     {
                         "label": f"{target['year']} {target['make']} {target['model']}",
                         "target": target,
+                        "vin": "",
                         "repair_orders": [],
                     },
                 )
                 ro = _clean(row.get("RO"))
                 if ro and ro not in entry["repair_orders"]:
                     entry["repair_orders"].append(ro)
+                # The board's row carries no VIN; the repair order itself
+                # does, and one VIN resolves the exact trim and engine that
+                # neither the trimmed label nor a make guess can.
+                if not entry.get("vin"):
+                    entry["vin"] = await self._vin_for(row.get("id"))
         return list(seen.values())
+
+    async def _vin_for(self, repair_order_id: Any) -> str:
+        """The VIN on one repair order, or "" when it carries none."""
+        identifier = _clean(repair_order_id)
+        if not identifier:
+            return ""
+        from . import calibration_iq
+
+        try:
+            detail = await calibration_iq.get_repair_order(
+                self.settings, {"repair_order_id": identifier}
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("RO %s detail unavailable: %s", identifier, type(exc).__name__)
+            return ""
+        import json as _json
+
+        match = _VIN_IN_TEXT.search(_json.dumps(detail, default=str))
+        return match.group(0) if match else ""
 
     # ----------------------------------------------------------- selection
     async def _combobox(self, task_id: str, wanted: str) -> Optional[str]:
@@ -480,9 +569,35 @@ class AdasSiHarvestService:
             found.append({"title": title or name, "url": url, "chars": text_length})
 
     async def documents_for(
-        self, task_id: str, label: str, target: Optional[dict[str, Any]] = None
+        self,
+        task_id: str,
+        label: str,
+        target: Optional[dict[str, Any]] = None,
+        vin: str = "",
     ) -> tuple[str, list[dict[str, Any]]]:
-        """Every ADAS procedure document reachable for one Recent Vehicle."""
+        """Every ADAS procedure document reachable for one vehicle.
+
+        A VIN is preferred wherever the repair order carries one: it names the
+        exact trim and engine, and needs neither the Recent Vehicles list nor
+        a guess at which shelf ALLDATA keeps the model on.
+        """
+        if _clean(vin):
+            chosen = await self.select_by_vin(task_id, vin)
+            if chosen.get("selected"):
+                page = await self._settle(task_id)
+                vehicle = str(chosen.get("vehicle") or label)
+                quick_ref = find_link(page, QUICK_REFERENCE)
+                if not quick_ref:
+                    return vehicle, []
+                table = await self._click(task_id, quick_ref, settle=3.0)
+                table_url = _clean(table.get("url"))
+                found: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                for _ref, component in page_links(table, stop_at_footer=True):
+                    await self.discover(task_id, table_url, component, 1, found, seen)
+                return vehicle, found
+            log.info("VIN selection failed (%s); falling back", chosen.get("reason"))
+
         page = await self._open(task_id, PICKER_URL, settle=3.0)
         tokens = [token for token in _clean(label).casefold().split() if token]
         ref = ""
@@ -571,10 +686,11 @@ class AdasSiHarvestService:
                     )
                     continue
                 vehicle, documents = await self.documents_for(
-                    task_id, label, request["target"]
+                    task_id, label, request["target"], str(request.get("vin") or "")
                 )
                 entry: dict[str, Any] = {
                     "requested": label,
+                    "vin": request.get("vin") or None,
                     "repair_orders": request.get("repair_orders") or [],
                     "vehicle": vehicle or label,
                     "found": len(documents),
@@ -674,7 +790,12 @@ class AdasSiHarvestService:
                 "started_at": self.clock().isoformat(),
             }
             requests = [
-                {"label": label, "target": vehicle_target(label), "repair_orders": []}
+                {
+                    "label": label,
+                    "target": vehicle_target(label),
+                    "vin": "",
+                    "repair_orders": [],
+                }
                 for label in labels
             ]
             self._tasks[run_id] = asyncio.create_task(self._run(run_id, requests))
