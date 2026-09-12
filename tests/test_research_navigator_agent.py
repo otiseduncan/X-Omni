@@ -1095,3 +1095,37 @@ async def test_reading_between_scrolls_resets_the_count(monkeypatch):
     last = json.dumps(client.messages_seen[-1], default=str)
     assert "times in a row" not in last
 
+
+@pytest.mark.asyncio
+async def test_the_same_rejected_extract_is_not_submitted_forever(monkeypatch):
+    """40 identical extracts, 40 identical refusals, one exhausted budget.
+
+    An extract that verification rejects still *executes*, so it carried no
+    error and the repeat guard never saw it. The live run on 2026-09-12
+    submitted the same candidate until the turn budget ran out.
+    """
+    navigator = _FakeNavigator()
+    navigator.verified_after_extract = False
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    same = ("extract", {"text": "2.5 m (8.2 ft) from the front radar"})
+    client = _ScriptedClient([[same], [same], [same], [same], [same], [same]])
+
+    result = await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai Truck", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    assert result["agent_stopped_reason"] == "repeated_tool_error"
+    assert navigator.extract_count <= 3, navigator.extract_count
+    # The verification feedback must survive being counted as a repeat.
+    context = json.dumps(client.messages_seen[-1], default=str)
+    assert "verification_after_extract" in context
+    assert "REPEATED MISTAKE" in context
+

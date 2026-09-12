@@ -975,6 +975,25 @@ async def run_navigator_search(
                             result["refresh_attempts"] = refresh_attempts
 
             call_error = (result or {}).get("error") if isinstance(result, dict) else None
+            # A rejected extract is a repeat worth catching. The action itself
+            # succeeds -- only ScrapeX's verification refuses it -- so without
+            # this the repeat guard never sees it: the live run on 2026-09-12
+            # submitted the SAME extract 40 times, was refused 40 times, and
+            # burned the whole budget. Counting it here routes it through the
+            # same escalation as any other repeated mistake, while leaving the
+            # verification feedback in the result untouched.
+            if (
+                not call_error
+                and action == "extract"
+                and dispatched
+                and isinstance(result, dict)
+                and result.get("verification_after_extract") is not None
+                and not candidate_verified
+            ):
+                call_error = str(
+                    (result.get("verification_after_extract") or {}).get("reason")
+                    or "This candidate was rejected by verification."
+                )
             call_signature = (action, tuple(sorted((k, v) for k, v in args.items() if k != "action")))
             if call_error and call_signature == last_failed_call:
                 repeated_failure_count += 1
