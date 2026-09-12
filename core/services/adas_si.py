@@ -277,6 +277,51 @@ def describe_document(source_root: Path, path: Path) -> dict[str, Any]:
     return _finish()
 
 
+# Group folders that do not spell their makes out. Shared with
+# adas_identity_guard so the gate and the ranking agree on what a sheet covers;
+# add a group here rather than teaching either side its own list.
+REFERENCE_MAKE_ALIASES: dict[str, tuple[str, ...]] = {
+    "general motors": ("chevrolet", "chevy", "gmc", "buick", "cadillac"),
+    "stellantis": ("chrysler", "dodge", "jeep", "ram"),
+    "fca": ("chrysler", "dodge", "jeep", "ram"),
+}
+
+
+def reference_group_of(doc: dict) -> str:
+    """The make-group folder a reference sheet is filed under, or ''."""
+
+    if str(doc.get("storage_class") or "").strip().casefold() != "reference":
+        return ""
+    segments = [part for part in re.split(r"[\\/]+", str(doc.get("relative_path") or "")) if part]
+    if len(segments) < 2:
+        return ""
+    group = segments[-2].strip().casefold()
+    return "" if group in {"", "general", "reference"} else group
+
+
+def _reference_make_bonus(doc: dict, folded_query: str) -> int:
+    """Identity credit for a manufacturer reference sheet the query's make.
+
+    Reference sheets are filed Reference/<kind>/<make group>/, and the group
+    folder is the only make identity they have. Worth the same as a parsed
+    make so the sheet competes with vehicle-specific manuals instead of
+    falling off the end of the candidate list.
+    """
+
+    group = reference_group_of(doc)
+    if not group:
+        return 0
+    if group in folded_query:
+        return 11
+    # "Honda Acura" earns its credit from a query naming only Honda, and
+    # "General Motors" from one naming Chevrolet.
+    candidates = [word for word in re.split(r"\s+", group) if len(word) > 2]
+    candidates.extend(REFERENCE_MAKE_ALIASES.get(group, ()))
+    return 11 if any(
+        re.search(rf"\b{re.escape(word)}\b", folded_query) for word in candidates
+    ) else 0
+
+
 class SourceInventory:
     """Enumerates the PDF library. Caches the walk, unlike XV12 which
     re-walked the whole tree on every single call."""
@@ -349,11 +394,25 @@ class SourceInventory:
                 score += 15
             if title_folded and title_folded in folded_query:
                 score += 12
+            # A manufacturer reference sheet carries no parsed year/make/model,
+            # so it only ever earns title-token points -- two or three, against
+            # the fifteen a vehicle-specific manual collects. Naming a make
+            # therefore buried every bumper requirement sheet below the
+            # twenty-five candidate cut: "bumper requirements" found eight,
+            # "Honda bumper requirements" found none. The make it covers is in
+            # the group folder it is filed under, and matching that is the same
+            # identity evidence a parsed make would be.
+            score += _reference_make_bonus(doc, folded_query)
             if score > 0:
                 scored.append({"score": score, "path": doc["_path"],
                                "descriptor": {k: v for k, v in doc.items() if k != "_path"}})
         scored.sort(key=lambda i: (-i["score"], i["descriptor"]["title"].casefold()))
-        return scored[: max(1, min(limit, 25))]
+        # The identity guard asks for 40 candidates precisely so its vehicle
+        # filter has something left after discarding other vehicles' manuals;
+        # a hard cap of 25 silently overrode that and starved the filter on
+        # any make with a deep library. The cap still exists, just above what
+        # the guard actually requests.
+        return scored[: max(1, min(limit, 60))]
 
     def snapshot(self) -> dict[str, Any]:
         if not self.available():

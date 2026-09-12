@@ -210,10 +210,86 @@ def descriptor_model_matches(descriptor: dict[str, Any], requested_model: Option
     return False
 
 
+# Manufacturer reference sheets are filed under Reference/<kind>/<make group>/
+# and cover a whole family across every model year, so they carry no parsed
+# year, model or make of their own. Most group folders name their makes
+# literally ("Honda Acura", "Toyota Lexus"); the ones that do not are listed in
+# adas_si.REFERENCE_MAKE_ALIASES, which the ranking side reads too so the gate
+# and the ranking cannot drift apart. Add a group there, not here.
+def _aliases(adas_mod: Any, group: str) -> tuple[str, ...]:
+    table = getattr(adas_mod, "REFERENCE_MAKE_ALIASES", {}) or {}
+    return tuple(table.get(group, ()))
+
+
+def is_reference_document(descriptor: dict[str, Any]) -> bool:
+    return str(descriptor.get("storage_class") or "").strip().casefold() == "reference"
+
+
+def reference_makes(descriptor: dict[str, Any], adas_mod: Any = None) -> frozenset[str]:
+    """Makes a reference sheet covers, from the group folder it is filed under.
+
+    An empty set means the sheet is not make-specific (the calculators live
+    under a General folder and apply to whatever manual supplies the inputs);
+    those clear the identity gate and are then judged on relevance like
+    anything else.
+    """
+
+    if not is_reference_document(descriptor):
+        return frozenset()
+
+    raw_path = str(descriptor.get("relative_path") or "")
+    segments = [part for part in re.split(r"[\\/]+", raw_path) if part]
+    group = ""
+    # The folder immediately above the file is the group; skip the filename.
+    if len(segments) >= 2:
+        group = segments[-2].strip()
+    if not group or group.casefold() in {"general", "reference"}:
+        return frozenset()
+
+    folded = group.casefold()
+    aliases = _aliases(adas_mod, folded) if adas_mod is not None else ()
+    # "Honda Acura" -> {honda, acura}; "Jaguar Land Rover" keeps the whole
+    # group name too, so a requested two-word make matches as a phrase.
+    words = [word for word in re.split(r"\s+", folded) if word]
+    return frozenset(words) | frozenset(aliases) | {folded}
+
+
+def reference_covers_make(
+    descriptor: dict[str, Any],
+    requested_make: Optional[str],
+    adas_mod: Any = None,
+) -> bool:
+    """Whether a reference sheet applies to the make the user named."""
+
+    if not is_reference_document(descriptor):
+        return False
+    if not requested_make:
+        return True
+    covered = reference_makes(descriptor, adas_mod)
+    if not covered:
+        # Not make-specific; relevance scoring decides whether it belongs.
+        return True
+    wanted = str(requested_make).strip().casefold()
+    if wanted in covered:
+        return True
+    # "land rover" against a {"jaguar", "land", "rover", "jaguar land rover"}
+    # group: every word of the requested make is covered by the group.
+    wanted_words = [word for word in re.split(r"\s+", wanted) if word]
+    return bool(wanted_words) and all(word in covered for word in wanted_words)
+
+
 def descriptor_matches_query(descriptor: dict[str, Any], query: object, adas_mod: Any) -> bool:
     requested_make = explicit_make(query, adas_mod)
     requested_year = explicit_year(query)
     requested_model = explicit_model(query, requested_make, adas_mod)
+
+    # A manufacturer reference sheet is not another vehicle's manual: it is
+    # this make's own rule, written to span years and models. Holding it to
+    # the year and model gates hid every bumper requirement sheet in the
+    # library the moment a vehicle was named -- "bumper requirements" found
+    # eight, "Honda bumper requirements" found none.
+    if is_reference_document(descriptor):
+        return reference_covers_make(descriptor, requested_make, adas_mod)
 
     if requested_make:
         actual_make = descriptor_make(descriptor, adas_mod)

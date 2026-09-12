@@ -69,13 +69,10 @@ function Get-SourceRevision {
 }
 
 function Assert-NoMergeConflicts {
-    # $ErrorActionPreference is Stop for this script, and under that setting a
-    # native command writing anything to stderr raises NativeCommandError --
-    # even when the text is only a warning and even with 2>$null. On
-    # 2026-09-12 git's routine "CRLF will be replaced by LF" notice on a
-    # working-copy file therefore aborted the launch with that warning shown
-    # as the failure. Only git's exit code decides whether this check
-    # succeeded, so stderr is made non-terminating for the call itself.
+    # With ErrorActionPreference Stop a native command writing to stderr
+    # raises NativeCommandError even for a warning and even with 2>$null: on
+    # 2026-09-12 git's routine "CRLF will be replaced by LF" notice aborted
+    # the launch. Only git's exit code decides this check.
     $unmerged = @(& {
         $ErrorActionPreference = 'Continue'
         & git -C $root diff --name-only --diff-filter=U 2>$null
