@@ -147,23 +147,36 @@ def _service(navigator: _FakeNavigator, captures: list[str]) -> harvest.AdasSiHa
     )
 
 
-def test_alldata_files_suvs_under_make_truck():
-    """A Palisade is never a Hyundai; ALLDATA calls it a Hyundai Truck."""
-    assert harvest.vehicle_target("2021 Hyundai Truck Palisade AWD (LX2) V6-3.8L") == {
-        "year": 2021, "make": "Hyundai Truck", "model": "Palisade AWD",
+def test_filing_follows_the_library_not_alldata_taxonomy():
+    """ADAS SI files year/plain-make/short-model; ALLDATA prints neither.
+
+    The library already holds 2020/Honda/Civic, 2026/Honda/CR-V,
+    2025/Kia/Carnival, 2016/Nissan/Rogue. ALLDATA prints "2025 Honda Truck
+    CR-V 2WD L4-1.5L Turbo", and filing that verbatim scatters one vehicle
+    across "Honda Truck/CR-V 2WD" and "Honda/CR-V" -- which is how a document
+    stops being findable.
+    """
+    assert harvest.vehicle_target("2025 Honda Truck CR-V 2WD L4-1.5L Turbo (L15BE)") == {
+        "year": 2025, "make": "Honda", "model": "CR-V",
     }
-    assert harvest.vehicle_target("2021 Honda Civic Sedan L4-2.0L (K20C2)") == {
-        "year": 2021, "make": "Honda", "model": "Civic Sedan",
+    assert harvest.vehicle_target("2021 Hyundai Truck Palisade AWD (LX2) V6-3.8L") == {
+        "year": 2021, "make": "Hyundai", "model": "Palisade",
+    }
+    # ALLDATA's own spelling of the make is not the library's.
+    assert harvest.vehicle_target("2024 Nissan-Datsun Truck Kicks FWD L4-1.6L (HR16DE)") == {
+        "year": 2024, "make": "Nissan", "model": "Kicks",
+    }
+    assert harvest.vehicle_target("2020 Mercedes Benz E 350 4MATIC Sedan (213.084)") == {
+        "year": 2020, "make": "Mercedes-Benz", "model": "E 350",
     }
 
 
 def test_a_single_word_model_does_not_swallow_the_engine_code():
     """"Niro L4-1.6L" is not a model, and ALLDATA will not confirm it.
 
-    A fixed two-word model works for "Civic Sedan" and "CTS Sedan" and fails
-    for every one-word model. In the first ten-vehicle batch the Kia Niro and
-    the Ford Mustang each found seven documents and filed none, both refused
-    with "ALLDATA vehicle selection was not confirmed".
+    In the first ten-vehicle batch the Kia Niro and the Ford Mustang each
+    found seven documents and filed none, both refused with "ALLDATA vehicle
+    selection was not confirmed".
     """
     assert harvest.vehicle_target("2022 Kia Niro L4-1.6L Hybrid") == {
         "year": 2022, "make": "Kia", "model": "Niro",
@@ -171,10 +184,12 @@ def test_a_single_word_model_does_not_swallow_the_engine_code():
     assert harvest.vehicle_target("2025 Ford Mustang L4-2.3L Turbo") == {
         "year": 2025, "make": "Ford", "model": "Mustang",
     }
-    # A drive layout is part of the model, not an engine code.
-    assert harvest.vehicle_target("2024 Nissan-Datsun Truck Kicks FWD L4-1.6L (HR16DE)") == {
-        "year": 2024, "make": "Nissan-Datsun Truck", "model": "Kicks FWD",
-    }
+
+
+def test_two_word_models_survive():
+    """Trimming trim must not trim the model: ES 350 and F-150 are names."""
+    assert harvest.vehicle_target("2019 Lexus ES 350")["model"] == "ES 350"
+    assert harvest.vehicle_target("2019 Ford F-150")["model"] == "F-150"
 
 
 def test_quick_reference_rows_stop_at_related_information():

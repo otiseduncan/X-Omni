@@ -87,9 +87,27 @@ PROCEDURE_WORDS = (
 
 
 # Engine and body codes as ALLDATA prints them: L4-2.0L, V6-3.8L, (K20C2),
-# (LX2), 1.6L. Drive layouts -- FWD, 4WD, AWD, RWD -- are part of the model
-# and must not match.
+# (LX2), 1.6L.
 _ENGINE_OR_CODE = re.compile(r"^\(|^[A-Za-z]\d+-\d|^\d+\.\d+L$")
+# ADAS SI files by year/make/model with the plain make and the short model --
+# 2020/Honda/Civic, 2026/Honda/CR-V, 2025/Kia/Carnival, 2016/Nissan/Rogue --
+# while ALLDATA prints its own taxonomy and trim: "2025 Honda Truck CR-V 2WD
+# L4-1.5L Turbo". Filing that verbatim scatters one vehicle across
+# "Honda Truck/CR-V 2WD" and "Honda/CR-V", which is how a document stops being
+# findable. The library's convention wins.
+_BODY_OR_DRIVE = frozenset({
+    "sedan", "coupe", "hatchback", "wagon", "convertible", "cabriolet",
+    "fwd", "rwd", "awd", "4wd", "2wd", "4matic", "quattro", "hybrid",
+})
+_MAKE_ALIASES = {"nissan-datsun": "Nissan"}
+# Makes ALLDATA prints as two words. Without these "2020 Mercedes Benz E 350"
+# reads as a Mercedes named "Benz E".
+_TWO_WORD_MAKES = {
+    "mercedes benz": "Mercedes-Benz",
+    "land rover": "Land Rover",
+    "alfa romeo": "Alfa Romeo",
+    "aston martin": "Aston Martin",
+}
 
 
 def _now() -> datetime:
@@ -154,12 +172,23 @@ def vehicle_target(label: str) -> dict[str, Any]:
     rest = words[1:] if words[0].isdigit() else words
     if not rest:
         return {"year": year, "make": "", "model": ""}
-    if len(rest) > 1 and rest[1].casefold() == "truck":
-        make = f"{rest[0]} {rest[1]}"
+    # "<Make> Truck" is ALLDATA's shelf, not the make: a Palisade is a
+    # Hyundai. Drop the suffix for filing, and keep the library's spelling of
+    # the make itself.
+    pair = " ".join(rest[:2]).casefold() if len(rest) > 1 else ""
+    if pair in _TWO_WORD_MAKES:
+        make = _TWO_WORD_MAKES[pair]
+        tail = rest[2:]
+    elif len(rest) > 1 and rest[1].casefold() == "truck":
+        make = rest[0]
         tail = rest[2:]
     else:
         make = rest[0]
         tail = rest[1:]
+    make = _MAKE_ALIASES.get(make.casefold(), make)
+    # "<Make> Truck" can also follow a two-word make.
+    if tail and tail[0].casefold() == "truck":
+        tail = tail[1:]
     # The label carries the engine and body code after the model, and taking a
     # fixed two words swallows them whenever the model is a single word:
     # "2022 Kia Niro L4-1.6L Hybrid" became the model "Niro L4-1.6L" and
@@ -167,10 +196,12 @@ def vehicle_target(label: str) -> dict[str, Any]:
     # the first engine or code token instead.
     model: list[str] = []
     for token in tail[:3]:
-        if _ENGINE_OR_CODE.match(token):
+        if _ENGINE_OR_CODE.match(token) or token.casefold() in _BODY_OR_DRIVE:
             break
         model.append(token)
-    return {"year": year, "make": make, "model": " ".join(model[:2])}
+        if len(model) == 2:
+            break
+    return {"year": year, "make": make, "model": " ".join(model)}
 
 
 class AdasSiHarvestService:
