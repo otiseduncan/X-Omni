@@ -132,7 +132,11 @@ async def _refresh_adas_si_forever(adas: adas_si_svc.AdasSI) -> None:
             log.exception("ADAS SI background refresh failed")
 
 
-def build_app(settings: Settings) -> FastAPI:
+def build_app(
+    settings: Settings,
+    *,
+    automatic_adas_filing: bool = False,
+) -> FastAPI:
     settings.audio_tmp.mkdir(parents=True, exist_ok=True)
 
     store = Store(settings.db_path)
@@ -272,6 +276,7 @@ def build_app(settings: Settings) -> FastAPI:
     adas = adas_si_svc.get_shared_instance(
         settings.adas_si_root,
         settings.root / "data" / "capabilities" / "adas_si" / "index.sqlite",
+        automatic_filing=automatic_adas_filing,
     )
     knowledge_repository = automotive_knowledge_svc.AutomotiveKnowledgeRepository(
         getattr(settings, "automotive_knowledge_db", None)
@@ -697,7 +702,7 @@ def main() -> None:
             "in config/.env.local, or set XOMNI_AUTH_ENABLED=0 for local dev."
         )
 
-    app = build_app(settings)
+    app = build_app(settings, automatic_adas_filing=True)
     log.info("X Omni Core -> http://127.0.0.1:%d", settings.port)
     if settings.public_origin:
         log.info("Remote (Tailscale) -> %s", settings.public_origin)

@@ -483,11 +483,16 @@ class SourceInventory:
 # page text cache + search
 # ==========================================================================
 
-_shared_instances: dict[tuple[str, str], "AdasSI"] = {}
+_shared_instances: dict[tuple[str, str, bool], "AdasSI"] = {}
 _shared_instances_lock = threading.Lock()
 
 
-def get_shared_instance(source_root: Path, cache_path: Path) -> "AdasSI":
+def get_shared_instance(
+    source_root: Path,
+    cache_path: Path,
+    *,
+    automatic_filing: bool = False,
+) -> "AdasSI":
     """Return one memoized `AdasSI` per (source_root, cache_path) pair.
 
     Building an `AdasSI` walks the entire source tree and opens a schema
@@ -496,20 +501,39 @@ def get_shared_instance(source_root: Path, cache_path: Path) -> "AdasSI":
     should go through this factory instead, so the walk only happens once.
     """
 
-    key = (str(Path(source_root).resolve()), str(Path(cache_path).resolve()))
+    key = (
+        str(Path(source_root).resolve()),
+        str(Path(cache_path).resolve()),
+        bool(automatic_filing),
+    )
     with _shared_instances_lock:
         instance = _shared_instances.get(key)
         if instance is None:
-            instance = AdasSI(source_root, cache_path)
+            instance = AdasSI(
+                source_root,
+                cache_path,
+                automatic_filing=automatic_filing,
+            )
             _shared_instances[key] = instance
         return instance
 
 
 class AdasSI:
-    def __init__(self, source_root: Path, cache_path: Path):
+    def __init__(
+        self,
+        source_root: Path,
+        cache_path: Path,
+        *,
+        automatic_filing: bool = False,
+    ):
         self.source_root = Path(source_root).resolve()
         self.cache_path = Path(cache_path).resolve()
         self.managed_root = self.source_root / MANAGED_DIRNAME
+        # Physical filing is a production-runtime responsibility. Search,
+        # indexing, tests, and one-off research helpers may all open the live
+        # library, but merely constructing one of those readers must never
+        # rearrange the operator's files.
+        self.automatic_filing = bool(automatic_filing)
         self.inventory = SourceInventory(self.source_root)
         self._refresh_lock = threading.Lock()
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -533,7 +557,9 @@ class AdasSI:
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (CACHE_SCHEMA_VERSION,),
             )
-        self.storage_migration = self.refresh_library(organize_root=True)
+        self.storage_migration = self.refresh_library(
+            organize_root=self.automatic_filing
+        )
 
     def available(self) -> bool:
         return self.inventory.available()
@@ -659,6 +685,7 @@ class AdasSI:
             self._record_arrivals(before)
             should_organize = bool(
                 organize_root
+                and self.automatic_filing
                 and adas_storage.is_authoritative_runtime_root(self.source_root)
             )
             if should_organize:
@@ -675,7 +702,10 @@ class AdasSI:
                     "unresolved": [],
                     "paths": {},
                     "classifications": {},
-                    "skipped_non_authoritative_root": True,
+                    "skipped_non_authoritative_root": not adas_storage.is_authoritative_runtime_root(
+                        self.source_root
+                    ),
+                    "automatic_filing_disabled": not self.automatic_filing,
                 }
             self.inventory._cache = None
             self.inventory._cache_key = None
@@ -707,6 +737,7 @@ class AdasSI:
                 "filed": compact,
                 "policy": result.get("policy") or {},
                 "organize_root": should_organize,
+                "automatic_filing_enabled": self.automatic_filing,
             }
 
     def _recent_additions(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -764,6 +795,12 @@ class AdasSI:
                     or descriptor.get("storage_class"),
                     "classification_confidence": classification.get("confidence"),
                     "classification_evidence": classification.get("evidence") or [],
+                    # Classification is written only when the inbox filer
+                    # moves a document from the root (or from Needs Review).
+                    # Keeping this provenance lets a later inventory answer
+                    # distinguish operator root drops from other documents
+                    # that happened to arrive in the same time window.
+                    "filed_from_root": bool(classification),
                     "vehicle": classification.get("vehicle"),
                     "ro_number": classification.get("ro_number"),
                 }
@@ -780,6 +817,9 @@ class AdasSI:
         return {
             "count": total,
             "returned_count": min(total, limit),
+            "filed_from_root_count": sum(
+                1 for item in selected if item.get("filed_from_root")
+            ),
             "documents": selected[:limit],
             "window": {
                 "added_since": since.isoformat(),

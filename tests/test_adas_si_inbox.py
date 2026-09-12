@@ -46,12 +46,31 @@ def test_root_classifier_extracts_adas_map_repair_order() -> None:
     }
 
 
+def test_kia_model_table_outweighs_unrelated_neighboring_workbook_tabs() -> None:
+    result = classify_root_pdf(
+        Path("capture.pdf"),
+        [
+            (
+                1,
+                "Calibration Requirements Cadenza Carnival EV6 EV9 Forte Telluride "
+                "Bumper Mount H/K/G BSM Bumper Off Nissan Infiniti ACC Bumper",
+            )
+        ],
+    )
+
+    assert result["storage_class"] == "reference"
+    assert result["group"] == "Hyundai Kia Genesis"
+    assert result["title"] == (
+        "Hyundai Kia Genesis Blind Spot Monitor Bumper Requirements"
+    )
+
+
 def test_inventory_discovers_files_added_after_start_and_files_them(tmp_path, monkeypatch) -> None:
     root = tmp_path / "ADAS SI"
     root.mkdir()
     cache = tmp_path / "cache" / "index.sqlite"
     monkeypatch.setenv("XOMNI_ADAS_SI_ROOT", str(root))
-    service = adas_si.AdasSI(root, cache)
+    service = adas_si.AdasSI(root, cache, automatic_filing=True)
 
     map_pdf = root / "anonymous.pdf"
     reference_pdf = root / "sheet.pdf"
@@ -96,6 +115,8 @@ def test_inventory_discovers_files_added_after_start_and_files_them(tmp_path, mo
     )
     recent = inventory["recent_additions"]
     assert recent["count"] == 3
+    assert recent["filed_from_root_count"] == 3
+    assert all(item["filed_from_root"] is True for item in recent["documents"])
     assert {item["storage_class"] for item in recent["documents"]} == {
         "adas_map_report",
         "reference",
@@ -103,6 +124,40 @@ def test_inventory_discovers_files_added_after_start_and_files_them(tmp_path, mo
     }
     assert inventory["summary"]["root_drop_count"] == 0
     assert inventory["summary"]["needs_review_document_count"] == 1
+
+    texts["mystery.pdf"] = (
+        "Cadenza Carnival EV6 Forte Telluride bumper mount on bumper mount off"
+    )
+    reclassified = service.refresh_library(
+        organize_root=True,
+        reclassify_review=True,
+    )
+    assert reclassified["moved_count"] == 1
+    assert reclassified["review_required_count"] == 0
+    assert (
+        root
+        / "Reference"
+        / "Calibration Requirements"
+        / "Kia"
+        / "Kia Blind Spot Monitor Bumper Requirements.pdf"
+    ).is_file()
+    assert not (root / "Needs Review" / "mystery.pdf").exists()
+
+
+def test_reader_instance_cannot_move_live_library_files(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "ADAS SI"
+    root.mkdir()
+    monkeypatch.setenv("XOMNI_ADAS_SI_ROOT", str(root))
+    service = adas_si.AdasSI(root, tmp_path / "index.sqlite")
+    dropped = root / "unclassified.pdf"
+    dropped.write_bytes(b"%PDF-1.4 placeholder")
+
+    refresh = service.refresh_library(organize_root=True)
+
+    assert refresh["moved_count"] == 0
+    assert refresh["organize_root"] is False
+    assert refresh["automatic_filing_enabled"] is False
+    assert dropped.is_file()
 
 
 def test_inventory_time_window_requires_offset(tmp_path) -> None:

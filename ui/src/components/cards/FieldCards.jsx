@@ -282,6 +282,7 @@ export function AdasInventoryCard({ data }) {
         <div><span>Vehicles</span><strong>{s.vehicle_application_count}</strong></div>
         <div><span>Unparsed</span><strong>{s.unparsed_document_count}</strong></div>
         <div><span>New in window</span><strong>{recent.count ?? 0}</strong></div>
+        <div><span>Root drops in window</span><strong>{recent.filed_from_root_count ?? 0}</strong></div>
         <div><span>Filed now</span><strong>{refresh.moved_count ?? 0}</strong></div>
         <div><span>Needs review</span><strong>{s.needs_review_document_count ?? 0}</strong></div>
       </div>

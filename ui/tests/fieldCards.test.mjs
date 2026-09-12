@@ -37,6 +37,7 @@ test("ADAS SI inventory shows recent arrivals and filing outcomes", async () => 
   assert.match(cards, /data\.recent_additions/);
   assert.match(cards, /Recent additions/);
   assert.match(cards, /New in window/);
+  assert.match(cards, /Root drops in window/);
   assert.match(cards, /Filed now/);
   assert.match(cards, /Needs review/);
   assert.match(cards, /document\.storage_class === "adas_map_report"/);

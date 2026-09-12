@@ -63,18 +63,23 @@ _REFERENCE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 
 def _reference_group(folded: str) -> tuple[str | None, list[str]]:
+    # The captured workbook keeps every manufacturer tab visible along the
+    # bottom, so unrelated family names can appear in OCR even though the open
+    # worksheet is Kia. Treat the dense Kia model column plus the selected
+    # H/K/G tab label as stronger evidence than those neighboring tab names.
+    kia_models = ("cadenza", "carnival", "ev6", "ev9", "forte", "telluride")
+    present_kia_models = [model for model in kia_models if model in folded]
+    if len(present_kia_models) >= 3 and "bumper mount" in folded:
+        if "h/k/g" in folded or "h k g" in folded:
+            return "Hyundai Kia Genesis", present_kia_models + ["H/K/G worksheet"]
+        return "Kia", present_kia_models + ["bumper mount"]
+
     best: tuple[str, list[str]] | None = None
     for label, markers in _REFERENCE_GROUPS:
         found = [marker.strip() for marker in markers if marker in folded]
         if found and (best is None or len(found) > len(best[1])):
             best = (label, found)
     if best is None:
-        # One captured Kia BSM sheet has its title clipped, but its model list
-        # is still specific enough to identify the make without guessing.
-        kia_models = ("cadenza", "carnival", "ev6", "ev9", "forte", "telluride")
-        present = [model for model in kia_models if model in folded]
-        if len(present) >= 3 and "bumper mount" in folded:
-            return "Kia", present + ["bumper mount"]
         return None, []
     # Prefer a family named directly by two or more markers. Ties retain the
     # curated order above, preventing a stray footer link from taking over.
