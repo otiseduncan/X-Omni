@@ -35,12 +35,13 @@ def _navigator_result(action: str, *, data: dict[str, Any], **overrides: Any) ->
 class _FakeNavigator:
     """Stands in for core.services.scrapex.navigator(settings, args)."""
 
-    def __init__(self, *, create_ok: bool = True, bulky: bool = False):
+    def __init__(self, *, create_ok: bool = True, bulky: bool = False, at_bottom: bool = False):
         self.calls: list[dict[str, Any]] = []
         self._create_ok = create_ok
         # bulky reproduces the shape that actually broke the live loop: a
         # large element map on a page that changes every action.
         self._bulky = bulky
+        self._at_bottom = at_bottom
         self._acted = 0
         self.verified_after_extract = False
         self.verification_sequence: list[bool] = []
@@ -116,6 +117,12 @@ class _FakeNavigator:
                         "backtrack_available": True,
                         "action_executed": True,
                         "is_search_action": action == "fill",
+                        "scroll_position": {
+                            "scroll_y": 18401 if self._at_bottom else 0,
+                            "scroll_height": 19121,
+                            "viewport_height": 720,
+                            "at_page_bottom": self._at_bottom,
+                        },
                     },
                 )
             return _navigator_result(
@@ -978,8 +985,13 @@ def test_a_cut_off_procedure_page_says_so_and_says_to_scroll():
     # The live Palisade article grew from 15,676px to 18,116px while being
     # scrolled, so "scroll to the bottom" spent an entire 40-turn budget and
     # extracted nothing.
-    assert "extract" in note.casefold()
-    assert "do not try to reach the bottom" in note.casefold()
+    # The specifications live at the END of an OEM procedure -- on the live
+    # Palisade article the reflector distance is in the last paragraphs -- and
+    # the page does end: measured, its bottom is about ten scrolls down. So the
+    # instruction is to go there, not to stop short of it.
+    assert "scroll to the bottom of this page" in note.casefold()
+    assert "it does end" in note.casefold()
+    assert "do not try to reach the bottom" not in note.casefold()
     assert summary["page_text_truncated"] is True
 
 
@@ -1029,27 +1041,21 @@ def test_an_observation_with_no_scroll_signal_is_not_assumed_to_continue():
 
 
 @pytest.mark.asyncio
-async def test_scrolling_without_reading_is_called_out(monkeypatch):
-    """A working scroll on a lazily-loaded page is its own trap.
+async def test_reaching_the_bottom_says_to_extract(monkeypatch):
+    """The bottom is the destination, and arriving there is the cue to take it.
 
-    Once scrolling actually moved ALLDATA's container, the model scrolled 40
-    times in a row and never extracted, because the page loads more as you go
-    and its bottom keeps receding. Scrolling is for reading; a run of them
-    with nothing read has to be said out loud.
+    The live Palisade procedure hides its reflector distance in the last
+    paragraphs, so a run that stops short of the bottom has not seen the
+    answer -- and one that sails past it without extracting has wasted the
+    trip.
     """
-    navigator = _FakeNavigator(bulky=True)
+    navigator = _FakeNavigator(bulky=True, at_bottom=True)
     monkeypatch.setattr(
         research_navigator_agent,
         "scrapex_svc",
         type("_S", (), {"navigator": navigator}),
     )
-    client = _ScriptedClient([
-        [("scroll", {"delta_y": 1600})],
-        [("scroll", {"delta_y": 1600})],
-        [("scroll", {"delta_y": 1600})],
-        [("scroll", {"delta_y": 1600})],
-        None,
-    ])
+    client = _ScriptedClient([[("scroll", {"delta_y": 1600})], None])
 
     await research_navigator_agent.run_navigator_search(
         client=client,
@@ -1059,11 +1065,10 @@ async def test_scrolling_without_reading_is_called_out(monkeypatch):
         topic="front radar calibration target distance",
     )
 
-    second = json.dumps(client.messages_seen[1], default=str)
     last = json.dumps(client.messages_seen[-1], default=str)
-    assert "times in a row" not in second
-    assert "times in a row" in last
-    assert "call extract NOW" in last
+    assert "reached the bottom of this page" in last
+    assert "call extract" in last
+    assert "page_bottom_reached" in last
 
 
 @pytest.mark.asyncio

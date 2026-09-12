@@ -122,8 +122,9 @@ _IMAGE_TOKEN_ESTIMATE = 1_200
 # screenshots.
 _TRANSCRIPT_TOKEN_BUDGET = 22_000
 _DIGEST_CHAR_CAP = 260
-# Three in a row is reading; more than that is drifting.
-_SCROLL_NUDGE_AFTER = 3
+# The longest ALLDATA procedure measured here reaches its bottom in about
+# ten scrolls, so a run longer than this is no longer heading anywhere.
+_SCROLL_NUDGE_AFTER = 16
 _TRUNCATION_NOTICE = (
     "\n\n[This observation was cut to fit the model's context. What is shown is "
     "complete up to the cut; if what you need is missing, narrow the page with a "
@@ -215,7 +216,15 @@ def _system_prompt(target: dict[str, Any], topic: str) -> str:
         "listed in the structured observation. Use pixels to understand layout, grouping, "
         "selected state, menus, and drill-down context, but act only by an observed ref. The "
         "browser will be re-observed after each executed action, so choose one action at a time "
-        "and then reassess. Do not require exact article-title wording: OEMs may express the same "
+        "and then reassess. A procedure page's own text may never contain the word you "
+        "were sent to find: this provider's Hyundai front-radar procedure is titled 'How "
+        "to check/adjust front radar installation angle', never uses the word "
+        "'calibration' once, and still is the calibration procedure -- with its target "
+        "distance in the last few paragraphs. Judge a page by what it actually describes "
+        "for the requested vehicle and system, not by whether it repeats your topic's "
+        "words back to you. When such a page is the procedure, the whole page is the "
+        "source: scroll to its bottom and extract it. "
+        "Do not require exact article-title wording: OEMs may express the same "
         "intent as calibration, aiming, alignment, adjustment, initialization, relearn, setup, "
         "registration, learn, or zero-point procedures, and system names also vary. Use the live "
         "page context to reason semantically while preserving the exact requested vehicle/system. "
@@ -320,6 +329,12 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
     # to the specifications at the bottom.
     position = summary.get("scroll_position") or {}
     more_below = bool(position) and not position.get("at_page_bottom")
+    if position and position.get("at_page_bottom"):
+        summary["page_bottom_reached"] = (
+            "You are at the BOTTOM of this page; there is nothing further down. "
+            "If this page is the procedure for the requested vehicle and system, "
+            "it is the source -- call extract now."
+        )
     if summary.get("page_text_truncated") or more_below:
         parts = []
         if summary.get("page_text_truncated"):
@@ -332,12 +347,14 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
         if more_below:
             parts.append("The viewport is not at the bottom of the page.")
         parts.append(
-            "Content you are looking for may be further down -- OEM procedures "
-            "put specifications, target dimensions and distances near the end. "
-            "Scroll to bring more into view, and call extract the moment what "
-            "you need is on screen. Do NOT try to reach the bottom: this page "
-            "loads more as you scroll, so its end moves and scrolling alone "
-            "never finishes."
+            "SCROLL TO THE BOTTOM OF THIS PAGE. OEM procedures put the "
+            "specifications -- target distances, reflector positions, "
+            "clearances, dimensions -- at the very END, after the preparation "
+            "steps. This page loads more as you scroll, so it grows as you go, "
+            "but it does end: keep scrolling until you are told you are at the "
+            "bottom. On this provider that takes roughly ten scrolls of 1600. "
+            "Do not leave the page, and do not conclude it lacks what you need, "
+            "before you have seen the bottom of it."
         )
         summary["page_continues"] = " ".join(parts)
     return summary
@@ -1126,14 +1143,24 @@ async def run_navigator_search(
                     "Reason from this new state and choose the next action yourself."
                 )
             )
-            if consecutive_scrolls >= _SCROLL_NUDGE_AFTER:
+            at_bottom = bool(
+                (latest_visual_summary.get("scroll_position") or {}).get("at_page_bottom")
+            )
+            # Scrolling toward the bottom is the job, so it is only drift once
+            # the bottom is actually reached, or once it has run well past the
+            # ten-or-so scrolls this provider's longest procedures need.
+            if consecutive_scrolls >= 1 and at_bottom:
                 heading += (
-                    f" You have now scrolled {consecutive_scrolls} times in a row "
-                    "without extracting anything. Scrolling is for reading, and "
-                    "this page keeps loading more, so it has no end to reach. If "
-                    "the procedure content you were sent for is on screen, call "
-                    "extract NOW. If this page is the wrong one, go back and "
-                    "choose a different branch."
+                    " You have reached the bottom of this page. If it is the "
+                    "procedure for the requested vehicle and system, call extract "
+                    "NOW -- do not keep scrolling, and do not go looking elsewhere."
+                )
+            elif consecutive_scrolls >= _SCROLL_NUDGE_AFTER:
+                heading += (
+                    f" You have scrolled {consecutive_scrolls} times without "
+                    "reaching the bottom or extracting anything. If the content "
+                    "you were sent for is on screen, call extract NOW; otherwise "
+                    "go back and choose a different branch."
                 )
             if unchanged:
                 # Stated as an observed fact, not a hint about what to click.
