@@ -1167,3 +1167,87 @@ async def test_the_receipt_names_the_action_it_closes(monkeypatch):
     assert "elements" not in payload
     assert "page_text" not in payload
 
+
+class _LaggingNavigator(_FakeNavigator):
+    """An act that answers before the navigation lands, then catches up.
+
+    This is ALLDATA's real behaviour: the click returns an observation still
+    describing the page being left, and a moment later the new page is there.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._observe_calls = 0
+
+    async def __call__(self, settings, args):
+        action = args.get("action")
+        if action == "click":
+            self.calls.append(dict(args))
+            # Byte-identical to the page the model just acted from: the
+            # navigation has been started but has not landed yet.
+            return _navigator_result(
+                "click",
+                status="acted",
+                data={
+                    "url": "https://my.alldata.com/vehicle-select",
+                    "title": "Vehicle Select",
+                    "elements": [
+                        {"ref": "e1", "role": "textbox", "name": "Vehicle search", "expanded": None},
+                        {"ref": "e2", "role": "button", "name": "Search", "expanded": None},
+                    ],
+                    "loop_warning": None,
+                    "backtrack_available": False,
+                    "action_executed": True,
+                },
+            )
+        if action == "observe":
+            self.calls.append(dict(args))
+            self._observe_calls += 1
+            if self._observe_calls <= 1:
+                return await super().__call__(settings, args)
+            return _navigator_result(
+                "observe",
+                status="observed",
+                data={
+                    "url": "https://my.alldata.com/repair/#/select-vehicle",
+                    "title": "ALLDATA Collision - Home",
+                    "page_text": "Select Vehicle",
+                    "elements": [
+                        {"ref": "f8e396", "role": "combobox", "name": "2021", "expanded": None},
+                    ],
+                },
+            )
+        return await super().__call__(settings, args)
+
+
+@pytest.mark.asyncio
+async def test_a_click_that_answers_before_the_page_lands_is_waited_out(monkeypatch):
+    """The alternation that cost half of every live turn budget.
+
+    ALLDATA answered the click while still showing the old page, so the model
+    saw "nothing changed", sent the same ref again, and by then the page had
+    moved and the ref no longer resolved -- a 409 after every single action.
+    """
+    navigator = _LaggingNavigator()
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([[("click", {"ref": "e2"})], None])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai Truck", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    # The model must be shown the page that actually arrived, with refs it can
+    # use -- not the page the click was leaving.
+    last = json.dumps(client.messages_seen[-1], default=str)
+    assert "ALLDATA Collision - Home" in last
+    assert "f8e396" in last
+    assert "settled_after_observations" in last
+

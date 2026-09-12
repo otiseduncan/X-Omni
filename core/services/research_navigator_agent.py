@@ -70,6 +70,12 @@ _TOOL_RESULT_CHAR_BACKSTOP = 24_000
 _INITIAL_OBSERVE_ATTEMPTS = 5
 _INITIAL_OBSERVE_DELAY_SECONDS = 0.45
 _FAILED_ACTION_OBSERVE_ATTEMPTS = 4
+# Actions that ask the page to become a different page. ALLDATA answers
+# the act call before the navigation lands, so the observation returned
+# with it can still describe the page the action was leaving.
+_PAGE_CHANGING_ACTIONS = frozenset({"click", "press", "open", "back"})
+_SETTLE_OBSERVE_ATTEMPTS = 4
+_SETTLE_OBSERVE_DELAY_SECONDS = 0.35
 _FAILED_ACTION_OBSERVE_DELAY_SECONDS = 0.35
 
 # --- Transcript budget ----------------------------------------------------
@@ -918,6 +924,45 @@ async def run_navigator_search(
                 navigator_result = await scrapex_svc.navigator(settings, dispatch_args)
                 if navigator_result.get("success"):
                     result = _observation_summary(navigator_result)
+                    # Let the page finish becoming itself before showing it.
+                    # Measured live on 2026-09-12: a click that navigated from
+                    # ALLDATA Home to Collision Home came back with an
+                    # observation still describing Home -- 26 elements, old
+                    # title -- and the very next action, a bare wait, showed
+                    # the new page. So the model saw "I clicked and nothing
+                    # changed", clicked the same ref again, and by then the
+                    # page really had moved, making the ref unresolvable. That
+                    # 409 alternation cost roughly half of every turn budget.
+                    # Only the suspicious case is worth waiting on: if this
+                    # observation already shows a different page, the action
+                    # landed and there is nothing to wait for. An observation
+                    # identical to the one the model just acted from is the
+                    # one that might have been read mid-transition, so poll
+                    # for a short while and adopt a changed page if one
+                    # arrives. If nothing changes, the action genuinely did
+                    # not move the page and the original result stands.
+                    if (
+                        action in _PAGE_CHANGING_ACTIONS
+                        and _observation_fingerprint(result) == previous_fingerprint
+                    ):
+                        (
+                            settled,
+                            settled_summary,
+                            settle_attempts,
+                        ) = await _observe_until_ready(
+                            settings,
+                            task_id,
+                            attempts=_SETTLE_OBSERVE_ATTEMPTS,
+                            delay_seconds=_SETTLE_OBSERVE_DELAY_SECONDS,
+                            previous_fingerprint=previous_fingerprint,
+                        )
+                        if (
+                            settled.get("success")
+                            and _observation_ready(settled_summary)
+                            and _observation_fingerprint(settled_summary) != previous_fingerprint
+                        ):
+                            result = settled_summary
+                            result["settled_after_observations"] = settle_attempts
                     if action != "done":
                         latest_visual_summary = result
                         latest_action_args = (
