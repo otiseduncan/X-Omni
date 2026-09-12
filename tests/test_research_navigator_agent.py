@@ -9,6 +9,7 @@ real ScrapeX service.
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
@@ -34,9 +35,13 @@ def _navigator_result(action: str, *, data: dict[str, Any], **overrides: Any) ->
 class _FakeNavigator:
     """Stands in for core.services.scrapex.navigator(settings, args)."""
 
-    def __init__(self, *, create_ok: bool = True):
+    def __init__(self, *, create_ok: bool = True, bulky: bool = False):
         self.calls: list[dict[str, Any]] = []
         self._create_ok = create_ok
+        # bulky reproduces the shape that actually broke the live loop: a
+        # large element map on a page that changes every action.
+        self._bulky = bulky
+        self._acted = 0
         self.verified_after_extract = False
         self.verification_sequence: list[bool] = []
         self._extracted = False
@@ -88,6 +93,31 @@ class _FakeNavigator:
             if action == "extract":
                 self._extracted = True
                 self.extract_count += 1
+            if self._bulky:
+                self._acted += 1
+                return _navigator_result(
+                    action,
+                    status="acted",
+                    work_complete=(action == "done"),
+                    data={
+                        "url": f"https://my.alldata.com/node/{self._acted}",
+                        "title": f"Menu level {self._acted}",
+                        "page_text": "Service and repair procedure listing. " * 200,
+                        "elements": [
+                            {
+                                "ref": f"e{self._acted}_{index}",
+                                "role": "link",
+                                "name": f"Adjustments and calibration subsection {index}",
+                                "expanded": None,
+                            }
+                            for index in range(120)
+                        ],
+                        "loop_warning": None,
+                        "backtrack_available": True,
+                        "action_executed": True,
+                        "is_search_action": action == "fill",
+                    },
+                )
             return _navigator_result(
                 action,
                 status="acted",
@@ -150,7 +180,7 @@ class _ScriptedClient:
         self.messages_seen: list[list[dict[str, Any]]] = []
 
     async def stream(self, messages, tools=None, max_tokens=None):  # noqa: ARG002
-        self.messages_seen.append(list(messages))
+        self.messages_seen.append(copy.deepcopy(list(messages)))
         if not self._turns:
             return
         turn = self._turns.pop(0)
@@ -533,3 +563,187 @@ async def test_initial_alldata_authentication_boundary_short_circuits_before_mod
     assert "ALLDATA requires interactive authentication" in result["reason"]
     assert client.messages_seen == []
     assert [call["action"] for call in navigator.calls] == ["create_task", "observe"]
+
+
+def _prompt_chars(messages: list[dict[str, Any]]) -> int:
+    return len(json.dumps(messages, default=str))
+
+
+@pytest.mark.asyncio
+async def test_transcript_stays_bounded_instead_of_growing_with_every_action(monkeypatch):
+    """The regression that stopped every live ALLDATA task at 2-5 actions.
+
+    The loop used to append each observation twice -- as the tool result and
+    again as the visual user message -- and never drop one, so the prompt
+    grew by thousands of tokens per browser action and the 32K worker
+    rejected the fifth call outright. Drill-down needs far more actions than
+    that, so bounded growth is the feature.
+    """
+    navigator = _FakeNavigator(bulky=True)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    turns = [[("click", {"ref": f"e{index}"})] for index in range(14)]
+    client = _ScriptedClient(turns + [None])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    assert len(client.messages_seen) >= 14
+    after_first_action = _prompt_chars(client.messages_seen[1])
+    after_last_action = _prompt_chars(client.messages_seen[-1])
+    # Thirteen more browser actions must not multiply the prompt. The only
+    # growth allowed is one short digest line per superseded observation.
+    assert after_last_action < after_first_action * 2
+
+    # Exactly one full element map is ever in context: stale refs are
+    # rejected by ScrapeX, so older maps cost context and buy nothing.
+    final = client.messages_seen[-1]
+    full_maps = [
+        message
+        for message in final
+        if "Adjustments and calibration subsection 119" in json.dumps(message, default=str)
+    ]
+    assert len(full_maps) == 1
+
+
+@pytest.mark.asyncio
+async def test_superseded_observations_collapse_to_a_digest_of_what_was_tried(monkeypatch):
+    navigator = _FakeNavigator(bulky=True)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([
+        [("click", {"ref": "e1"})],
+        [("click", {"ref": "e2"})],
+        [("click", {"ref": "e3"})],
+        None,
+    ])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    final = client.messages_seen[-1]
+    digests = [
+        message["content"]
+        for message in final
+        if isinstance(message.get("content"), str)
+        and message["content"].startswith("[action ")
+    ]
+    # Dropping the old element maps must not drop the navigation memory:
+    # each superseded observation leaves behind what was tried and where it
+    # led, so the model can still tell a new branch from a repeat.
+    assert digests, final
+    assert any("click" in digest and "ref=e1" in digest for digest in digests)
+    assert any("/node/1" in digest for digest in digests)
+    assert any(
+        isinstance(message.get("content"), str)
+        and message["content"].startswith("[initial page]")
+        for message in final
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_receipt_does_not_repeat_the_observation(monkeypatch):
+    navigator = _FakeNavigator(bulky=True)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([[("click", {"ref": "e1"})], None])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    tool_messages = [
+        message for message in client.messages_seen[-1] if message.get("role") == "tool"
+    ]
+    assert tool_messages
+    for message in tool_messages:
+        payload = json.loads(message["content"])
+        assert payload["executed"] is True
+        assert payload["url"] == "https://my.alldata.com/node/1"
+        assert "elements" not in payload
+        assert "page_text" not in payload
+
+
+@pytest.mark.asyncio
+async def test_model_is_told_plainly_when_an_action_changed_nothing(monkeypatch):
+    """Three identical scrolls on the live vehicle picker is what this stops.
+
+    ScrapeX's loop warning covers its own navigation graph; an action that
+    leaves the rendered page byte-identical never reaches it. The signal is
+    a statement about observed state, not a hint about what to click.
+    """
+    navigator = _FakeNavigator()
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    client = _ScriptedClient([
+        [("scroll", {"delta_y": 1600})],
+        [("scroll", {"delta_y": 1600})],
+        None,
+    ])
+
+    await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    first_action_context = json.dumps(client.messages_seen[1], default=str)
+    second_action_context = json.dumps(client.messages_seen[2], default=str)
+    assert "left the page exactly as it was" not in first_action_context
+    assert "left the page exactly as it was" in second_action_context
+
+
+@pytest.mark.asyncio
+async def test_one_oversized_page_is_degraded_rather_than_refused(monkeypatch):
+    navigator = _FakeNavigator(bulky=True)
+    monkeypatch.setattr(
+        research_navigator_agent,
+        "scrapex_svc",
+        type("_S", (), {"navigator": navigator}),
+    )
+    monkeypatch.setattr(research_navigator_agent, "_TRANSCRIPT_TOKEN_BUDGET", 900)
+    client = _ScriptedClient([[("click", {"ref": "e1"})], [("click", {"ref": "e2"})], None])
+
+    result = await research_navigator_agent.run_navigator_search(
+        client=client,
+        settings=object(),
+        provider="alldata",
+        target={"year": 2021, "make": "Hyundai", "model": "Palisade"},
+        topic="front radar calibration target distance",
+    )
+
+    # A degraded turn beats the HTTP 400 that used to end the task, and the
+    # degradation is reported rather than silent.
+    assert result["context_degraded"] is True
+    assert "cut to fit the model's context" in json.dumps(
+        client.messages_seen[-1], default=str
+    )
+

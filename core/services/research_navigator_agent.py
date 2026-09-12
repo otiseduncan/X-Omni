@@ -67,6 +67,46 @@ _NAV_ACTIONS = ("observe", "click", "fill", "press", "back", "open", "scroll", "
 MAX_ELEMENTS_FOR_MODEL = 120
 _TOOL_RESULT_CHAR_BACKSTOP = 24_000
 
+# --- Transcript budget ----------------------------------------------------
+#
+# This loop's own transcript is the only thing competing for the local
+# worker's 32K context, and it used to grow without bound: every turn
+# appended the same observation twice -- once as the tool result, once as
+# the visual user message -- plus a fresh screenshot, and nothing was ever
+# dropped.
+#
+# Measured live on 2026-09-12 against the real ALLDATA vehicle picker, a
+# single observation tokenized at 3.1k-5.7k tokens on the worker itself, so
+# four browser actions reached ~32.6k tokens of text before one image was
+# counted, and llama-server rejected the fifth model call with HTTP 400.
+# Every Navigator task ScrapeX has ever recorded died that way -- 2 to 5
+# actions in, all of them still on the vehicle picker, none ever reaching
+# the service-information tree that actually needs the reasoning.
+#
+# So only the newest observation is carried in full; superseded ones
+# collapse to a one-line digest of what was done and where it led. That is
+# not only a size win: a ref from a superseded observation is stale, and
+# ScrapeX rejects it, so keeping old element maps in context does nothing
+# but offer the model refs it must not use.
+#
+# Measured on that same real JSON, this payload runs ~2.2 characters per
+# token -- opaque refs like "f8e397" tokenize badly -- so the usual ~4
+# chars/token rule of thumb underestimates it by nearly half.
+_CHARS_PER_TOKEN_ESTIMATE = 2.2
+# One annotated JPEG viewport, charged as a flat estimate rather than
+# measured; it is a backstop input, not an accounting record.
+_IMAGE_TOKEN_ESTIMATE = 1_200
+# Leaves room inside 32K for the tool schema, the system prompt, the image,
+# and generation, with headroom for a worker configured smaller than the
+# 32768 in config/workers.json.
+_TRANSCRIPT_TOKEN_BUDGET = 14_000
+_DIGEST_CHAR_CAP = 260
+_TRUNCATION_NOTICE = (
+    "\n\n[This observation was cut to fit the model's context. What is shown is "
+    "complete up to the cut; if what you need is missing, narrow the page with a "
+    "search or a more specific menu rather than guessing a ref that is not listed.]"
+)
+
 NAVIGATOR_AGENT_TOOL_SCHEMA = {
     "type": "function",
     "function": {
@@ -280,6 +320,221 @@ def _visual_observation_content(
     ]
 
 
+def _observation_fingerprint(summary: dict[str, Any]) -> str:
+    """A stable identity for one rendered page state.
+
+    Used only to tell the model, factually, whether its last action moved
+    the page. It compares what the model was actually shown -- url, title,
+    and the ref/role/name of every listed element -- and makes no judgement
+    about what the page means or what should be clicked next.
+    """
+    elements = summary.get("elements")
+    listed = (
+        [
+            f"{item.get('ref')}:{item.get('role')}:{item.get('name')}"
+            for item in elements
+            if isinstance(item, dict)
+        ]
+        if isinstance(elements, list)
+        else []
+    )
+    return json.dumps(
+        [summary.get("url"), summary.get("title"), listed], default=str, sort_keys=True
+    )
+
+
+def _action_digest(
+    ordinal: int,
+    action: str,
+    args: dict[str, Any],
+    summary: Optional[dict[str, Any]],
+    *,
+    unchanged: bool = False,
+) -> str:
+    """The one line that stands in for a superseded full observation.
+
+    This is the loop's navigation memory once the old element maps are
+    dropped: what was tried, in order, and where each attempt landed.
+    Without it, collapsing the transcript would leave the model free to
+    re-try an action it has already watched do nothing. A failed action
+    needs no digest -- its error stays in its own tool receipt, which is
+    small and never collapsed.
+    """
+    detail = " ".join(
+        f"{key}={value}"
+        for key, value in sorted(args.items())
+        if key != "action" and value not in (None, "")
+    )
+    head = " ".join(part for part in (f"[action {ordinal}]", action, detail) if part)
+    where = ""
+    if summary:
+        title = str(summary.get("title") or "")
+        where = " ".join(
+            part
+            for part in (str(summary.get("url") or ""), f'"{title}"' if title else "")
+            if part
+        )
+    outcome = "page unchanged" if unchanged else "new page state"
+    return f"{head} -> {outcome}: {where}".rstrip()[:_DIGEST_CHAR_CAP]
+
+
+def _tool_receipt(result: Any) -> dict[str, Any]:
+    """What the tool role carries now that the observation lives in one place.
+
+    The full observation rides in exactly one message per turn -- the visual
+    user message -- so this is an execution receipt, not a second copy of
+    it. Everything the model must act on rather than merely see is kept
+    verbatim: the error text, and ScrapeX's post-extract verification
+    verdict with its instruction.
+    """
+    if not isinstance(result, dict):
+        return {"error": "The navigator returned no usable result."}
+    if result.get("error"):
+        return {"error": result["error"]}
+    receipt: dict[str, Any] = {
+        "executed": True,
+        "url": result.get("url"),
+        "title": result.get("title"),
+    }
+    for key in (
+        "verification_after_extract",
+        "next_instruction",
+        "loop_warning",
+        "repeated_action_warning",
+        "elements_truncated",
+    ):
+        if result.get(key) is not None:
+            receipt[key] = result[key]
+    return receipt
+
+
+def _estimated_tokens(content: Any) -> int:
+    """Cheap local size estimate for one message's content.
+
+    Deliberately not a call to the worker's tokenizer: this runs before
+    every model turn and only has to be right enough to keep the backstop
+    below from firing late.
+    """
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return int(len(content) / _CHARS_PER_TOKEN_ESTIMATE)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                total += _IMAGE_TOKEN_ESTIMATE
+            else:
+                total += int(len(str(part.get("text") or "")) / _CHARS_PER_TOKEN_ESTIMATE)
+        return total
+    return int(len(str(content)) / _CHARS_PER_TOKEN_ESTIMATE)
+
+
+def _estimated_message_tokens(message: dict[str, Any]) -> int:
+    """Size of one whole message, tool-call arguments included.
+
+    Counting only "content" would leave the assistant turns uncounted, and
+    those carry the tool-call arguments -- small individually, but a blind
+    spot that grows with every turn is exactly what this budget exists to
+    stop having.
+    """
+    total = _estimated_tokens(message.get("content"))
+    calls = message.get("tool_calls")
+    if calls:
+        total += _estimated_tokens(json.dumps(calls, default=str))
+    return total
+
+
+def _collapse_superseded_observations(
+    messages: list[dict[str, Any]],
+    slots: list[int],
+    digests: dict[int, str],
+) -> None:
+    """Replace every observation but the newest with its one-line digest.
+
+    Idempotent, and safe to run before every model turn: each slot is
+    rewritten from the digest recorded when that observation arrived, so
+    running it again changes nothing.
+    """
+    for index in slots[:-1]:
+        messages[index]["content"] = digests.get(index) or "[superseded observation]"
+
+
+def _strip_images(messages: list[dict[str, Any]]) -> bool:
+    stripped = False
+    for message in reversed(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        kept = [
+            part
+            for part in content
+            if not (isinstance(part, dict) and part.get("type") == "image_url")
+        ]
+        if len(kept) != len(content):
+            message["content"] = kept
+            stripped = True
+    return stripped
+
+
+def _enforce_transcript_budget(messages: list[dict[str, Any]]) -> bool:
+    """Backstop for a page large enough to blow the budget on its own.
+
+    With superseded observations collapsed this should not fire -- one
+    observation plus one image measured well inside the budget on the real
+    ALLDATA pages. It exists because the alternative to firing is an HTTP
+    400 from the worker that ends the task outright, and a degraded turn is
+    worth more than no turn. The image goes first, since the element map is
+    the only thing an action can be built from; only then is observation
+    text cut, with the cut declared in place so the model knows not to
+    trust the list as complete.
+    """
+
+    def total() -> int:
+        return sum(_estimated_message_tokens(message) for message in messages)
+
+    if total() <= _TRANSCRIPT_TOKEN_BUDGET:
+        return False
+
+    degraded = _strip_images(messages)
+    if total() <= _TRANSCRIPT_TOKEN_BUDGET:
+        return degraded
+
+    for message in reversed(messages):
+        content = message.get("content")
+        text = None
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = str(part.get("text") or "")
+                    break
+        if text is None or len(text) < 2_000:
+            continue
+        over_tokens = total() - _TRANSCRIPT_TOKEN_BUDGET
+        keep_chars = max(
+            1_500, len(text) - int(over_tokens * _CHARS_PER_TOKEN_ESTIMATE) - 400
+        )
+        if keep_chars >= len(text):
+            continue
+        trimmed = text[:keep_chars] + _TRUNCATION_NOTICE
+        if isinstance(content, str):
+            message["content"] = trimmed
+        else:
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["text"] = trimmed
+                    break
+        degraded = True
+        if total() <= _TRANSCRIPT_TOKEN_BUDGET:
+            break
+
+    return degraded
+
+
 async def run_navigator_search(
     *,
     client: Any,
@@ -364,7 +619,28 @@ async def run_navigator_search(
     model_called_done = False
     candidate_verified = False
 
+    # Which messages hold a full observation, and the one line each collapses
+    # to once a newer one arrives. The opening message carries the goal as
+    # well as the first page, so its digest restates the goal -- the system
+    # prompt holds the authoritative copy either way.
+    observation_slots: list[int] = [len(messages) - 1]
+    slot_digests: dict[int, str] = {
+        len(messages) - 1: (
+            f"[initial page] goal: {_target_label(target)} -- {topic} -> "
+            f"{initial_summary.get('url') or ''}"
+        )[:_DIGEST_CHAR_CAP]
+    }
+    previous_fingerprint = _observation_fingerprint(initial_summary)
+    action_ordinal = 0
+    context_degraded = False
+
     for turn in range(max_turns):
+        # Bound the transcript before every model call, not after the worker
+        # has already refused one. Only the newest observation stays whole;
+        # refs in the older ones are stale and ScrapeX would reject them.
+        _collapse_superseded_observations(messages, observation_slots, slot_digests)
+        if _enforce_transcript_budget(messages):
+            context_degraded = True
         try:
             events = [
                 event
@@ -395,6 +671,7 @@ async def run_navigator_search(
 
         turn_hit_repeat_limit = False
         latest_visual_summary: Optional[dict[str, Any]] = None
+        latest_action_args: Optional[tuple[str, dict[str, Any]]] = None
         for call_index, (call, wire_call) in enumerate(zip(calls, wire_calls)):
             try:
                 args = json.loads(call.get("arguments") or "{}")
@@ -436,11 +713,16 @@ async def run_navigator_search(
                 elif action == "wait":
                     dispatch_args["milliseconds"] = args.get("milliseconds")
                 dispatched = True
+                action_ordinal += 1
                 navigator_result = await scrapex_svc.navigator(settings, dispatch_args)
                 if navigator_result.get("success"):
                     result = _observation_summary(navigator_result)
                     if action != "done":
                         latest_visual_summary = result
+                        latest_action_args = (
+                            action,
+                            {key: value for key, value in args.items() if key != "action"},
+                        )
 
                     # Close the reasoning loop at the moment X proposes a
                     # candidate procedure. ScrapeX remains the truth authority:
@@ -517,24 +799,56 @@ async def run_navigator_search(
                 "args": {k: v for k, v in args.items() if k != "action"},
                 "error": call_error,
             })
+            # A receipt, not a second copy of the observation: the full
+            # page state rides in the visual user message appended below, so
+            # sending it here too was doubling the cost of every turn.
             messages.append({
                 "role": "tool",
                 "tool_call_id": wire_call["id"],
-                "content": json.dumps(result, default=str)[:_TOOL_RESULT_CHAR_BACKSTOP],
+                "content": json.dumps(_tool_receipt(result), default=str)[
+                    :_TOOL_RESULT_CHAR_BACKSTOP
+                ],
             })
 
         if latest_visual_summary is not None and not model_called_done:
             current_screenshot = await _task_screenshot(settings, task_id)
+            fingerprint = _observation_fingerprint(latest_visual_summary)
+            unchanged = fingerprint == previous_fingerprint
+            previous_fingerprint = fingerprint
+            heading = (
+                "Current rendered browser state after the executed action. "
+                "Reason from this new state and choose the next action yourself."
+            )
+            if unchanged:
+                # Stated as an observed fact, not a hint about what to click.
+                # Three identical scrolls in a row on the live vehicle picker
+                # (2026-09-12) is what this exists to stop: ScrapeX's own
+                # loop warning covers its navigation graph, but an action that
+                # leaves the rendered page byte-identical never reached it.
+                heading += (
+                    " That action left the page exactly as it was: same URL, same "
+                    "title, same elements. Repeating it will not change anything -- "
+                    "act on a different element, or go back."
+                )
             messages.append(
                 {
                     "role": "user",
                     "content": _visual_observation_content(
-                        "Current rendered browser state after the executed action. "
-                        "Reason from this new state and choose the next action yourself.",
+                        heading,
                         latest_visual_summary,
                         current_screenshot,
                     ),
                 }
+            )
+            slot = len(messages) - 1
+            observation_slots.append(slot)
+            digest_action, digest_args = latest_action_args or ("", {})
+            slot_digests[slot] = _action_digest(
+                action_ordinal,
+                digest_action,
+                digest_args,
+                latest_visual_summary,
+                unchanged=unchanged,
             )
 
         if candidate_verified:
@@ -592,6 +906,8 @@ async def run_navigator_search(
         "topic": topic,
         "agent_trace": trace,
         "agent_stopped_reason": stopped_reason,
+        "browser_actions_observed": len(observation_slots) - 1,
+        "context_degraded": context_degraded,
         "source_url": evidence.get("source_url"),
         "extracted_text": (evidence.get("extracted_text") or "")[:20_000],
         "provenance": {
