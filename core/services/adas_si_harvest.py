@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -83,6 +84,12 @@ PROCEDURE_WORDS = (
     "calibration", "aiming", "initialization", "alignment", "component tests",
     "removal and installation",
 )
+
+
+# Engine and body codes as ALLDATA prints them: L4-2.0L, V6-3.8L, (K20C2),
+# (LX2), 1.6L. Drive layouts -- FWD, 4WD, AWD, RWD -- are part of the model
+# and must not match.
+_ENGINE_OR_CODE = re.compile(r"^\(|^[A-Za-z]\d+-\d|^\d+\.\d+L$")
 
 
 def _now() -> datetime:
@@ -153,7 +160,17 @@ def vehicle_target(label: str) -> dict[str, Any]:
     else:
         make = rest[0]
         tail = rest[1:]
-    return {"year": year, "make": make, "model": " ".join(tail[:2])}
+    # The label carries the engine and body code after the model, and taking a
+    # fixed two words swallows them whenever the model is a single word:
+    # "2022 Kia Niro L4-1.6L Hybrid" became the model "Niro L4-1.6L" and
+    # ALLDATA would not confirm the vehicle, so nothing filed for it. Stop at
+    # the first engine or code token instead.
+    model: list[str] = []
+    for token in tail[:3]:
+        if _ENGINE_OR_CODE.match(token):
+            break
+        model.append(token)
+    return {"year": year, "make": make, "model": " ".join(model[:2])}
 
 
 class AdasSiHarvestService:

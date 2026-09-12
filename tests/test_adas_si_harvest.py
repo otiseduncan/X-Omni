@@ -157,6 +157,26 @@ def test_alldata_files_suvs_under_make_truck():
     }
 
 
+def test_a_single_word_model_does_not_swallow_the_engine_code():
+    """"Niro L4-1.6L" is not a model, and ALLDATA will not confirm it.
+
+    A fixed two-word model works for "Civic Sedan" and "CTS Sedan" and fails
+    for every one-word model. In the first ten-vehicle batch the Kia Niro and
+    the Ford Mustang each found seven documents and filed none, both refused
+    with "ALLDATA vehicle selection was not confirmed".
+    """
+    assert harvest.vehicle_target("2022 Kia Niro L4-1.6L Hybrid") == {
+        "year": 2022, "make": "Kia", "model": "Niro",
+    }
+    assert harvest.vehicle_target("2025 Ford Mustang L4-2.3L Turbo") == {
+        "year": 2025, "make": "Ford", "model": "Mustang",
+    }
+    # A drive layout is part of the model, not an engine code.
+    assert harvest.vehicle_target("2024 Nissan-Datsun Truck Kicks FWD L4-1.6L (HR16DE)") == {
+        "year": 2024, "make": "Nissan-Datsun Truck", "model": "Kicks FWD",
+    }
+
+
 def test_quick_reference_rows_stop_at_related_information():
     """The ADAS rows sit above a block of site-wide links."""
     names = [name for _ref, name in harvest.page_links(_FakeNavigator.QUICK, stop_at_footer=True)]
