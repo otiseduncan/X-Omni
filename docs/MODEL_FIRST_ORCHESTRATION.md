@@ -27,8 +27,8 @@ rereads, provenance, audit, bounded serialization, and terminal media safety.
 | Tool | Owns | Expands to |
 |---|---|---|
 | `query_ciq` | every Calibration IQ read: one RO, board count/list, phase list, RO requirements, ADAS Map inventory, sweep progress, service status | `calibration_iq_ro`, `_summary`, `_read`, `_work_prep`, `_status` (pure structural expansion in `Registry.invoke` and the loop) |
-| `delegate_research` | one research objective over local ADAS SI, durable knowledge, licensed ALLDATA (ScrapeX Navigator, model-driven inside the call), public OEM web; provenance-bearing findings; any vehicle, RO or not; never writes CIQ | `core/services/research_delegate.py` |
-| `stage_action` | the only write path: fresh exact-RO read, then `stage=staged` (current version, valid targets, argument contract, exact `next_call`) or `stage=executed` (receipt + final snapshot); one-RO ADAS Map acquisition; `sweep_adas_maps` for a scope | `calibration_iq_operator`, `calibration_iq_destructive` (approval-gated), `scrapex_adas_map`, all through `Registry.invoke` with the exact-RO write binding |
+| `delegate_research` | one research objective over local ADAS SI, durable knowledge, licensed ALLDATA (ScrapeX Navigator, model-driven inside the call, every candidate judged by an independent semantic review), public OEM web; provenance-bearing findings; any vehicle, RO or not; never writes CIQ | `core/services/research_delegate.py` |
+| `stage_action` | the only write path: fresh exact-RO read, then `stage=staged` (current version, valid targets, argument contract, exact `next_call`) or `stage=executed` (receipt + final snapshot); one-RO ADAS Map acquisition; `sweep_adas_maps` for a scope; `research_si` for background service-information research | `calibration_iq_operator`, `calibration_iq_destructive` (approval-gated), `scrapex_adas_map`, `adas_map_sweep`, `adas_si_research`, all through `Registry.invoke` with the exact-RO write binding |
 | `capability_search` | ranks the profile's discoverable tools against a structured query and unlocks matches for the rest of the turn | `core/tools/builtin/system.py::make_capability_search` |
 
 Everything else in the `adas_operator` profile (calendar, tasks, files,
@@ -78,6 +78,89 @@ does not contain; if the review rejects a draft without choosing a read, the
 fail-closed answer is the record's own status sentence. Live acceptance showed
 why: without this, "how'd the maps go?" produced "all 16 attached" five times
 out of five while the sweep was still running.
+
+## Background work: service-information research (2026-09-13)
+
+Getting every calibration procedure a repair order needs is the second daily
+routine, and the first attempt at it -- `core/services/adas_si_harvest.py` --
+scripted the meaning: Python chose which ALLDATA links to descend from a word
+list, decided a page was a document from its character count, and verified
+each capture against the candidate page's own title. The field result was a
+library full of removal/replacement and parts pages and few procedures. That
+module is now **legacy, experimental, non-default and not authoritative**
+(registered only with `XOMNI_LEGACY_SI_HARVEST=1`, for comparison runs).
+
+The production path is `stage_action` operation `research_si` starting
+`core/services/adas_si_research.py`:
+
+1. The scheduler reads the exact RO, vehicle, VIN, and active calibration
+   requirements from Calibration IQ. That is all it knows.
+2. Each requirement becomes one structured objective handed to the
+   model-driven Navigator (`research_navigator_agent.run_navigator_search`).
+   X decides where to go in ALLDATA, what to click, what is a procedure, and
+   what else is required. Provider notes (Recent Vehicles, the ADAS Quick
+   Reference, "<Make> Truck" shelving) are offered as non-binding hints.
+3. When X marks a page, ScrapeX proves the mechanics (vehicle selected,
+   navigation happened, leaf reached, text extracted) and an **independent
+   semantic review** (`research_semantic_review.py`) judges the evidence in a
+   fresh model context that never sees the Navigator's transcript. It returns
+   a structured verdict -- classification, procedure type, an evidence table
+   (`PRESENT` / `NOT_APPLICABLE` / `REFERENCED_ELSEWHERE` /
+   `MISSING_OR_UNCERTAIN`), dependencies with reasons, decision, confidence.
+   Python validates structure and internal consistency only: an acceptance
+   whose own table says the execution steps are missing is `UNCERTAIN`, and an
+   unreadable reply is never an acceptance.
+4. Documents the reviewer names as required are pursued as their own ScrapeX
+   tasks under the same turn budget (a resource limit, not a depth rule); a
+   limit reached is reported as incompleteness.
+5. ScrapeX captures accepted pages as rendered page-image PDFs (ALLDATA's own
+   print control ends in `window.print()` and cannot be completed by a driven
+   browser), with the extracted text, breadcrumb, hashes, and the reviewer's
+   verdict beside them in the provenance sidecar.
+6. The job attaches each captured document to the RO through the operator
+   path (`ensure_case_workspace` + `import_document` bound to the calibration
+   item), and only a fresh Calibration IQ reread decides "attached". Research
+   state is never marked complete by the job.
+7. One `adas_si_research` card posts to the originating conversation, with a
+   push and a `conversation_updated` event; `query_ciq` kind
+   `adas_si_research` reads progress; the turn context carries the job's
+   status line while it runs.
+
+### Hand-eye: observation-bound actions
+
+Every ScrapeX observation now carries an `observation_id`, the page identity,
+the viewport size, the geometry of interactive refs, and the visible DOM
+controls the accessibility tree does not expose. Actions bind to the
+observation they were chosen from:
+
+- `click`/`type`/`fill`/`press` by ref, checked against the ref's observed box
+  and label;
+- `observe_marks` numbers visible controls that have no usable ref (bounded
+  Set-of-Mark, only when asked), then `click_mark` re-locates that exact
+  control and clicks its current centre;
+- `click_visual` (last resort) takes a point as fractions of the screenshot of
+  the named observation, and ScrapeX compares the target-local region of the
+  frame it served with the same region now.
+
+A target that moved, changed, or cannot be re-established is refused (HTTP
+409) and X gets a fresh observation; the runtime never substitutes the element
+it thinks was meant. `type` sends real keystrokes for fields that ignore a
+programmatic fill, and `select_vehicle` is the provider's mechanical exact-VIN
+fast path.
+
+### Budgets and receipts
+
+The Navigator keeps the hard turn ceiling and adds progress accounting: a new
+page, candidate, dependency, or capture refunds a point; the same page again,
+a failed or repeated action, or a stale-target refusal costs one (a repeated
+identical failure two); the task stops as stalled at the limit. Every run
+returns a `research_receipt` -- objective, vehicle, provider, task ids,
+actions with observation ids, visited URLs, candidates, reviewer decisions,
+dependencies, stale rejections, artifacts with hashes, final status, and why
+it is incomplete -- and the job keeps it with each objective.
+
+`scripts/si_research_acceptance.py` runs the live acceptance cases in
+`scripts/si_research_cases.json` and records those measures per case.
 
 ## Turn-loop rules added 2026-09-11
 

@@ -3960,8 +3960,9 @@ def install() -> None:
                     "which active ROs already have or are missing an attached ADAS Map. "
                     "For ADAS Map presence/count/list questions use adas_map_inventory; it "
                     "reads Calibration IQ only and never calls ScrapeX or starts acquisition. "
-                    "Calibration IQ service-information coverage, acquisition, and missing-SI "
-                    "queues are dormant. Do not invent/default a phase or shop."
+                    "Service information is live in Calibration IQ: acquire procedures with "
+                    "stage_action research_si (background) or delegate_research, never here. "
+                    "Do not invent/default a phase or shop."
                 ),
                 "parameters": {
                     "type": "object",

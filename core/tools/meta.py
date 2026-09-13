@@ -90,6 +90,7 @@ QUERY_CIQ_KINDS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], dict[str
     ),
     "status": ("calibration_iq_status", (), (), {}),
     "adas_map_sweep": ("adas_map_sweep_status", (), (), {}),
+    "adas_si_research": ("adas_si_research_status", (), (), {}),
 }
 
 QUERY_CIQ_SCHEMA: dict[str, Any] = {
@@ -106,7 +107,9 @@ QUERY_CIQ_SCHEMA: dict[str, Any] = {
         "adas_map_sweep: only the progress or outcome of the latest background "
         "sweep (is it done, how did it go); reading it never advances the sweep, "
         "which continues on its own. It is a past snapshot rather "
-        "than current state. status: service reachability. CIQ state is not OEM proof."
+        "than current state; adas_si_research reads the latest background "
+        "service-information research job the same way. "
+        "status: service reachability. CIQ state is not OEM proof."
     ),
     "parameters": {
         "type": "object",
@@ -257,6 +260,12 @@ DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
                     "make": {"type": "string", "minLength": 1, "maxLength": 80},
                     "model": {"type": "string", "minLength": 1, "maxLength": 120},
                     "trim": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "vin": {
+                        "type": "string",
+                        "minLength": 11,
+                        "maxLength": 32,
+                        "description": "The RO's VIN when a read returned one; it selects the exact vehicle.",
+                    },
                 },
             },
             "system": {"type": "string", "maxLength": 200},
@@ -290,8 +299,16 @@ ADAS_MAP_STAGE_OPERATIONS: tuple[str, ...] = (
     "acquire_adas_map",
     "open_adas_map_authentication",
 )
+# Background service-information research: X navigates ALLDATA per
+# Calibration IQ requirement, an independent review judges each candidate,
+# ScrapeX files, the operator path attaches. Scheduled here, not decided here.
+RESEARCH_STAGE_OPERATIONS: tuple[str, ...] = ("research_si",)
+BACKGROUND_STAGE_OPERATIONS: tuple[str, ...] = (
+    *ADAS_MAP_STAGE_OPERATIONS,
+    *RESEARCH_STAGE_OPERATIONS,
+)
 # Operations that address a scope, not one RO: no fresh exact-RO read.
-SCOPE_STAGE_OPERATIONS: frozenset[str] = frozenset({"sweep_adas_maps"})
+SCOPE_STAGE_OPERATIONS: frozenset[str] = frozenset({"sweep_adas_maps", "research_si"})
 
 
 def _operator_branches(tool_name: str) -> list[dict[str, Any]]:
@@ -319,7 +336,7 @@ def stage_operations(*, allow_unscoped_creates: bool = False) -> tuple[str, ...]
     return (
         *routine,
         *CALIBRATION_IQ_DESTRUCTIVE_OPERATIONS,
-        *ADAS_MAP_STAGE_OPERATIONS,
+        *BACKGROUND_STAGE_OPERATIONS,
     )
 
 
@@ -347,7 +364,9 @@ def stage_action_schema(*, allow_unscoped_creates: bool = False) -> dict[str, An
             "never for one named RO, and never loop acquire_adas_map over a list. "
             "open_adas_map_authentication opens the managed sign-in after a result "
             "reported authentication_required. Nothing continues automatically "
-            "after sign-in; Otis asks again."
+            "after sign-in; Otis asks again. research_si: background service-"
+            "information research for one RO, named phases/shop, or the board "
+            "(arguments.systems narrows it); results post here."
         ),
         "parameters": {
             "type": "object",
@@ -514,7 +533,7 @@ def plan_stage_action(
 
     operation = str(args.get("operation") or "").strip()
     allowed = stage_operations(allow_unscoped_creates=allow_unscoped_creates)
-    if operation not in allowed or operation in ADAS_MAP_STAGE_OPERATIONS:
+    if operation not in allowed or operation in BACKGROUND_STAGE_OPERATIONS:
         raise ValueError(f"{operation or 'operation'} is not a stageable Calibration IQ operation")
     binding = _calibration_iq_exact_binding(read_result)
     if binding is None:

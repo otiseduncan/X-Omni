@@ -33,6 +33,7 @@ from .models.client import ModelClient
 from .models.router import ModelRouter, WorkerSwapError
 from .services import adas_map_sweep as adas_map_sweep_svc
 from .services import adas_si_harvest as adas_si_harvest_svc
+from .services import adas_si_research as adas_si_research_svc
 from .services import attachments as attachments_svc
 from .services import adas_si as adas_si_svc
 from .services import target_placement as target_placement_svc
@@ -348,9 +349,26 @@ def build_app(
     registry.register("adas_map_sweep", adas_map_sweep.start)
     registry.register("adas_map_sweep_status", adas_map_sweep.status)
 
-    adas_si_harvest = adas_si_harvest_svc.AdasSiHarvestService(settings, store)
-    registry.register("adas_si_harvest", adas_si_harvest.start)
-    registry.register("adas_si_harvest_status", adas_si_harvest.status)
+    # Background service-information research: the scheduler knows the RO,
+    # the exact vehicle, and the requirements; X drives the Navigator.
+    adas_si_research = adas_si_research_svc.AdasSiResearchService(
+        settings,
+        store,
+        client=client,
+        router=router,
+        adas=adas,
+        publish=live_events.publish,
+    )
+    registry.register("adas_si_research", adas_si_research.start)
+    registry.register("adas_si_research_status", adas_si_research.status)
+
+    # The scripted harvester is legacy and non-authoritative; it is registered
+    # only for an explicit side-by-side comparison run.
+    adas_si_harvest = None
+    if os.getenv("XOMNI_LEGACY_SI_HARVEST", "").strip() == "1":
+        adas_si_harvest = adas_si_harvest_svc.AdasSiHarvestService(settings, store)
+        registry.register("adas_si_harvest", adas_si_harvest.start)
+        registry.register("adas_si_harvest_status", adas_si_harvest.status)
 
     registry.register("automotive_knowledge_search", automotive_knowledge.search)
     registry.register("automotive_knowledge_read", automotive_knowledge.read)
@@ -491,6 +509,12 @@ def build_app(
         except Exception:  # noqa: BLE001 - a sweep problem must not block startup
             log.exception("Could not resume ADAS Map sweeps")
         try:
+            resumed_research = await adas_si_research.resume()
+            if resumed_research:
+                log.info("Resumed %d unfinished service-information research job(s).", resumed_research)
+        except Exception:  # noqa: BLE001 - a research problem must not block startup
+            log.exception("Could not resume service-information research")
+        try:
             swept = await asyncio.to_thread(
                 _sweep_abandoned_attachments, settings, store
             )
@@ -508,7 +532,9 @@ def build_app(
             try:
                 camera_monitor.stop()
                 await adas_map_sweep.shutdown()
-                await adas_si_harvest.shutdown()
+                await adas_si_research.shutdown()
+                if adas_si_harvest is not None:
+                    await adas_si_harvest.shutdown()
                 monitor_task.cancel()
                 adas_refresh_task.cancel()
                 await asyncio.gather(
@@ -551,6 +577,7 @@ def build_app(
     app.state.video_generation_config = video_config
     app.state.live_events = live_events
     app.state.adas_map_sweep = adas_map_sweep
+    app.state.adas_si_research = adas_si_research
 
     # Vite dev server runs on 5173 during development. Production serves the
     # built UI from this same origin, where CORS is irrelevant.

@@ -326,6 +326,8 @@ ARTIFACT_FOR_TOOL = {
     "web_research_current": "web_research",
     "adas_map_sweep": "adas_map_sweep",
     "adas_map_sweep_status": "adas_map_sweep",
+    "adas_si_research": "adas_si_research",
+    "adas_si_research_status": "adas_si_research",
     "delegate_research": "research_findings",
     "capability_search": "capabilities",
     "website_preview_generate": "website_preview",
@@ -1577,6 +1579,9 @@ def artifacts_for_result(name: str, result: Any) -> list[tuple[str, dict[str, An
         if result.get("executed_via") == "adas_map_sweep" and isinstance(execution, dict):
             cards.append(("adas_map_sweep", execution))
             return cards
+        if result.get("executed_via") == "adas_si_research" and isinstance(execution, dict):
+            cards.append(("adas_si_research", execution))
+            return cards
         if stage in {"executed", "not_executed"} and isinstance(execution, dict):
             via = result.get("executed_via")
             if via in _CALIBRATION_IQ_OPERATOR_TOOLS:
@@ -2051,13 +2056,23 @@ class Orchestrator:
             role, calibration_iq_evidence, scrapex_evidence, unlocked_tool_names
         )
         from ..services import adas_map_sweep as adas_map_sweep_svc
+        from ..services import adas_si_research as adas_si_research_svc
 
-        background = adas_map_sweep_svc.latest_context_line(
-            self.store,
-            effective_context.get("user_id"),
-            conversation_id=conversation_id,
-            include_completed=False,
-        )
+        background_lines = [
+            adas_map_sweep_svc.latest_context_line(
+                self.store,
+                effective_context.get("user_id"),
+                conversation_id=conversation_id,
+                include_completed=False,
+            ),
+            adas_si_research_svc.latest_context_line(
+                self.store,
+                effective_context.get("user_id"),
+                conversation_id=conversation_id,
+                include_completed=False,
+            ),
+        ]
+        background = " ".join(line for line in background_lines if line) or None
         messages = prompt_mod.build_messages(
             self.router,
             history,

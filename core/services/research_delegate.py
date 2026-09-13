@@ -7,7 +7,9 @@ sources in order and returns provenance-bearing findings:
     adas_si              local authoritative OEM/service-information library
     automotive_knowledge durable, provenance-backed structured knowledge
     alldata              licensed ALLDATA through ScrapeX's Navigator, driven
-                         by the active X model inside this one tool call
+                         by the active X model inside this one tool call;
+                         each candidate page is judged by an independent
+                         semantic review before it counts as a finding
     web                  public OEM web search with bounded page reads
 
 Structural only: no user prose is parsed here.  Source order comes from the
@@ -56,6 +58,12 @@ def _vehicle(args: dict[str, Any]) -> dict[str, Any]:
         value = _clean(raw.get(field), 120)
         if value:
             vehicle[field] = value
+    # A VIN identifies one vehicle including trim and engine, which a
+    # year/make/model cascade cannot. Kept apart from the label so it never
+    # becomes part of a search phrase.
+    vin = "".join(_clean(raw.get("vin"), 32).split()).upper()
+    if vin:
+        vehicle["vin"] = vin
     label = " ".join(
         str(vehicle[field]) for field in ("year", "make", "model", "trim") if field in vehicle
     )
@@ -255,20 +263,29 @@ def make_delegate_research(
                         )
                         ledger.append(entry)
                         continue
+                    target = {
+                        "year": vehicle["year"],
+                        "make": vehicle["make"],
+                        "model": " ".join(
+                            part for part in (vehicle.get("model"), vehicle.get("trim")) if part
+                        ),
+                    }
+                    if vehicle.get("vin"):
+                        target["vin"] = vehicle["vin"]
+                    research_objective = {
+                        "objective": objective,
+                        "system": _clean(args.get("system"), 200) or None,
+                        "component": _clean(args.get("component"), 200) or None,
+                    }
                     result = await _maybe_await(
                         search(
                             client=client,
                             settings=settings,
                             provider="alldata",
-                            target={
-                                "year": vehicle["year"],
-                                "make": vehicle["make"],
-                                "model": " ".join(
-                                    part for part in (vehicle.get("model"), vehicle.get("trim")) if part
-                                ),
-                            },
+                            target=target,
                             topic=objective,
                             capture=preserve,
+                            objective=research_objective,
                         )
                     )
                     result = result if isinstance(result, dict) else {}
@@ -276,29 +293,62 @@ def make_delegate_research(
                         "verified" if result.get("verified") else "unverified"
                     )
                     entry["verified"] = bool(result.get("verified"))
+                    entry["complete"] = result.get("complete")
                     entry["reason"] = result.get("reason") or result.get("verification_reason")
                     entry["task_id"] = result.get("task_id")
+                    if result.get("incomplete_reasons"):
+                        entry["incomplete_reasons"] = list(result["incomplete_reasons"])[:6]
                     if result.get("requires_human") or result.get("status") == "authentication_required":
                         authentication_required = True
                         requires_human = True
-                    if result.get("task_id"):
-                        evidence_ids.append(f"navigator-task:{result['task_id']}")
+                    for task_id in result.get("task_ids") or ([result["task_id"]] if result.get("task_id") else []):
+                        evidence_ids.append(f"navigator-task:{task_id}")
                     if entry["verified"]:
+                        review = result.get("semantic_review") if isinstance(result.get("semantic_review"), dict) else {}
                         finding = {
                             "source": "alldata",
-                            "title": _clean(result.get("topic") or objective, 200),
+                            "title": _clean(result.get("evidence_title") or result.get("topic") or objective, 200),
                             "url": result.get("source_url"),
                             "excerpt": _clean(result.get("extracted_text"), ALLDATA_EXTRACT_CHARS),
                             "task_id": result.get("task_id"),
                             "captured": bool(result.get("captured")),
                             "provenance": result.get("provenance"),
                             "verification": result.get("verification"),
+                            "semantic_review": {
+                                key: review.get(key)
+                                for key in ("classification", "procedure_type", "decision", "confidence", "evidence_summary")
+                                if review.get(key) is not None
+                            } or None,
+                            "documents": [
+                                {
+                                    key: document.get(key)
+                                    for key in ("role", "title", "url", "accepted", "classification", "decision", "captured", "artifact")
+                                }
+                                for document in (result.get("documents") or [])
+                                if isinstance(document, dict)
+                            ][:8] or None,
+                            "dependencies": [
+                                {key: dependency.get(key) for key in ("title", "reason", "status")}
+                                for dependency in (result.get("dependencies") or [])
+                                if isinstance(dependency, dict)
+                            ][:8] or None,
+                            "complete": result.get("complete"),
                         }
                         if result.get("captured") and isinstance(result.get("capture"), dict):
                             finding["capture"] = result["capture"]
                         source_findings = [
                             {key: value for key, value in finding.items() if value not in (None, "", {})}
                         ]
+                    if isinstance(result.get("research_receipt"), dict):
+                        receipt = result["research_receipt"]
+                        entry["receipt"] = {
+                            "task_ids": receipt.get("task_ids"),
+                            "final_status": receipt.get("final_status"),
+                            "critic_decisions": receipt.get("critic_decisions"),
+                            "artifacts": receipt.get("artifacts"),
+                            "stale_action_rejections": receipt.get("stale_action_rejections"),
+                            "metrics": receipt.get("metrics"),
+                        }
                     entry["result_count"] = len(source_findings)
                 elif source == "web":
                     from . import research_workflow

@@ -361,6 +361,22 @@ tools:
       Progress or results of the latest ADAS Map sweep. Reached through
       query_ciq kind=adas_map_sweep.
 
+  adas_si_research:
+    tier: operator_authorized
+    description: >-
+      Background ADAS service-information research: exact vehicle/VIN and
+      calibration requirements from Calibration IQ, one model-driven ALLDATA
+      Navigator objective per requirement, an independent semantic review of
+      every candidate, capture into ADAS SI with provenance, and attachment to
+      the RO through the operator path. Reached through stage_action
+      research_si; not advertised directly in the daily profile.
+
+  adas_si_research_status:
+    tier: read_only
+    description: >-
+      Progress or results of the latest background service-information
+      research job. Reached through query_ciq kind=adas_si_research.
+
   scrapex_start_native:
     tier: operator_authorized
     description: "Start ScrapeX's local server when unreachable, then verify it answers."
@@ -398,15 +414,17 @@ tools:
     description: >-
       Perform verified, idempotent Calibration IQ operator batches for the
       active field workflow: research state, photos, ADAS Map/case documents,
-      status undo, calibration decisions, and location administration. SI-gap
-      bookkeeping and CIQ service-information attachment are dormant.
+      service-information (OEM procedure) documents, status undo, calibration
+      decisions, and location administration. Service information is live in
+      Calibration IQ: procedures filed in ADAS SI attach to the RO's case.
 
   calibration_iq_work_prep:
     tier: operator_authorized
     description: >-
       Prepare active Calibration IQ field work from the authoritative RO queue:
       list an explicitly named phase or read/reconcile one RO's governing ADAS Map
-      requirements. CIQ service-information coverage/acquisition is dormant.
+      requirements. Service-information acquisition runs through stage_action
+      research_si (background, model-driven) and delegate_research.
 
   calibration_iq_destructive:
     tier: confirm_required

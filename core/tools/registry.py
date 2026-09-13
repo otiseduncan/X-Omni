@@ -62,6 +62,8 @@ _CALIBRATION_IQ_CONTEXT_KEY = "__xomni_invocation"
 _SCRAPEX_CONTEXT_KEY = "__xomni_invocation"
 SWEEP_TOOLS = frozenset({
     "adas_map_sweep", "adas_map_sweep_status",
+    "adas_si_research", "adas_si_research_status",
+    # Legacy scripted harvester: registered only for comparison runs.
     "adas_si_harvest", "adas_si_harvest_status",
 })
 _CALIBRATION_IQ_WORK_PREP_CONTEXT_KEY = "__xomni_work_prep_context"
@@ -610,6 +612,7 @@ NAVIGATOR_ID_BOUND_ACTIONS = frozenset(
         "get_evidence",
         "click",
         "fill",
+        "type",
         "press",
         "back",
         "open",
@@ -617,6 +620,9 @@ NAVIGATOR_ID_BOUND_ACTIONS = frozenset(
         "wait",
         "extract",
         "done",
+        "click_mark",
+        "click_visual",
+        "select_vehicle",
     }
 )
 _NAVIGATOR_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
@@ -2807,11 +2813,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                 },
                             ),
                             # create_missing_si_record / resolve_missing_si_record
-                            # are intentionally NOT advertised: CIQ's SI workflow is
-                            # dormant, and operator_execute rejects them as
-                            # invalid_operation since they are absent from
-                            # ROUTINE_OPERATOR_OPERATIONS. Advertising an operation the
-                            # service refuses only invites a guaranteed failure.
+                            # are not advertised here: procedures reach the RO
+                            # through import_document (stage_action research_si
+                            # files them from the model-driven Navigator), and
+                            # missing-SI bookkeeping stays a Calibration IQ
+                            # workflow rather than a model-facing operation.
                             _calibration_iq_action_branch(
                                 ("ensure_case_workspace",),
                                 ("repair_order_id",),
@@ -3214,14 +3220,49 @@ TOOL_SCHEMAS["adas_map_sweep"] = {
         "required": [],
     },
 }
+TOOL_SCHEMAS["adas_si_research"] = {
+    "description": (
+        "Start background ADAS service-information research: for each repair order "
+        "in scope, read its exact vehicle, VIN and calibration requirements from "
+        "Calibration IQ, then have X research each requirement's procedure in ALLDATA "
+        "through the Navigator with an independent semantic review; accepted "
+        "procedures are filed in ADAS SI with provenance and attached to the RO. "
+        "Returns immediately; started is not complete."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "repair_order_id": {"type": "string", "minLength": 1},
+            "ro_numbers": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 40},
+                "maxItems": 25,
+            },
+            "phases": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 4},
+                "maxItems": 12,
+            },
+            "shop": {"type": "string"},
+            "systems": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 160},
+                "maxItems": 12,
+                "description": "Only when the request names systems; otherwise every active requirement.",
+            },
+        },
+        "required": [],
+    },
+}
+TOOL_SCHEMAS["adas_si_research_status"] = {
+    "description": "Progress or results of the latest background service-information research job.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
 TOOL_SCHEMAS["adas_si_harvest"] = {
     "description": (
-        "Start a background ADAS service-information harvest from ALLDATA: for each "
-        "vehicle, open its ADAS Quick Reference, follow every ADAS component to its "
-        "calibration procedures, and file each one into ADAS SI as a verified PDF "
-        "with provenance. Give either explicit vehicle labels, or Calibration IQ "
-        "phases to take every vehicle on those phases. Returns immediately; started "
-        "is not complete."
+        "LEGACY, non-default scripted harvester kept for comparison only; not the "
+        "production service-information path. Use adas_si_research instead."
     ),
     "parameters": {
         "type": "object",
@@ -4658,6 +4699,41 @@ class Registry:
                     "mutated": started,
                     "operation": operation,
                     "executed_via": "adas_map_sweep",
+                    "execution": execution,
+                },
+                status="succeeded" if started or (
+                    isinstance(execution, dict) and execution.get("success") is True
+                ) else "failed",
+            )
+
+        if operation == "research_si":
+            research_args: dict[str, Any] = {}
+            if args.get("phases") not in (None, "", []):
+                research_args["phases"] = args.get("phases")
+            for field in ("repair_order_id", "shop"):
+                value = _calibration_iq_nonempty(args.get(field))
+                if value:
+                    research_args[field] = value
+            arguments = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+            systems = arguments.get("systems", args.get("systems"))
+            if isinstance(systems, list) and systems:
+                research_args["systems"] = [
+                    str(item) for item in systems if str(item or "").strip()
+                ][:12]
+            execution = await self.invoke(
+                "adas_si_research",
+                research_args,
+                message_id=message_id,
+                **common,
+            )
+            started = isinstance(execution, dict) and execution.get("executed") is True
+            return record(
+                {
+                    "stage": "started" if started else "not_started",
+                    "executed": started,
+                    "mutated": started,
+                    "operation": operation,
+                    "executed_via": "adas_si_research",
                     "execution": execution,
                 },
                 status="succeeded" if started or (
