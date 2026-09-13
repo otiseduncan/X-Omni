@@ -144,8 +144,10 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
     # Length as well as names: the set comparison above would not notice the
     # same tool being advertised to the model twice.
     assert len(adas_catalog) == len(EXPECTED_ADAS_TOOLS)
-    # 60 since 2026-09-12: adas_target_placement.
-    assert len(full_catalog) == len(full_names) == 60
+    # 60 since 2026-09-12: adas_target_placement. 62 since 2026-09-13:
+    # adas_si_research and adas_si_research_status (background research
+    # reached through stage_action research_si / query_ciq adas_si_research).
+    assert len(full_catalog) == len(full_names) == 62
     assert NON_ADAS_NORMAL_TOOLS <= full_names
     assert META_WRAPPED_CIQ_TOOLS <= full_names
     assert PERMANENT <= full_names
@@ -413,8 +415,12 @@ def test_stage_action_lists_every_operator_operation_without_the_grammar() -> No
     assert {"acquire_adas_map", "open_adas_map_authentication", "sweep_adas_maps"} <= operations
     encoded = json.dumps(catalog["stage_action"], separators=(",", ":"))
     operator_encoded = json.dumps(TOOL_SCHEMAS["calibration_iq_operator"], separators=(",", ":"))
-    assert len(encoded) < 3_700
-    assert len(encoded) * 4 < len(operator_encoded)
+    # 2026-09-13: research_si (background service-information research) and
+    # its systems field added ~300 chars to the staged contract.
+    assert len(encoded) < 4_000
+    # Still a small fraction of the operator grammar (measured 3.9k vs 15.0k
+    # on 2026-09-13, after research_si joined the staged operations).
+    assert len(encoded) * 3.5 < len(operator_encoded)
 
     full_catalog = {
         item["function"]["name"]: item["function"]
@@ -521,8 +527,11 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # Measured 2026-09-11 after the ADAS Map sweep contract: about 8,800 chars
     # and 2,500 estimator tokens (exact Qwen3 tokens run slightly lower), down
     # from ~12,300 exact tokens for the old 33-tool reserve.
-    assert metrics["advertised_tools"]["catalog_chars"] < 9_200
-    assert metrics["advertised_tools"]["catalog_tokens"] < 2_650
+    # 2026-09-13: stage_action research_si (background service-information
+    # research) and query_ciq adas_si_research added ~500 chars to the permanent
+    # catalog; measured 9,706 chars / 2,774 estimator tokens after trimming.
+    assert metrics["advertised_tools"]["catalog_chars"] < 9_900
+    assert metrics["advertised_tools"]["catalog_tokens"] < 2_830
     assert metrics["total_input_used_tokens"] < 4_900
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
     # The no-tool review now reserves room for the background-work line.
@@ -531,7 +540,8 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # 24,497, three short. The guard's substance is that a normal turn keeps
     # roughly 24.5k of headroom, which still holds -- trimming a safety rule
     # further to recover three tokens would be the wrong trade.
-    assert metrics["remaining_normal_turn_tokens"] > 24_400
+    # 2026-09-13 after the research_si contract: 24,4xx measured.
+    assert metrics["remaining_normal_turn_tokens"] > 24_300
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

@@ -106,8 +106,11 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # fields. The old 33-tool reserve was ~12,300 exact tokens.
     # The ADAS Map sweep contract (sweep_adas_maps, query_ciq adas_map_sweep)
     # added about 1,000 chars on 2026-09-11.
-    assert metrics["advertised_tools"]["catalog_tokens"] < 2_650
-    assert metrics["advertised_tools"]["catalog_chars"] < 9_200
+    # 2026-09-13: stage_action research_si (background service-information
+    # research) and query_ciq adas_si_research added ~500 chars to the permanent
+    # catalog; measured 9,706 chars / 2,774 estimator tokens after trimming.
+    assert metrics["advertised_tools"]["catalog_tokens"] < 2_830
+    assert metrics["advertised_tools"]["catalog_chars"] < 9_900
     # Static system prompt, measured with the voice-dictation sentence: 4,831
     # chars, ~1,381 estimator tokens. Raised 2026-09-12 by 637 chars for the
     # setup-measurement rule: X had answered a target placement question from
@@ -359,4 +362,5 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     )
     assert abs(metrics["fixed_prompt"]["tokens"] - summed_sections) <= 2
     # Measured 2026-09-11 after the ADAS Map sweep contract: 24,985.
-    assert metrics["remaining_normal_turn_tokens"] >= 24_700
+    # 2026-09-13 after the research_si contract: 24,649.
+    assert metrics["remaining_normal_turn_tokens"] >= 24_550

@@ -14,13 +14,24 @@ ScrapeX Navigator is the production ALLDATA browser path. The model owns
 perception and navigation; ScrapeX owns the isolated provider session,
 bounded action execution, and verification.
 
-Truthfulness never depends on the model's own narration of what it did.
-After the loop ends (the model stops calling tools, sends "done", or the
-turn budget runs out), ScrapeX's verify action is the single authority on
-evaluate_navigation_claim, so "verified" means the same thing regardless
-of how many turns the model actually used.
-This loop never recomputes browser semantics itself; it only checks the
-*shape* of what ScrapeX's contract-validated client returns.
+Three things the loop keeps strictly apart:
+
+* **Observation-bound action.** Every ref action names the observation it
+  was chosen from; a control the accessibility tree does not expose can be
+  reached through a numbered mark (``observe_marks`` then ``click_mark``) or,
+  last, a point on the screenshot (``click_visual``). ScrapeX proves the
+  target is still what was seen, or refuses; a refusal comes back here as a
+  fresh observation, never as a substituted click.
+* **Semantic review in a clean context.** When the model marks a page and
+  ScrapeX's mechanical gates pass (vehicle selected, navigation happened,
+  leaf reached, text extracted), the page's evidence goes to an independent
+  reviewer that has never seen this loop's transcript
+  (``research_semantic_review``). Only its structured acceptance makes a
+  candidate count, and only then is anything captured.
+* **Execution truth.** ScrapeX's verify action is the single authority on
+  the mechanical claim, capture is the single authority on what was filed,
+  and the research receipt records ids, URLs, decisions, and hashes -- not
+  the model's narration of what it did.
 """
 
 from __future__ import annotations
@@ -29,10 +40,14 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from . import scrapex as scrapex_svc
+from .research_semantic_review import accepted as review_accepted
+from .research_semantic_review import review_candidate
 
 log = logging.getLogger("xomni.research_navigator_agent")
 
@@ -58,8 +73,32 @@ def current_model_client() -> Any | None:
     return _ACTIVE_MODEL_CLIENT.get()
 
 
+# One Navigator run at a time: ScrapeX drives one provider browser, and two
+# loops interleaving actions on it would each be acting from the other's
+# page. A caller that finds the lock held gets a structured "busy" result
+# instead of a wait that outlives a chat turn.
+NAVIGATOR_LOCK = asyncio.Lock()
+
 MAX_MODEL_TURNS = 40
-_NAV_ACTIONS = ("observe", "click", "fill", "press", "back", "open", "scroll", "wait", "extract", "done")
+# Dependencies a single objective may pursue, and the share of the turn
+# budget each may use. These are resource limits, not a depth rule: a
+# procedure whose prerequisite has its own prerequisite is followed as long
+# as the budget holds, and running out is reported as incompleteness.
+MAX_DEPENDENCIES = 3
+DEPENDENCY_TURN_SHARE = 0.5
+# Non-progress accounting. Progress is a new page, a new candidate, a new
+# dependency, a capture; non-progress is the same page again, a repeated or
+# failed action, a stale-target refusal. Each non-progress turn costs one
+# point (a repeated identical failure two), each progress turn refunds one,
+# and the task stops as stalled at the limit. The hard turn ceiling above
+# still applies regardless.
+STALL_LIMIT = 8
+_NAV_ACTIONS = (
+    "observe", "observe_marks", "click", "type", "fill", "press", "back", "open",
+    "scroll", "wait", "click_mark", "click_visual", "select_vehicle", "extract", "done",
+)
+_REF_ACTIONS = frozenset({"click", "fill", "type", "press"})
+_OBSERVATION_BOUND_ACTIONS = frozenset({"click_mark", "click_visual"})
 # Bounded at the element level, not by an outer character truncation --
 # confirmed live against real ALLDATA search results (500+ entries): a flat
 # json.dumps(...)[:N] cap cut the elements array off mid-object, so the
@@ -73,10 +112,14 @@ _FAILED_ACTION_OBSERVE_ATTEMPTS = 4
 # Actions that ask the page to become a different page. ALLDATA answers
 # the act call before the navigation lands, so the observation returned
 # with it can still describe the page the action was leaving.
-_PAGE_CHANGING_ACTIONS = frozenset({"click", "press", "open", "back"})
+_PAGE_CHANGING_ACTIONS = frozenset(
+    {"click", "press", "open", "back", "click_mark", "click_visual", "select_vehicle"}
+)
 _SETTLE_OBSERVE_ATTEMPTS = 4
 _SETTLE_OBSERVE_DELAY_SECONDS = 0.35
 _FAILED_ACTION_OBSERVE_DELAY_SECONDS = 0.35
+# ScrapeX codes that mean "the target you named is no longer what you saw".
+_STALE_CODES = ("stale_observation", "stale_target", "stale_visual_target", "stale_ref", "visual_frame_missing")
 
 # --- Transcript budget ----------------------------------------------------
 #
@@ -139,16 +182,20 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
             "Operate the real, already-authenticated ALLDATA browser session one bounded "
             "action at a time. Reason from the current rendered page and structured element "
             "map; do not assume a fixed ALLDATA hierarchy or scripted drill-down sequence. "
-            "Every click/fill/press targets an exact 'ref' copied verbatim from the latest "
-            "observation -- never invent a ref, role, label, selector, or coordinate. After "
-            "each action the browser is re-observed, so choose the next action from the new "
-            "state rather than predicting what a page should contain. Maintain the exact "
-            "requested vehicle as a hard evidence requirement, explore/backtrack as needed, "
-            "and call extract only when actual procedure content is on screen rather than a "
-            "menu or results list. Every extract is immediately checked by ScrapeX; if the "
-            "candidate is rejected, use the returned verification gates/reason to backtrack "
-            "and explore a different branch. Call done only when the observed site state "
-            "shows the exact goal is not reachable."
+            "Prefer refs: every click/type/fill/press targets an exact 'ref' copied verbatim "
+            "from the latest observation -- never invent a ref, role, label, or selector. "
+            "When you can SEE a control in the screenshot but no ref reaches it, call "
+            "observe_marks: the runtime numbers such controls [m21], [m22]... and you may "
+            "click_mark one. Only if neither works, click_visual with x_norm/y_norm as "
+            "fractions of the screenshot's width and height. Every action is bound to the "
+            "observation you chose it from; if the page changed you get a fresh observation "
+            "instead, so choose again from that. After each action the browser is "
+            "re-observed. Keep the exact requested vehicle as a hard requirement; "
+            "select_vehicle with the VIN selects it exactly when one is given. Call extract "
+            "only when actual procedure content is on screen rather than a menu or results "
+            "list; it is then checked mechanically by ScrapeX and judged by an independent "
+            "reviewer, and you get both verdicts back. Call done only when the observed site "
+            "state shows the exact goal is not reachable."
         ),
         "parameters": {
             "type": "object",
@@ -158,10 +205,10 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
                     "type": "string",
                     "description": (
                         "The exact element ref from the most recent observation -- required "
-                        "by, and only used by, click/fill/press."
+                        "by, and only used by, click/type/fill/press."
                     ),
                 },
-                "text": {"type": "string", "description": "Text to type -- only used by fill."},
+                "text": {"type": "string", "description": "Text to type -- only used by type/fill."},
                 "key": {
                     "type": "string",
                     "description": "A keyboard key name such as Enter or Tab -- only used by press.",
@@ -182,11 +229,48 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
                     "maximum": 2500,
                     "description": "Only used by wait for bounded client-rendered content settling.",
                 },
+                "mark": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Only used by click_mark: a mark number from the latest observe_marks result.",
+                },
+                "x_norm": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Only used by click_visual: horizontal position as a fraction of the screenshot width.",
+                },
+                "y_norm": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Only used by click_visual: vertical position as a fraction of the screenshot height.",
+                },
+                "vin": {
+                    "type": "string",
+                    "description": "Only used by select_vehicle: the exact 17-character VIN the repair order carries.",
+                },
             },
             "required": ["action"],
             "additionalProperties": False,
         },
     },
+}
+
+# Non-binding provider notes: what this provider has been observed to do.
+# They are offered as context and may be ignored; nothing here routes.
+PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
+    "alldata": (
+        "Recent Vehicles on the picker reaches a vehicle worked on before in one click.",
+        "ALLDATA files SUVs, trucks and vans under a '<Make> Truck' make; a Palisade may be "
+        "under 'Hyundai Truck' rather than 'Hyundai'.",
+        "Every vehicle page has an 'ADAS Quick Reference' in its Reference panel: a table of "
+        "ADAS components with links into each component's procedures.",
+        "Some Nissan/Infiniti radar material has been filed under Cruise Control.",
+        "Procedure titles vary by make: Aiming, Adjustment, Alignment, Programming and "
+        "Relearning, Initialization, Learn, Zero Point.",
+        "The vehicle search box ignores programmatic fills; typing keystrokes works.",
+    ),
 }
 
 
@@ -200,21 +284,50 @@ def _target_label(target: dict[str, Any]) -> str:
     return label or "the requested vehicle"
 
 
-def _system_prompt(target: dict[str, Any], topic: str) -> str:
+def _system_prompt(
+    target: dict[str, Any],
+    topic: str,
+    objective: Optional[dict[str, Any]] = None,
+    provider: str = "alldata",
+    goal_note: str = "",
+) -> str:
     label = _target_label(target)
+    objective = objective or {}
+    system_line = ""
+    if objective.get("system") or objective.get("component"):
+        system_line = (
+            f"System: {objective.get('system') or ''}"
+            + (f" / Component: {objective.get('component')}" if objective.get("component") else "")
+            + "\n"
+        )
+    vin_line = (
+        f"VIN: {target.get('vin')} -- select_vehicle with this VIN selects the exact vehicle.\n"
+        if target.get("vin")
+        else ""
+    )
+    hints = PROVIDER_HINTS.get(provider, ())
+    hint_block = (
+        "\n\nHistorical provider notes (non-binding; verify on the live page rather than "
+        "assuming any of them):\n- " + "\n- ".join(hints)
+        if hints
+        else ""
+    )
+    goal_block = f"\n\n{goal_note}" if goal_note else ""
     return (
         "You are operating a licensed ALLDATA Repair/Collision browser session for a "
         "collision repair technician, through a bounded Navigator action interface. The "
         "session is already authenticated. Your very first tool call has already been "
         "answered with an initial observation of the current page -- read it before acting. "
-        f"Find the exact OEM procedure for:\nVehicle: {label}\nTopic: {topic}\n\n"
+        f"Find the exact OEM procedure for:\nVehicle: {label}\n{vin_line}{system_line}Topic: {topic}\n\n"
         "Do not substitute a different model, trim, or year, and do not answer from general "
         "knowledge -- only from what you actually observe. You are the navigation reasoner: "
         "choose the next browser action from the live page state and reassess after every turn. "
         "A task-bound annotated screenshot accompanies each "
         "observation when available; labels such as [e12] on the image are the same exact refs "
-        "listed in the structured observation. Use pixels to understand layout, grouping, "
-        "selected state, menus, and drill-down context, but act only by an observed ref. The "
+        "listed in the structured observation, and [m21]-style labels are marks you asked for. "
+        "Use pixels to understand layout, grouping, "
+        "selected state, menus, and drill-down context, but act by ref first, by mark when a "
+        "visible control has no ref, and by click_visual only as a last resort. The "
         "browser will be re-observed after each executed action, so choose one action at a time "
         "and then reassess. A procedure page's own text may never contain the word you "
         "were sent to find: this provider's Hyundai front-radar procedure is titled 'How "
@@ -228,8 +341,10 @@ def _system_prompt(target: dict[str, Any], topic: str) -> str:
         "intent as calibration, aiming, alignment, adjustment, initialization, relearn, setup, "
         "registration, learn, or zero-point procedures, and system names also vary. Use the live "
         "page context to reason semantically while preserving the exact requested vehicle/system. "
-        "Your final claim is independently checked against the real page. After extract, read the "
-        "verification feedback; if it is rejected, correct course instead of declaring success. "
+        "Your final claim is independently checked against the real page and reviewed by an "
+        "independent reader who sees only the evidence. After extract, read both verdicts; if "
+        "the candidate is rejected or the reviewer wants another document, correct course "
+        "instead of declaring success. "
         "If a tool call returns an error, adapt to the observed state rather than repeating it. "
         "On ALLDATA's vehicle picker, prefer its full-vehicle search box (for example, "
         "'Search by Year, Make, Model, Engine, or VIN') when that box is visible. Fill it "
@@ -237,17 +352,19 @@ def _system_prompt(target: dict[str, Any], topic: str) -> str:
         "make taxonomy; do not invent or hardcode make aliases to drive separate dropdowns. "
         "If the exact vehicle/topic cannot be found after reasonable exploration, call 'done' "
         "and say so plainly instead of guessing."
+        + hint_block
+        + goal_block
     )
 
 
 def _validate_args(action: str, args: dict[str, Any]) -> Optional[str]:
-    if action in ("click", "fill", "press") and not str(args.get("ref") or "").strip():
+    if action in _REF_ACTIONS and not str(args.get("ref") or "").strip():
         return (
             f"{action} requires a non-empty 'ref' copied verbatim from the most recent "
             "observation's elements list."
         )
-    if action == "fill" and not str(args.get("text") or "").strip():
-        return "fill requires a non-empty 'text' field with the value to type."
+    if action in {"fill", "type"} and not str(args.get("text") or "").strip():
+        return f"{action} requires a non-empty 'text' field with the value to type."
     if action == "press" and not str(args.get("key") or "").strip():
         return "press requires a non-empty 'key', e.g. Enter."
     if action == "open" and not str(args.get("url") or "").strip():
@@ -268,6 +385,17 @@ def _validate_args(action: str, args: dict[str, Any]) -> Optional[str]:
             or not 100 <= milliseconds <= 2500
         ):
             return "wait requires integer 'milliseconds' from 100 to 2500."
+    if action == "click_mark":
+        mark = args.get("mark")
+        if isinstance(mark, bool) or not isinstance(mark, int) or mark < 1:
+            return "click_mark requires integer 'mark' from the latest observe_marks result."
+    if action == "click_visual":
+        for key in ("x_norm", "y_norm"):
+            value = args.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+                return "click_visual requires 'x_norm' and 'y_norm' between 0 and 1."
+    if action == "select_vehicle" and not str(args.get("vin") or "").strip():
+        return "select_vehicle requires the 'vin' the repair order carries."
     return None
 
 
@@ -277,6 +405,21 @@ def _extract_content(events: list[dict[str, Any]]) -> str:
 
 def _extract_tool_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [event for event in events if event.get("type") == "tool_call"]
+
+
+def _extract_usage(events: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    for event in events:
+        if event.get("type") == "usage":
+            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            timings = event.get("timings") if isinstance(event.get("timings"), dict) else {}
+            return {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "cached_tokens": timings.get("cache_n"),
+                "prompt_ms": timings.get("prompt_ms"),
+                "predicted_ms": timings.get("predicted_ms"),
+            }
+    return None
 
 
 def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
@@ -290,12 +433,20 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {"error": (navigator_result or {}).get("error") if isinstance(navigator_result, dict) else "no_data"}
     elements = data.get("elements")
-    elements = elements[:MAX_ELEMENTS_FOR_MODEL] if isinstance(elements, list) else elements
+    if isinstance(elements, list):
+        # Boxes are for the runtime's binding checks and the screenshot
+        # labels; the model relates refs to the picture through the labels.
+        elements = [
+            {key: value for key, value in item.items() if key != "box"} if isinstance(item, dict) else item
+            for item in elements[:MAX_ELEMENTS_FOR_MODEL]
+        ]
     truncated = isinstance(data.get("elements"), list) and len(data["elements"]) > MAX_ELEMENTS_FOR_MODEL
     summary: dict[str, Any] = {
+        "observation_id": data.get("observation_id"),
         "url": data.get("url"),
         "title": data.get("title"),
         "breadcrumb": data.get("breadcrumb"),
+        "viewport": data.get("viewport"),
         # ScrapeX bounds this to 8k chars while building the observation.
         # This is the semantic content X was previously missing when it had
         # only labels/refs and a screenshot to reason from.
@@ -314,6 +465,17 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
         "backtrack_available": data.get("backtrack_available"),
         "repeated_action_warning": data.get("repeated_action_warning"),
     }
+    if data.get("marks"):
+        summary["marks"] = data["marks"]
+    if isinstance(data.get("controls_without_refs"), int) and data["controls_without_refs"] > 0:
+        summary["controls_without_refs"] = data["controls_without_refs"]
+    if isinstance(data.get("action_target"), dict):
+        summary["action_target"] = data["action_target"]
+    if data.get("action_detail"):
+        summary["action_detail"] = data["action_detail"]
+    if isinstance(data.get("extract"), dict):
+        summary["extract"] = data["extract"]
+    summary = {key: value for key, value in summary.items() if key != "observation_id" or value}
     if truncated:
         summary["elements_truncated"] = (
             f"Only the first {MAX_ELEMENTS_FOR_MODEL} of "
@@ -361,10 +523,17 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _task_screenshot(
-    settings: Any, task_id: str
+    settings: Any, task_id: str, observation_id: Optional[str] = None
 ) -> Optional[tuple[bytes, str]]:
-    """Best-effort visual observation; pixels never become the truth gate."""
+    """Best-effort visual observation; pixels never become the truth gate.
+
+    Bound to the observation it accompanies: ScrapeX refuses a still for a
+    superseded observation and echoes the bound id, which is what makes a
+    later click_visual checkable against exactly this frame.
+    """
     try:
+        if observation_id:
+            return await scrapex_svc.navigator_screenshot(settings, task_id, observation_id)
         return await scrapex_svc.navigator_screenshot(settings, task_id)
     except Exception as exc:  # noqa: BLE001 - vision supplements the DOM contract
         log.debug("Navigator screenshot unavailable for %s: %s", task_id, exc)
@@ -390,8 +559,9 @@ def _visual_observation_content(
             "text": (
                 text
                 + "\n\nThe attached image is this same task's current rendered viewport. "
-                "Its [eN] overlays correspond to the exact refs above. Use the image to "
-                "understand what a human sees, but execute browser actions only by ref."
+                "Its [eN] overlays correspond to the exact refs above, and any [mN] overlays "
+                "to the marks listed. Use the image to understand what a human sees; act by "
+                "ref, then mark, then click_visual only when nothing else reaches the control."
             ),
         },
         {
@@ -487,6 +657,19 @@ def _navigator_failure_message(result: dict[str, Any], action: str) -> str:
     return message
 
 
+def _failure_code(result: dict[str, Any]) -> str:
+    """The ScrapeX-side code of a refusal, when it carried one."""
+    detail = result.get("detail")
+    if isinstance(detail, dict) and detail.get("code"):
+        return str(detail["code"])
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    text = json.dumps([error.get("message"), detail], default=str)
+    for code in _STALE_CODES:
+        if code in text:
+            return code
+    return str(error.get("code") or result.get("status") or "")
+
+
 def _can_refresh_after_failure(result: dict[str, Any]) -> bool:
     """True only when ScrapeX definitively rejected the requested action."""
 
@@ -521,7 +704,7 @@ def _action_digest(
     detail = " ".join(
         f"{key}={value}"
         for key, value in sorted(args.items())
-        if key != "action" and value not in (None, "")
+        if key not in {"action", "observation_id"} and value not in (None, "")
     )
     head = " ".join(part for part in (f"[action {ordinal}]", action, detail) if part)
     where = ""
@@ -547,13 +730,16 @@ def _tool_receipt(
     The full observation rides in exactly one message per turn -- the visual
     user message -- so this is an execution receipt, not a second copy of
     it. Everything the model must act on rather than merely see is kept
-    verbatim: the error text, and ScrapeX's post-extract verification
-    verdict with its instruction.
+    verbatim: the error text, ScrapeX's post-extract verification verdict,
+    the reviewer's verdict, and the instruction that follows from them.
     """
     if not isinstance(result, dict):
         return {"error": "The navigator returned no usable result."}
     if result.get("error"):
-        return {"error": result["error"]}
+        receipt = {"error": result["error"]}
+        if result.get("fallback_hint"):
+            receipt["fallback_hint"] = result["fallback_hint"]
+        return receipt
     # Name the action that just happened and say it is finished. On an SPA
     # the url and title frequently do not move when a click opens a panel or
     # a menu, and a receipt that only echoed those read as "nothing
@@ -562,14 +748,13 @@ def _tool_receipt(
     # of each budget on duplicates. The refreshed page arrives in the very
     # next message, so the receipt's job is to close the action, not to
     # describe the page.
-    performed = " ".join(
-        part
-        for part in (
-            action,
-            str((args or {}).get("ref") or ""),
-        )
-        if part
-    ).strip()
+    target_word = ""
+    if args:
+        for key in ("ref", "mark", "vin"):
+            if args.get(key) not in (None, ""):
+                target_word = str(args[key])
+                break
+    performed = " ".join(part for part in (action, target_word) if part).strip()
     receipt: dict[str, Any] = {
         "executed": True,
         "completed_action": performed or action or "action",
@@ -583,7 +768,10 @@ def _tool_receipt(
     }
     for key in (
         "verification_after_extract",
+        "semantic_review",
         "next_instruction",
+        "action_target",
+        "action_detail",
         "loop_warning",
         "repeated_action_warning",
         "elements_truncated",
@@ -720,17 +908,106 @@ def _enforce_transcript_budget(messages: list[dict[str, Any]]) -> bool:
     return degraded
 
 
-async def run_navigator_search(
+# --------------------------------------------------------------- budgets
+
+
+@dataclass
+class _Budget:
+    """Turns and progress accounting shared by one objective's tasks."""
+
+    max_turns: int
+    turns_used: int = 0
+    stall_points: int = 0
+    dependency_slots: int = MAX_DEPENDENCIES
+    progress_events: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def turns_left(self) -> int:
+        return max(0, self.max_turns - self.turns_used)
+
+    def note(self, kind: str, *, progress: bool, cost: int = 1, **detail: Any) -> None:
+        if progress:
+            self.stall_points = max(0, self.stall_points - 1)
+        else:
+            self.stall_points += cost
+        self.progress_events.append({"kind": kind, "progress": progress, **detail})
+
+    @property
+    def stalled(self) -> bool:
+        return self.stall_points >= STALL_LIMIT
+
+
+def _candidate_from_evidence(evidence: dict[str, Any], summary: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """The evidence packet the reviewer sees: what the page itself said."""
+    summary = summary or {}
+    return {
+        "title": evidence.get("title") or summary.get("title"),
+        "url": evidence.get("source_url") or summary.get("url"),
+        "breadcrumb": evidence.get("breadcrumb") or summary.get("breadcrumb") or [],
+        "text": str(evidence.get("extracted_text") or summary.get("page_text") or ""),
+        "text_truncated": bool(evidence.get("extracted_text_truncated") or summary.get("page_text_truncated")),
+        "referenced_links": list(evidence.get("referenced_links") or []),
+        "observation_id": evidence.get("observation_id") or summary.get("observation_id"),
+        "text_sha256": evidence.get("extracted_text_sha256"),
+    }
+
+
+def _next_instruction_for_review(review: dict[str, Any]) -> str:
+    decision = review.get("decision")
+    summary = str(review.get("evidence_summary") or "")[:400]
+    if decision == "ACCEPT":
+        return "Independent review ACCEPTED this page as the procedure. Stop browsing; the evidence has been reached."
+    if decision == "ACCEPT_WITH_DEPENDENCIES":
+        names = ", ".join(item.get("title", "") for item in review.get("dependencies") or [])
+        return (
+            "Independent review ACCEPTED this page and requires these documents as well: "
+            f"{names}. Stop browsing this task; they are pursued next."
+        )
+    if decision == "FOLLOW_DEPENDENCY":
+        names = ", ".join(item.get("title", "") for item in review.get("dependencies") or [])
+        return (
+            "Independent review: this page is not the procedure, but it names the document "
+            f"that is: {names}. Stop browsing this task; that document is pursued next."
+        )
+    if decision == "CONTINUE_SEARCH":
+        return (
+            "Independent review: related, but NOT the requested procedure. "
+            f"Reviewer: {summary} Keep searching from the current page; do not extract this page again."
+        )
+    if decision == "REJECT":
+        return (
+            "Independent review REJECTED this page as the wrong kind of document or wrong vehicle. "
+            f"Reviewer: {summary} Go back and choose a different branch; do not extract this page again."
+        )
+    return (
+        "Independent review could not tell whether this page is the procedure. "
+        f"Reviewer: {summary} If more of the page exists, scroll it into view and extract again; "
+        "otherwise keep searching."
+    )
+
+
+# --------------------------------------------------------------- one task
+
+
+async def _run_task(
     *,
     client: Any,
     settings: Any,
     provider: str,
     target: dict[str, Any],
     topic: str,
-    max_turns: int = MAX_MODEL_TURNS,
-    action_budget: Optional[int] = None,
-    capture: bool = False,
+    objective: dict[str, Any],
+    budget: _Budget,
+    action_budget: Optional[int],
+    capture: bool,
+    review: bool,
+    reviewer: Any,
+    goal_note: str = "",
+    role: str = "primary",
 ) -> dict[str, Any]:
+    """Drive one ScrapeX task to a verdict and return everything that happened."""
+
+    started = time.perf_counter()
     create_body: dict[str, Any] = {
         "action": "create_task",
         "provider": provider,
@@ -742,14 +1019,21 @@ async def run_navigator_search(
     created = await scrapex_svc.navigator(settings, create_body)
     if not (created.get("success") and created.get("verified")):
         return {
+            "role": role,
+            "topic": topic,
             "attempted": True,
             "searched": False,
             "verified": False,
+            "accepted": False,
+            "captured": False,
             "reason": (
                 "Could not start a Navigator task: "
                 f"{(created.get('error') or {}).get('message') or created.get('status')}"
             ),
             "create_task_result": created,
+            "agent_trace": [],
+            "agent_stopped_reason": "task_not_created",
+            "stats": {},
         }
     task_id = str(created["data"]["id"])
 
@@ -766,11 +1050,14 @@ async def run_navigator_search(
     if not initial_observation.get("success"):
         if initial_observation.get("status") == "authentication_required":
             return {
+                "role": role,
+                "topic": topic,
                 "status": "authentication_required",
                 "provider": provider,
                 "attempted": True,
                 "searched": False,
                 "verified": False,
+                "accepted": False,
                 "captured": False,
                 "requires_human": True,
                 "task_id": task_id,
@@ -779,25 +1066,38 @@ async def run_navigator_search(
                     or "ALLDATA requires interactive authentication."
                 ),
                 "navigator": initial_observation,
+                "agent_trace": [],
+                "agent_stopped_reason": "authentication_required",
+                "stats": {},
             }
         return {
+            "role": role,
+            "topic": topic,
             "attempted": True,
             "searched": False,
             "verified": False,
+            "accepted": False,
+            "captured": False,
             "task_id": task_id,
             "reason": (
                 "Could not observe the initial Navigator page: "
                 f"{(initial_observation.get('error') or {}).get('message') or initial_observation.get('status')}"
             ),
+            "agent_trace": [],
+            "agent_stopped_reason": "initial_observe_failed",
+            "stats": {},
         }
 
     if not _observation_ready(initial_summary):
         return {
+            "role": role,
+            "topic": topic,
             "status": "initial_page_not_ready",
             "provider": provider,
             "attempted": True,
             "searched": False,
             "verified": False,
+            "accepted": False,
             "captured": False,
             "task_id": task_id,
             "initial_observe_attempts": initial_observe_attempts,
@@ -807,11 +1107,18 @@ async def run_navigator_search(
                 "bounded readiness window ended. No browser action was attempted."
             ),
             "navigator": initial_observation,
+            "agent_trace": [],
+            "agent_stopped_reason": "initial_page_not_ready",
+            "stats": {},
         }
 
-    initial_screenshot = await _task_screenshot(settings, task_id)
+    current_observation_id: Optional[str] = initial_summary.get("observation_id")
+    initial_screenshot = await _task_screenshot(settings, task_id, current_observation_id)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": _system_prompt(target, topic)},
+        {
+            "role": "system",
+            "content": _system_prompt(target, topic, objective, provider, goal_note),
+        },
         {
             "role": "user",
             "content": _visual_observation_content(
@@ -826,6 +1133,7 @@ async def run_navigator_search(
             "turn": -1,
             "action": "observe",
             "attempts": initial_observe_attempts,
+            "observation_id": current_observation_id,
             "result": initial_summary,
         }
     ]
@@ -834,6 +1142,17 @@ async def run_navigator_search(
     repeated_failure_count = 0
     model_called_done = False
     candidate_verified = False
+    accepted_review: Optional[dict[str, Any]] = None
+    latest_review: Optional[dict[str, Any]] = None
+    reviews: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    model_calls = 0
+    prompt_tokens: list[int] = []
+    stale_rejections = 0
+    visited_urls: list[str] = []
+    observation_ids: list[str] = [current_observation_id] if current_observation_id else []
+    if initial_summary.get("url"):
+        visited_urls.append(str(initial_summary["url"]))
 
     # Which messages hold a full observation, and the one line each collapses
     # to once a newer one arrives. The opening message carries the goal as
@@ -856,7 +1175,9 @@ async def run_navigator_search(
     # any reading happened.
     consecutive_scrolls = 0
 
-    for turn in range(max_turns):
+    while budget.turns_left > 0:
+        budget.turns_used += 1
+        turn = budget.turns_used - 1
         # Bound the transcript before every model call, not after the worker
         # has already refused one. Only the newest observation stays whole;
         # refs in the older ones are stale and ScrapeX would reject them.
@@ -874,6 +1195,10 @@ async def run_navigator_search(
             trace.append({"turn": turn, "error": f"model call failed: {type(exc).__name__}: {exc}"})
             stopped_reason = "model_error"
             break
+        model_calls += 1
+        usage = _extract_usage(events)
+        if usage and isinstance(usage.get("prompt_tokens"), int):
+            prompt_tokens.append(int(usage["prompt_tokens"]))
 
         content = _extract_content(events)
         calls = _extract_tool_calls(events)
@@ -895,6 +1220,8 @@ async def run_navigator_search(
         latest_visual_summary: Optional[dict[str, Any]] = None
         latest_action_args: Optional[tuple[str, dict[str, Any]]] = None
         latest_visual_is_failure_refresh = False
+        turn_progress: Optional[bool] = None
+        turn_progress_kind = ""
         for call_index, (call, wire_call) in enumerate(zip(calls, wire_calls)):
             try:
                 args = json.loads(call.get("arguments") or "{}")
@@ -920,21 +1247,32 @@ async def run_navigator_search(
             elif validation_error:
                 result = {"error": validation_error}
             else:
-                dispatch_args = {"action": action, "task_id": task_id}
-                if action == "click":
+                dispatch_args: dict[str, Any] = {"action": action, "task_id": task_id}
+                if action == "observe_marks":
+                    dispatch_args = {"action": "observe", "task_id": task_id, "marks": True}
+                elif action in _REF_ACTIONS:
                     dispatch_args["ref"] = args.get("ref")
-                elif action == "fill":
-                    dispatch_args["ref"] = args.get("ref")
-                    dispatch_args["text"] = args.get("text")
-                elif action == "press":
-                    dispatch_args["ref"] = args.get("ref")
-                    dispatch_args["key"] = args.get("key")
+                    if action in {"fill", "type"}:
+                        dispatch_args["text"] = args.get("text")
+                    elif action == "press":
+                        dispatch_args["key"] = args.get("key")
+                    if current_observation_id:
+                        dispatch_args["observation_id"] = current_observation_id
                 elif action == "open":
                     dispatch_args["url"] = args.get("url")
                 elif action == "scroll":
                     dispatch_args["delta_y"] = args.get("delta_y")
                 elif action == "wait":
                     dispatch_args["milliseconds"] = args.get("milliseconds")
+                elif action == "click_mark":
+                    dispatch_args["mark"] = args.get("mark")
+                    dispatch_args["observation_id"] = current_observation_id or "obs_unknown"
+                elif action == "click_visual":
+                    dispatch_args["x_norm"] = float(args.get("x_norm"))
+                    dispatch_args["y_norm"] = float(args.get("y_norm"))
+                    dispatch_args["observation_id"] = current_observation_id or "obs_unknown"
+                elif action == "select_vehicle":
+                    dispatch_args["vin"] = args.get("vin")
                 dispatched = True
                 action_ordinal += 1
                 consecutive_scrolls = consecutive_scrolls + 1 if action == "scroll" else 0
@@ -988,10 +1326,10 @@ async def run_navigator_search(
                         )
 
                     # Close the reasoning loop at the moment X proposes a
-                    # candidate procedure. ScrapeX remains the truth authority:
-                    # if the candidate fails any vehicle/subject/leaf/content
-                    # gate, feed that proof straight back to X while the live
-                    # page and navigation history are still available.
+                    # candidate procedure. ScrapeX remains the truth authority
+                    # on the mechanical claim; the independent reviewer on the
+                    # semantic one. Both verdicts go straight back to X while
+                    # the live page and navigation history are still available.
                     if action == "extract":
                         candidate_check = await scrapex_svc.navigator(
                             settings, {"action": "verify", "task_id": task_id}
@@ -1001,9 +1339,9 @@ async def run_navigator_search(
                             if isinstance(candidate_check.get("data"), dict)
                             else {}
                         )
-                        candidate_verified = bool(candidate_proof.get("verified"))
+                        mechanically_verified = bool(candidate_proof.get("verified"))
                         result["verification_after_extract"] = {
-                            "verified": candidate_verified,
+                            "verified": mechanically_verified,
                             "reason": candidate_proof.get("reason"),
                             "vehicle_verified": candidate_proof.get("vehicle_verified"),
                             "subject_verified": candidate_proof.get("subject_verified"),
@@ -1011,27 +1349,109 @@ async def run_navigator_search(
                             "content_extracted": candidate_proof.get("content_extracted"),
                             "matched_terms": candidate_proof.get("matched_terms"),
                         }
-                        result["next_instruction"] = (
-                            "Candidate verified. Stop browsing; verified evidence has been reached."
-                            if candidate_verified
-                            else (
-                                "Candidate rejected by ScrapeX verification. Use the failed gates/reason "
-                                "and current page state to backtrack or choose a different branch; do not "
-                                "repeat extract on the same unchanged page."
-                            )
-                        )
                         trace.append(
                             {
                                 "turn": turn,
                                 "action": "verify_after_extract",
-                                "verified": candidate_verified,
+                                "verified": mechanically_verified,
                                 "reason": candidate_proof.get("reason"),
                             }
                         )
+                        candidate_record: dict[str, Any] = {
+                            "task_id": task_id,
+                            "title": result.get("title"),
+                            "url": result.get("url"),
+                            "observation_id": result.get("observation_id"),
+                            "mechanically_verified": mechanically_verified,
+                            "mechanical_reason": candidate_proof.get("reason"),
+                        }
+                        if not mechanically_verified:
+                            result["next_instruction"] = (
+                                "Candidate rejected by ScrapeX verification. Use the failed gates/reason "
+                                "and current page state to backtrack or choose a different branch; do not "
+                                "repeat extract on the same unchanged page."
+                            )
+                        elif not review:
+                            candidate_verified = True
+                            result["next_instruction"] = (
+                                "Candidate verified. Stop browsing; verified evidence has been reached."
+                            )
+                        else:
+                            evidence_result = await scrapex_svc.navigator(
+                                settings, {"action": "get_evidence", "task_id": task_id}
+                            )
+                            evidence = (
+                                evidence_result.get("data")
+                                if isinstance(evidence_result.get("data"), dict)
+                                else {}
+                            )
+                            candidate = _candidate_from_evidence(evidence, result)
+                            review_screenshot = await _task_screenshot(
+                                settings, task_id, result.get("observation_id")
+                            )
+                            verdict = await reviewer(
+                                client=client,
+                                objective=objective,
+                                vehicle=target,
+                                candidate=candidate,
+                                provider=provider,
+                                screenshot=review_screenshot,
+                            )
+                            verdict = verdict if isinstance(verdict, dict) else {"decision": "UNCERTAIN", "malformed": True}
+                            latest_review = verdict
+                            reviews.append(verdict)
+                            candidate_record["review"] = verdict
+                            candidate_record["text_sha256"] = candidate.get("text_sha256")
+                            result["semantic_review"] = {
+                                key: verdict.get(key)
+                                for key in (
+                                    "classification",
+                                    "procedure_type",
+                                    "decision",
+                                    "confidence",
+                                    "evidence",
+                                    "dependencies",
+                                    "evidence_summary",
+                                    "malformed",
+                                )
+                            }
+                            result["next_instruction"] = _next_instruction_for_review(verdict)
+                            trace.append(
+                                {
+                                    "turn": turn,
+                                    "action": "semantic_review",
+                                    "decision": verdict.get("decision"),
+                                    "classification": verdict.get("classification"),
+                                    "confidence": verdict.get("confidence"),
+                                    "malformed": verdict.get("malformed"),
+                                    "dependencies": verdict.get("dependencies"),
+                                }
+                            )
+                            if review_accepted(verdict):
+                                candidate_verified = True
+                                accepted_review = verdict
+                            elif verdict.get("decision") == "FOLLOW_DEPENDENCY" and verdict.get("dependencies"):
+                                # Not this page: the reviewer named the document
+                                # that is. This task ends; that document is a
+                                # dependency task of its own.
+                                accepted_review = None
+                                latest_review = verdict
+                                model_called_done = True
+                        candidates.append(candidate_record)
                 else:
                     result = {
                         "error": _navigator_failure_message(navigator_result, action)
                     }
+                    code = _failure_code(navigator_result)
+                    if code in _STALE_CODES:
+                        stale_rejections += 1
+                        result["stale_rejection"] = code
+                    if action in _REF_ACTIONS and code in {"unknown_ref", "stale_ref", "stale_target"}:
+                        result["fallback_hint"] = (
+                            "If you can see the control in the screenshot but no listed ref reaches "
+                            "it, call observe_marks and then click_mark; use click_visual only if no "
+                            "mark is offered for it."
+                        )
                     # A 409/422 is a definitive rejection: the requested
                     # action did not execute. The page can still have changed
                     # while ALLDATA was settling, which makes every ref from
@@ -1065,7 +1485,7 @@ async def run_navigator_search(
 
             call_error = (result or {}).get("error") if isinstance(result, dict) else None
             # A rejected extract is a repeat worth catching. The action itself
-            # succeeds -- only ScrapeX's verification refuses it -- so without
+            # succeeds -- only verification or review refuses it -- so without
             # this the repeat guard never sees it: the live run on 2026-09-12
             # submitted the SAME extract 40 times, was refused 40 times, and
             # burned the whole budget. Counting it here routes it through the
@@ -1078,9 +1498,12 @@ async def run_navigator_search(
                 and isinstance(result, dict)
                 and result.get("verification_after_extract") is not None
                 and not candidate_verified
+                and not model_called_done
             ):
                 call_error = str(
-                    (result.get("verification_after_extract") or {}).get("reason")
+                    (result.get("semantic_review") or {}).get("evidence_summary")
+                    if result.get("semantic_review")
+                    else (result.get("verification_after_extract") or {}).get("reason")
                     or "This candidate was rejected by verification."
                 )
             call_signature = (action, tuple(sorted((k, v) for k, v in args.items() if k != "action")))
@@ -1104,10 +1527,22 @@ async def run_navigator_search(
             if action == "done" and dispatched and not call_error:
                 model_called_done = True
 
+            if call_index == 0:
+                if call_error:
+                    turn_progress = False
+                    turn_progress_kind = (
+                        "repeated_failure" if repeated_failure_count >= 2 else
+                        ("stale_rejection" if result.get("stale_rejection") else "failed_action")
+                    )
+                elif action == "extract":
+                    turn_progress = True
+                    turn_progress_kind = "candidate"
+
             trace.append({
                 "turn": turn,
                 "action": action,
                 "args": {k: v for k, v in args.items() if k != "action"},
+                "observation_id": current_observation_id,
                 "error": call_error,
             })
             # A receipt, not a second copy of the observation: the full
@@ -1127,10 +1562,23 @@ async def run_navigator_search(
             })
 
         if latest_visual_summary is not None and not model_called_done:
-            current_screenshot = await _task_screenshot(settings, task_id)
+            next_observation_id = latest_visual_summary.get("observation_id")
+            current_screenshot = await _task_screenshot(settings, task_id, next_observation_id)
             fingerprint = _observation_fingerprint(latest_visual_summary)
             unchanged = fingerprint == previous_fingerprint
             previous_fingerprint = fingerprint
+            if next_observation_id:
+                current_observation_id = next_observation_id
+                observation_ids.append(next_observation_id)
+            url = str(latest_visual_summary.get("url") or "")
+            new_url = bool(url) and url not in visited_urls
+            if new_url:
+                visited_urls.append(url)
+            if turn_progress is None:
+                turn_progress = not unchanged
+                turn_progress_kind = (
+                    "new_url" if new_url else ("new_page_state" if not unchanged else "page_unchanged")
+                )
             heading = (
                 (
                     "The requested browser action was rejected and did not execute. "
@@ -1194,6 +1642,15 @@ async def run_navigator_search(
                 unchanged=unchanged,
             )
 
+        if turn_progress is not None:
+            budget.note(
+                turn_progress_kind or ("progress" if turn_progress else "no_progress"),
+                progress=turn_progress,
+                cost=2 if turn_progress_kind == "repeated_failure" else 1,
+                turn=turn,
+                task_id=task_id,
+            )
+
         if candidate_verified:
             stopped_reason = "verified_after_extract"
             break
@@ -1203,7 +1660,12 @@ async def run_navigator_search(
         if turn_hit_repeat_limit:
             stopped_reason = "repeated_tool_error"
             break
+        if budget.stalled:
+            stopped_reason = "stalled"
+            break
     else:
+        stopped_reason = "turn_budget_exhausted"
+    if budget.turns_left <= 0 and stopped_reason == "model_finished" and not candidate_verified:
         stopped_reason = "turn_budget_exhausted"
 
     # ScrapeX's own verify action is the single authority on
@@ -1211,7 +1673,7 @@ async def run_navigator_search(
     # or text-matching itself.
     verification = await scrapex_svc.navigator(settings, {"action": "verify", "task_id": task_id})
     proof = verification.get("data") if isinstance(verification.get("data"), dict) else {}
-    verified = bool(proof.get("verified"))
+    mechanically_verified = bool(proof.get("verified"))
 
     evidence_result = await scrapex_svc.navigator(
         settings, {"action": "get_evidence", "task_id": task_id}
@@ -1222,40 +1684,497 @@ async def run_navigator_search(
         else {}
     )
 
+    accepted = bool(mechanically_verified and (accepted_review is not None or not review))
     capture_result: dict[str, Any] | None = None
     captured = False
-    if verified and capture:
+    if accepted and capture:
         # Persistence is a separate structured choice from research. ScrapeX
         # owns the provider browser and therefore owns the final verified-page
         # capture when the calling workflow explicitly requests preservation.
-        capture_result = await scrapex_svc.navigator_capture(settings, task_id)
+        # The reviewer's verdict rides along as data in the provenance.
+        if accepted_review is not None:
+            capture_result = await scrapex_svc.navigator_capture(
+                settings, task_id, semantic_review=accepted_review, objective=objective
+            )
+        else:
+            capture_result = await scrapex_svc.navigator_capture(settings, task_id)
         captured = bool(
             capture_result.get("success") is True
             and capture_result.get("verified") is True
             and capture_result.get("work_complete") is True
         )
 
+    if not mechanically_verified:
+        reason = proof.get("reason")
+    elif review and accepted_review is None:
+        reason = (
+            "Semantic review did not accept a candidate: "
+            + str((latest_review or {}).get("evidence_summary") or (latest_review or {}).get("decision") or "no candidate reviewed")
+        )
+    else:
+        reason = None
+
+    capture_data = capture_result.get("data") if isinstance(capture_result, dict) and isinstance(capture_result.get("data"), dict) else {}
     return {
+        "role": role,
+        "topic": topic,
+        "goal_note": goal_note or None,
         "attempted": True,
         "searched": len(trace) > 1,
-        "verified": verified,
+        "mechanically_verified": mechanically_verified,
+        "verified": accepted,
+        "accepted": accepted,
         "captured": captured,
         "capture": capture_result,
-        "verification_reason": proof.get("reason"),
+        "artifact": {
+            "relative_path": capture_data.get("relative_path"),
+            "sha256": capture_data.get("sha256"),
+            "text_sidecar": capture_data.get("text_sidecar"),
+            "source_sidecar": capture_data.get("source_sidecar"),
+            "title": capture_data.get("title"),
+            "already_present": capture_data.get("already_present"),
+        } if captured else None,
+        "verification_reason": reason,
         "verification": proof,
+        "review": accepted_review or latest_review,
+        "reviews": reviews,
+        "candidates": candidates,
         "task_id": task_id,
         "provider": provider,
         "target": target,
-        "topic": topic,
         "agent_trace": trace,
         "agent_stopped_reason": stopped_reason,
         "browser_actions_observed": len(observation_slots) - 1,
         "context_degraded": context_degraded,
         "source_url": evidence.get("source_url"),
+        "title": evidence.get("title") or proof.get("title"),
         "extracted_text": (evidence.get("extracted_text") or "")[:20_000],
+        "extracted_text_sha256": evidence.get("extracted_text_sha256"),
+        "stats": {
+            "model_calls": model_calls,
+            "browser_actions": action_ordinal,
+            "stale_rejections": stale_rejections,
+            "prompt_tokens_max": max(prompt_tokens) if prompt_tokens else None,
+            "prompt_tokens_total": sum(prompt_tokens) if prompt_tokens else None,
+            "observation_ids": observation_ids,
+            "visited_urls": visited_urls,
+            "wall_s": round(time.perf_counter() - started, 1),
+        },
+    }
+
+
+# --------------------------------------------------------------- objective
+
+
+def _objective_record(objective: Optional[dict[str, Any]], topic: str, target: dict[str, Any]) -> dict[str, Any]:
+    record = dict(objective or {})
+    record.setdefault("objective", topic)
+    record["vehicle"] = {
+        key: target.get(key) for key in ("year", "make", "model", "trim", "vin") if target.get(key) not in (None, "")
+    }
+    return record
+
+
+def _receipt(
+    *,
+    objective: dict[str, Any],
+    target: dict[str, Any],
+    provider: str,
+    tasks: list[dict[str, Any]],
+    dependencies: list[dict[str, Any]],
+    budget: _Budget,
+    status: str,
+    incomplete_reasons: list[str],
+    wall_s: float,
+) -> dict[str, Any]:
+    """Structured history of one research objective, for diagnosis without logs.
+
+    Actions, observation ids, visited URLs, candidates, reviewer decisions,
+    dependencies, stale-action refusals, artifacts and hashes, final status,
+    and why it is incomplete. Summaries of what happened, never the model's
+    hidden reasoning.
+    """
+    actions: list[dict[str, Any]] = []
+    observation_ids: list[str] = []
+    visited: list[str] = []
+    candidates: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+    artifacts: list[dict[str, Any]] = []
+    stale = 0
+    model_calls = 0
+    browser_actions = 0
+    prompt_max = 0
+    prompt_total = 0
+    for task in tasks:
+        stats = task.get("stats") or {}
+        stale += int(stats.get("stale_rejections") or 0)
+        model_calls += int(stats.get("model_calls") or 0)
+        browser_actions += int(stats.get("browser_actions") or 0)
+        prompt_max = max(prompt_max, int(stats.get("prompt_tokens_max") or 0))
+        prompt_total += int(stats.get("prompt_tokens_total") or 0)
+        observation_ids.extend(stats.get("observation_ids") or [])
+        for url in stats.get("visited_urls") or []:
+            if url not in visited:
+                visited.append(url)
+        for item in task.get("agent_trace") or []:
+            if not isinstance(item.get("turn"), int) or item.get("turn") < 0:
+                continue
+            if item.get("action") in {"verify_after_extract", "semantic_review"}:
+                continue
+            actions.append(
+                {
+                    "task_id": task.get("task_id"),
+                    "turn": item.get("turn"),
+                    "action": item.get("action"),
+                    "args": item.get("args"),
+                    "observation_id": item.get("observation_id"),
+                    "error": (str(item.get("error"))[:200] if item.get("error") else None),
+                }
+            )
+        for candidate in task.get("candidates") or []:
+            candidates.append({key: value for key, value in candidate.items() if key != "review"})
+            verdict = candidate.get("review")
+            if isinstance(verdict, dict):
+                decisions.append(
+                    {
+                        "task_id": task.get("task_id"),
+                        "title": candidate.get("title"),
+                        "url": candidate.get("url"),
+                        "decision": verdict.get("decision"),
+                        "classification": verdict.get("classification"),
+                        "confidence": verdict.get("confidence"),
+                        "malformed": verdict.get("malformed"),
+                        "inconsistent": verdict.get("inconsistent"),
+                        "evidence_summary": verdict.get("evidence_summary"),
+                    }
+                )
+        if task.get("captured") and task.get("artifact"):
+            artifacts.append({"task_id": task.get("task_id"), **task["artifact"]})
+    return {
+        "objective": objective,
+        "vehicle": target,
+        "provider": provider,
+        "task_ids": [task.get("task_id") for task in tasks if task.get("task_id")],
+        "actions": actions,
+        "observation_ids": observation_ids,
+        "visited_urls": visited,
+        "candidates": candidates,
+        "critic_decisions": decisions,
+        "dependencies": dependencies,
+        "stale_action_rejections": stale,
+        "artifacts": artifacts,
+        "final_status": status,
+        "incomplete_reasons": incomplete_reasons,
+        "metrics": {
+            "model_calls": model_calls,
+            "browser_actions": browser_actions,
+            "turns_used": budget.turns_used,
+            "turns_allowed": budget.max_turns,
+            "stall_points": budget.stall_points,
+            "prompt_tokens_max": prompt_max or None,
+            "prompt_tokens_total": prompt_total or None,
+            "wall_s": round(wall_s, 1),
+        },
+    }
+
+
+async def run_navigator_search(
+    *,
+    client: Any,
+    settings: Any,
+    provider: str,
+    target: dict[str, Any],
+    topic: str,
+    max_turns: int = MAX_MODEL_TURNS,
+    action_budget: Optional[int] = None,
+    capture: bool = False,
+    objective: Optional[dict[str, Any]] = None,
+    review: bool = True,
+    reviewer: Any = None,
+    max_dependencies: int = MAX_DEPENDENCIES,
+) -> dict[str, Any]:
+    """Research one objective: the primary document, then what it requires.
+
+    The model navigates; ScrapeX proves the mechanics; the independent
+    reviewer judges the evidence; capture files what was accepted. When the
+    reviewer names documents the objective needs, each is pursued as its own
+    ScrapeX task inside the same turn budget, and running out of budget is
+    reported as incompleteness rather than hidden.
+    """
+    if NAVIGATOR_LOCK.locked():
+        return {
+            "status": "navigator_busy",
+            "attempted": False,
+            "searched": False,
+            "verified": False,
+            "captured": False,
+            "provider": provider,
+            "target": target,
+            "topic": topic,
+            "reason": (
+                "Another research run is using the provider browser right now; "
+                "nothing was started for this objective."
+            ),
+        }
+    async with NAVIGATOR_LOCK:
+        return await _run_objective(
+            client=client,
+            settings=settings,
+            provider=provider,
+            target=target,
+            topic=topic,
+            max_turns=max_turns,
+            action_budget=action_budget,
+            capture=capture,
+            objective=objective,
+            review=review,
+            reviewer=reviewer,
+            max_dependencies=max_dependencies,
+        )
+
+
+async def _run_objective(
+    *,
+    client: Any,
+    settings: Any,
+    provider: str,
+    target: dict[str, Any],
+    topic: str,
+    max_turns: int,
+    action_budget: Optional[int],
+    capture: bool,
+    objective: Optional[dict[str, Any]],
+    review: bool,
+    reviewer: Any,
+    max_dependencies: int,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    objective_record = _objective_record(objective, topic, target)
+    reviewer = reviewer or review_candidate
+    budget = _Budget(max_turns=max(1, int(max_turns)), dependency_slots=max(0, int(max_dependencies)))
+    tasks: list[dict[str, Any]] = []
+    dependencies: list[dict[str, Any]] = []
+    incomplete: list[str] = []
+
+    primary = await _run_task(
+        client=client,
+        settings=settings,
+        provider=provider,
+        target=target,
+        topic=topic,
+        objective=objective_record,
+        budget=budget,
+        action_budget=action_budget,
+        capture=capture,
+        review=review,
+        reviewer=reviewer,
+        role="primary",
+    )
+    tasks.append(primary)
+    if not primary.get("task_id") or primary.get("agent_stopped_reason") in {
+        "task_not_created", "authentication_required", "initial_observe_failed", "initial_page_not_ready",
+    }:
+        result = dict(primary)
+        result.pop("role", None)
+        result["status"] = result.get("status") or "unverified"
+        result["documents"] = []
+        result["dependencies"] = []
+        result["task_ids"] = [primary["task_id"]] if primary.get("task_id") else []
+        result["research_receipt"] = _receipt(
+            objective=objective_record, target=target, provider=provider, tasks=tasks,
+            dependencies=[], budget=budget, status=result["status"],
+            incomplete_reasons=[str(primary.get("reason") or "")], wall_s=time.perf_counter() - started,
+        )
+        result.setdefault("topic", topic)
+        result["provenance"] = {"provider": provider, "licensed_session": True, "workflow": "model_navigator_agent"}
+        return result
+
+    # Dependency queue: what the reviewer said the objective needs, why, and
+    # what came of pursuing it. Bounded by slots and by the shared turn
+    # budget; a limit reached is reported, never papered over.
+    def enqueue(verdict: Optional[dict[str, Any]], origin: dict[str, Any]) -> None:
+        for item in (verdict or {}).get("dependencies") or []:
+            title = str(item.get("title") or "").strip()
+            if not title or any(dep["title"].casefold() == title.casefold() for dep in dependencies):
+                continue
+            dependencies.append(
+                {
+                    "title": title,
+                    "reason": str(item.get("reason") or "").strip(),
+                    "originating_document": origin.get("title"),
+                    "originating_url": origin.get("url"),
+                    "originating_task_id": origin.get("task_id"),
+                    "status": "pending",
+                    "resolved_artifact": None,
+                    "task_id": None,
+                }
+            )
+
+    enqueue(primary.get("review"), primary)
+    dependency_turns_each = max(4, int(budget.max_turns * DEPENDENCY_TURN_SHARE / max(1, budget.dependency_slots or 1)))
+    index = 0
+    while index < len(dependencies):
+        dependency = dependencies[index]
+        index += 1
+        if budget.dependency_slots <= 0:
+            dependency["status"] = "not_pursued"
+            dependency["reason_not_pursued"] = f"dependency limit of {max_dependencies} reached"
+            incomplete.append(f"dependency '{dependency['title']}' not pursued: dependency limit reached")
+            continue
+        if budget.turns_left < 3:
+            dependency["status"] = "not_pursued"
+            dependency["reason_not_pursued"] = "turn budget exhausted"
+            incomplete.append(f"dependency '{dependency['title']}' not pursued: turn budget exhausted")
+            continue
+        budget.dependency_slots -= 1
+        sub_budget = _Budget(
+            max_turns=min(budget.turns_left, dependency_turns_each),
+            dependency_slots=0,
+        )
+        dependency_objective = dict(objective_record)
+        dependency_objective["dependency_context"] = (
+            f"Required document '{dependency['title']}' for the objective; reason: "
+            f"{dependency['reason']} (referenced from '{dependency.get('originating_document') or 'the accepted procedure'}')."
+        )
+        goal_note = (
+            "This task pursues a REQUIRED SUPPORTING DOCUMENT named by the independent reviewer "
+            f"of the primary procedure: '{dependency['title']}'. Why the objective needs it: "
+            f"{dependency['reason']}. Find that exact document for the same vehicle and extract it."
+        )
+        dependency["status"] = "in_progress"
+        outcome = await _run_task(
+            client=client,
+            settings=settings,
+            provider=provider,
+            target=target,
+            topic=dependency["title"],
+            objective=dependency_objective,
+            budget=sub_budget,
+            action_budget=action_budget,
+            capture=capture,
+            review=review,
+            reviewer=reviewer,
+            goal_note=goal_note,
+            role="dependency",
+        )
+        budget.turns_used += sub_budget.turns_used
+        budget.progress_events.extend(sub_budget.progress_events)
+        tasks.append(outcome)
+        dependency["task_id"] = outcome.get("task_id")
+        if outcome.get("accepted"):
+            dependency["status"] = "resolved"
+            dependency["resolved_artifact"] = outcome.get("artifact") if outcome.get("captured") else None
+            dependency["resolved_url"] = outcome.get("source_url")
+            dependency["resolved_title"] = outcome.get("title")
+            enqueue(outcome.get("review"), outcome)
+        else:
+            dependency["status"] = "unresolved"
+            dependency["reason_unresolved"] = str(outcome.get("verification_reason") or outcome.get("reason") or outcome.get("agent_stopped_reason") or "")
+            incomplete.append(
+                f"dependency '{dependency['title']}' unresolved: {dependency['reason_unresolved'] or 'not found'}"
+            )
+
+    documents = [
+        {
+            "role": task.get("role"),
+            "topic": task.get("topic"),
+            "task_id": task.get("task_id"),
+            "title": task.get("title"),
+            "url": task.get("source_url"),
+            "accepted": bool(task.get("accepted")),
+            "mechanically_verified": bool(task.get("mechanically_verified")),
+            "classification": (task.get("review") or {}).get("classification"),
+            "procedure_type": (task.get("review") or {}).get("procedure_type"),
+            "decision": (task.get("review") or {}).get("decision"),
+            "confidence": (task.get("review") or {}).get("confidence"),
+            "captured": bool(task.get("captured")),
+            "artifact": task.get("artifact"),
+            "extracted_text_sha256": task.get("extracted_text_sha256"),
+            "stopped_reason": task.get("agent_stopped_reason"),
+        }
+        for task in tasks
+    ]
+    accepted_docs = [doc for doc in documents if doc["accepted"]]
+    procedure_found = any(
+        doc["accepted"] and (not review or doc.get("classification") == "ACTUAL_PROCEDURE")
+        for doc in documents
+    )
+    primary_review = primary.get("review") or {}
+    if primary.get("accepted"):
+        verified = True
+    elif primary_review.get("decision") == "FOLLOW_DEPENDENCY":
+        verified = procedure_found
+    else:
+        verified = False
+    unresolved = [dep for dep in dependencies if dep["status"] in {"unresolved", "not_pursued", "pending"}]
+    if not verified:
+        status = "unverified"
+        if primary.get("agent_stopped_reason") == "stalled":
+            incomplete.append("navigation stalled without progress")
+        if primary.get("agent_stopped_reason") == "turn_budget_exhausted":
+            incomplete.append("turn budget exhausted before a procedure was accepted")
+        if review and primary.get("mechanically_verified") and not primary.get("accepted"):
+            incomplete.append(str(primary.get("verification_reason") or "semantic review did not accept the candidate"))
+        if review and (primary.get("review") or {}).get("decision") == "UNCERTAIN":
+            status = "uncertain"
+    elif unresolved:
+        status = "incomplete"
+    else:
+        status = "verified"
+    if verified and capture and any(doc["accepted"] and not doc["captured"] for doc in documents):
+        status = "incomplete"
+        incomplete.append("an accepted document was not captured")
+
+    accepted_primary = next((task for task in tasks if task.get("accepted")), None) or primary
+    review_out = primary.get("review")
+    result: dict[str, Any] = {
+        "status": status,
+        "attempted": True,
+        "searched": bool(primary.get("searched")),
+        "verified": verified,
+        "complete": status == "verified",
+        "mechanically_verified": bool(accepted_primary.get("mechanically_verified")),
+        "captured": bool(accepted_primary.get("captured")),
+        "capture": accepted_primary.get("capture"),
+        "verification_reason": primary.get("verification_reason"),
+        "verification": accepted_primary.get("verification"),
+        "semantic_review": review_out,
+        "task_id": primary.get("task_id"),
+        "task_ids": [task.get("task_id") for task in tasks if task.get("task_id")],
+        "provider": provider,
+        "target": target,
+        "topic": topic,
+        "objective": objective_record,
+        "agent_trace": [item for task in tasks for item in (task.get("agent_trace") or [])],
+        "agent_stopped_reason": primary.get("agent_stopped_reason"),
+        "browser_actions_observed": sum(int(task.get("browser_actions_observed") or 0) for task in tasks),
+        "context_degraded": any(task.get("context_degraded") for task in tasks),
+        "source_url": accepted_primary.get("source_url"),
+        "evidence_title": accepted_primary.get("title"),
+        "extracted_text": accepted_primary.get("extracted_text") or "",
+        "extracted_text_sha256": accepted_primary.get("extracted_text_sha256"),
+        "documents": documents,
+        "accepted_documents": accepted_docs,
+        "dependencies": dependencies,
+        "incomplete_reasons": incomplete,
         "provenance": {
             "provider": provider,
             "licensed_session": True,
             "workflow": "model_navigator_agent",
+            "semantic_review": bool(review),
         },
     }
+    if primary.get("requires_human"):
+        result["requires_human"] = True
+    result["research_receipt"] = _receipt(
+        objective=objective_record,
+        target=target,
+        provider=provider,
+        tasks=tasks,
+        dependencies=dependencies,
+        budget=budget,
+        status=status,
+        incomplete_reasons=incomplete,
+        wall_s=time.perf_counter() - started,
+    )
+    return result

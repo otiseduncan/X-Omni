@@ -207,6 +207,10 @@ test("delegated research findings render a provenance-first card", async () => {
 
   assert.match(cards, /research_findings:\s*ResearchFindingsCard/);
   assert.match(cards, /export function ResearchFindingsCard/);
+  // A licensed finding carries the independent reviewer's verdict and the
+  // documents it required, and says when one is still missing.
+  assert.match(cards, /Independent review: \{finding\.semantic_review\.decision\}/);
+  assert.match(cards, /still has a required document missing/);
   // Every source the worker touched is listed with its verification state,
   // and an ALLDATA sign-in boundary is stated instead of claimed as a result.
   assert.match(cards, /research-source-ledger/);
@@ -234,4 +238,23 @@ test("ADAS Map sweep results render grouped by outcome and reload on background 
   assert.match(cards, /waiting_for_sign_in: "Waiting for ADAS Map sign-in"/);
   // The sweep posts its result from a background task; an open chat re-reads.
   assert.match(app, /case "conversation_updated":[\s\S]*?reconcile\(\)/);
+});
+
+
+test("background service-information research renders per-objective truth", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/FieldCards.jsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(cards, /adas_si_research:\s*AdasSiResearchCard/);
+  assert.match(cards, /export function AdasSiResearchCard/);
+  // Each objective states its outcome as Core classified it from Calibration
+  // IQ's reread, the reviewer's verdict, and the attachment result -- never
+  // a summary the model wrote.
+  assert.match(cards, /row\.outcome_label \|\| row\.outcome/);
+  assert.match(cards, /Attached in Calibration IQ/);
+  assert.match(cards, /Also needs/);
+  assert.match(cards, /could not be read/);
+  assert.doesNotMatch(cards, /intentionally dormant/);
 });

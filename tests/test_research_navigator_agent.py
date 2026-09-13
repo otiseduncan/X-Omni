@@ -208,6 +208,45 @@ async def _no_sleep(_seconds: float) -> None:
     return None
 
 
+async def _accepting_reviewer(**kwargs):
+    """Stands in for the independent semantic reviewer.
+
+    The loop's control flow is what these tests exercise; the reviewer has
+    its own suite. This stub accepts every mechanically verified candidate
+    and records what it was shown so isolation can still be asserted.
+    """
+    _accepting_reviewer.seen.append(kwargs)
+    return {
+        "classification": "ACTUAL_PROCEDURE",
+        "procedure_type": "STATIC_RADAR",
+        "vehicle_match": "MATCHES",
+        "evidence": {
+            "prerequisites": "PRESENT",
+            "tools_or_equipment": "PRESENT",
+            "physical_setup": "PRESENT",
+            "geometry_or_measurements": "PRESENT",
+            "scan_tool_steps": "PRESENT",
+            "execution_steps": "PRESENT",
+            "completion_criteria": "PRESENT",
+        },
+        "dependencies": [],
+        "decision": "ACCEPT",
+        "confidence": 0.9,
+        "evidence_summary": "Accepted by the test reviewer.",
+        "malformed": False,
+    }
+
+
+_accepting_reviewer.seen = []
+
+
+@pytest.fixture(autouse=True)
+def _isolated_reviewer(monkeypatch):
+    _accepting_reviewer.seen.clear()
+    monkeypatch.setattr(research_navigator_agent, "review_candidate", _accepting_reviewer)
+    yield
+
+
 def test_system_prompt_prefers_alldata_ymme_search_without_make_aliases() -> None:
     prompt = research_navigator_agent._system_prompt(
         {"year": 2021, "make": "Hyundai", "model": "Palisade"},
@@ -444,8 +483,9 @@ async def test_verified_navigation_captures_only_when_explicitly_requested(monke
     navigator.verified_after_extract = True
     captured_tasks: list[str] = []
 
-    async def capture(_settings, task_id):
+    async def capture(_settings, task_id, **kwargs):
         captured_tasks.append(task_id)
+        capture.kwargs.append(kwargs)
         return {
             "success": True,
             "verified": True,
@@ -456,6 +496,7 @@ async def test_verified_navigation_captures_only_when_explicitly_requested(monke
             },
         }
 
+    capture.kwargs = []
     monkeypatch.setattr(
         research_navigator_agent,
         "scrapex_svc",
@@ -478,6 +519,9 @@ async def test_verified_navigation_captures_only_when_explicitly_requested(monke
     assert result["verified"] is True
     assert result["captured"] is True
     assert captured_tasks == ["task-1"]
+    # The reviewer's verdict travels into the capture as provenance data.
+    assert capture.kwargs[0]["semantic_review"]["decision"] == "ACCEPT"
+    assert capture.kwargs[0]["objective"]["objective"] == "blind spot monitor calibration"
 
 
 @pytest.mark.asyncio
@@ -650,7 +694,7 @@ async def test_unknown_action_is_reported_back_to_the_model_without_calling_scra
 async def test_visual_observation_is_passed_to_multimodal_model_when_available(monkeypatch):
     navigator = _FakeNavigator()
 
-    async def screenshot(settings, task_id):  # noqa: ARG001
+    async def screenshot(settings, task_id, observation_id=None):  # noqa: ARG001
         assert task_id == "task-1"
         return b"\xff\xd8\xfffake-jpeg", "image/jpeg"
 

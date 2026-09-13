@@ -559,9 +559,9 @@ def test_work_prep_schema_owns_active_ciq_field_work_without_si():
     assert "authoritative calibration iq source" in description
     assert "active field-work preparation" in description
     assert "adas map" in description
-    assert "service-information" in description
-    assert "dormant" in description
-    assert "missing-si queues are dormant" in description
+    assert "service information is live in calibration iq" in description
+    assert "dormant" not in description
+    assert "research_si" in description
     assert "do not invent/default a phase" in description
     assert "active ciq preparation operation" in mode_description
     assert "adas map requirements" in mode_description

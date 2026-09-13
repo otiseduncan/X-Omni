@@ -93,9 +93,18 @@ SOURCE_SCOPES = frozenset({"active", "all", "terminal"})
 # ScrapeX Navigator architecture plan.
 NAVIGATOR_PROVIDERS = frozenset({"alldata"})
 NAVIGATOR_META_ACTIONS = frozenset({"create_task", "observe", "verify", "get_evidence"})
-NAVIGATOR_ACT_KINDS = frozenset({"click", "fill", "press", "back", "open", "scroll", "wait", "extract", "done"})
+# Ref actions address an element the accessibility tree exposed; mark and
+# visual actions address a control the caller could see but not name, and
+# are bound to the exact observation (and screenshot) they were chosen on.
+# select_vehicle is the provider's mechanical exact-VIN fast path.
+NAVIGATOR_ACT_KINDS = frozenset({
+    "click", "fill", "type", "press", "back", "open", "scroll", "wait", "extract", "done",
+    "click_mark", "click_visual", "select_vehicle",
+})
 NAVIGATOR_ACTIONS = NAVIGATOR_META_ACTIONS | NAVIGATOR_ACT_KINDS
+NAVIGATOR_OBSERVATION_BOUND_ACTIONS = frozenset({"click_mark", "click_visual"})
 MAX_TASK_ID_CHARS = 80
+MAX_OBSERVATION_ID_CHARS = 40
 MAX_TOPIC_CHARS = 400
 MAX_TARGET_FIELD_CHARS = 120
 MAX_VIN_CHARS = 32
@@ -104,6 +113,7 @@ MAX_FILL_TEXT_CHARS = 400
 MAX_KEY_CHARS = 40
 MAX_NAV_URL_CHARS = 2048
 MAX_NAV_SCREENSHOT_BYTES = 4 * 1024 * 1024
+MAX_MARK_NUMBER = 999
 
 
 SCRAPEX_STATUS_SCHEMA: dict[str, Any] = {
@@ -399,6 +409,15 @@ _NAVIGATOR_REF_PROPERTY: dict[str, Any] = {
         "may no longer resolve; re-observe if so."
     ),
 }
+_NAVIGATOR_OBSERVATION_ID_PROPERTY: dict[str, Any] = {
+    "type": "string",
+    "maxLength": MAX_OBSERVATION_ID_CHARS,
+    "description": (
+        "observation_id of the observe/act result this action was chosen from. "
+        "ScrapeX refuses the action if a newer observation exists or the page "
+        "changed since; it never redirects to another target."
+    ),
+}
 
 SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
     "description": (
@@ -441,6 +460,23 @@ SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
                 },
                 "required": ["action", "provider", "target", "topic"],
             },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "observe",
+                        "description": (
+                            "Re-read the current page. marks=true also numbers visible "
+                            "controls that have no usable ref ([m21], [m22]...) for click_mark."
+                        ),
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "marks": {"type": "boolean"},
+                },
+                "required": ["action", "task_id"],
+            },
             *[
                 {
                     "type": "object",
@@ -451,7 +487,7 @@ SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
                     },
                     "required": ["action", "task_id"],
                 }
-                for meta_action in ("observe", "verify", "get_evidence")
+                for meta_action in ("verify", "get_evidence")
             ],
             {
                 "type": "object",
@@ -464,6 +500,7 @@ SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
                     },
                     "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
                     "ref": _NAVIGATOR_REF_PROPERTY,
+                    "observation_id": _NAVIGATOR_OBSERVATION_ID_PROPERTY,
                 },
                 "required": ["action", "task_id", "ref"],
             },
@@ -474,11 +511,31 @@ SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
                     "action": {
                         "type": "string",
                         "const": "fill",
-                        "description": "Type text into one observed field by its ref.",
+                        "description": "Set text into one observed field by its ref.",
                     },
                     "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
                     "ref": _NAVIGATOR_REF_PROPERTY,
                     "text": {"type": "string", "maxLength": MAX_FILL_TEXT_CHARS},
+                    "observation_id": _NAVIGATOR_OBSERVATION_ID_PROPERTY,
+                },
+                "required": ["action", "task_id", "ref", "text"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "type",
+                        "description": (
+                            "Focus one observed field by its ref and type text as real "
+                            "keystrokes, for fields that ignore a programmatic fill."
+                        ),
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "ref": _NAVIGATOR_REF_PROPERTY,
+                    "text": {"type": "string", "minLength": 1, "maxLength": MAX_FILL_TEXT_CHARS},
+                    "observation_id": _NAVIGATOR_OBSERVATION_ID_PROPERTY,
                 },
                 "required": ["action", "task_id", "ref", "text"],
             },
@@ -494,8 +551,64 @@ SCRAPEX_NAVIGATOR_SCHEMA: dict[str, Any] = {
                     "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
                     "ref": _NAVIGATOR_REF_PROPERTY,
                     "key": {"type": "string", "maxLength": MAX_KEY_CHARS},
+                    "observation_id": _NAVIGATOR_OBSERVATION_ID_PROPERTY,
                 },
                 "required": ["action", "task_id", "ref", "key"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "click_mark",
+                        "description": (
+                            "Click a numbered mark from an observe marks=true result. Bound to "
+                            "that observation; refused if the control moved or changed."
+                        ),
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "mark": {"type": "integer", "minimum": 1, "maximum": MAX_MARK_NUMBER},
+                    "observation_id": _NAVIGATOR_OBSERVATION_ID_PROPERTY,
+                },
+                "required": ["action", "task_id", "mark", "observation_id"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "click_visual",
+                        "description": (
+                            "Click a point on the screenshot of the named observation, as "
+                            "fractions of its width and height. Last resort when no ref or "
+                            "mark reaches the control; refused if that region changed."
+                        ),
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "x_norm": {"type": "number", "minimum": 0, "maximum": 1},
+                    "y_norm": {"type": "number", "minimum": 0, "maximum": 1},
+                    "observation_id": _NAVIGATOR_OBSERVATION_ID_PROPERTY,
+                },
+                "required": ["action", "task_id", "x_norm", "y_norm", "observation_id"],
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "const": "select_vehicle",
+                        "description": (
+                            "Provider fast path: select the exact vehicle by the VIN the "
+                            "repair order carries. Reports selected true/false; never guesses."
+                        ),
+                    },
+                    "task_id": _NAVIGATOR_TASK_ID_PROPERTY,
+                    "vin": {"type": "string", "minLength": 11, "maxLength": MAX_VIN_CHARS},
+                },
+                "required": ["action", "task_id", "vin"],
             },
             {
                 "type": "object",
@@ -1617,6 +1730,28 @@ def _validate_navigator_observation_contract(payload: Any) -> dict[str, Any]:
                 "navigator_observation_malformed",
                 "An observation element is missing its role or name.",
             )
+    observation_id = observation.get("observation_id")
+    if observation_id is not None and (
+        not isinstance(observation_id, str) or not _RESOURCE_ID_RE.fullmatch(observation_id)
+    ):
+        raise ScrapeXContract(
+            "navigator_observation_malformed",
+            "ScrapeX returned a malformed observation id.",
+        )
+    marks = observation.get("marks")
+    if marks is not None:
+        if not isinstance(marks, list):
+            raise ScrapeXContract(
+                "navigator_observation_malformed", "ScrapeX returned a malformed marks list."
+            )
+        for raw_mark in marks:
+            mark = _contract_mapping(raw_mark, "observation mark")
+            number = mark.get("mark")
+            if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+                raise ScrapeXContract(
+                    "navigator_observation_malformed",
+                    "An observation mark is missing its number.",
+                )
     return observation
 
 
@@ -2753,18 +2888,24 @@ async def navigator_current_page_signals(settings: Any, provider: str) -> dict[s
 
 
 
-async def navigator_screenshot(settings: Any, task_id: str) -> tuple[bytes, str]:
+async def navigator_screenshot(
+    settings: Any, task_id: str, observation_id: str | None = None
+) -> tuple[bytes, str]:
     """Fetch one task-bound Navigator still for transient multimodal reasoning.
 
     This is intentionally not a registered model tool. Raw image bytes never
     enter a tool result or durable conversation artifact; the caller may feed
     the validated still directly to the active local vision worker for the
-    current browser turn only.
+    current browser turn only. When ``observation_id`` is given, the still
+    must belong to exactly that observation -- ScrapeX refuses a superseded
+    one and echoes the bound id, which is what lets a later coordinate
+    action name the frame it was chosen on.
     """
     task_value = _text(task_id, "task_id", maximum=MAX_TASK_ID_CHARS)
     assert task_value is not None
     if not _RESOURCE_ID_RE.fullmatch(task_value):
         raise ScrapeXInput("task_id must be a bounded ScrapeX identifier.")
+    bound = _navigator_observation_id(observation_id, required=False)
 
     base_url = _base_url(settings)
     try:
@@ -2779,7 +2920,8 @@ async def navigator_screenshot(settings: Any, task_id: str) -> tuple[bytes, str]
             },
         ) as client:
             response = await client.get(
-                f"/api/navigator/tasks/{quote(task_value, safe='')}/screenshot"
+                f"/api/navigator/tasks/{quote(task_value, safe='')}/screenshot",
+                params={"observation_id": bound} if bound else None,
             )
     except httpx.TimeoutException as exc:
         raise ScrapeXTransport(
@@ -2821,32 +2963,59 @@ async def navigator_screenshot(settings: Any, task_id: str) -> tuple[bytes, str]
             "navigator_task_mismatch",
             "ScrapeX returned a screenshot for a different Navigator task.",
         )
+    echoed_observation = str(
+        response.headers.get("x-scrapex-observation-id") or ""
+    ).strip()
+    if bound and echoed_observation != bound:
+        raise ScrapeXContract(
+            "navigator_observation_mismatch",
+            "ScrapeX returned a screenshot for a different observation.",
+        )
     return content, media_type
 
 
 _NAVIGATOR_ALLOWED_KEYS: dict[str, set[str]] = {
     "create_task": {"action", "provider", "target", "topic", "action_budget"},
-    "observe": {"action", "task_id"},
+    "observe": {"action", "task_id", "marks"},
     "verify": {"action", "task_id"},
     "get_evidence": {"action", "task_id"},
     "back": {"action", "task_id"},
     "extract": {"action", "task_id"},
     "done": {"action", "task_id"},
-    "click": {"action", "task_id", "ref"},
-    "fill": {"action", "task_id", "ref", "text"},
-    "press": {"action", "task_id", "ref", "key"},
+    "click": {"action", "task_id", "ref", "observation_id"},
+    "fill": {"action", "task_id", "ref", "text", "observation_id"},
+    "type": {"action", "task_id", "ref", "text", "observation_id"},
+    "press": {"action", "task_id", "ref", "key", "observation_id"},
     "open": {"action", "task_id", "url"},
     "scroll": {"action", "task_id", "delta_y"},
     "wait": {"action", "task_id", "milliseconds"},
+    "click_mark": {"action", "task_id", "mark", "observation_id"},
+    "click_visual": {"action", "task_id", "x_norm", "y_norm", "observation_id"},
+    "select_vehicle": {"action", "task_id", "vin"},
 }
 
 
-async def navigator_capture(settings: Any, task_id: str) -> dict[str, Any]:
+def _navigator_observation_id(value: Any, *, required: bool) -> str | None:
+    result = _text(value, "observation_id", maximum=MAX_OBSERVATION_ID_CHARS, required=required)
+    if result is not None and not _RESOURCE_ID_RE.fullmatch(result):
+        raise ScrapeXInput("observation_id must be a bounded ScrapeX identifier.")
+    return result
+
+
+async def navigator_capture(
+    settings: Any,
+    task_id: str,
+    *,
+    semantic_review: dict[str, Any] | None = None,
+    objective: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Preserve one already-verified Navigator leaf in canonical ADAS SI.
 
     This is intentionally an internal composite helper rather than a model-
-    advertised browser action. The model chooses navigation; ScrapeX's
-    verification proof is what authorizes persistence.
+    advertised browser action. The model chooses navigation and, through the
+    separate semantic review, whether the page is the procedure asked for;
+    ScrapeX's verification proof is what authorizes persistence, and the
+    review travels into the provenance sidecar as data.
     """
     action = "capture"
     try:
@@ -2854,11 +3023,16 @@ async def navigator_capture(settings: Any, task_id: str) -> dict[str, Any]:
         assert task_value is not None
         if not _RESOURCE_ID_RE.fullmatch(task_value):
             raise ScrapeXInput("task_id must be a bounded ScrapeX identifier.")
+        body: dict[str, Any] = {}
+        if isinstance(semantic_review, dict) and semantic_review:
+            body["semantic_review"] = semantic_review
+        if isinstance(objective, dict) and objective:
+            body["objective"] = objective
         data = await _request(
             settings,
             "POST",
             f"/api/navigator/tasks/{quote(task_value, safe='')}/capture",
-            body={},
+            body=body,
             timeout=OPERATOR_TIMEOUT,
             may_mutate=True,
         )
@@ -2963,11 +3137,14 @@ async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
         encoded_task = quote(task_id, safe="")
 
         if action == "observe":
+            marks = clean.get("marks", False)
+            if marks is not None and not isinstance(marks, bool):
+                raise ScrapeXInput("marks must be a boolean.")
             data = await _request(
                 settings,
                 "POST",
                 f"/api/navigator/tasks/{encoded_task}/observe",
-                body={},
+                body={"marks": True} if marks else {},
                 timeout=OPERATOR_TIMEOUT,
                 may_mutate=True,
             )
@@ -3011,9 +3188,15 @@ async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
         # bounded /act endpoint; ScrapeX's own executor is the sole authority on
         # whether the ref/url is valid and the action kind is legal.
         body = {"action": action}
+        if action in {"click", "fill", "type", "press"}:
+            bound_observation = _navigator_observation_id(
+                clean.get("observation_id"), required=False
+            )
+            if bound_observation:
+                body["observation_id"] = bound_observation
         if action == "click":
             body["ref"] = _navigator_ref(clean.get("ref"))
-        elif action == "fill":
+        elif action in {"fill", "type"}:
             body["ref"] = _navigator_ref(clean.get("ref"))
             text = _text(clean.get("text"), "text", maximum=MAX_FILL_TEXT_CHARS)
             assert text is not None
@@ -3023,6 +3206,31 @@ async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
             key = _text(clean.get("key"), "key", maximum=MAX_KEY_CHARS)
             assert key is not None
             body["key"] = key
+        elif action == "click_mark":
+            mark = clean.get("mark")
+            if isinstance(mark, bool) or not isinstance(mark, int) or not 1 <= mark <= MAX_MARK_NUMBER:
+                raise ScrapeXInput(f"mark must be an integer from 1 to {MAX_MARK_NUMBER}.")
+            body["mark"] = mark
+            body["observation_id"] = _navigator_observation_id(
+                clean.get("observation_id"), required=True
+            )
+        elif action == "click_visual":
+            for field in ("x_norm", "y_norm"):
+                value = clean.get(field)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not 0.0 <= float(value) <= 1.0
+                ):
+                    raise ScrapeXInput(f"{field} must be a number from 0 to 1.")
+                body[field] = float(value)
+            body["observation_id"] = _navigator_observation_id(
+                clean.get("observation_id"), required=True
+            )
+        elif action == "select_vehicle":
+            vin = _text(clean.get("vin"), "vin", maximum=MAX_VIN_CHARS)
+            assert vin is not None
+            body["vin"] = "".join(vin.split()).upper()
         elif action == "open":
             url = _text(clean.get("url"), "url", maximum=MAX_NAV_URL_CHARS)
             assert url is not None

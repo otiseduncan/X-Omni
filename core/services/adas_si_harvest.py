@@ -1,4 +1,23 @@
-"""Background ADAS service-information harvest from ALLDATA.
+"""LEGACY, EXPERIMENTAL, NON-DEFAULT: scripted ADAS service-information harvest.
+
+NOT AUTHORITATIVE. Frozen on 2026-09-13 as a comparison baseline only.
+
+This module is the scripted traversal that the model-driven research job in
+``core/services/adas_si_research.py`` replaced. It decided, in Python, which
+links to descend (``PROCEDURE_WORDS``), which pages were documents
+(``DOCUMENT_CHARS`` / ``DOCUMENT_WITH_LINKS_CHARS``), how deep to walk
+(``MAX_DEPTH``), and it verified each capture against the candidate page's own
+title as the task topic. Field results were many saved documents, most of
+them removal/replacement and parts information, and few actual calibration
+procedures. Those semantic decisions belong to X, not to this file.
+
+It is no longer registered by default. Set ``XOMNI_LEGACY_SI_HARVEST=1`` to
+register its tools for a side-by-side comparison run. Do not extend its
+semantic rules; the mechanical pieces worth keeping (label parsing, the VIN
+keystroke fast path) have moved to ScrapeX's provider and to the research
+job's target resolution.
+
+Original description follows.
 
 Otis's need: every ADAS calibration procedure for a vehicle, filed in ADAS SI
 as a PDF with provenance, ready to attach to an RO when it comes up. This runs
@@ -44,6 +63,8 @@ from typing import Any, Optional
 log = logging.getLogger("xomni.adas_si_harvest")
 
 NAMESPACE = "adas_si_harvest"
+LEGACY = True
+AUTHORITATIVE = False
 
 PICKER_URL = "https://my.alldata.com/repair/#/select-vehicle"
 VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")

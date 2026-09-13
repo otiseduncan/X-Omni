@@ -990,9 +990,10 @@ export function CalibrationWorkPrepCard({ data }) {
     case "ro_requirements":
       return <WorkPrepRoRequirementsCard data={data} />;
     default:
-      // Weekly/SI readiness and persisted SI queues are intentionally dormant.
-      // Keep their implementation in source, but never render them in the
-      // active product while the CIQ SI integration is disabled.
+      // Weekly readiness and persisted SI queue modes are not advertised to
+      // the model; service information itself is live and reaches the RO
+      // through the background research job (AdasSiResearchCard) and the
+      // operator document path. Nothing renders for an unadvertised mode.
       return null;
   }
 }
@@ -1286,6 +1287,33 @@ export function ResearchFindingsCard({ data }) {
               {finding?.page ? ` · p.${finding.page}` : ""}
             </span>
           </summary>
+          {finding?.semantic_review?.decision ? (
+            <p className="card-note research-review">
+              Independent review: {finding.semantic_review.decision}
+              {finding.semantic_review.classification
+                ? ` · ${String(finding.semantic_review.classification).toLowerCase().replace(/_/g, " ")}`
+                : ""}
+              {typeof finding.semantic_review.confidence === "number"
+                ? ` · ${Math.round(finding.semantic_review.confidence * 100)}%`
+                : ""}
+              {finding.semantic_review.evidence_summary ? ` — ${finding.semantic_review.evidence_summary}` : ""}
+            </p>
+          ) : null}
+          {Array.isArray(finding?.documents) && finding.documents.length > 1 ? (
+            <div className="research-documents">
+              {finding.documents.map((doc, docIndex) => (
+                <p className="card-note" key={`${finding?.source}-${index}-doc-${docIndex}`}>
+                  {doc.role === "dependency" ? "Also needs: " : ""}
+                  {doc.title || doc.url}
+                  {doc.accepted ? " · accepted" : " · not accepted"}
+                  {doc.captured ? " · filed" : ""}
+                </p>
+              ))}
+            </div>
+          ) : null}
+          {finding?.complete === false ? (
+            <em className="card-note">This procedure still has a required document missing.</em>
+          ) : null}
           {finding?.excerpt ? <pre className="pre field-excerpt">{finding.excerpt}</pre> : null}
           {finding?.url ? (
             <a className="field-link" href={finding.url} target="_blank" rel="noreferrer noopener">
@@ -1380,6 +1408,118 @@ export function AdasMapSweepCard({ data }) {
   );
 }
 
+/* ---------------- ADAS SI research (background job) ---------------- */
+
+const RESEARCH_STATE_LABELS = {
+  running: "Running",
+  completed: "Finished",
+  failed: "Stopped",
+  already_running: "Already running",
+  no_targets: "Nothing to research",
+  no_requirements: "No requirements listed",
+  model_unavailable: "Model unavailable",
+  context_missing: "Not started",
+  invalid_scope: "Not started",
+};
+
+function ResearchObjectiveRow({ row }) {
+  const review = row?.review || null;
+  const attachments = Array.isArray(row?.attachments) ? row.attachments : [];
+  const dependencies = Array.isArray(row?.dependencies) ? row.dependencies : [];
+  const reasons = Array.isArray(row?.incomplete_reasons) ? row.incomplete_reasons : [];
+  return (
+    <div className="field-row research-objective" key={row.objective_id}>
+      <strong>{row.ro_number}</strong>
+      <span className="field-topics">
+        {[row.vehicle, row.calibration].filter(Boolean).join(" · ")}
+      </span>
+      <em className="field-meta">{row.outcome_label || row.outcome}</em>
+      {row.title ? (
+        <p className="card-note">
+          {row.source_url ? (
+            <a className="field-link" href={row.source_url} target="_blank" rel="noreferrer noopener">
+              <ExternalLink size={12} /> {row.title}
+            </a>
+          ) : (
+            row.title
+          )}
+          {review?.decision ? ` · review ${review.decision}${review.classification ? ` (${review.classification.toLowerCase().replace(/_/g, " ")})` : ""}` : ""}
+        </p>
+      ) : null}
+      {attachments.map((item, index) => (
+        <p className="card-note" key={`${row.objective_id}-att-${index}`}>
+          {item.attached ? "Attached in Calibration IQ" : `Attachment ${item.status || "not confirmed"}`}
+          {item.document_status ? ` as ${item.document_status}` : ""}
+          {item.title ? ` · ${item.title}` : ""}
+        </p>
+      ))}
+      {dependencies.map((item, index) => (
+        <p className="card-note" key={`${row.objective_id}-dep-${index}`}>
+          Also needs “{item.title}” · {item.status}
+        </p>
+      ))}
+      {reasons.map((reason, index) => (
+        <em className="card-note" key={`${row.objective_id}-why-${index}`}>{String(reason).slice(0, 200)}</em>
+      ))}
+      {row.reason && !row.title ? <em className="card-note">{String(row.reason).slice(0, 200)}</em> : null}
+    </div>
+  );
+}
+
+export function AdasSiResearchCard({ data }) {
+  const status = data?.status || "unknown";
+  const scope = data?.scope || "the requested work";
+  const rows = Array.isArray(data?.objectives) ? data.objectives : [];
+  const groups = Array.isArray(data?.groups) ? data.groups : [];
+  const progress = data?.progress || null;
+  const finished = status === "completed";
+  const tone =
+    status === "failed" || status === "no_targets" || status === "no_requirements" || status === "model_unavailable"
+      ? "warn"
+      : undefined;
+  const meta = finished
+    ? `${data?.attached_count ?? 0} of ${data?.objective_count ?? rows.length} attached`
+    : progress
+      ? `${progress.finished} of ${progress.total} researched`
+      : RESEARCH_STATE_LABELS[status] || status;
+  return (
+    <Card icon={BookOpen} title={`Service information research · ${scope}`} meta={meta} tone={tone}>
+      <p className="card-note">
+        <strong>{RESEARCH_STATE_LABELS[status] || status}.</strong> {data?.message || ""}
+      </p>
+      {finished
+        ? groups.map((group, index) => (
+            <details className="field-hit" key={group.outcome} open={index === 0 && group.outcome !== "attached"}>
+              <summary>
+                <strong>{group.label}</strong>
+                <span className="field-page">{group.count}</span>
+              </summary>
+              {(group.objectives || []).map((row) => (
+                <ResearchObjectiveRow row={row} key={row.objective_id} />
+              ))}
+            </details>
+          ))
+        : rows.length > 0 ? (
+            <details className="field-alts">
+              <summary>{rows.length} procedure objective{rows.length === 1 ? "" : "s"} in this job</summary>
+              {rows.map((row) => (
+                <ResearchObjectiveRow row={row} key={row.objective_id} />
+              ))}
+            </details>
+          ) : null}
+      {Array.isArray(data?.problems) && data.problems.length > 0 ? (
+        <details className="field-alts">
+          <summary>{data.problems.length} repair order{data.problems.length === 1 ? "" : "s"} could not be read</summary>
+          {data.problems.map((problem, index) => (
+            <p className="card-note" key={`problem-${index}`}>{String(problem).slice(0, 200)}</p>
+          ))}
+        </details>
+      ) : null}
+      {data?.note ? <p className="card-note">{data.note}</p> : null}
+    </Card>
+  );
+}
+
 export const FIELD_CARDS = {
   adas_si_document: AdasDocumentCard,
   adas_si_results: AdasResultsCard,
@@ -1397,4 +1537,5 @@ export const FIELD_CARDS = {
   automotive_knowledge: AutomotiveKnowledgeCard,
   research_findings: ResearchFindingsCard,
   adas_map_sweep: AdasMapSweepCard,
+  adas_si_research: AdasSiResearchCard,
 };
