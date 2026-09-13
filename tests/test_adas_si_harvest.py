@@ -499,3 +499,87 @@ async def test_vehicles_and_phases_are_not_both_accepted():
     assert both["executed"] is False
     assert "not both" in both["reason"]
 
+
+class _KiaNavigator(_FakeNavigator):
+    """A 2025 Kia K4's radar branch, at the sizes the live site returned.
+
+    The hub is small and the calibration below it is large, and the
+    calibration closes with a cross-reference back to Removal and Replacement
+    -- which is what made every real procedure look like an index.
+    """
+
+    HUB = _page(
+        "https://my.alldata.com/repair/#/vehicle/1/component/radar",
+        "Collision Avoidance Sensor - ALLDATA Collision",
+        ["Front Radar (ADAS) - Adjustment", "Removal and Replacement"],
+        text="h" * 540,
+    )
+    ADJUSTMENT = _page(
+        "https://my.alldata.com/repair/#/article/1/radar/adjustment",
+        "Front Radar (ADAS) - Adjustment (Collision Avoidance Sensor) - ALLDATA Collision",
+        ["Removal and Replacement"],          # the cross-reference at its foot
+        text="Install the reflector. " * 260,  # ~5,700 characters
+    )
+    REMOVAL = _page(
+        "https://my.alldata.com/repair/#/article/1/radar/removal",
+        "Removal and Replacement (Collision Avoidance Sensor) - ALLDATA Collision",
+        [], text="r" * 900,
+    )
+
+    async def __call__(self, body):
+        action = body.get("action")
+        if action == "click":
+            ref = str(body.get("ref") or "")
+            name = ""
+            for element in self.current["elements"]:
+                if element["ref"] == ref:
+                    name = element["name"]
+                    break
+            route = {
+                "Front Radar (ADAS) - Adjustment": self.ADJUSTMENT,
+                "Removal and Replacement": self.REMOVAL,
+            }
+            if name in route:
+                self.current = route[name]
+                return {"success": True, "data": self.current}
+        if action == "open":
+            for page in (self.HUB, self.ADJUSTMENT, self.REMOVAL):
+                if page["url"] == str(body.get("url")):
+                    self.current = page
+                    return {"success": True, "data": self.current}
+        return await super().__call__(body)
+
+
+@pytest.mark.asyncio
+async def test_a_calibration_that_links_onward_is_still_captured():
+    """The failure Otis watched: found the page, then walked past it.
+
+    "Front Radar (ADAS) - Adjustment" carries 5,768 characters of procedure
+    and one cross-reference at its foot. Treating any page with links below it
+    as an index skipped it, and the same rule skipped "Wide Angle Camera
+    (ADAS) - Adjustment" at 8,000 characters and "Front Camera (ADAS) -
+    Adjustment" at 4,390.
+    """
+    navigator = _KiaNavigator()
+    navigator.current = _KiaNavigator.HUB
+    service = _service(navigator, [])
+    found: list = []
+    await service.discover("task-1", _KiaNavigator.HUB["url"],
+                           "Front Radar (ADAS) - Adjustment", 1, found, set())
+    titles = [item["title"] for item in found]
+    assert any("Front Radar (ADAS) - Adjustment" in t for t in titles), titles
+    # and it still follows the cross-reference
+    assert any("Removal and Replacement" in t for t in titles), titles
+
+
+@pytest.mark.asyncio
+async def test_a_small_hub_is_still_only_an_index():
+    """540 characters of links is a hub, not a procedure."""
+    navigator = _KiaNavigator()
+    navigator.current = _KiaNavigator.HUB
+    service = _service(navigator, [])
+    found: list = []
+    await service.discover("task-1", _KiaNavigator.HUB["url"],
+                           "Removal and Replacement", 1, found, set())
+    assert all("Collision Avoidance Sensor - ALLDATA" not in item["title"] for item in found)
+

@@ -62,6 +62,15 @@ MAX_DEPTH = 3
 # only separates a real page from an empty shell; having children is what
 # separates an index from a document.
 DOCUMENT_CHARS = 400
+# A procedure that also links onward is still a procedure. OEM pages close
+# with cross-references -- "Removal and Replacement", "(Refer to Wide Angle
+# Camera - Adjustment)" -- so treating any page with links below it as an
+# index walked straight past the calibrations. Measured on a 2025 Kia K4:
+# "Front Radar (ADAS) - Adjustment" 5,768 chars, "Wide Angle Camera (ADAS) -
+# Adjustment" 8,000, "Front Camera (ADAS) - Adjustment" 4,390 -- every one
+# skipped -- while the real hubs above them ran 430 to 647 chars. Past this
+# much text a page is captured whether or not it leads anywhere else.
+DOCUMENT_WITH_LINKS_CHARS = 1_200
 SETTLE_TRIES = 14
 
 # Page furniture, and the help links inside the Quick Reference table.
@@ -561,12 +570,11 @@ class AdasSiHarvestService:
         text_length = len(str(here.get("page_text") or ""))
 
         children = procedure_children(here, name) if depth < MAX_DEPTH else []
-        if children:
-            for child in children:
-                await self.discover(task_id, url, child, depth + 1, found, seen)
-            return
-        if text_length >= DOCUMENT_CHARS:
+        substantial = text_length >= DOCUMENT_WITH_LINKS_CHARS
+        if substantial or (not children and text_length >= DOCUMENT_CHARS):
             found.append({"title": title or name, "url": url, "chars": text_length})
+        for child in children:
+            await self.discover(task_id, url, child, depth + 1, found, seen)
 
     async def documents_for(
         self,
