@@ -29,6 +29,12 @@
 .PARAMETER Clear
     Remove the stored credential instead of registering one.
 
+.PARAMETER BaseUrl
+    Authenticated Frigate origin. Defaults to FRIGATE_BASE_URL.
+
+.PARAMETER Camera
+    Logical Frigate camera name. Defaults to FRIGATE_CAMERA (exterior).
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\scripts\configure-frigate.ps1 -Username x-omni
 
@@ -38,6 +44,8 @@
 [CmdletBinding()]
 param(
     [string]$Username,
+    [string]$BaseUrl,
+    [string]$Camera,
     [switch]$Clear
 )
 
@@ -45,19 +53,13 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repoRoot '.venv\Scripts\python.exe'
+$helper = Join-Path $PSScriptRoot 'configure_frigate.py'
 if (-not (Test-Path -LiteralPath $python)) {
     throw "X Omni's virtual environment was not found at $python"
 }
 
 if ($Clear) {
-    & $python -c @'
-import sys
-sys.path.insert(0, r".")
-from core.config import Settings
-from core.services.frigate_client import credential_store
-store = credential_store(Settings.load().frigate_credential_path)
-print("removed" if store.clear() else "nothing was registered")
-'@
+    & $python $helper --clear
     exit $LASTEXITCODE
 }
 
@@ -68,35 +70,31 @@ $Username = $Username.Trim()
 if (-not $Username) { throw 'A Frigate username is required.' }
 
 $secure = Read-Host "Frigate password for '$Username'" -AsSecureString
-$plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR(
-    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-)
-if (-not $plain) { throw 'A Frigate password is required.' }
+$bstr = [IntPtr]::Zero
+$plain = $null
 
 try {
-    # The password reaches Python on stdin, never as an argument.
-    $script = @'
-import sys
-sys.path.insert(0, r".")
-from core.config import Settings
-from core.services.frigate_client import credential_store
-
-username = sys.stdin.readline().rstrip("\n")
-password = sys.stdin.readline().rstrip("\n")
-settings = Settings.load()
-store = credential_store(settings.frigate_credential_path)
-store.save({"username": username, "password": password})
-print(f"Sealed the Frigate credential for {username!r} at {store.path}")
-print("Base URL:", settings.frigate_base_url or "(FRIGATE_BASE_URL is not set yet)")
-print("Camera:", settings.frigate_camera)
-'@
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    if (-not $plain) { throw 'A Frigate password is required.' }
+    $arguments = @($helper, '--username', $Username)
+    if ($BaseUrl) { $arguments += @('--base-url', $BaseUrl) }
+    if ($Camera) { $arguments += @('--camera', $Camera) }
     Push-Location $repoRoot
     try {
-        "$Username`n$plain" | & $python -c $script
+        # Password reaches the helper only on stdin, never in an argument,
+        # process listing, environment variable, log line, or shell history.
+        $plain | & $python @arguments
+        $exitCode = $LASTEXITCODE
     } finally {
         Pop-Location
     }
+    exit $exitCode
 } finally {
+    if ($bstr -ne [IntPtr]::Zero) {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
     $plain = $null
+    $secure = $null
     [System.GC]::Collect()
 }

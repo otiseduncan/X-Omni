@@ -10,18 +10,22 @@ happening outside.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
+import httpx
 import pytest
 
 from core.services import camera_security, frigate_surveillance
 from core.services.frigate_client import (
     FrigateAuthError,
     FrigateCameraNotFound,
+    FrigateClient,
     FrigateNoRecording,
     FrigateNotConfigured,
     FrigateState,
     FrigateUnavailable,
 )
+from core.services.windows_secrets import SecretStore
 
 NOW = datetime(2026, 9, 13, 14, 30, tzinfo=timezone.utc)
 
@@ -156,6 +160,8 @@ async def test_event_history_maps_frigate_review_into_the_existing_item_shape():
     assert item["person_detected"] is True
     assert item["vehicle_detected"] is False
     assert item["snapshot_url"].startswith("/api/camera/event-snapshot.jpg?")
+    assert item["snapshot_event_id"] == "d1"
+    assert "event_id=d1" in item["snapshot_url"]
     assert result["frigate_url"] == "https://frigate.example:8971"
 
 
@@ -165,6 +171,17 @@ async def test_a_vehicle_label_becomes_a_vehicle_detection():
     result = await camera_security.camera_event_history({}, surveillance=service)
     assert result["items"][0]["vehicle_detected"] is True
     assert result["items"][0]["person_detected"] is False
+
+
+@pytest.mark.asyncio
+async def test_audio_review_labels_are_preserved_as_evidence():
+    record = _review_record(objects=())
+    record["data"]["audio"] = ["speech", "bark"]
+    result = await camera_security.camera_event_history(
+        {}, surveillance=_surveillance(review=[record])
+    )
+    assert result["items"][0]["audio_detected"] is True
+    assert result["items"][0]["audio_labels"] == ["speech", "bark"]
 
 
 @pytest.mark.asyncio
@@ -204,6 +221,84 @@ async def test_event_history_can_include_bounded_recording_coverage():
         {"include_recordings": True}, surveillance=service
     )
     assert result["recordings"][0]["duration_seconds"] == 600.0
+
+
+@pytest.mark.asyncio
+async def test_no_events_can_still_return_continuous_recording_coverage():
+    service = _surveillance(
+        review=[],
+        recording_spans=[
+            {
+                "started_at": NOW,
+                "ended_at": NOW + timedelta(minutes=5),
+                "duration_seconds": 300.0,
+            }
+        ],
+    )
+    result = await camera_security.camera_event_history(
+        {"include_recordings": True}, surveillance=service
+    )
+    assert result["state"] == FrigateState.NO_EVENT_DATA
+    assert result["items"] == []
+    assert result["recordings"][0]["duration_seconds"] == 300.0
+
+
+def test_offsetless_camera_time_is_operator_local_not_utc():
+    parsed = camera_security._parse_iso(
+        "2026-09-13T10:30:00", local_timezone=ZoneInfo("America/New_York")
+    )
+    assert parsed == datetime(2026, 9, 13, 14, 30, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_historical_1030_to_1035_request_reaches_frigate_with_exact_epochs(tmp_path):
+    observed: dict[str, str] = {}
+    start = datetime(2026, 9, 13, 14, 30, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=5)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/login":
+            return httpx.Response(
+                200, headers={"set-cookie": "frigate_token=test.jwt.token; HttpOnly"}
+            )
+        if request.url.path == "/api/exterior/recordings":
+            observed.update(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "start_time": start.timestamp(),
+                        "end_time": end.timestamp(),
+                    }
+                ],
+            )
+        raise AssertionError(request.url.path)
+
+    store = SecretStore(
+        tmp_path / "frigate.bin",
+        entropy=b"test",
+        description="test",
+        protect=lambda raw: raw,
+        unprotect=lambda raw: raw,
+    )
+    store.save({"username": "x-omni", "password": "not-logged"})
+    client = FrigateClient(
+        base_url="https://frigate.example:8971",
+        camera="exterior",
+        credential_path=store.path,
+        transport=httpx.MockTransport(handler),
+        store=store,
+    )
+    service = frigate_surveillance.FrigateSurveillance(
+        client, operator_timezone="America/New_York"
+    )
+    result = await camera_security.camera_motion_clip(
+        {"since": "2026-09-13T10:30:00", "until": "2026-09-13T10:35:00"},
+        surveillance=service,
+    )
+    assert result["ok"] is True
+    assert float(observed["after"]) == start.timestamp()
+    assert float(observed["before"]) == end.timestamp()
 
 
 # ---------------------------------------------------------------- playback

@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import footage_frames
 from .frigate_client import (
@@ -61,8 +62,8 @@ def _iso(value: datetime) -> str:
     return _utc(value).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _local(value: datetime) -> str:
-    return value.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+def _local(value: datetime, local_timezone=None) -> str:
+    return value.astimezone(local_timezone).strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
 def _from_epoch(value: object) -> Optional[datetime]:
@@ -91,8 +92,8 @@ def state_message(state: str, detail: Optional[str] = None) -> str:
             "evidence to look at."
         ),
         FrigateState.AUTHENTICATION_REQUIRED: (
-            "Frigate refused X's credential, so camera evidence cannot be read until "
-            "it is registered again."
+            "X cannot authenticate to Frigate, so camera evidence cannot be read until "
+            "the Frigate credential is registered or corrected."
         ),
         FrigateState.NOT_CONFIGURED: (
             "Frigate is not configured on this machine yet, so there is no camera "
@@ -147,9 +148,20 @@ def resolve_ffmpeg(explicit: Optional[Path] = None) -> Optional[Path]:
 class FrigateSurveillance:
     """Frigate-backed answers for X's existing camera capabilities."""
 
-    def __init__(self, client: FrigateClient, *, ffmpeg_path: Optional[Path] = None):
+    def __init__(
+        self,
+        client: FrigateClient,
+        *,
+        ffmpeg_path: Optional[Path] = None,
+        operator_timezone: str = "America/New_York",
+    ):
         self.client = client
         self.ffmpeg_path = Path(ffmpeg_path) if ffmpeg_path else None
+        try:
+            self.local_timezone = ZoneInfo(str(operator_timezone))
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Unknown operator timezone: {operator_timezone}") from exc
+        self.operator_timezone = str(operator_timezone)
 
     # --------------------------------------------------------------- health
 
@@ -168,14 +180,14 @@ class FrigateSurveillance:
         try:
             health = await self.client.health()
         except FrigateError as exc:
+            summary = self.client.configuration_summary()
             return {
                 "ok": False,
                 "state": exc.state,
                 "recording": False,
                 "source": "frigate",
-                "base_url": self.client.base_url,
-                "camera": self.client.camera,
                 "detail": state_message(exc.state, str(exc)),
+                **summary,
             }
         available = health.get("state") == FrigateState.AVAILABLE
         return {
@@ -191,6 +203,9 @@ class FrigateSurveillance:
             "camera_running": health.get("camera_running"),
             "cameras": health.get("cameras"),
             "version": health.get("version"),
+            "credential_registered": self.client.configuration_summary().get(
+                "credential_registered"
+            ),
             "detail": health.get("detail"),
         }
 
@@ -251,8 +266,8 @@ class FrigateSurveillance:
             "clip_url": footage_url(covered_from, covered_to),
             "started_at": _iso(covered_from),
             "ended_at": _iso(covered_to),
-            "started_at_local": _local(covered_from),
-            "ended_at_local": _local(covered_to),
+            "started_at_local": _local(covered_from, self.local_timezone),
+            "ended_at_local": _local(covered_to, self.local_timezone),
             "partial": partial,
         }
 
@@ -331,6 +346,7 @@ class FrigateSurveillance:
             ended = _from_epoch(record.get("end_time"))
             data = record.get("data") if isinstance(record.get("data"), dict) else {}
             labels = [str(label) for label in (data.get("objects") or []) if label]
+            audio_labels = [str(label) for label in (data.get("audio") or []) if label]
             zones = [str(zone) for zone in (data.get("zones") or []) if zone]
             detections = [str(value) for value in (data.get("detections") or []) if value]
             rows.append(
@@ -339,9 +355,11 @@ class FrigateSurveillance:
                     "severity": str(record.get("severity") or ""),
                     "started_at": _iso(started),
                     "ended_at": _iso(ended) if ended else None,
-                    "started_at_local": _local(started),
-                    "ended_at_local": _local(ended) if ended else None,
+                    "started_at_local": _local(started, self.local_timezone),
+                    "ended_at_local": _local(ended, self.local_timezone) if ended else None,
                     "labels": labels,
+                    "audio_labels": audio_labels,
+                    "audio_detected": bool(audio_labels),
                     "zones": zones,
                     "detection_ids": detections,
                     "reviewed": bool(record.get("has_been_reviewed")),

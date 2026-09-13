@@ -73,7 +73,30 @@ def _login_response(request: httpx.Request) -> httpx.Response:
 def test_a_base_url_is_reduced_to_a_bare_origin():
     assert normalize_base_url("https://192.168.1.201:8971/") == "https://192.168.1.201:8971"
     assert normalize_base_url("192.168.1.201:8971") == "https://192.168.1.201:8971"
-    assert normalize_base_url("http://frigate.local:5000") == "http://frigate.local:5000"
+    assert normalize_base_url("https://frigate.local") == "https://frigate.local:8971"
+
+
+def test_the_unauthenticated_port_is_rejected_not_merely_discouraged():
+    with pytest.raises(FrigateInvalidRequest, match="authenticated API"):
+        normalize_base_url("http://frigate.local:5000")
+
+
+def test_another_route_to_frigate_needs_no_code_change():
+    """The endpoint must be able to move without editing this module.
+
+    A reverse proxy or a Tailscale name terminates TLS on 443, so refusing
+    every port but 8971 would turn "change one setting" into "change the
+    code". Only the unauthenticated API is off-limits.
+    """
+    # A bare host means Frigate's own port, because that is the common case.
+    assert normalize_base_url("https://frigate.example.com") == "https://frigate.example.com:8971"
+    # A proxy or Tailscale name terminating TLS on 443 is stated explicitly
+    # and accepted -- one setting, no code change.
+    assert (
+        normalize_base_url("https://omega-frigate.tail1234.ts.net:443")
+        == "https://omega-frigate.tail1234.ts.net:443"
+    )
+    assert normalize_base_url("https://192.168.1.201:8971") == "https://192.168.1.201:8971"
 
 
 def test_a_base_url_carrying_credentials_is_refused():
@@ -114,6 +137,17 @@ def test_no_secret_appears_in_repr_summary_or_logs(tmp_path, caplog):
     assert PASSWORD not in caplog.text
     # Presence is reportable; the value is not.
     assert client.configuration_summary()["credential_registered"] is True
+
+
+def test_frigate_http_never_inherits_machine_proxy_settings(tmp_path):
+    client = _client(tmp_path, lambda request: httpx.Response(200, json={}))
+    transport_client = client._client(timeout_seconds=1)
+    try:
+        assert transport_client._trust_env is False
+    finally:
+        import asyncio
+
+        asyncio.run(transport_client.aclose())
 
 
 @pytest.mark.asyncio
@@ -198,14 +232,56 @@ async def test_a_timeout_is_reported_as_unavailable(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_missing_credential_is_not_configured_rather_than_unauthorized(tmp_path):
+async def test_a_configured_endpoint_with_no_credential_requires_authentication(tmp_path):
     empty = SecretStore(
         tmp_path / "absent.bin", entropy=b"t", description="t",
         protect=lambda raw: raw, unprotect=lambda raw: raw,
     )
     client = _client(tmp_path, _login_response, store=empty)
-    with pytest.raises(FrigateNotConfigured):
+    assert client.configured() is True
+    with pytest.raises(FrigateAuthError) as raised:
         await client.stats()
+    assert raised.value.state == FrigateState.AUTHENTICATION_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_verified_registration_rolls_back_a_bad_replacement(tmp_path):
+    store = _secret_store(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _login_response(request)
+
+    client = _client(tmp_path, handler, store=store)
+    with pytest.raises(FrigateAuthError):
+        await client.save_credential_verified(username="x-omni", password="wrong")
+    restored = store.load()
+    assert restored["username"] == "x-omni"
+    assert restored["password"] == PASSWORD
+
+
+@pytest.mark.asyncio
+async def test_verified_registration_proves_login_and_logical_camera(tmp_path):
+    empty = _secret_store(tmp_path, username="", password="")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/login":
+            return _login_response(request)
+        if request.url.path == "/api/config":
+            return httpx.Response(200, json={"cameras": {"exterior": {}}})
+        if request.url.path == "/api/stats":
+            return httpx.Response(
+                200,
+                json={"cameras": {"exterior": {"pid": 7, "camera_fps": 5.0}}},
+            )
+        raise AssertionError(request.url.path)
+
+    client = _client(tmp_path, handler, store=empty)
+    result = await client.save_credential_verified(
+        username="x-omni", password=PASSWORD
+    )
+    assert result["health"]["state"] == FrigateState.AVAILABLE
+    assert result["health"]["camera_running"] is True
+    assert empty.configured() is True
 
 
 @pytest.mark.asyncio

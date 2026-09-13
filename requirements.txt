@@ -28,3 +28,6 @@ playwright>=1.62,<2
 # Web Push delivery for the background camera-monitoring notification.
 pywebpush>=2.0,<3
 jsonschema>=4.26,<5
+# IANA timezone data is not bundled with Python on Windows. Camera questions
+# use it to turn local wall-clock ranges into the exact Frigate epoch window.
+tzdata>=2025.2

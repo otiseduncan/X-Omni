@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -39,8 +39,9 @@ SECURITY_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "camera_footage": {
         "description": (
             "Show recorded exterior footage for a time range or a detection, or analyze "
-            "what changed across it. Set analysis true only for a temporal action question; "
-            "it samples real recorded frames, not captions."
+            "what changed across it. For 'what happened' in a bounded window, provide both "
+            "bounds and set analysis true even when event history is empty; this samples real "
+            "continuous-recording frames rather than relying on detector captions."
         ),
         "parameters": {
             "type": "object",
@@ -55,11 +56,11 @@ SECURITY_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "since": {
                     "type": "string",
-                    "description": "ISO start with local UTC offset (for EDT use -04:00, never Z).",
+                    "description": "ISO start; an explicit offset is preferred, and an offset-less value is interpreted in the operator timezone.",
                 },
                 "until": {
                     "type": "string",
-                    "description": "ISO end with the same explicit UTC offset.",
+                    "description": "ISO end with the same offset or operator-local convention.",
                 },
                 "prompt": {"type": "string", "maxLength": 1000},
             },
@@ -84,7 +85,8 @@ SECURITY_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "camera_event_history": {
         "description": (
             "List exterior-camera detections the recorder logged, most recent first. Use to "
-            "find when something showed up or left. For playable footage use camera_footage."
+            "find when an object or configured audio label appeared. An empty list does not "
+            "prove nothing happened; for actual scene review use camera_footage with analysis."
         ),
         "parameters": {
             "type": "object",
@@ -136,7 +138,7 @@ _FOOTAGE_ANALYSIS_PROMPT = (
 # ------------------------------------------------------------------ helpers
 
 
-def _parse_iso(value: object) -> Optional[datetime]:
+def _parse_iso(value: object, *, local_timezone: tzinfo = timezone.utc) -> Optional[datetime]:
     text = str(value or "").strip()
     if not text:
         return None
@@ -144,11 +146,11 @@ def _parse_iso(value: object) -> Optional[datetime]:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         try:
-            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
         except ValueError:
             return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=local_timezone)
     return parsed.astimezone(timezone.utc)
 
 
@@ -158,8 +160,8 @@ def _iso(value: datetime) -> str:
     )
 
 
-def _local(value: datetime) -> str:
-    return value.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+def _local(value: datetime, local_timezone: Optional[tzinfo] = None) -> str:
+    return value.astimezone(local_timezone).strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
 def snapshot_url(event_id: str) -> str:
@@ -253,6 +255,7 @@ def _temporal_error(
     since: Optional[datetime] = None,
     until: Optional[datetime] = None,
     event: Optional[dict[str, Any]] = None,
+    local_timezone: Optional[tzinfo] = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": False,
@@ -262,10 +265,10 @@ def _temporal_error(
     }
     if since is not None:
         result["analyzed_started_at"] = _iso(since)
-        result["started_at_local"] = _local(since)
+        result["started_at_local"] = _local(since, local_timezone)
     if until is not None:
         result["analyzed_ended_at"] = _iso(until)
-        result["ended_at_local"] = _local(until)
+        result["ended_at_local"] = _local(until, local_timezone)
     if event is not None:
         result["event_id"] = event.get("id")
     return result
@@ -288,8 +291,22 @@ async def _vision_ready(router) -> bool:
 
 async def camera_event_history(args: dict, *, surveillance) -> dict[str, Any]:
     """What the recorder actually detected, and whether it is reachable at all."""
-    since = _parse_iso(args.get("since"))
-    until = _parse_iso(args.get("until"))
+    local_timezone = getattr(surveillance, "local_timezone", timezone.utc)
+    since = _parse_iso(args.get("since"), local_timezone=local_timezone)
+    until = _parse_iso(args.get("until"), local_timezone=local_timezone)
+    invalid_bounds = [
+        name for name, parsed in (("since", since), ("until", until))
+        if str(args.get(name) or "").strip() and parsed is None
+    ]
+    if invalid_bounds:
+        return surveillance_svc.error_result(
+            FrigateInvalidRequest(
+                f"Invalid ISO camera time: {', '.join(invalid_bounds)}."
+            ),
+            items=[],
+            total_count=0,
+            shown_count=0,
+        )
     try:
         limit = min(max(int(args.get("limit") or DEFAULT_HISTORY_ITEMS), 1), MAX_HISTORY_ITEMS)
     except (TypeError, ValueError):
@@ -311,8 +328,10 @@ async def camera_event_history(args: dict, *, surveillance) -> dict[str, Any]:
         return result
 
     for item in items:
-        if item.get("id"):
-            item["snapshot_url"] = snapshot_url(item["id"])
+        detection_ids = item.get("detection_ids") or []
+        if detection_ids:
+            item["snapshot_event_id"] = detection_ids[0]
+            item["snapshot_url"] = snapshot_url(detection_ids[0])
         item.setdefault("trigger", "detection")
         item.setdefault("captured_at", item.get("started_at"))
         item.setdefault("captured_at_local", item.get("started_at_local"))
@@ -348,8 +367,15 @@ async def camera_footage_analyze(router, args: dict, *, surveillance) -> dict[st
     """Answer temporal security questions from real recorded frames, never captions."""
     event: Optional[dict[str, Any]] = None
     raw_event_id = args.get("event_id")
-    requested_since = _parse_iso(args.get("since"))
-    requested_until = _parse_iso(args.get("until"))
+    local_timezone = getattr(surveillance, "local_timezone", timezone.utc)
+    requested_since = _parse_iso(args.get("since"), local_timezone=local_timezone)
+    requested_until = _parse_iso(args.get("until"), local_timezone=local_timezone)
+
+    for name, parsed in (("since", requested_since), ("until", requested_until)):
+        if str(args.get(name) or "").strip() and parsed is None:
+            return _temporal_error(
+                f"{name} must be an ISO datetime.", status="invalid_request"
+            )
 
     if (requested_since is None) != (requested_until is None):
         return _temporal_error(
@@ -505,8 +531,8 @@ async def camera_footage_analyze(router, args: dict, *, surveillance) -> dict[st
         "source": "frigate",
         "analyzed_started_at": samples["analyzed_started_at"],
         "analyzed_ended_at": samples["analyzed_ended_at"],
-        "started_at_local": _local(since),
-        "ended_at_local": _local(until),
+        "started_at_local": _local(since, local_timezone),
+        "ended_at_local": _local(until, local_timezone),
         "sample_count": int(samples["sample_count"]),
         "sampled_at": list(samples["sampled_at"]),
         "source_segments": list(samples["source_segments"]),
@@ -531,8 +557,14 @@ async def camera_footage_analyze(router, args: dict, *, surveillance) -> dict[st
 
 async def camera_motion_clip(args: dict, *, surveillance) -> dict[str, Any]:
     """Playable recorded footage for a detection or an explicit time range."""
-    since = _parse_iso(args.get("since"))
-    until = _parse_iso(args.get("until"))
+    local_timezone = getattr(surveillance, "local_timezone", timezone.utc)
+    since = _parse_iso(args.get("since"), local_timezone=local_timezone)
+    until = _parse_iso(args.get("until"), local_timezone=local_timezone)
+    for name, parsed in (("since", since), ("until", until)):
+        if str(args.get(name) or "").strip() and parsed is None:
+            return surveillance_svc.error_result(
+                FrigateInvalidRequest(f"{name} must be an ISO datetime.")
+            )
     raw_event_id = args.get("event_id")
     event: Optional[dict[str, Any]] = None
 
@@ -579,8 +611,8 @@ async def camera_motion_clip(args: dict, *, surveillance) -> dict[str, Any]:
         "clip_url": playback["clip_url"],
         "started_at_local": playback["started_at_local"],
         "ended_at_local": playback["ended_at_local"],
-        "requested_started_at_local": _local(since),
-        "requested_ended_at_local": _local(until),
+        "requested_started_at_local": _local(since, local_timezone),
+        "requested_ended_at_local": _local(until, local_timezone),
         "partial": playback["partial"],
     }
     if event is not None:
@@ -601,8 +633,15 @@ async def camera_snapshot_analyze(router, args: dict, *, surveillance) -> dict[s
             event_id = str(raw_event_id)
             since, _until, event = await surveillance.event_window(event_id)
             captured_at = since
-            frame_bytes = await surveillance.event_snapshot(event_id)
-            image_url = snapshot_url(event_id)
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            detections = [str(value) for value in (data.get("detections") or []) if value]
+            if not detections:
+                raise FrigateInvalidRequest(
+                    "That Frigate review item has no object snapshot; it may be motion or audio only."
+                )
+            snapshot_event_id = detections[0]
+            frame_bytes = await surveillance.event_snapshot(snapshot_event_id)
+            image_url = snapshot_url(snapshot_event_id)
             trigger = "detection"
         else:
             event_id = None
@@ -665,7 +704,9 @@ async def camera_snapshot_analyze(router, args: dict, *, surveillance) -> dict[s
         "state": FrigateState.AVAILABLE,
         "trigger": trigger,
         "captured_at": _iso(captured_at),
-        "captured_at_local": _local(captured_at),
+        "captured_at_local": _local(
+            captured_at, getattr(surveillance, "local_timezone", None)
+        ),
         "caption": description,
         "person_detected": person,
         "vehicle_detected": vehicle,
@@ -675,6 +716,7 @@ async def camera_snapshot_analyze(router, args: dict, *, surveillance) -> dict[s
     if event_id is not None:
         result["id"] = event_id
         result["event_id"] = event_id
+        result["snapshot_event_id"] = snapshot_event_id
     return result
 
 

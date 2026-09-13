@@ -176,6 +176,7 @@ def build_app(
     surveillance = frigate_surveillance_svc.FrigateSurveillance(
         frigate_client,
         ffmpeg_path=frigate_surveillance_svc.resolve_ffmpeg(),
+        operator_timezone=settings.operator_timezone,
     )
     image_config = None
     image_generation = None
@@ -212,7 +213,9 @@ def build_app(
     registry.register("system_status", builtin.make_system_status(router))
     registry.register(
         "assistant_capabilities_read",
-        builtin.make_assistant_capabilities(router, registry),
+        builtin.make_assistant_capabilities(
+            router, registry, surveillance=surveillance
+        ),
     )
     registry.register("web_research_current", research_svc.search_current)
     registry.register("scrapex_status", lambda a: scrapex_svc.status(settings, a))
@@ -368,7 +371,9 @@ def build_app(
     # above), so only the two real handlers are registered here.
     registry.register(
         "capability_search",
-        builtin.make_capability_search(router, registry),
+        builtin.make_capability_search(
+            router, registry, surveillance=surveillance
+        ),
     )
     registry.register(
         "delegate_research",

@@ -170,7 +170,20 @@ def normalize_base_url(value: object) -> str:
     # catching here rather than as a confusing connection error later.
     if not _HOST_RE.fullmatch(host):
         raise FrigateInvalidRequest("The Frigate base URL host is not a valid name or address.")
-    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise FrigateInvalidRequest("The Frigate base URL has an invalid port.") from exc
+    port = port or DEFAULT_FRIGATE_PORT
+    # Port 5000 is Frigate's unauthenticated internal API and is refused
+    # outright. Any other port is allowed, because the endpoint is meant to
+    # move to a different route without a code change -- a reverse proxy or
+    # a Tailscale name terminates TLS on 443, not on 8971.
+    if port == UNAUTHENTICATED_FRIGATE_PORT:
+        raise FrigateInvalidRequest(
+            f"Port {UNAUTHENTICATED_FRIGATE_PORT} is Frigate's unauthenticated internal API; "
+            f"X Omni uses its authenticated API (port {DEFAULT_FRIGATE_PORT} by default)."
+        )
     netloc = f"{host}:{port}"
     return urlunsplit((parts.scheme, netloc, "", "", ""))
 
@@ -271,15 +284,18 @@ class FrigateClient:
         self._token: Optional[str] = None
         self._token_expires_at: float = 0.0
         self._login_lock = asyncio.Lock()
+        self._credential_update_lock = asyncio.Lock()
 
     # ---------------------------------------------------------------- config
 
     def configured(self) -> bool:
-        return (
-            self.base_url is not None
-            and self.camera is not None
-            and self._secrets.configured()
-        )
+        """Whether the endpoint and logical camera are valid configuration.
+
+        Credential presence is deliberately separate. A configured Frigate
+        endpoint with no registered secret is an authentication boundary, not
+        an absent configuration.
+        """
+        return self.base_url is not None and self.camera is not None
 
     def configuration_summary(self) -> dict[str, Any]:
         """Safe to return over the API and to put in front of the model."""
@@ -298,7 +314,7 @@ class FrigateClient:
         try:
             document = self._secrets.load()
         except SecretNotConfigured as exc:
-            raise FrigateNotConfigured(
+            raise FrigateAuthError(
                 "No Frigate credential is registered on this machine."
             ) from exc
         except SecretStoreError as exc:
@@ -306,7 +322,7 @@ class FrigateClient:
         username = str(document.get("username") or "").strip()
         password = str(document.get("password") or "")
         if not username or not password:
-            raise FrigateNotConfigured("The stored Frigate credential is incomplete.")
+            raise FrigateAuthError("The stored Frigate credential is incomplete.")
         return FrigateCredential(username=username, password=password)
 
     def save_credential(self, *, username: str, password: str) -> dict[str, Any]:
@@ -318,6 +334,42 @@ class FrigateClient:
         self._token = None
         self._token_expires_at = 0.0
         return non_secret_summary(document, secret_keys=SECRET_KEYS)
+
+    async def save_credential_verified(
+        self, *, username: str, password: str
+    ) -> dict[str, Any]:
+        """Replace the secret only if login and camera verification succeed.
+
+        The previous DPAPI document is restored on every failed or cancelled
+        verification, so an operator typo cannot destroy a working setup.
+        """
+        async with self._credential_update_lock:
+            previous: Optional[dict[str, Any]] = None
+            had_previous = False
+            try:
+                previous = self._secrets.load()
+                had_previous = True
+            except SecretNotConfigured:
+                pass
+            except SecretStoreError as exc:
+                raise FrigateAuthError(str(exc)) from exc
+
+            summary = self.save_credential(username=username, password=password)
+            try:
+                health = await self.health()
+                if health.get("state") != FrigateState.AVAILABLE:
+                    raise FrigateCameraNotFound(
+                        str(health.get("detail") or "The configured Frigate camera is unavailable.")
+                    )
+            except BaseException:
+                self._token = None
+                self._token_expires_at = 0.0
+                if had_previous and previous is not None:
+                    self._secrets.save(previous)
+                else:
+                    self._secrets.clear()
+                raise
+            return {"credential": summary, "health": health}
 
     def forget_credential(self) -> bool:
         self._token = None
@@ -337,6 +389,9 @@ class FrigateClient:
             "base_url": self.base_url or "",
             "timeout": httpx.Timeout(timeout_seconds),
             "follow_redirects": False,
+            # A machine-level proxy must never receive Frigate credentials or
+            # redirect this private-LAN integration away from the configured host.
+            "trust_env": False,
         }
         if self._transport is not None:
             kwargs["transport"] = self._transport

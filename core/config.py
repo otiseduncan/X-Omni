@@ -48,6 +48,14 @@ def _int(name: str, default: int) -> int:
     return int(raw) if raw and raw.strip() else default
 
 
+def _rooted_path(name: str, default: Path) -> Path:
+    """Resolve a configurable path against the repository, never the CWD."""
+    configured = Path(os.getenv(name, str(default))).expanduser()
+    if not configured.is_absolute():
+        configured = ROOT / configured
+    return configured.resolve(strict=False)
+
+
 def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
@@ -150,6 +158,7 @@ class Settings:
     frigate_timeout_seconds: float = 10.0
     frigate_clip_timeout_seconds: float = 120.0
     frigate_max_clip_seconds: int = 300
+    operator_timezone: str = "America/New_York"
     # The Frigate account password is never stored here or in .env. It is
     # sealed with Windows DPAPI in this file (see windows_secrets.py).
     frigate_credential_path: Path = Path("data") / "credentials" / "frigate.bin"
@@ -249,10 +258,12 @@ class Settings:
                 os.getenv("FRIGATE_CLIP_TIMEOUT_SECONDS", "120.0")
             ),
             frigate_max_clip_seconds=_int("FRIGATE_MAX_CLIP_SECONDS", 300),
-            frigate_credential_path=Path(
-                os.getenv(
-                    "FRIGATE_CREDENTIAL_PATH",
-                    str(ROOT / "data" / "credentials" / "frigate.bin"),
-                )
+            frigate_credential_path=_rooted_path(
+                "FRIGATE_CREDENTIAL_PATH",
+                ROOT / "data" / "credentials" / "frigate.bin",
+            ),
+            operator_timezone=(
+                os.getenv("XOMNI_OPERATOR_TIMEZONE", "America/New_York").strip()
+                or "America/New_York"
             ),
         )

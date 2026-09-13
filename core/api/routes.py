@@ -992,11 +992,13 @@ def create_router(
         if not username or not password:
             raise HTTPException(400, "A Frigate username and password are both required.")
         try:
-            summary = service.client.save_credential(username=username, password=password)
+            verified = await service.client.save_credential_verified(
+                username=username, password=password
+            )
         except Exception as exc:
             raise frigate_http_error(exc) from exc
         store.audit("frigate_credential_registered", {"username": username})
-        return {"ok": True, "credential": summary}
+        return {"ok": True, **verified}
 
     @api.delete("/camera/credential")
     async def forget_frigate_credential(_session: dict = Depends(require_owner)):
@@ -1043,8 +1045,12 @@ def create_router(
         gone, so Omega never becomes a second copy of the recording.
         """
         service = require_surveillance()
-        start = camera_security_svc._parse_iso(since)
-        end = camera_security_svc._parse_iso(until)
+        start = camera_security_svc._parse_iso(
+            since, local_timezone=service.local_timezone
+        )
+        end = camera_security_svc._parse_iso(
+            until, local_timezone=service.local_timezone
+        )
         if start is None or end is None:
             raise HTTPException(400, "since and until must both be ISO datetimes.")
         try:

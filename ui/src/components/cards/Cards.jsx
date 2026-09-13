@@ -412,8 +412,19 @@ function WebResearchCard({ data }) {
 function CapabilitiesCard({ data }) {
   const tools = data?.tools || [];
   const unavailable = data?.not_wired || [];
+  const statusLabel = (tool) => {
+    if (tool.status === "approval_required") return "approval";
+    if (!tool.runtime_checked) return "listed";
+    return {
+      available: "ready",
+      authentication_required: "sign-in",
+      not_configured: "setup",
+      unavailable: "offline",
+      camera_unavailable: "camera offline",
+    }[tool.runtime_state] || "unavailable";
+  };
   return (
-    <Card icon={Sparkles} title="Capabilities · live catalog">
+    <Card icon={Sparkles} title="Capabilities · live status">
       <p className="card-note">
         Active worker: <strong>{data?.active_worker || "none"}</strong>. Catalog presence is not execution proof.
       </p>
@@ -421,7 +432,7 @@ function CapabilitiesCard({ data }) {
         {tools.map((tool) => (
           <div className="capability-row" key={tool.name}>
             <span>{tool.name.replace(/_/g, " ")}</span>
-            <strong>{tool.status === "approval_required" ? "approval" : "ready"}</strong>
+            <strong title={tool.runtime_detail || undefined}>{statusLabel(tool)}</strong>
           </div>
         ))}
       </div>

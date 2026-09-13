@@ -241,8 +241,39 @@ def make_system_status(router):
     return system_status
 
 
-def make_assistant_capabilities(router, registry):
-    def assistant_capabilities_read(_args: dict) -> dict:
+_FRIGATE_CAPABILITIES = {
+    "exterior_camera_request",
+    "camera_event_history",
+    "camera_snapshot_analyze",
+    "camera_footage",
+}
+
+
+async def _apply_runtime_capability_status(tools: list[dict], surveillance) -> None:
+    relevant = [tool for tool in tools if tool.get("name") in _FRIGATE_CAPABILITIES]
+    if not relevant or surveillance is None:
+        return
+    try:
+        status = await surveillance.status()
+    except Exception:  # status surfaces should never take down capability discovery
+        status = {
+            "ok": False,
+            "state": "unavailable",
+            "detail": "Frigate readiness could not be checked.",
+        }
+    executable = status.get("ok") is True
+    runtime_state = str(status.get("state") or "unavailable")
+    for capability in relevant:
+        capability["catalog_status"] = capability["status"]
+        capability["runtime_checked"] = True
+        capability["runtime_state"] = runtime_state
+        capability["runtime_detail"] = str(status.get("detail") or "")[:360]
+        capability["executable"] = executable
+        capability["status"] = "available" if executable else runtime_state
+
+
+def make_assistant_capabilities(router, registry, *, surveillance=None):
+    async def assistant_capabilities_read(_args: dict) -> dict:
         tools = []
         try:
             configured_tools = registry.capability_catalog()
@@ -281,6 +312,7 @@ def make_assistant_capabilities(router, registry):
                     "create_location",
                 ]
             tools.append(capability)
+        await _apply_runtime_capability_status(tools, surveillance)
         workers = []
         for name, cfg in router.configs.items():
             workers.append({
@@ -424,7 +456,7 @@ def make_task_tools(store):
     return list_tasks, add_task, update_task_status
 
 
-def make_capability_search(router, registry):
+def make_capability_search(router, registry, *, surveillance=None):
     """In-turn discovery for capabilities outside the permanent surface.
 
     The model supplies a structured ``query``; this ranks the profile's
@@ -435,7 +467,7 @@ def make_capability_search(router, registry):
 
     from ...tools import meta as meta_mod
 
-    def capability_search(args: dict) -> dict:
+    async def capability_search(args: dict) -> dict:
         query = str((args or {}).get("query") or "").strip()[:200]
         try:
             discoverable = registry.discoverable_catalog()
@@ -476,6 +508,7 @@ def make_capability_search(router, registry):
                     "description": str(function.get("description") or "")[:360],
                 }
             )
+        await _apply_runtime_capability_status(tools, surveillance)
         permanent = []
         try:
             permanent = [item["function"]["name"] for item in registry.permanent_catalog()]

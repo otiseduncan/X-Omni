@@ -64,3 +64,11 @@ test("tool rail counts only actions that are actually one-click runnable", async
   assert.match(source, /\{oneClickCount\} quick/);
   assert.doesNotMatch(source, /\{runnable\} ready/);
 });
+
+test("capability card does not call catalog presence ready", async () => {
+  const cards = await readFile(new URL("../src/components/cards/Cards.jsx", import.meta.url), "utf8");
+  assert.match(cards, /if \(!tool\.runtime_checked\) return "listed"/);
+  assert.match(cards, /authentication_required:\s*"sign-in"/);
+  assert.match(cards, /camera_unavailable:\s*"camera offline"/);
+  assert.doesNotMatch(cards, /tool\.status === "approval_required" \? "approval" : "ready"/);
+});

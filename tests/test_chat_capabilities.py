@@ -199,7 +199,8 @@ def test_file_search_traversal_and_quoted_secret_results_are_bounded(tmp_path, m
     assert "[REDACTED]" in str(result)
 
 
-def test_capability_catalog_reports_real_tools_and_known_limits(tmp_path):
+@pytest.mark.asyncio
+async def test_capability_catalog_reports_real_tools_and_known_limits(tmp_path):
     policy = tmp_path / "policy.yaml"
     policy.write_text(
         "roots:\n"
@@ -219,14 +220,15 @@ def test_capability_catalog_reports_real_tools_and_known_limits(tmp_path):
             "coder": SimpleNamespace(supports_vision=False, supports_audio=False),
         },
     )
-    result = builtin.make_assistant_capabilities(router, registry)({})
+    result = await builtin.make_assistant_capabilities(router, registry)({})
     assert result["delivery"] == "existing_chat_stream"
     assert result["catalog_is_execution_proof"] is False
     assert [item["name"] for item in result["tools"]] == ["web_research_current"]
     assert any(item["name"] == "image attachments" for item in result["not_wired"])
 
 
-def test_capability_catalog_reports_the_meta_surface_not_raw_ciq_writes() -> None:
+@pytest.mark.asyncio
+async def test_capability_catalog_reports_the_meta_surface_not_raw_ciq_writes() -> None:
     from core.main import configured_profile_catalog
 
     configured_profile_catalog(
@@ -258,7 +260,7 @@ def test_capability_catalog_reports_the_meta_surface_not_raw_ciq_writes() -> Non
         "query_ciq", "stage_action", "delegate_research", "capability_search",
     }
 
-    result = builtin.make_assistant_capabilities(router, registry)({})
+    result = await builtin.make_assistant_capabilities(router, registry)({})
     tools = {item["name"]: item for item in result["tools"]}
     # The raw write tools are not part of the profile; stage_action is the
     # write path and it is reported as an ordinary available capability.
@@ -268,7 +270,45 @@ def test_capability_catalog_reports_the_meta_surface_not_raw_ciq_writes() -> Non
     assert tools["get_calendar"]["turn_availability"] == "advertised_normally"
 
 
-def test_capability_search_ranks_and_unlocks_discoverable_tools() -> None:
+@pytest.mark.asyncio
+async def test_frigate_capability_readiness_comes_from_live_status() -> None:
+    from core.main import configured_profile_catalog
+
+    configured_profile_catalog(
+        SimpleNamespace(tools_config="config/tools.yaml", tool_profile="adas_operator")
+    )
+    registry = Registry("config/tools.yaml", profile="adas_operator")
+    for item in registry.profile_catalog():
+        registry.register(item["function"]["name"], lambda _args: {})
+
+    class AuthenticationRequired:
+        async def status(self):
+            return {
+                "ok": False,
+                "state": "authentication_required",
+                "detail": "No Frigate credential is registered on this machine.",
+            }
+
+    router = SimpleNamespace(active_name="omni", configs={})
+    result = await builtin.make_assistant_capabilities(
+        router, registry, surveillance=AuthenticationRequired()
+    )({})
+    tools = {item["name"]: item for item in result["tools"]}
+    for name in (
+        "exterior_camera_request",
+        "camera_event_history",
+        "camera_snapshot_analyze",
+        "camera_footage",
+    ):
+        assert tools[name]["status"] == "authentication_required"
+        assert tools[name]["executable"] is False
+        assert tools[name]["runtime_checked"] is True
+    assert tools["get_calendar"]["status"] == "available"
+    assert "runtime_checked" not in tools["get_calendar"]
+
+
+@pytest.mark.asyncio
+async def test_capability_search_ranks_and_unlocks_discoverable_tools() -> None:
     from core.main import configured_profile_catalog
     from core.tools.meta import MAX_UNLOCKED_TOOLS
 
@@ -281,7 +321,7 @@ def test_capability_search_ranks_and_unlocks_discoverable_tools() -> None:
     router = SimpleNamespace(active_name="omni", configs={})
     search = builtin.make_capability_search(router, registry)
 
-    calendar = search({"query": "calendar appointments"})
+    calendar = await search({"query": "calendar appointments"})
     assert calendar["catalog_is_execution_proof"] is False
     assert calendar["unlocked_tools"][0] == "get_calendar"
     assert "create_calendar_event" in calendar["unlocked_tools"]
@@ -292,18 +332,18 @@ def test_capability_search_ranks_and_unlocks_discoverable_tools() -> None:
         "query_ciq", "delegate_research", "stage_action", "capability_search",
     ]
 
-    footage = search({"query": "camera footage"})
+    footage = await search({"query": "camera footage"})
     assert "camera_footage" in footage["unlocked_tools"]
     # The raw Calibration IQ write tools are never discoverable.
     assert "calibration_iq_operator" not in footage["available_names"]
     assert "calibration_iq_destructive" not in footage["available_names"]
 
-    everything = search({})
+    everything = await search({})
     assert everything["unlocked_tools"] == []
     assert set(everything["available_names"]) == set(
         item["function"]["name"] for item in registry.discoverable_catalog()
     )
-    assert search({"query": "zzz-nothing-matches"})["unlocked_tools"] == []
+    assert (await search({"query": "zzz-nothing-matches"}))["unlocked_tools"] == []
 
     # What capability_search reports as unlocked is exactly what the gateway
     # will advertise on the next round.

@@ -12,6 +12,7 @@ recorder back one convenient helper at a time.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import pytest
 
@@ -127,6 +128,31 @@ def test_the_unauthenticated_frigate_port_is_never_the_default():
     # Whatever the operator configured, it must not be the unauthenticated API.
     if settings.frigate_base_url:
         assert ":5000" not in settings.frigate_base_url
+
+
+def test_relative_credential_configuration_is_rooted_to_the_repo(monkeypatch, tmp_path):
+    monkeypatch.setenv("FRIGATE_CREDENTIAL_PATH", "data/credentials/custom-frigate.bin")
+    previous = Path.cwd()
+    os.chdir(tmp_path)
+    try:
+        settings = Settings.load()
+    finally:
+        os.chdir(previous)
+    assert settings.frigate_credential_path == (
+        ROOT / "data" / "credentials" / "custom-frigate.bin"
+    ).resolve()
+
+
+def test_secure_configuration_script_verifies_before_reporting_success():
+    wrapper = (ROOT / "scripts" / "configure-frigate.ps1").read_text(encoding="utf-8")
+    helper = (ROOT / "scripts" / "configure_frigate.py").read_text(encoding="utf-8")
+    assert "Read-Host" in wrapper and "-AsSecureString" in wrapper
+    assert "ZeroFreeBSTR" in wrapper
+    assert "--username" in wrapper
+    assert "--password" not in wrapper
+    assert "save_credential_verified" in helper
+    assert "atomic_update_env" in helper
+    assert '"FRIGATE_BASE_URL"' in helper and '"FRIGATE_CAMERA"' in helper
 
 
 def test_the_camera_tool_names_the_model_knows_are_unchanged():
