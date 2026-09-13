@@ -32,7 +32,7 @@ rereads, provenance, audit, bounded serialization, and terminal media safety.
 | `capability_search` | ranks the profile's discoverable tools against a structured query and unlocks matches for the rest of the turn | `core/tools/builtin/system.py::make_capability_search` |
 
 Everything else in the `adas_operator` profile (calendar, tasks, files,
-cameras/DVR, ADAS SI browsing, knowledge capture, ScrapeX reads, service starts)
+cameras/recorded footage, ADAS SI browsing, knowledge capture, ScrapeX reads, service starts)
 is *discoverable*: advertised only on later rounds of a turn in which
 `capability_search` matched it. The raw Calibration IQ read and write tools are
 not in the profile at all; the full maintenance profile still advertises them.

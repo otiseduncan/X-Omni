@@ -22,8 +22,9 @@ from ..services import attachments as attachments_svc
 from ..services import camera as camera_svc
 from ..services import calendar as calendar_svc
 from ..services import calibration_iq as calibration_iq_svc
-from ..services import camera_monitoring as camera_monitoring_svc
-from ..services import exterior_camera as exterior_camera_svc
+from ..services import camera_security as camera_security_svc
+from ..services import frigate_surveillance as frigate_surveillance_svc
+from ..services.frigate_client import FrigateError, FrigateState
 from ..services import transcript as transcript_svc
 from ..services.image_generation import ImageGenerationError, generated_image_path
 from ..services.video_generation import (
@@ -52,9 +53,6 @@ _TRANSCRIPTION_PROMPT = (
     "or 'ass'. 'cars' is never 'carbs'."
 )
 
-MAX_EXTERIOR_CAMERA_CONFIG_BYTES = 16 * 1024
-_SAFE_CAMERA_SNAPSHOT_FILENAME_RE = re.compile(r"^\d{9,11}-(?:interval|motion)(?:-\d+)?\.jpg$")
-_SAFE_CAMERA_CLIP_FILENAME_RE = re.compile(r"^motion-\d+\.mp4$")
 
 _CALIBRATION_IQ_PROXY_STATUS = {
     "invalid_input": 400,
@@ -143,15 +141,9 @@ class DirectToolRequest(BaseModel):
     conversation_id: int
 
 
-class ExteriorCameraConfigureRequest(BaseModel):
-    label: str
-    host: str
+class FrigateCredentialRequest(BaseModel):
     username: str
     password: SecretStr
-
-
-class ExteriorCameraSessionRequest(BaseModel):
-    conversation_id: int
 
 
 class PushSubscribeRequest(BaseModel):
@@ -173,7 +165,7 @@ def create_router(
     *,
     image_config=None,
     video_config=None,
-    exterior_camera=None,
+    surveillance=None,
     adas=None,
 ) -> APIRouter:
     api = APIRouter(prefix="/api", tags=["core"], dependencies=[Depends(require_session)])
@@ -220,24 +212,30 @@ def create_router(
         if not origin or origin not in allowed_origins:
             raise HTTPException(403, message)
 
-    def exterior_camera_http_error(exc: BaseException) -> HTTPException:
-        if isinstance(exc, exterior_camera_svc.ExteriorCameraAuthError):
-            return HTTPException(401, "Exterior camera credentials were rejected.")
-        if isinstance(exc, exterior_camera_svc.ExteriorCameraSessionNotFound):
-            return HTTPException(404, str(exc))
-        if isinstance(exc, exterior_camera_svc.ExteriorCameraFrameUnavailable):
-            return HTTPException(409, str(exc))
-        if isinstance(
-            exc,
-            (
-                exterior_camera_svc.ExteriorCameraNotConfigured,
-                exterior_camera_svc.ExteriorCameraConflict,
-            ),
-        ):
-            return HTTPException(409, str(exc))
+    def frigate_http_error(exc: BaseException) -> HTTPException:
+        """One Frigate failure state per status code, and never a secret.
+
+        Frigate lives on another machine, so "cannot reach it" is ordinary
+        and must stay distinguishable from "it refused the credential".
+        """
+        if isinstance(exc, FrigateError):
+            status = {
+                FrigateState.AUTHENTICATION_REQUIRED: 401,
+                FrigateState.NOT_CONFIGURED: 409,
+                FrigateState.CAMERA_UNAVAILABLE: 409,
+                FrigateState.NO_RECORDING: 404,
+                FrigateState.NO_EVENT_DATA: 404,
+                FrigateState.INVALID_REQUEST: 400,
+            }.get(exc.state, 503)
+            return HTTPException(status, frigate_surveillance_svc.state_message(exc.state))
         if isinstance(exc, ValueError):
             return HTTPException(400, str(exc))
-        return HTTPException(503, "Exterior camera is unavailable.")
+        return HTTPException(503, "The camera recorder is unavailable.")
+
+    def require_surveillance():
+        if surveillance is None:
+            raise HTTPException(409, "Frigate is not configured on this machine.")
+        return surveillance
 
     # ---------- system ----------
 
@@ -654,47 +652,6 @@ def create_router(
             headers={"Content-Disposition": f'inline; filename="{filename}"'},
         )
 
-    @api.get("/camera-snapshots/{filename}")
-    async def camera_snapshot_image(filename: str, _session: dict = Depends(require_owner)):
-        """Serve only a snapshot this app actually wrote and logged, to the
-        Owner only -- exterior-camera imagery is surveillance data, same
-        access level as the live stream itself."""
-        if not _SAFE_CAMERA_SNAPSHOT_FILENAME_RE.match(filename):
-            raise HTTPException(404, "Camera snapshot not found.")
-        if not store.camera_snapshot_is_tracked(filename):
-            raise HTTPException(404, "Camera snapshot not found.")
-        path = Path(settings.camera_snapshot_dir) / filename
-        if not path.is_file():
-            raise HTTPException(404, "Camera snapshot not found.")
-        return FileResponse(
-            path,
-            media_type="image/jpeg",
-            headers={
-                "Content-Disposition": f'inline; filename="{filename}"',
-                "Cache-Control": "private, max-age=86400",
-            },
-        )
-
-    @api.get("/camera-clips/{filename}")
-    async def camera_motion_clip_video(filename: str, _session: dict = Depends(require_owner)):
-        """Serve only an assembled motion clip this app actually encoded and
-        logged, to the Owner only -- same access level as camera stills."""
-        if not _SAFE_CAMERA_CLIP_FILENAME_RE.match(filename):
-            raise HTTPException(404, "Camera clip not found.")
-        if not store.camera_clip_is_tracked(filename):
-            raise HTTPException(404, "Camera clip not found.")
-        path = Path(settings.camera_snapshot_dir) / camera_monitoring_svc.CLIP_SUBDIR / filename
-        if not path.is_file():
-            raise HTTPException(404, "Camera clip not found.")
-        return FileResponse(
-            path,
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'inline; filename="{filename}"',
-                "Cache-Control": "private, max-age=86400",
-            },
-        )
-
     @api.get("/generated-videos/{filename}")
     async def generated_video(
         filename: str, request: Request, session: dict = Depends(require_session),
@@ -1000,162 +957,108 @@ def create_router(
             "replayed": outcome["replayed"],
         }
 
-    # ---------- local exterior camera ----------
+    # ---------- exterior camera (Frigate) ----------
+    #
+    # Frigate owns the camera, the recording disk, and detection on its own
+    # machine. These routes are read-only clients of it, Owner-only because
+    # surveillance imagery is Owner-only, and every one of them answers with
+    # a structured state rather than hanging when Frigate is unreachable.
 
-    @api.get("/cameras/exterior")
-    async def exterior_camera_status(_session: dict = Depends(require_owner)):
-        if exterior_camera is None:
+    @api.get("/camera/status")
+    async def camera_status(_session: dict = Depends(require_owner)):
+        if surveillance is None:
             return {
                 "ok": False,
-                "configured": False,
-                "status": "unavailable",
-                "runtime_available": False,
-                "streaming": False,
-                "message": "Exterior camera connector is not available.",
+                "state": FrigateState.NOT_CONFIGURED,
+                "detail": frigate_surveillance_svc.state_message(FrigateState.NOT_CONFIGURED),
             }
-        return exterior_camera.status()
+        return await surveillance.status()
 
-    @api.post("/cameras/exterior/configure")
-    async def configure_exterior_camera(
+    @api.post("/camera/credential")
+    async def register_frigate_credential(
+        body: FrigateCredentialRequest,
         request: Request,
         _session: dict = Depends(require_owner),
     ):
-        require_exact_origin(
-            request, "Exterior camera configuration requires the exact X Omni origin."
-        )
-        if exterior_camera is None:
-            raise HTTPException(503, "Exterior camera connector is not available.")
-        content_type = str(request.headers.get("content-type") or "").partition(";")[0]
-        if content_type.strip().casefold() != "application/json":
-            raise HTTPException(415, "Exterior camera configuration requires JSON.")
-        if str(request.headers.get("content-encoding") or "").strip().casefold() not in {
-            "",
-            "identity",
-        }:
-            raise HTTPException(415, "Encoded camera configuration is not accepted.")
-        content_length = str(request.headers.get("content-length") or "").strip()
-        if content_length:
-            try:
-                if int(content_length) < 0:
-                    raise ValueError
-                if int(content_length) > MAX_EXTERIOR_CAMERA_CONFIG_BYTES:
-                    raise HTTPException(413, "Exterior camera configuration is too large.")
-            except ValueError:
-                raise HTTPException(400, "Invalid configuration Content-Length.") from None
-        body = bytearray()
-        async for chunk in request.stream():
-            if not chunk:
-                continue
-            if len(body) + len(chunk) > MAX_EXTERIOR_CAMERA_CONFIG_BYTES:
-                body.clear()
-                raise HTTPException(413, "Exterior camera configuration is too large.")
-            body.extend(chunk)
-        try:
-            configuration = ExteriorCameraConfigureRequest.model_validate_json(bytes(body))
-        except (ValidationError, ValueError):
-            raise HTTPException(400, "Exterior camera configuration is invalid.") from None
-        finally:
-            body.clear()
-        try:
-            result = await exterior_camera.configure(
-                label=configuration.label,
-                host=configuration.host,
-                username=configuration.username,
-                password=configuration.password.get_secret_value(),
-            )
-        except exterior_camera_svc.ExteriorCameraError as exc:
-            raise exterior_camera_http_error(exc) from exc
-        except ValueError as exc:
-            raise exterior_camera_http_error(exc) from exc
-        store.audit(
-            "exterior_camera_configured",
-            {
-                "label": result.get("label"),
-                "host": result.get("host"),
-                "username": result.get("username"),
-                "verified": result.get("verified") is True,
-            },
-        )
-        return result
+        """Seal X's Frigate account password with Windows DPAPI.
 
-    @api.post("/cameras/exterior/sessions")
-    async def create_exterior_camera_session(
-        request: Request,
-        body: ExteriorCameraSessionRequest,
-        session: dict = Depends(require_owner),
-    ):
-        require_exact_origin(
-            request, "Exterior camera sessions require the exact X Omni origin."
-        )
-        if exterior_camera is None:
-            raise HTTPException(503, "Exterior camera connector is not available.")
-        if body.conversation_id <= 0:
-            raise HTTPException(400, "conversation_id must be a positive integer.")
-        require_conversation(body.conversation_id, session)
+        The password is never written to .env, never logged, and never read
+        back out -- only its presence is ever reported.
+        """
+        require_exact_origin(request, "Credentials must come from the X Omni origin.")
+        service = require_surveillance()
+        username = body.username.strip()
+        password = body.password.get_secret_value()
+        if not username or not password:
+            raise HTTPException(400, "A Frigate username and password are both required.")
         try:
-            result = await exterior_camera.create_session(
-                conversation_id=body.conversation_id,
-                owner_id=session_id(session),
-            )
-        except exterior_camera_svc.ExteriorCameraError as exc:
-            raise exterior_camera_http_error(exc) from exc
-        except ValueError as exc:
-            raise exterior_camera_http_error(exc) from exc
-        store.audit(
-            "exterior_camera_session_created",
-            {
-                "conversation_id": body.conversation_id,
-                "label": result.get("label"),
-                "expires_at": result.get("expires_at"),
-                "streaming": False,
-            },
-        )
-        return result
+            summary = service.client.save_credential(username=username, password=password)
+        except Exception as exc:
+            raise frigate_http_error(exc) from exc
+        store.audit("frigate_credential_registered", {"username": username})
+        return {"ok": True, "credential": summary}
 
-    @api.get("/cameras/exterior/sessions/{camera_session_id}/stream.mjpg")
-    async def exterior_camera_stream(
-        camera_session_id: str,
-        session: dict = Depends(require_owner),
-    ):
-        if exterior_camera is None:
-            raise HTTPException(503, "Exterior camera connector is not available.")
+    @api.delete("/camera/credential")
+    async def forget_frigate_credential(_session: dict = Depends(require_owner)):
+        service = require_surveillance()
+        removed = service.client.forget_credential()
+        store.audit("frigate_credential_removed", {"removed": removed})
+        return {"ok": True, "removed": removed}
+
+    @api.get("/camera/latest.jpg")
+    async def camera_latest_frame(_session: dict = Depends(require_owner)):
+        service = require_surveillance()
         try:
-            iterator = await exterior_camera.stream(
-                session_id=camera_session_id,
-                owner_id=session_id(session),
-            )
-        except exterior_camera_svc.ExteriorCameraError as exc:
-            raise exterior_camera_http_error(exc) from exc
-        return StreamingResponse(
-            iterator,
-            media_type="multipart/x-mixed-replace; boundary=xomni",
+            raw = await service.latest_frame()
+        except FrigateError as exc:
+            raise frigate_http_error(exc) from exc
+        return Response(
+            content=raw,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    @api.get("/camera/event-snapshot.jpg")
+    async def camera_event_snapshot(
+        event_id: str, _session: dict = Depends(require_owner),
+    ):
+        service = require_surveillance()
+        try:
+            raw = await service.event_snapshot(event_id)
+        except FrigateError as exc:
+            raise frigate_http_error(exc) from exc
+        return Response(
+            content=raw,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    @api.get("/camera/footage.mp4")
+    async def camera_footage_clip(
+        since: str, until: str, _session: dict = Depends(require_owner),
+    ):
+        """Stream one bounded range straight through from Frigate.
+
+        Nothing is cached on this machine: the bytes pass through and are
+        gone, so Omega never becomes a second copy of the recording.
+        """
+        service = require_surveillance()
+        start = camera_security_svc._parse_iso(since)
+        end = camera_security_svc._parse_iso(until)
+        if start is None or end is None:
+            raise HTTPException(400, "since and until must both be ISO datetimes.")
+        try:
+            raw = await service.clip_bytes(start, end)
+        except FrigateError as exc:
+            raise frigate_http_error(exc) from exc
+        return Response(
+            content=raw,
+            media_type="video/mp4",
             headers={
-                "Cache-Control": "no-store, no-cache, must-revalidate",
-                "Pragma": "no-cache",
-                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": 'inline; filename="footage.mp4"',
+                "Cache-Control": "private, no-store",
             },
         )
-
-    @api.delete("/cameras/exterior/sessions/{camera_session_id}")
-    async def delete_exterior_camera_session(
-        camera_session_id: str,
-        request: Request,
-        session: dict = Depends(require_owner),
-    ):
-        require_exact_origin(
-            request, "Stopping an exterior camera session requires the exact X Omni origin."
-        )
-        if exterior_camera is None:
-            raise HTTPException(503, "Exterior camera connector is not available.")
-        try:
-            result = await exterior_camera.delete_session(
-                session_id=camera_session_id,
-                owner_id=session_id(session),
-            )
-        except exterior_camera_svc.ExteriorCameraError as exc:
-            raise exterior_camera_http_error(exc) from exc
-        store.audit("exterior_camera_session_stopped", {"streaming": False})
-        return result
 
     # ---------- push notifications ----------
 
@@ -1195,18 +1098,17 @@ def create_router(
     ):
         """Analyze one explicitly submitted still without persisting bytes.
 
-        Browser-camera stills arrive as a bounded raw body. Exterior-camera
-        analysis accepts no uploaded image: it resolves the latest JPEG that
-        Core actually proxied from the exact active Owner-bound MJPEG session.
+        Browser-camera stills arrive as a bounded raw body. The exterior
+        camera is Frigate's, and its current frame is read through the
+        Frigate routes below rather than uploaded through this one.
         """
         require_exact_origin(request, "Camera frames must come from the X Omni origin.")
 
         requested_camera_source = str(
             request.headers.get("x-xomni-camera-source-id") or ""
         ).strip()
-        if requested_camera_source not in {"", "exterior"}:
+        if requested_camera_source:
             raise HTTPException(400, "Unknown camera source identifier.")
-        is_exterior = requested_camera_source == "exterior"
 
         raw_conversation_id = str(
             request.headers.get("x-xomni-conversation-id") or ""
@@ -1220,8 +1122,6 @@ def create_router(
                 400, "X-XOmni-Conversation-ID must be a positive integer."
             ) from exc
         require_conversation(conversation_id, auth_session)
-        if is_exterior and auth_session.get("role", "owner") != "owner":
-            raise HTTPException(403, "Exterior camera access requires Owner authorization.")
         try:
             bounded_prompt = camera_svc.decode_camera_prompt_header(
                 request.headers.get("x-xomni-camera-prompt-b64")
@@ -1243,70 +1143,36 @@ def create_router(
                 raise HTTPException(400, "Invalid camera frame Content-Length.")
 
         camera_provenance: dict[str, str]
-        if is_exterior:
-            if exterior_camera is None:
-                raise HTTPException(409, "Exterior camera is not configured.")
-            camera_session_id = str(
-                request.headers.get("x-xomni-camera-session-id") or ""
-            ).strip()
-            if not 8 <= len(camera_session_id) <= 160:
-                raise HTTPException(400, "X-XOmni-Camera-Session-ID is required.")
-            if announced_length not in {None, 0}:
-                raise HTTPException(
-                    400,
-                    "Exterior camera analysis does not accept an uploaded image body.",
-                )
-            async for chunk in request.stream():
-                if chunk:
-                    raise HTTPException(
-                        400,
-                        "Exterior camera analysis does not accept an uploaded image body.",
-                    )
-            try:
-                frame = await exterior_camera.current_frame(
-                    session_id=camera_session_id,
-                    owner_id=session_id(auth_session),
-                    conversation_id=conversation_id,
-                )
-                camera_provenance = {
-                    **exterior_camera.source_metadata(),
-                    "capture_transport": "server_mjpeg_frame",
-                }
-            except exterior_camera_svc.ExteriorCameraError as exc:
-                raise exterior_camera_http_error(exc) from exc
-        else:
-            if request.headers.get("x-xomni-camera-session-id"):
-                raise HTTPException(
-                    400, "Camera session identifiers require the exterior source."
-                )
-            if (
-                announced_length is not None
-                and announced_length > camera_svc.MAX_CAMERA_FRAME_BYTES
-            ):
+        if request.headers.get("x-xomni-camera-session-id"):
+            raise HTTPException(400, "Camera session identifiers are no longer used.")
+        if (
+            announced_length is not None
+            and announced_length > camera_svc.MAX_CAMERA_FRAME_BYTES
+        ):
+            raise HTTPException(
+                413,
+                f"Camera frame exceeds the "
+                f"{camera_svc.MAX_CAMERA_FRAME_BYTES // (1024 * 1024)} MiB limit.",
+            )
+        chunks = bytearray()
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            if len(chunks) + len(chunk) > camera_svc.MAX_CAMERA_FRAME_BYTES:
                 raise HTTPException(
                     413,
                     f"Camera frame exceeds the "
                     f"{camera_svc.MAX_CAMERA_FRAME_BYTES // (1024 * 1024)} MiB limit.",
                 )
-            chunks = bytearray()
-            async for chunk in request.stream():
-                if not chunk:
-                    continue
-                if len(chunks) + len(chunk) > camera_svc.MAX_CAMERA_FRAME_BYTES:
-                    raise HTTPException(
-                        413,
-                        f"Camera frame exceeds the "
-                        f"{camera_svc.MAX_CAMERA_FRAME_BYTES // (1024 * 1024)} MiB limit.",
-                    )
-                chunks.extend(chunk)
-            raw = bytes(chunks)
-            try:
-                frame = camera_svc.validate_camera_frame(
-                    raw, request.headers.get("content-type") or ""
-                )
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-            camera_provenance = {"source": "browser_camera_still"}
+            chunks.extend(chunk)
+        raw = bytes(chunks)
+        try:
+            frame = camera_svc.validate_camera_frame(
+                raw, request.headers.get("content-type") or ""
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        camera_provenance = {"source": "browser_camera_still"}
 
         swap_info = None
         if not router_.supports_vision():

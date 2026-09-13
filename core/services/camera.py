@@ -232,30 +232,16 @@ def observation_artifact(
 ) -> dict:
     """Build metadata-only provenance for one explicitly submitted still.
 
-    The route maps the sole supported remote source identifier to the stored
-    service label.  No client-provided label or URL reaches this function.
+    Only the browser's own camera submits stills here. The exterior camera
+    belongs to the Frigate recorder, and its frames are read through the
+    Frigate routes rather than uploaded, so they never reach this function.
     """
 
-    if source not in {"browser_camera_still", "exterior_camera_still"}:
+    if source != "browser_camera_still":
         raise ValueError("Unknown camera observation source.")
+    if camera_source_id or camera_label or capture_transport:
+        raise ValueError("Browser camera stills carry no remote camera identity.")
     provenance: dict[str, object] = {"source": source}
-    if source == "exterior_camera_still":
-        if camera_source_id != "exterior":
-            raise ValueError("Exterior camera observation source is invalid.")
-        label = str(camera_label or "").strip()
-        if not label or len(label) > 80:
-            raise ValueError("Exterior camera observation label is invalid.")
-        provenance.update(
-            camera_source_id="exterior",
-            camera_label=label,
-            capture_transport=(
-                "server_mjpeg_frame"
-                if capture_transport == "server_mjpeg_frame"
-                else None
-            ),
-        )
-        if provenance["capture_transport"] is None:
-            raise ValueError("Exterior camera capture transport is invalid.")
     return {
         "type": "camera_observation",
         "data": {

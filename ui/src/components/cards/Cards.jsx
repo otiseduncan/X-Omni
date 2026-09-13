@@ -572,26 +572,6 @@ const CAMERA_STAGE_COPY = {
   analyzing: "Analyzing the captured frame…",
 };
 
-const EXTERIOR_CAMERA_DEFAULTS = {
-  label: "Exterior camera",
-  host: "192.168.1.10",
-  username: "admin",
-};
-
-const EXTERIOR_CAMERA_STAGE_COPY = {
-  checking: "Checking the exterior camera setup…",
-  saving: "Saving the exterior camera setup…",
-  starting: "Signing in to the exterior camera and starting its live feed…",
-  analyzing: "Asking Core to analyze the current proxied exterior camera frame…",
-  disconnecting: "Disconnecting from the exterior camera…",
-};
-
-function exteriorCameraText(value, fallback, limit = 200) {
-  const text = displayText(value, fallback).trim();
-  if (!text) return fallback;
-  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
-}
-
 function CameraRequestCard({ data, onCameraCapture }) {
   const [stage, setStage] = useState("idle");
   const [error, setError] = useState("");
@@ -765,437 +745,58 @@ function CameraRequestCard({ data, onCameraCapture }) {
   );
 }
 
-function ExteriorCameraRequestCard({
-  data,
-  onCameraCapture,
-  onExteriorCameraStatus,
-  onExteriorCameraConfigure,
-  onExteriorCameraStart,
-  onExteriorCameraStop,
-}) {
-  const labelId = useId();
-  const hostId = useId();
-  const usernameId = useId();
-  const passwordId = useId();
-  const [configurationKnown, setConfigurationKnown] = useState(false);
-  const [configured, setConfigured] = useState(false);
-  const [label, setLabel] = useState(EXTERIOR_CAMERA_DEFAULTS.label);
-  const [host, setHost] = useState(EXTERIOR_CAMERA_DEFAULTS.host);
-  const [username, setUsername] = useState(EXTERIOR_CAMERA_DEFAULTS.username);
-  const [stage, setStage] = useState("checking");
-  const [error, setError] = useState("");
-  const [session, setSession] = useState(null);
-  const [frameReady, setFrameReady] = useState(false);
-  const [streamFailed, setStreamFailed] = useState(false);
-  const [analyzed, setAnalyzed] = useState(false);
-  const passwordRef = useRef(null);
-  const imageRef = useRef(null);
-  const sessionRef = useRef(null);
-  const stopCallbackRef = useRef(onExteriorCameraStop);
-  const operationRef = useRef(0);
-  const mountedRef = useRef(true);
-  const prompt = exteriorCameraText(
-    data?.prompt,
-    "Describe what is visible in this exterior camera frame.",
-    1_000
-  );
-  const busy = ["checking", "saving", "starting", "capturing", "analyzing", "disconnecting"]
-    .includes(stage);
-  const live = Boolean(session?.session_id && session?.stream_url);
-
-  stopCallbackRef.current = onExteriorCameraStop;
-
-  useEffect(() => {
-    let active = true;
-    mountedRef.current = true;
-    setStage("checking");
-    setError("");
-
-    Promise.resolve()
-      .then(() => {
-        if (typeof onExteriorCameraStatus !== "function") {
-          throw new Error("Exterior camera setup is not available in this chat session.");
-        }
-        return onExteriorCameraStatus();
-      })
-      .then((payload) => {
-        if (!active) return;
-        const details = payload?.camera || payload?.configuration || payload || {};
-        const isConfigured = payload?.configured === true
-          || details?.configured === true
-          || ["configured", "ready"].includes(String(payload?.status || details?.status || "").toLowerCase());
-        setLabel(exteriorCameraText(details?.label, EXTERIOR_CAMERA_DEFAULTS.label, 80));
-        setHost(exteriorCameraText(details?.host, EXTERIOR_CAMERA_DEFAULTS.host, 255));
-        setUsername(exteriorCameraText(details?.username, EXTERIOR_CAMERA_DEFAULTS.username, 160));
-        setConfigured(isConfigured);
-        setConfigurationKnown(true);
-        setStage("ready");
-      })
-      .catch((statusError) => {
-        if (!active) return;
-        setConfigurationKnown(true);
-        setConfigured(false);
-        setStage("error");
-        setError(exteriorCameraText(
-          statusError?.message,
-          "X Omni could not check the exterior camera setup."
-        ));
-      });
-
-    return () => {
-      active = false;
-      mountedRef.current = false;
-      operationRef.current += 1;
-      const activeSession = sessionRef.current;
-      sessionRef.current = null;
-      imageRef.current?.removeAttribute?.("src");
-      if (activeSession?.session_id && typeof stopCallbackRef.current === "function") {
-        Promise.resolve(
-          stopCallbackRef.current(activeSession.session_id, { keepalive: true })
-        ).catch(() => {});
-      }
-    };
-  }, [onExteriorCameraStatus]);
-
-  async function saveExteriorCamera(event) {
-    event.preventDefault();
-    if (stage === "saving") return;
-    if (typeof onExteriorCameraConfigure !== "function") {
-      setError("Exterior camera setup is not available in this chat session.");
-      return;
-    }
-
-    let credential = passwordRef.current?.value || "";
-    if (passwordRef.current) passwordRef.current.value = "";
-    if (!credential) {
-      setError("Enter the exterior camera password to finish setup.");
-      passwordRef.current?.focus?.();
-      return;
-    }
-
-    const operation = operationRef.current + 1;
-    operationRef.current = operation;
-    setError("");
-    setStage("saving");
-    try {
-      const pending = onExteriorCameraConfigure({
-        label: label.trim(),
-        host: host.trim(),
-        username: username.trim(),
-        password: credential,
-      });
-      // The credential has already left the DOM and is cleared from the local
-      // variable as soon as the callback has synchronously built its request.
-      credential = "";
-      const payload = await pending;
-      if (!mountedRef.current || operationRef.current !== operation) return;
-      const details = payload?.camera || payload?.configuration || payload || {};
-      setLabel(exteriorCameraText(details?.label, label.trim(), 80));
-      setHost(exteriorCameraText(details?.host, host.trim(), 255));
-      setUsername(exteriorCameraText(details?.username, username.trim(), 160));
-      setConfigured(true);
-      setConfigurationKnown(true);
-      setStage("ready");
-    } catch (setupError) {
-      if (!mountedRef.current || operationRef.current !== operation) return;
-      setStage("error");
-      setError(exteriorCameraText(
-        setupError?.message,
-        "X Omni could not save the exterior camera setup."
-      ));
-    } finally {
-      credential = "";
-      if (passwordRef.current) passwordRef.current.value = "";
-    }
-  }
-
-  async function startExteriorCamera() {
-    if (busy || live) return;
-    if (typeof onExteriorCameraStart !== "function") {
-      setError("Exterior camera streaming is not available in this chat session.");
-      return;
-    }
-    const operation = operationRef.current + 1;
-    operationRef.current = operation;
-    setError("");
-    setFrameReady(false);
-    setStreamFailed(false);
-    setAnalyzed(false);
-    setStage("starting");
-    try {
-      const nextSession = await onExteriorCameraStart();
-      if (!mountedRef.current || operationRef.current !== operation) {
-        if (nextSession?.session_id && typeof stopCallbackRef.current === "function") {
-          Promise.resolve(
-            stopCallbackRef.current(nextSession.session_id, { keepalive: true })
-          ).catch(() => {});
-        }
-        return;
-      }
-      sessionRef.current = nextSession;
-      setSession(nextSession);
-      setLabel(exteriorCameraText(nextSession?.label, label, 80));
-      setStage("live");
-    } catch (startError) {
-      if (!mountedRef.current || operationRef.current !== operation) return;
-      setStage("error");
-      setError(exteriorCameraText(
-        startError?.message,
-        "X Omni could not start the exterior camera feed."
-      ));
-    }
-  }
-
-  async function analyzeExteriorFrame() {
-    if (busy || !live || streamFailed || !frameReady) return;
-    if (typeof onCameraCapture !== "function") {
-      setError("Camera analysis is not available in this chat session.");
-      return;
-    }
-    const operation = operationRef.current + 1;
-    operationRef.current = operation;
-    setError("");
-    try {
-      await onCameraCapture(
-        { ...data, prompt },
-        (nextStage) => {
-          if (mountedRef.current && operationRef.current === operation) setStage(nextStage);
-        },
-        {
-          cameraSourceId: "exterior",
-          cameraSessionId: sessionRef.current?.session_id,
-        }
-      );
-      if (!mountedRef.current || operationRef.current !== operation) return;
-      setAnalyzed(true);
-      setStage(sessionRef.current ? "live" : "ready");
-    } catch (captureError) {
-      if (!mountedRef.current || operationRef.current !== operation) return;
-      setError(exteriorCameraText(
-        captureError?.message,
-        "Exterior camera capture failed before a frame was described."
-      ));
-      setStage(sessionRef.current ? "live" : "error");
-    }
-  }
-
-  async function disconnectExteriorCamera() {
-    if (stage === "disconnecting") return;
-    const activeSession = sessionRef.current;
-    operationRef.current += 1;
-    sessionRef.current = null;
-    imageRef.current?.removeAttribute?.("src");
-    setSession(null);
-    setFrameReady(false);
-    setStreamFailed(false);
-    setAnalyzed(false);
-    setError("");
-    if (!activeSession?.session_id) {
-      setStage("ready");
-      return;
-    }
-    setStage("disconnecting");
-    try {
-      if (typeof onExteriorCameraStop !== "function") {
-        throw new Error("Exterior camera disconnect is not available in this chat session.");
-      }
-      await onExteriorCameraStop(activeSession.session_id);
-      if (mountedRef.current) setStage("ready");
-    } catch (stopError) {
-      if (!mountedRef.current) return;
-      setStage("error");
-      setError(exteriorCameraText(
-        stopError?.message,
-        "The live feed was closed here, but Core could not confirm camera logout."
-      ));
-    }
-  }
+function ExteriorCameraRequestCard({ data }) {
+  // Frigate owns the camera and the recording. This card shows what X
+  // actually saw in the frame it fetched, and links onward to Frigate's own
+  // interface for browsing and playback rather than rebuilding one here.
+  const [frameFailed, setFrameFailed] = useState(false);
+  const unavailable = !data?.ok;
+  const frigateUrl = typeof data?.frigate_url === "string" ? data.frigate_url : "";
+  const liveFrameUrl =
+    typeof data?.live_frame_url === "string" ? data.live_frame_url : "";
+  const caption = displayText(data?.caption, "");
 
   return (
     <Card icon={Camera} title="Exterior camera" className="camera-request exterior-camera-request">
-      {!configurationKnown && (
-        <p className="card-note camera-state" role="status" aria-live="polite">
-          {EXTERIOR_CAMERA_STAGE_COPY.checking}
+      {unavailable ? (
+        <p className="card-note" role="status">
+          {displayText(data?.error, "The camera recorder is unavailable right now.")}
         </p>
-      )}
-
-      {configurationKnown && !configured && (
-        <form className="exterior-camera-setup" onSubmit={saveExteriorCamera} aria-label="Exterior camera setup">
-          <p className="camera-prompt">
-            Connect the exterior camera once. Its password is sent directly to Core and is never kept in chat or browser storage.
-          </p>
-          <div className="exterior-camera-fields">
-            <label className="exterior-camera-field" htmlFor={labelId}>
-              <span>Camera label</span>
-              <input
-                id={labelId}
-                value={label}
-                onChange={(event) => setLabel(event.target.value)}
-                required
-                maxLength={80}
-                autoComplete="off"
-              />
-            </label>
-            <label className="exterior-camera-field" htmlFor={hostId}>
-              <span>Camera address</span>
-              <input
-                id={hostId}
-                value={host}
-                onChange={(event) => setHost(event.target.value)}
-                required
-                maxLength={255}
-                inputMode="url"
-                autoCapitalize="none"
-                spellCheck="false"
-                autoComplete="off"
-              />
-            </label>
-            <label className="exterior-camera-field" htmlFor={usernameId}>
-              <span>Username</span>
-              <input
-                id={usernameId}
-                value={username}
-                onChange={(event) => setUsername(event.target.value)}
-                required
-                maxLength={160}
-                autoCapitalize="none"
-                spellCheck="false"
-                autoComplete="username"
-              />
-            </label>
-            <label className="exterior-camera-field" htmlFor={passwordId}>
-              <span>Password</span>
-              <input
-                id={passwordId}
-                ref={passwordRef}
-                type="password"
-                required
-                autoComplete="off"
-                data-1p-ignore="true"
-                data-lpignore="true"
-              />
-            </label>
-          </div>
-          <button
-            type="submit"
-            className="camera-action"
-            disabled={stage === "saving"}
-            aria-label="Save exterior camera setup"
-          >
-            <Camera size={16} aria-hidden="true" />
-            {stage === "saving" ? "Saving camera…" : "Save camera setup"}
-          </button>
-          <p className="card-note exterior-camera-private-note">
-            X Omni does not place the password, raw frames, or base64 image data in conversation history.
-          </p>
-        </form>
-      )}
-
-      {configured && (
+      ) : (
         <>
-          <p className="camera-prompt">
-            {label} is configured at <span className="exterior-camera-host">{host}</span>. The feed connects only when you start it.
-          </p>
-          {live && (
+          {liveFrameUrl && !frameFailed && (
             <div className="camera-preview exterior-camera-preview">
-              {!streamFailed ? (
-                <img
-                  ref={imageRef}
-                  className="exterior-camera-live-image"
-                  src={session.stream_url}
-                  alt={`${label} live feed`}
-                  onLoad={() => {
-                    if (!sessionRef.current) return;
-                    setFrameReady(true);
-                    setStreamFailed(false);
-                    setStage((current) => ["capturing", "analyzing", "disconnecting"].includes(current)
-                      ? current
-                      : "live");
-                  }}
-                  onError={() => {
-                    if (!sessionRef.current) return;
-                    setFrameReady(false);
-                    setStreamFailed(true);
-                    setStage("error");
-                    setError("The exterior camera feed could not load. Disconnect, then try again.");
-                  }}
-                />
-              ) : (
-                <div className="exterior-camera-stream-error" role="img" aria-label="Exterior camera feed unavailable">
-                  Live feed unavailable
-                </div>
-              )}
-              {frameReady && !streamFailed && (
-                <span className="camera-live-badge" aria-hidden="true">Live</span>
-              )}
+              <img
+                className="exterior-camera-live-image"
+                src={liveFrameUrl}
+                alt={caption || "Current exterior camera view"}
+                referrerPolicy="no-referrer"
+                onError={() => setFrameFailed(true)}
+              />
             </div>
           )}
-          <div className="camera-controls" role="group" aria-label="Exterior camera controls">
-            {!live && (
-              <button
-                type="button"
-                className="camera-action"
-                onClick={startExteriorCamera}
-                disabled={busy}
-                aria-label="Start exterior camera live feed"
-              >
-                <Camera size={16} aria-hidden="true" />
-                {stage === "starting" ? "Starting live feed…" : "Start live feed"}
-              </button>
-            )}
-            {live && (
-              <>
-                <button
-                  type="button"
-                  className="camera-action"
-                  onClick={analyzeExteriorFrame}
-                  disabled={busy || streamFailed || !frameReady}
-                  aria-label="Analyze current exterior camera frame"
-                >
-                  <Camera size={16} aria-hidden="true" />
-                  {stage === "analyzing"
-                    ? "Analyzing frame…"
-                    : "Analyze current frame"}
-                </button>
-                <button
-                  type="button"
-                  className="camera-action is-secondary"
-                  onClick={disconnectExteriorCamera}
-                  disabled={stage === "disconnecting"}
-                  aria-label="Disconnect and log out of exterior camera"
-                >
-                  <Square size={15} aria-hidden="true" />
-                  {stage === "disconnecting" ? "Disconnecting…" : "Disconnect / log out"}
-                </button>
-              </>
-            )}
-          </div>
-          {!live && stage === "ready" && (
-            <p className="card-note camera-state" role="status">
-              Camera is configured and offline. Start the live feed when you want to view it.
+          {frameFailed && (
+            <p className="card-note" role="status">
+              The current frame could not be loaded from the recorder.
             </p>
           )}
-          {live && stage === "live" && (
-            <p className={`card-note camera-state${analyzed ? " is-complete" : ""}`} role="status" aria-live="polite">
-              {analyzed
-                ? "Frame analyzed and added to this chat. The exterior feed remains live."
-                : frameReady
-                  ? "Live exterior feed is visible. No frame is analyzed until you choose Analyze current frame."
-                  : "Live exterior feed is connecting. Analyze becomes available after a frame is visible, then asks Core to inspect one current proxied frame."}
-            </p>
-          )}
+          {caption && <p className="card-note">{caption}</p>}
         </>
       )}
-
-      {EXTERIOR_CAMERA_STAGE_COPY[stage] && stage !== "checking" && (
-        <p className="card-note camera-state" role="status" aria-live="polite">
-          {EXTERIOR_CAMERA_STAGE_COPY[stage]}
-        </p>
+      {frigateUrl && (
+        <a
+          className="camera-action camera-frigate-link"
+          href={frigateUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Open Frigate
+        </a>
       )}
-      {error && <p className="camera-error" role="alert">{error}</p>}
     </Card>
   );
 }
+
 
 function CameraObservationCard({ data }) {
   const description = displayText(
@@ -1409,22 +1010,34 @@ function GeneratedImageCard({ data, receipt }) {
 
 function cameraEventTime(capturedAt) {
   if (!capturedAt) return "";
-  // SQLite datetime('now') is UTC with a space separator; force UTC parsing.
-  return fmtTime(`${String(capturedAt).replace(" ", "T")}Z`);
+  // The recorder reports explicit ISO instants with their own offset.
+  return fmtTime(String(capturedAt));
 }
 
 function CameraEventHistoryCard({ data }) {
   const items = Array.isArray(data?.items) ? data.items : [];
-  const dvrUrl = data?.dvr_url === "/dvr" ? "/dvr" : null;
+  const frigateUrl =
+    typeof data?.frigate_url === "string" && data.frigate_url ? data.frigate_url : null;
+  const frigateLink = frigateUrl && (
+    <a
+      className="camera-action camera-frigate-link"
+      href={frigateUrl}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      Open Frigate
+    </a>
+  );
   if (!data?.ok || !items.length) {
     return (
       <Card icon={Camera} title="Camera history">
-        <p className="card-note">No stored camera snapshots in that range.</p>
-        {dvrUrl && (
-          <a className="camera-action camera-dvr-link" href={dvrUrl} target="_blank" rel="noopener noreferrer">
-            Open standalone DVR
-          </a>
-        )}
+        <p className="card-note">
+          {displayText(
+            data?.note || data?.error,
+            "The recorder logged no detections in that range."
+          )}
+        </p>
+        {frigateLink}
       </Card>
     );
   }
@@ -1455,11 +1068,7 @@ function CameraEventHistoryCard({ data }) {
           Showing the {data.shown_count} most recent of {data.total_count} total.
         </p>
       )}
-      {dvrUrl && (
-        <a className="camera-action camera-dvr-link" href={dvrUrl} target="_blank" rel="noopener noreferrer">
-          Open standalone DVR
-        </a>
-      )}
+      {frigateLink}
     </Card>
   );
 }
@@ -1508,24 +1117,18 @@ function CameraSnapshotCard({ data }) {
 }
 
 function cameraMotionClipPresentation(data = {}) {
-  const isContinuousDvr = data.source === "continuous_dvr";
   const timeRange = [data.started_at_local, data.ended_at_local].filter(Boolean).join(" – ");
+  const labels = Array.isArray(data.labels) ? data.labels.filter(Boolean) : [];
   const details = [
     timeRange,
-    Number.isFinite(data.frame_count) ? `${data.frame_count} frames` : null,
-    isContinuousDvr ? "continuous DVR" : null,
+    labels.length ? labels.join(", ") : null,
     data.partial ? "available portion" : null,
-    data.cached ? "cached" : null,
   ].filter(Boolean);
 
   return {
-    title: isContinuousDvr ? "Continuous DVR footage" : "Motion event clip",
-    descriptionFallback: isContinuousDvr
-      ? "Requested continuous camera footage."
-      : "No description available.",
-    errorFallback: isContinuousDvr
-      ? "This continuous DVR footage could not be assembled."
-      : "This motion event's clip could not be assembled.",
+    title: "Recorded footage",
+    descriptionFallback: "Recorded exterior camera footage.",
+    errorFallback: "This footage could not be retrieved from the recorder.",
     details: details.join(" · "),
   };
 }
@@ -1570,9 +1173,9 @@ function CameraMotionClipCard({ data }) {
 function CameraFootageAnalysisCard({ data }) {
   if (!data?.ok) {
     return (
-      <Card icon={Camera} title="DVR footage analysis" className="image-generation-warning">
+      <Card icon={Camera} title="Footage analysis" className="image-generation-warning">
         <p className="card-note" role="alert">
-          {displayText(data?.error, "No temporal conclusion was made from the DVR footage.")}
+          {displayText(data?.error, "No temporal conclusion was made from the recorded footage.")}
         </p>
       </Card>
     );
@@ -1594,7 +1197,7 @@ function CameraFootageAnalysisCard({ data }) {
     <figure className={`card camera-snapshot-card${sufficient ? "" : " image-generation-warning"}`}>
       <div className="card-head">
         <Camera size={14} aria-hidden="true" />
-        <span>{sufficient ? "DVR temporal analysis" : "DVR temporal analysis — insufficient evidence"}</span>
+        <span>{sufficient ? "Temporal analysis" : "Temporal analysis — insufficient evidence"}</span>
       </div>
       {data.clip_url && (
         <video
@@ -1603,21 +1206,21 @@ function CameraFootageAnalysisCard({ data }) {
           controls
           playsInline
           preload="metadata"
-          aria-label="Playable DVR footage analyzed for temporal changes"
+          aria-label="Playable recorded footage analyzed for temporal changes"
         />
       )}
       <figcaption>
         <p className="camera-snapshot-caption">
-          {displayText(data.description, "Chronological DVR samples were analyzed.")}
+          {displayText(data.description, "Chronological recorded samples were analyzed.")}
         </p>
         {data.evidence && <p className="card-note">Evidence · {displayText(data.evidence)}</p>}
         <p className="card-note">
-          {[movement, interaction, timeRange, Number.isFinite(data.sample_count) ? `${data.sample_count} sampled frames` : null, sourceCount ? `${sourceCount} DVR segment${sourceCount === 1 ? "" : "s"}` : null]
+          {[movement, interaction, timeRange, Number.isFinite(data.sample_count) ? `${data.sample_count} sampled frames` : null, sourceCount ? `${sourceCount} camera${sourceCount === 1 ? "" : "s"}` : null]
             .filter(Boolean).join(" · ")}
         </p>
         {!sufficient && (
           <p className="card-note" role="alert">
-            No absence-of-action conclusion is drawn from insufficient DVR samples.
+            No absence-of-action conclusion is drawn from insufficient samples.
           </p>
         )}
         {data.range_narrowed && (
@@ -1953,14 +1556,7 @@ const REGISTRY = {
   ...FIELD_CARDS,
 };
 
-export default function Artifact({
-  artifact,
-  onCameraCapture,
-  onExteriorCameraStatus,
-  onExteriorCameraConfigure,
-  onExteriorCameraStart,
-  onExteriorCameraStop,
-}) {
+export default function Artifact({ artifact, onCameraCapture }) {
   const Component = REGISTRY[artifact?.type];
   if (!Component) return null;
   return (
@@ -1968,10 +1564,6 @@ export default function Artifact({
       data={artifact.data}
       receipt={artifact.receipt}
       onCameraCapture={onCameraCapture}
-      onExteriorCameraStatus={onExteriorCameraStatus}
-      onExteriorCameraConfigure={onExteriorCameraConfigure}
-      onExteriorCameraStart={onExteriorCameraStart}
-      onExteriorCameraStop={onExteriorCameraStop}
     />
   );
 }

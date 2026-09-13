@@ -34,7 +34,6 @@ import {
   captureCameraVideoJpeg,
   encodeCameraPromptHeader,
   safeCameraObservationArtifact,
-  safeExteriorCameraSession,
 } from "./lib/cameraCapture.js";
 import {
   receiptMatchesArtifact,
@@ -70,20 +69,6 @@ const AUTH_ERRORS = {
   tailscale_identity_missing: "Return through the private Tailscale Serve URL and try again.",
   tailscale_identity_changed: "The Tailscale identity changed during sign-in. Start again.",
 };
-
-async function exteriorCameraPayload(response, fallbackMessage) {
-  if (response.status === 204) return {};
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const detail = typeof payload?.detail === "string"
-      ? payload.detail
-      : typeof payload?.message === "string"
-        ? payload.message
-        : fallbackMessage;
-    throw new Error(String(detail || fallbackMessage).slice(0, 500));
-  }
-  return payload && typeof payload === "object" ? payload : {};
-}
 
 export function isNearChatBottom(element, threshold = 72) {
   if (!element) return true;
@@ -743,59 +728,6 @@ export default function App() {
     }
   }
 
-  const getExteriorCameraStatus = useCallback(async () => {
-    const response = await fetch("/api/cameras/exterior", {
-      method: "GET",
-      credentials: "include",
-      cache: "no-store",
-    });
-    return exteriorCameraPayload(response, "Could not check the exterior camera setup.");
-  }, []);
-
-  const configureExteriorCamera = useCallback(async ({ label, host, username, password }) => {
-    const response = await fetch("/api/cameras/exterior/configure", {
-      method: "POST",
-      credentials: "include",
-      cache: "no-store",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ label, host, username, password }),
-    });
-    return exteriorCameraPayload(response, "Could not save the exterior camera setup.");
-  }, []);
-
-  const startExteriorCamera = useCallback(async () => {
-    const conversationId = conversationIdRef.current;
-    if (conversationId == null) {
-      throw new Error("This exterior camera request is not attached to an active conversation.");
-    }
-    const response = await fetch("/api/cameras/exterior/sessions", {
-      method: "POST",
-      credentials: "include",
-      cache: "no-store",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ conversation_id: conversationId }),
-    });
-    const payload = await exteriorCameraPayload(response, "Could not start the exterior camera feed.");
-    return safeExteriorCameraSession(payload, window.location);
-  }, [conversationIdRef]);
-
-  const stopExteriorCamera = useCallback(async (sessionId, { keepalive = false } = {}) => {
-    const safeSessionId = String(sessionId || "").trim();
-    if (!/^[A-Za-z0-9_-]{8,160}$/.test(safeSessionId)) {
-      throw new Error("The exterior camera session is invalid.");
-    }
-    const response = await fetch(
-      `/api/cameras/exterior/sessions/${encodeURIComponent(safeSessionId)}`,
-      {
-        method: "DELETE",
-        credentials: "include",
-        cache: "no-store",
-        keepalive: Boolean(keepalive),
-      }
-    );
-    await exteriorCameraPayload(response, "Could not confirm exterior camera logout.");
-  }, []);
-
   async function captureAndAnalyzeCamera(data, onStage = () => {}, source = {}) {
     if (cameraCaptureActiveRef.current) {
       throw new Error("Another camera capture is already in progress.");
@@ -1171,10 +1103,6 @@ export default function App() {
             return <Artifact artifact={item.artifact}
                 key={item.key}
                 onCameraCapture={captureAndAnalyzeCamera}
-                onExteriorCameraStatus={getExteriorCameraStatus}
-                onExteriorCameraConfigure={configureExteriorCamera}
-                onExteriorCameraStart={startExteriorCamera}
-                onExteriorCameraStop={stopExteriorCamera}
               />;
           if (item.kind === "approval")
             return (

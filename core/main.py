@@ -40,15 +40,12 @@ from .services import target_placement as target_placement_svc
 from .services import automotive_knowledge as automotive_knowledge_svc
 from .services import calibration_iq as ciq_svc
 from .services import camera as camera_svc
-from .services import camera_monitoring as camera_monitoring_svc
 from .services import camera_security as camera_security_svc
 from .services import calendar as calendar_svc
-from .services import exterior_camera as exterior_camera_svc
+from .services import frigate_surveillance as frigate_surveillance_svc
+from .services.frigate_client import FrigateClient
 from .services import image_generation as image_svc
 from .services import live_events as live_events_svc
-from .services import mediamtx_dvr as mediamtx_dvr_svc
-from .services.mediamtx_client import MediaMTXClient, PATH_MAIN
-from .services import onvif_motion as onvif_motion_svc
 from .services import research as research_svc
 from .services import research_delegate as research_delegate_svc
 from .services import scrapex as scrapex_svc
@@ -162,33 +159,23 @@ def build_app(
         store=store,
         profile=getattr(settings, "tool_profile", None),
     )
-    exterior_camera = exterior_camera_svc.ExteriorCameraService(settings.root)
-    # Continuous recording, E:\MediaMTX\recordings, and retention are all
-    # owned by MediaMTX now -- an independently-managed process started by
-    # scripts/launch-mediamtx.ps1, never by Core. This OnvifMotionWatcher
-    # instance never touches a recording; it exists only so
-    # OnvifCameraMonitor can read the camera's own ONVIF motion-subscription
-    # state (motion_states()/events_healthy). mediamtx_dvr is Core's actual
-    # client for DVR playback/analysis, reached over MediaMTX's own bounded
-    # local HTTP APIs.
-    camera_dvr = onvif_motion_svc.OnvifMotionWatcher(exterior_camera)
-    camera_monitor = camera_security_svc.OnvifCameraMonitor(
-        settings, exterior_camera, router, store, dvr=camera_dvr
+    # Surveillance lives on the Frigate appliance: it owns the camera, the
+    # recording disk, detection, and playback. Building the client performs
+    # no I/O, so a Frigate machine that is asleep, rebooting, or off the
+    # network cannot delay or fail X Omni's startup -- only Frigate-backed
+    # camera capabilities go unavailable, and they say so.
+    frigate_client = FrigateClient(
+        base_url=settings.frigate_base_url,
+        camera=settings.frigate_camera,
+        credential_path=settings.frigate_credential_path,
+        verify_tls=settings.frigate_verify_tls,
+        timeout_seconds=settings.frigate_timeout_seconds,
+        clip_timeout_seconds=settings.frigate_clip_timeout_seconds,
+        max_clip_seconds=settings.frigate_max_clip_seconds,
     )
-    mediamtx_client = MediaMTXClient(
-        control_base_url=settings.mediamtx_control_base_url,
-        playback_base_url=settings.mediamtx_playback_base_url,
-        hls_base_url=settings.mediamtx_hls_base_url,
-        webrtc_base_url=settings.mediamtx_webrtc_base_url,
-        rtsp_base_url=settings.mediamtx_rtsp_base_url,
-    )
-    mediamtx_dvr = mediamtx_dvr_svc.MediaMTXDVR(
-        mediamtx_client,
-        path=PATH_MAIN,
-        ffmpeg_path=exterior_camera.ffmpeg_path,
-        recordings_root=settings.mediamtx_recordings_root,
-        clips_dir=settings.mediamtx_clips_root / "_cache",
-        saved_clips_dir=settings.mediamtx_clips_root / "saved",
+    surveillance = frigate_surveillance_svc.FrigateSurveillance(
+        frigate_client,
+        ffmpeg_path=frigate_surveillance_svc.resolve_ffmpeg(),
     )
     image_config = None
     image_generation = None
@@ -238,7 +225,9 @@ def build_app(
     registry.register("camera_request", camera_svc.make_camera_request())
     registry.register(
         "exterior_camera_request",
-        exterior_camera_svc.make_exterior_camera_request(exterior_camera),
+        lambda a: camera_security_svc.exterior_camera_look(
+            router, a, surveillance=surveillance
+        ),
     )
     if image_generation is not None:
         registry.register("image_generation_status", image_generation.status)
@@ -451,17 +440,21 @@ def build_app(
 
     registry.register(
         "camera_event_history",
-        lambda a: camera_security_svc.camera_event_history(store, a, dvr=mediamtx_dvr),
+        lambda a: camera_security_svc.camera_event_history(a, surveillance=surveillance),
     )
     registry.register(
         "camera_snapshot_analyze",
-        lambda a: camera_monitoring_svc.camera_snapshot_analyze(store, router, settings, a),
+        lambda a: camera_security_svc.camera_snapshot_analyze(
+            router, a, surveillance=surveillance
+        ),
     )
     async def camera_footage_handler(args: dict) -> dict:
         if args.get("analysis") is True:
-            return await camera_security_svc.camera_footage_analyze(store, router, args, dvr=mediamtx_dvr)
+            return await camera_security_svc.camera_footage_analyze(
+                router, args, surveillance=surveillance
+            )
         return await camera_security_svc.camera_motion_clip(
-            store, settings, exterior_camera.ffmpeg_path, args, dvr=mediamtx_dvr
+            args, surveillance=surveillance
         )
 
     registry.register(
@@ -500,7 +493,6 @@ def build_app(
             # which beats an opaque crash at startup.
             log.error("Could not start default worker: %s", exc)
             store.audit("worker_start_failed", {"error": str(exc)})
-        monitor_task = asyncio.create_task(camera_monitor.run_forever())
         adas_refresh_task = asyncio.create_task(_refresh_adas_si_forever(adas))
         try:
             resumed = await adas_map_sweep.resume()
@@ -526,33 +518,24 @@ def build_app(
             yield
         finally:
             log.info(
-                "Shutting down; stopping camera monitor, camera, and model workers... "
-                "(the X DVR recording service is independent and keeps running)"
+                "Shutting down; stopping background jobs and model workers... "
+                "(the Frigate recorder runs on its own machine and is untouched)"
             )
             try:
-                camera_monitor.stop()
                 await adas_map_sweep.shutdown()
                 await adas_si_research.shutdown()
                 if adas_si_harvest is not None:
                     await adas_si_harvest.shutdown()
-                monitor_task.cancel()
                 adas_refresh_task.cancel()
-                await asyncio.gather(
-                    monitor_task,
-                    adas_refresh_task,
-                    return_exceptions=True,
-                )
+                await asyncio.gather(adas_refresh_task, return_exceptions=True)
             finally:
                 try:
-                    await exterior_camera.shutdown()
+                    await router.shutdown()
                 finally:
                     try:
-                        await router.shutdown()
+                        knowledge_repository.close()
                     finally:
-                        try:
-                            knowledge_repository.close()
-                        finally:
-                            store.close()
+                        store.close()
 
     app = FastAPI(
         title="X Omni",
@@ -567,10 +550,8 @@ def build_app(
     app.state.client = client
     app.state.registry = registry
     app.state.automotive_knowledge = automotive_knowledge
-    app.state.exterior_camera = exterior_camera
-    app.state.camera_dvr = camera_dvr
-    app.state.mediamtx_client = mediamtx_client
-    app.state.mediamtx_dvr = mediamtx_dvr
+    app.state.frigate_client = frigate_client
+    app.state.surveillance = surveillance
     app.state.image_generation = image_generation
     app.state.image_generation_config = image_config
     app.state.video_generation = video_generation
@@ -608,51 +589,12 @@ def build_app(
             "https://*.rainviewer.com; "
             "media-src 'self' blob:; worker-src 'self' blob:; form-action 'self'"
         )
-        if request.url.path.startswith(("/api/", "/healthz", "/dvr/api/")):
+        if request.url.path.startswith(("/api/", "/healthz")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     require_session = auth_api.make_require_session(settings, store)
     app.include_router(auth_api.create_router(settings, store))
-
-    _dvr_clip_name_re = re.compile(r"^[A-Za-z0-9_.-]{1,160}\.mp4$")
-
-    @app.get("/dvr/api/clips/{filename}")
-    async def dvr_clip_proxy(filename: str, _session: dict = Depends(require_session)):
-        # Chat camera cards render clip_url values Core itself issued (e.g.
-        # "/dvr/api/clips/range-....mp4") when mediamtx_dvr.range_clip()/
-        # event_clip() cached that time range. Core and the standalone DVR
-        # GUI process both read MediaMTX over HTTP and share this one cache
-        # directory on disk -- no cross-process proxy or shared secret is
-        # needed to serve a file Core already has locally.
-        if not _dvr_clip_name_re.fullmatch(filename):
-            raise HTTPException(404, "Clip not found.")
-        path = mediamtx_dvr.clips_dir / filename
-        try:
-            if path.resolve().parent != mediamtx_dvr.clips_dir.resolve() or not path.is_file():
-                raise HTTPException(404, "Clip not found.")
-        except OSError:
-            raise HTTPException(404, "Clip not found.")
-        return FileResponse(
-            path,
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'inline; filename="{filename}"',
-                "Cache-Control": "private, no-store",
-            },
-        )
-
-    @app.get("/dvr")
-    @app.get("/dvr/{rest:path}")
-    async def dvr_gui_redirect(rest: str = ""):
-        # The standalone DVR GUI moved to its own independent service/origin
-        # (X DVR); this only forgives an old bookmark or habit of opening it
-        # through Core. /dvr/api/... is handled above (clip proxy) or by
-        # dvr_clip_proxy's 404 -- never silently redirected.
-        if rest.startswith("api/") or rest == "api":
-            return JSONResponse({"detail": "Not found"}, status_code=404)
-        target = f"{settings.dvr_local_origin}/dvr/{rest}".rstrip("/")
-        return RedirectResponse(url=target)
 
     app.include_router(
         core_routes.create_router(
@@ -663,7 +605,7 @@ def build_app(
             require_session,
             image_config=image_config,
             video_config=video_config,
-            exterior_camera=exterior_camera,
+            surveillance=surveillance,
             adas=adas,
         )
     )
@@ -696,7 +638,7 @@ def build_app(
         async def spa(full_path: str):
             # Never let the SPA fallback swallow an unmatched API path --
             # that turns a 404 into a confusing page of HTML.
-            if full_path.startswith(("api/", "ws/", "dvr/api/")):
+            if full_path.startswith(("api/", "ws/")):
                 return JSONResponse({"detail": "Not found"}, status_code=404)
             candidate = dist / full_path
             if full_path and candidate.is_file():

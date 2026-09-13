@@ -164,35 +164,6 @@ export async function captureCameraVideoJpeg({
   return { blob, ...dimensions };
 }
 
-/** Accept only an opaque session and same-origin stream URL returned by Core. */
-export function safeExteriorCameraSession(payload, locationRef = globalThis.location) {
-  const sessionId = String(payload?.session_id || "").trim();
-  const rawUrl = String(payload?.stream_url || "").trim();
-  const origin = String(locationRef?.origin || "").trim();
-  if (!/^[A-Za-z0-9_-]{8,160}$/.test(sessionId)) {
-    throw new Error("Core returned an invalid exterior camera session.");
-  }
-  if (!rawUrl || !origin) {
-    throw new Error("Core did not return an exterior camera stream URL.");
-  }
-  let streamUrl;
-  try {
-    const resolved = new URL(rawUrl, `${origin}/`);
-    if (resolved.origin !== origin || !["http:", "https:"].includes(resolved.protocol)) {
-      throw new Error("cross-origin");
-    }
-    streamUrl = `${resolved.pathname}${resolved.search}`;
-  } catch {
-    throw new Error("Core returned an unsafe exterior camera stream URL.");
-  }
-  return {
-    session_id: sessionId,
-    stream_url: streamUrl,
-    status: boundedText(payload?.status, 80),
-    label: boundedText(payload?.label, 80) || "Exterior camera",
-  };
-}
-
 /**
  * Capture one bounded JPEG. The caller must invoke this from an explicit user
  * action. The Blob stays in this function's return value only long enough for
@@ -264,7 +235,7 @@ export function safeCameraObservationArtifact(artifact) {
     ok: raw.ok !== false,
     description,
     prompt: boundedText(raw.prompt, 1_000),
-    source: ["camera", "browser_camera_still", "exterior_camera_still"].includes(raw.source)
+    source: ["camera", "browser_camera_still"].includes(raw.source)
       ? raw.source
       : "camera",
     camera_source_id: boundedText(raw.camera_source_id || provenance.camera_source_id, 80),

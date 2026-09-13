@@ -42,16 +42,18 @@ test("service worker bypasses range and media requests before static caching", a
   assert.ok(rangeBypass >= 0 && rangeBypass < staticInterception);
 });
 
-test("service worker leaves every DVR path network-only", async () => {
+test("service worker leaves every camera path network-only", async () => {
+  // Camera imagery is Owner-only surveillance data fetched live from the
+  // recorder. Caching it would let a stale frame outlive a logout, so every
+  // camera path stays on the browser's native network path.
   const listener = await serviceWorkerFetchListener();
   assert.equal(typeof listener, "function");
 
   for (const pathname of [
-    "/dvr",
-    "/dvr/",
-    "/dvr/app.js",
-    "/dvr/api/status",
-    "/dvr/api/events/7/video.mp4",
+    "/api/camera/status",
+    "/api/camera/latest.jpg",
+    "/api/camera/event-snapshot.jpg",
+    "/api/camera/footage.mp4",
   ]) {
     let intercepted = false;
     listener({
@@ -60,7 +62,7 @@ test("service worker leaves every DVR path network-only", async () => {
         url: `https://omega.example${pathname}`,
         headers: { has: () => false },
         destination: "",
-        mode: pathname === "/dvr" || pathname === "/dvr/" ? "navigate" : "cors",
+        mode: "cors",
       },
       respondWith: () => { intercepted = true; },
     });

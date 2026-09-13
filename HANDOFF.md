@@ -19,6 +19,7 @@ Updated 2026-08-18 on Omega. This file is the current implementation record; `PL
 - UI: React/Vite PWA served by Core.
 - External services: Open-Meteo weather, RainViewer/CARTO radar, DuckDuckGo/Google News research, Google OAuth/Calendar, and optional browser/Google speech. Model inference, camera-frame vision, website generation, ComfyUI image synthesis, and fixed FFmpeg source animation remain on Omega.
 - Model/runtime/weights remain owned under `X:\XV12`; X Omni reads them by configured absolute path and does not modify the reference tree.
+- Surveillance: a **Frigate NVR on its own Ubuntu machine** owns the exterior camera, continuous recording (to its USB disk), detection, and playback. X Omni is a client of Frigate's authenticated API on port `8971` and records nothing locally. Its address is configuration (`FRIGATE_BASE_URL`), never code.
 
 ## Hardened behavior now implemented
 
@@ -148,6 +149,117 @@ Not yet proved and must stay labeled as such:
 One non-fatal Windows `WinError 10054` Proactor callback was logged during expected Coder load polling; the swap completed healthy and it did not recur on the Omni return. Treat it as diagnostic noise unless it repeats outside lifecycle turnover.
 
 The shared-node Tailscale contract is now explicit: `https://omega.<tailnet>.ts.net/` (port 443) proxies Calibration IQ on loopback 8084, while `https://omega.<tailnet>.ts.net:8443/` proxies X Omni on loopback 8100. `scripts\tailscale-serve.ps1` changes only 8443 and deliberately preserves Calibration IQ's 443 handler. Re-check live Serve status before relying on it because external routing state can drift.
+
+
+## Surveillance moved to Frigate (2026-09-13)
+
+X Omni used to be the recorder. It ran MediaMTX for the camera's RTSP
+transport and continuous recording, a standalone X DVR service and GUI on
+its own port, an ONVIF motion subscription against the camera, and a
+background loop that pulled frames every minute and decided for itself what
+counted as motion. All of that is gone. A Frigate NVR on a separate Ubuntu
+machine now owns the camera, the recording disk, detection, and playback,
+and X consumes its authenticated API.
+
+The architecture is now:
+
+```
+Exterior camera -> Ubuntu Frigate -> USB recording storage
+X Omni (Omega)  -> Frigate API over the LAN, port 8971
+```
+
+### What X no longer does
+
+- run or supervise MediaMTX, or any media server;
+- run a standalone DVR service or serve a DVR interface;
+- record, retain, or cache surveillance video on Omega;
+- connect to the camera over RTSP or ONVIF, or hold camera credentials;
+- decide for itself what motion is, on a polling loop.
+
+### The boundary, and how it is enforced
+
+- **One client.** `core/services/frigate_client.py` is the only place that
+  speaks HTTP to Frigate. It owns base-URL normalization, JWT login and
+  session reuse, bounded timeouts, response-size ceilings, camera-name
+  validation, and error translation.
+- **Secrets stay put.** The Frigate account password is sealed with Windows
+  DPAPI (`core/services/windows_secrets.py`), never written to `.env`, never
+  logged, never returned by an API, and never rendered by a `repr`. Errors
+  name a request *path*, never a URL, because a token can ride in a query
+  string.
+- **Port 8971 only.** Frigate's unauthenticated internal API on port 5000 is
+  never used across the LAN, and a configured base URL pointing at it is
+  rejected by a test.
+- **No address in code.** The Ubuntu machine's LAN address, its mDNS name,
+  and any Tailscale name are all just values of `FRIGATE_BASE_URL`. A test
+  fails if any of them appears in a source file.
+- **Failure is a state.** Every capability reports one of `available`,
+  `unavailable`, `authentication_required`, `not_configured`,
+  `camera_unavailable`, `no_recording`, or `no_event_data`. A refused
+  credential is always distinguishable from an unreachable machine, and
+  "Frigate detected nothing" is always distinguishable from "there is no
+  recording".
+- **Startup never waits.** Building the Frigate client performs no I/O, so a
+  sleeping or rebooting Frigate machine cannot delay or fail X Omni's boot.
+  Only camera capabilities go unavailable, and they say so.
+
+### What the model sees
+
+The tool names did not change -- `camera_event_history`, `camera_footage`,
+`camera_snapshot_analyze`, and `exterior_camera_request` all still exist and
+still mean what they meant, so prompting and tool routing were untouched.
+Their backends changed: detections come from Frigate's review API, footage
+from its recording export, and "look outside" from its current-frame API.
+Composition stays the model's job; this layer only retrieves evidence,
+enforces bounds, and reports state. When Frigate is unreachable X says so
+rather than describing a scene it did not see.
+
+Bounded footage analysis still works the same way and still runs FFmpeg
+exactly once per question: a clip for the requested range is fetched from
+Frigate, sampled into one chronological contact sheet, analyzed, and
+dropped. Nothing is written where it would outlive the answer.
+
+### Acceptance against the real Frigate (2026-09-13)
+
+Run from Omega against the live instance, with no credential registered, so
+these prove the boundary rather than a happy path:
+
+| check | result |
+|---|---|
+| Frigate answers on the authenticated port 8971 | yes, HTTPS, self-signed |
+| port 5000 reachable across the LAN | no -- correctly closed |
+| every endpoint requires authentication | yes, HTTP 401 unauthenticated |
+| no credential registered | `not_configured` |
+| wrong credential against real Frigate | `authentication_required` |
+| unreachable address | `unavailable` (never confused with a refusal) |
+| password present in any repr/status/error | none |
+| FFmpeg available for bounded analysis | found |
+
+Because Frigate's self-signed certificate is what the installed instance
+serves, `FRIGATE_VERIFY_TLS` defaults to false and becomes true the moment a
+real certificate exists -- a setting, never a silent exception.
+
+**Not yet done:** an end-to-end read with a real Frigate account (latest
+frame, a recording query, a review query). It needs a dedicated Frigate user
+for X, which is created in Frigate's own interface. Register it with:
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\configure-frigate.ps1 -Username x-omni
+```
+
+### Windows cleanup
+
+The retired stack installed a scheduled task and two logon shortcuts. Remove
+them with:
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\remove-mediamtx-dvr-startup.ps1
+```
+
+It removes exactly `X Omni MediaMTX+DVR Watchdog`, `MediaMTX.lnk`, and
+`X DVR.lnk`, and nothing else. `X:\MediaMTX` and its recordings are left
+untouched and only reported: deleting them is a person's decision, not a
+migration's.
 
 ## Agentic service-information research (2026-09-13)
 

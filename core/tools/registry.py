@@ -1928,8 +1928,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "exterior_camera_request": {
         "description": (
-            "Request the exterior camera inline; returns status only. Doesn't "
-            "start a stream or claim a frame was seen."
+            "Look at the exterior camera now: fetches its current frame from the "
+            "recorder and describes what is visible. Says so plainly when the "
+            "recorder is unreachable rather than guessing."
         ),
         "parameters": {
             "type": "object",
@@ -1937,7 +1938,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
                 "prompt": {
                     "type": "string",
                     "maxLength": 1000,
-                    "description": "What to look for in the submitted frame.",
+                    "description": "What to look for in the current frame.",
                 },
             },
             "required": ["prompt"],

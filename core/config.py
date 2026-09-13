@@ -63,24 +63,6 @@ def _generate_vapid_keypair() -> tuple[str, str]:
     return _b64url(public_raw), private_b64
 
 
-def _ensure_internal_dvr_token(env_path: Path) -> str:
-    """A stable, loopback-only secret shared by Core and the DVR service.
-
-    It authenticates Core's server-to-server calls into the DVR service's
-    API (Core's tool handlers run with no browser session/cookie of their
-    own). Generated once and persisted, like the VAPID keypair, so both
-    independently-started processes agree on the same value without a
-    coordinated restart.
-    """
-    token = os.getenv("XOMNI_INTERNAL_DVR_TOKEN", "").strip()
-    if token:
-        return token
-    token = secrets.token_urlsafe(32)
-    atomic_update_env(env_path, {"XOMNI_INTERNAL_DVR_TOKEN": token})
-    os.environ["XOMNI_INTERNAL_DVR_TOKEN"] = token
-    return token
-
-
 def _ensure_vapid_keys(env_path: Path) -> tuple[str, str]:
     """Web Push needs a stable keypair -- a subscription is bound to the
     public key it was created against, so unlike session_secret's fresh-
@@ -149,48 +131,32 @@ class Settings:
     # costs nothing and `read_attachment` can page through a long document.
     attachment_dir: Path = Path("data") / "attachments"
 
-    # Background exterior-camera monitoring
-    camera_snapshot_dir: Path = Path("data") / "camera-snapshots"
-    camera_monitor_interval_seconds: int = 60
-    camera_baseline_interval_seconds: int = 600
-    camera_snapshot_retention_days: int = 30
-    camera_motion_threshold: float = 18.0
-    # A motion trigger opens a rolling documentation window: frames are
-    # captured every camera_motion_burst_interval_seconds instead of the
-    # normal baseline cadence, and continued motion re-arms the window so
-    # sustained activity (e.g. floodlights staying on) keeps being
-    # documented for as long as it continues.
-    camera_motion_burst_seconds: int = 90
-    camera_motion_burst_interval_seconds: int = 5
-
-    # X DVR -- the standalone operator GUI (core/dvr_service.py). It survives
-    # Core restarts; this is only the address Core's client and the DVR
-    # service's own exact-origin check use, not a claim that DVR runs inside
-    # Core. Actual recording/playback now lives entirely in MediaMTX, an
-    # independently-managed process outside this repo (see mediamtx_client.py).
-    dvr_port: int = 8300
-    internal_dvr_token: str = ""
-
-    # MediaMTX -- the exterior camera's media transport (RTSP connection,
-    # continuous native recording, HLS/WebRTC live delivery, recorded-range
-    # playback). All addresses are loopback; MediaMTX itself is started
-    # independently (scripts/launch-mediamtx.ps1), never by Core or the DVR
-    # GUI process.
-    mediamtx_control_base_url: str = "http://127.0.0.1:9997"
-    mediamtx_playback_base_url: str = "http://127.0.0.1:9996"
-    mediamtx_hls_base_url: str = "http://127.0.0.1:8888"
-    mediamtx_webrtc_base_url: str = "http://127.0.0.1:8889"
-    mediamtx_rtsp_base_url: str = "rtsp://127.0.0.1:8554"
-    mediamtx_recordings_root: Path = Path("E:/MediaMTX/recordings")
-    mediamtx_clips_root: Path = Path("E:/MediaMTX/clips")
+    # Frigate -- the exterior camera's recorder, running in Docker on its own
+    # Ubuntu machine with the camera and the recording disk attached to it.
+    # X is a client of its authenticated API and nothing more: it does not
+    # start Frigate, supervise it, record anything itself, or touch the
+    # camera. The address is configuration rather than a constant so the
+    # same build works against a LAN name, a LAN address, or (if the Owner
+    # ever wants it) a Tailscale name, with no code change.
+    #
+    # Port 8971 is Frigate's authenticated API. Port 5000 is its
+    # unauthenticated internal API and is deliberately never used here.
+    frigate_base_url: str = ""
+    frigate_camera: str = "exterior"
+    # Frigate ships a self-signed certificate on 8971, so verification is
+    # off by default for that install and on the moment a real certificate
+    # exists -- a setting, never a silent exception.
+    frigate_verify_tls: bool = False
+    frigate_timeout_seconds: float = 10.0
+    frigate_clip_timeout_seconds: float = 120.0
+    frigate_max_clip_seconds: int = 300
+    # The Frigate account password is never stored here or in .env. It is
+    # sealed with Windows DPAPI in this file (see windows_secrets.py).
+    frigate_credential_path: Path = Path("data") / "credentials" / "frigate.bin"
 
     @property
     def local_origin(self) -> str:
         return f"http://127.0.0.1:{self.port}"
-
-    @property
-    def dvr_local_origin(self) -> str:
-        return f"http://127.0.0.1:{self.dvr_port}"
 
     @property
     def redirect_uris(self) -> list[str]:
@@ -211,7 +177,6 @@ class Settings:
         vapid_public_key, vapid_private_key = _ensure_vapid_keys(
             ROOT / "config" / ".env.local"
         )
-        internal_dvr_token = _ensure_internal_dvr_token(ROOT / "config" / ".env.local")
         return cls(
             root=ROOT,
             # Core always binds loopback. Remote reach is Tailscale's job --
@@ -223,8 +188,6 @@ class Settings:
             tools_config=ROOT / "config" / "tools.yaml",
             db_path=ROOT / "data" / "x_omni.sqlite",
             audio_tmp=ROOT / "data" / "audio",
-            dvr_port=_int("XOMNI_DVR_PORT", 8300),
-            internal_dvr_token=internal_dvr_token,
             auth_enabled=_flag("XOMNI_AUTH_ENABLED", True),
             google_client_id=os.getenv("XOMNI_GOOGLE_CLIENT_ID", "").strip(),
             google_client_secret=os.getenv("XOMNI_GOOGLE_CLIENT_SECRET", "").strip(),
@@ -278,36 +241,18 @@ class Settings:
             attachment_dir=Path(
                 os.getenv("XOMNI_ATTACHMENT_DIR", str(ROOT / "data" / "attachments"))
             ),
-            camera_snapshot_dir=Path(
-                os.getenv("XOMNI_CAMERA_SNAPSHOT_DIR", str(ROOT / "data" / "camera-snapshots"))
+            frigate_base_url=os.getenv("FRIGATE_BASE_URL", "").strip(),
+            frigate_camera=os.getenv("FRIGATE_CAMERA", "exterior").strip() or "exterior",
+            frigate_verify_tls=_flag("FRIGATE_VERIFY_TLS", False),
+            frigate_timeout_seconds=float(os.getenv("FRIGATE_TIMEOUT_SECONDS", "10.0")),
+            frigate_clip_timeout_seconds=float(
+                os.getenv("FRIGATE_CLIP_TIMEOUT_SECONDS", "120.0")
             ),
-            camera_monitor_interval_seconds=_int("XOMNI_CAMERA_MONITOR_INTERVAL_SECONDS", 60),
-            camera_baseline_interval_seconds=_int("XOMNI_CAMERA_BASELINE_INTERVAL_SECONDS", 600),
-            camera_snapshot_retention_days=_int("XOMNI_CAMERA_SNAPSHOT_RETENTION_DAYS", 30),
-            camera_motion_threshold=float(os.getenv("XOMNI_CAMERA_MOTION_THRESHOLD", "18.0")),
-            camera_motion_burst_seconds=_int("XOMNI_CAMERA_MOTION_BURST_SECONDS", 90),
-            camera_motion_burst_interval_seconds=_int(
-                "XOMNI_CAMERA_MOTION_BURST_INTERVAL_SECONDS", 5
-            ),
-            mediamtx_control_base_url=os.getenv(
-                "XOMNI_MEDIAMTX_CONTROL_BASE_URL", "http://127.0.0.1:9997"
-            ).strip().rstrip("/"),
-            mediamtx_playback_base_url=os.getenv(
-                "XOMNI_MEDIAMTX_PLAYBACK_BASE_URL", "http://127.0.0.1:9996"
-            ).strip().rstrip("/"),
-            mediamtx_hls_base_url=os.getenv(
-                "XOMNI_MEDIAMTX_HLS_BASE_URL", "http://127.0.0.1:8888"
-            ).strip().rstrip("/"),
-            mediamtx_webrtc_base_url=os.getenv(
-                "XOMNI_MEDIAMTX_WEBRTC_BASE_URL", "http://127.0.0.1:8889"
-            ).strip().rstrip("/"),
-            mediamtx_rtsp_base_url=os.getenv(
-                "XOMNI_MEDIAMTX_RTSP_BASE_URL", "rtsp://127.0.0.1:8554"
-            ).strip().rstrip("/"),
-            mediamtx_recordings_root=Path(
-                os.getenv("XOMNI_MEDIAMTX_RECORDINGS_ROOT", r"E:\MediaMTX\recordings")
-            ),
-            mediamtx_clips_root=Path(
-                os.getenv("XOMNI_MEDIAMTX_CLIPS_ROOT", r"E:\MediaMTX\clips")
+            frigate_max_clip_seconds=_int("FRIGATE_MAX_CLIP_SECONDS", 300),
+            frigate_credential_path=Path(
+                os.getenv(
+                    "FRIGATE_CREDENTIAL_PATH",
+                    str(ROOT / "data" / "credentials" / "frigate.bin"),
+                )
             ),
         )

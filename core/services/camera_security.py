@@ -1,81 +1,106 @@
-"""ONVIF-driven security monitoring layered over the proven camera monitor.
+"""The exterior-camera capabilities X offers, answered from Frigate.
 
-The legacy frame-difference monitor remains intact as a fallback. When the
-Xiongmai PullPoint subscription is healthy, ONVIF motion is authoritative:
-it opens/extends the existing burst, captures an immediate frame, and runs the
-same person/vehicle vision contract. Continuous DVR footage is preferred for
-playback while the existing still-frame timelapse remains a fallback.
+The tool names here are unchanged on purpose -- camera_event_history,
+camera_footage, camera_snapshot_analyze, exterior_camera_request are what
+the model already knows how to reach for, and what routing and prompting
+already assume. What changed is underneath: every answer now comes from the
+Frigate NVR on its own machine instead of a recorder running on Omega.
+
+The division of labour is the same one the rest of X follows. This module
+decides nothing conversational: it retrieves evidence, enforces bounds,
+runs the existing vision contract over real pixels, and reports a
+structured state. Composing that into an answer stays the model's job, and
+when Frigate is unreachable the honest structured state travels outward
+rather than a guess about what is happening outside.
 """
+
 from __future__ import annotations
 
 import asyncio
-import copy
 import logging
 import re
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 from . import camera as camera_svc
-from . import camera_monitoring as legacy
-from . import mediamtx_dvr
-from . import exterior_camera as exterior_camera_svc
-from . import push_notifications
+from . import frigate_surveillance as surveillance_svc
+from .frigate_client import FrigateError, FrigateInvalidRequest, FrigateState
+
 log = logging.getLogger("xomni.camera_security")
 
-SECURITY_TOOL_SCHEMAS = {
-    # Put media-rendering capabilities before the broad history reader in the
-    # model catalog.  The model still owns intent and argument selection, but
-    # a request to show media should encounter the exact rendering contracts
-    # before the tempting collection read.
-    "camera_footage": copy.deepcopy(
-        legacy.CAMERA_MONITORING_TOOL_SCHEMAS["camera_motion_clip"]
-    ),
-    "camera_snapshot_analyze": copy.deepcopy(
-        legacy.CAMERA_MONITORING_TOOL_SCHEMAS["camera_snapshot_analyze"]
-    ),
-    "camera_event_history": copy.deepcopy(
-        legacy.CAMERA_MONITORING_TOOL_SCHEMAS["camera_event_history"]
-    ),
-}
-SECURITY_TOOL_SCHEMAS["camera_event_history"]["description"] = (
-    "Lists event metadata/thumbnails and returns /dvr. For 'show me the DVR', "
-    "present that link. For playable footage/video/time ranges use camera_footage."
-)
-SECURITY_TOOL_SCHEMAS["camera_event_history"]["parameters"]["properties"][
-    "include_recordings"
-] = {
-    "type": "boolean",
-    "description": "Include bounded continuous-DVR segment metadata for the same time range.",
-}
-SECURITY_TOOL_SCHEMAS["camera_footage"]["description"] = (
-    "Show DVR footage, clips, or times. Set analysis true for temporal actions; it samples "
-    "DVR frames, not still captions."
-)
-SECURITY_TOOL_SCHEMAS["camera_footage"]["parameters"]["properties"]["event_id"]["description"] = (
-    "Motion event id; omit for the latest motion event."
-)
-SECURITY_TOOL_SCHEMAS["camera_footage"]["parameters"]["properties"].update(
-    {
-        "analysis": {
-            "type": "boolean",
-            "description": "True only for a temporal action question.",
-        },
-        "since": {
-            "type": "string",
-            "description": "ISO start with local UTC offset (for EDT use -04:00, never Z).",
-        },
-        "until": {
-            "type": "string",
-            "description": "ISO end with the same explicit UTC offset.",
-        },
-    }
-)
+MAX_HISTORY_ITEMS = 50
+DEFAULT_HISTORY_ITEMS = 20
 
-_EVENT_HEALTH_POLL_SECONDS = 2.0
-_EVENT_CONSUMER_RESTART_SECONDS = 1.0
-_SECOND_LOOK_DELAY_SECONDS = 2.0
-
+SECURITY_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    # Media-rendering capabilities come before the broad history reader so a
+    # request to *see* something meets the rendering contract first. The
+    # model still owns intent and argument selection.
+    "camera_footage": {
+        "description": (
+            "Show recorded exterior footage for a time range or a detection, or analyze "
+            "what changed across it. Set analysis true only for a temporal action question; "
+            "it samples real recorded frames, not captions."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "event_id": {
+                    "type": "string",
+                    "description": "Detection id from camera_event_history; omit for the most recent one.",
+                },
+                "analysis": {
+                    "type": "boolean",
+                    "description": "True only for a temporal action question.",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "ISO start with local UTC offset (for EDT use -04:00, never Z).",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "ISO end with the same explicit UTC offset.",
+                },
+                "prompt": {"type": "string", "maxLength": 1000},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "camera_snapshot_analyze": {
+        "description": (
+            "Render/analyze one exterior still -- a specific detection's snapshot, or the "
+            "camera's current view when event_id is omitted. Required for its image card; "
+            "text URLs are insufficient."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string"},
+                "prompt": {"type": "string", "maxLength": 1000},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "camera_event_history": {
+        "description": (
+            "List exterior-camera detections the recorder logged, most recent first. Use to "
+            "find when something showed up or left. For playable footage use camera_footage."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "string", "description": "ISO datetime, inclusive lower bound."},
+                "until": {"type": "string", "description": "ISO datetime, inclusive upper bound."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_HISTORY_ITEMS},
+                "include_recordings": {
+                    "type": "boolean",
+                    "description": "Include bounded continuous-recording coverage for the same range.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+}
 
 _SECURITY_ANALYSIS_PROMPT = (
     "Reply in exactly this three-line format:\n"
@@ -90,7 +115,7 @@ _SECURITY_ANALYSIS_PROMPT = (
 
 _FOOTAGE_ANALYSIS_PROMPT = (
     "You are analyzing one contact sheet made from chronological, time-labeled frames "
-    "from a continuous exterior DVR recording. Read left-to-right and top-to-bottom; the "
+    "from a continuous exterior recording. Read left-to-right and top-to-bottom; the "
     "first and last frames are intentional before/after evidence. Answer only from changes "
     "visible across those pixels. A sparse sample can establish an observed change, but it "
     "cannot prove that nothing happened between samples.\n"
@@ -106,6 +131,9 @@ _FOOTAGE_ANALYSIS_PROMPT = (
     "not_observed only with SUFFICIENCY: sufficient, and word it as not observed in the "
     "sample rather than proof nothing happened."
 )
+
+
+# ------------------------------------------------------------------ helpers
 
 
 def _parse_iso(value: object) -> Optional[datetime]:
@@ -124,38 +152,31 @@ def _parse_iso(value: object) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-def _dvr_iso(value: datetime) -> str:
+def _iso(value: datetime) -> str:
     return (
-        value.astimezone(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
+        value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     )
 
 
-def _preferred_burst_caption(events: list[dict[str, Any]]) -> Optional[str]:
-    positive = [
-        row
-        for row in events
-        if row.get("caption")
-        and (bool(row.get("person_detected")) or bool(row.get("vehicle_detected")))
-    ]
-    if positive:
-        return str(positive[-1]["caption"])
-    return next((str(row["caption"]) for row in events if row.get("caption")), None)
+def _local(value: datetime) -> str:
+    return value.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
-def _parse_security_caption(
-    text: str,
-) -> tuple[Optional[bool], Optional[bool], str]:
+def snapshot_url(event_id: str) -> str:
+    return f"/api/camera/event-snapshot.jpg?{urlencode({'event_id': str(event_id)})}"
+
+
+def latest_frame_url() -> str:
+    return "/api/camera/latest.jpg"
+
+
+def _parse_security_caption(text: str) -> tuple[Optional[bool], Optional[bool], str]:
     """Parse only the exact security response contract.
 
-    The legacy parser intentionally tolerates ordinary prose, but substring
-    matching is unsafe at the notification boundary (for example,
-    ``PERSON: yes or no`` or ``PERSON: yesterday``).  A security decision is
-    authoritative only when all three required lines occur exactly once.
+    Substring matching is unsafe at a security boundary (``PERSON: yes or
+    no``, ``PERSON: yesterday``): a decision counts only when all three
+    required lines occur exactly once.
     """
-
     decisions: dict[str, bool] = {}
     descriptions: list[str] = []
     invalid = False
@@ -219,474 +240,181 @@ def _parse_footage_analysis_caption(text: str) -> Optional[dict[str, str]]:
     if set(values) != required:
         return None
     if values["SUFFICIENCY"] == "insufficient":
-        # Never turn sparse DVR samples into a negative action conclusion.
+        # Never turn sparse samples into a negative action conclusion.
         values["VEHICLE_MOVEMENT"] = "uncertain"
         values["PERSON_INTERACTION"] = "uncertain"
     return values
 
 
-def _motion_event_in_range(store, since: datetime, until: datetime) -> Optional[dict[str, Any]]:
-    try:
-        rows = store.list_camera_events(
-            since=since.strftime("%Y-%m-%d %H:%M:%S"),
-            until=until.strftime("%Y-%m-%d %H:%M:%S"),
-            limit=500,
-        )
-    except Exception:
-        log.warning("could not search stored motion events for historical fallback", exc_info=True)
-        return None
-    candidates = [
-        row
-        for row in rows
-        if row.get("trigger") == "motion" and row.get("burst_id") is not None
-    ]
-    if not candidates:
-        return None
-    midpoint = since + (until - since) / 2
-
-    def distance(row: dict[str, Any]) -> float:
-        captured = _parse_iso(row.get("captured_at"))
-        return abs((captured - midpoint).total_seconds()) if captured else float("inf")
-
-    return min(candidates, key=distance)
-
-
-def _event_times(store, event: dict[str, Any]) -> tuple[list[dict[str, Any]], list[datetime]]:
-    """Return the full motion burst and its trustworthy UTC capture times."""
-    burst_id = event.get("burst_id")
-    if burst_id is not None:
-        try:
-            events = list(store.list_camera_events_by_burst(int(burst_id)))
-        except Exception:
-            events = []
-    else:
-        events = []
-    if not events:
-        events = [event]
-    captured = sorted(
-        value for value in (_parse_iso(row.get("captured_at")) for row in events)
-        if value is not None
-    )
-    return events, captured
-
-
-def _temporal_event_window(
-    store, event: dict[str, Any]
-) -> tuple[datetime, datetime, list[dict[str, Any]]]:
-    events, captured = _event_times(store, event)
-    if not captured:
-        raise ValueError("Motion event timestamps are invalid.")
-    since = captured[0] - timedelta(seconds=30)
-    until = captured[-1] + timedelta(seconds=75)
-    if (until - since).total_seconds() > mediamtx_dvr.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
-        raise ValueError("The selected motion event is too long for bounded DVR analysis.")
-    return since, until, events
-
-
 def _temporal_error(
-    error: str,
+    message: str,
     *,
-    status: str = "insufficient_footage",
+    status: str = "no_footage",
     since: Optional[datetime] = None,
     until: Optional[datetime] = None,
     event: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ok": False,
+        "source": "frigate",
         "analysis_status": status,
-        "error": error,
-        "source": "continuous_dvr",
+        "error": message,
     }
     if since is not None:
-        result["analyzed_started_at"] = _dvr_iso(since)
-        result["started_at_local"] = since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+        result["analyzed_started_at"] = _iso(since)
+        result["started_at_local"] = _local(since)
     if until is not None:
-        result["analyzed_ended_at"] = _dvr_iso(until)
-        result["ended_at_local"] = until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+        result["analyzed_ended_at"] = _iso(until)
+        result["ended_at_local"] = _local(until)
     if event is not None:
-        if event.get("id") is not None:
-            result["event_id"] = event["id"]
-        if event.get("burst_id") is not None:
-            result["burst_id"] = event["burst_id"]
+        result["event_id"] = event.get("id")
     return result
 
 
-def _decorate_legacy_clip(store, result: dict[str, Any], burst_id: Optional[int]) -> dict[str, Any]:
-    if not result.get("ok") or burst_id is None:
-        return result
+async def _vision_ready(router) -> bool:
+    if router.supports_vision():
+        return True
     try:
-        events = store.list_camera_events_by_burst(int(burst_id))
+        await router.ensure_capability(vision=True)
+        return True
+    except asyncio.CancelledError:
+        raise
     except Exception:
-        return result
-    caption = _preferred_burst_caption(events)
-    if caption:
-        result = dict(result)
-        result["caption"] = caption
-    result.setdefault("source", "stored_frame_timelapse")
-    return result
+        return False
 
 
-class OnvifCameraMonitor(legacy.CameraMonitor):
-    """Keep legacy behavior as fallback; use camera-native motion when healthy."""
-
-    def __init__(self, settings, exterior_camera, router, store, *, dvr):
-        super().__init__(settings, exterior_camera, router, store)
-        self.dvr = dvr
-        self._onvif_motion_active = False
-        self._monitor_wake = asyncio.Event()
-
-    def stop(self) -> None:
-        super().stop()
-        self._monitor_wake.set()
-
-    def _mark_dvr_events_unhealthy(self) -> None:
-        """Fail closed across old and new CameraDVR implementations."""
-
-        marker = getattr(self.dvr, "mark_events_unhealthy", None)
-        if callable(marker):
-            try:
-                marker()
-                return
-            except Exception:
-                log.warning("could not mark DVR event health through its public API", exc_info=True)
-        for setter_name in ("set_events_healthy", "set_event_health"):
-            setter = getattr(self.dvr, setter_name, None)
-            if not callable(setter):
-                continue
-            try:
-                setter(False)
-                return
-            except Exception:
-                log.warning("could not clear DVR event health through its public API", exc_info=True)
-        if hasattr(self.dvr, "_events_healthy"):
-            # Compatibility for the feature branch's original CameraDVR.  The
-            # guarded public methods above are preferred when available.
-            self.dvr._events_healthy = False
-
-    def _lose_onvif_authority(self) -> None:
-        self._onvif_motion_active = False
-        self._mark_dvr_events_unhealthy()
-        self._monitor_wake.set()
-
-    async def run_forever(self) -> None:
-        event_task = asyncio.create_task(self._supervise_onvif_events())
-        next_tick_at = 0.0
-        last_health: Optional[bool] = None
-        try:
-            while not self._stopped:
-                now = time.monotonic()
-                healthy = bool(self.dvr.events_healthy)
-                health_changed = last_health is not None and healthy != last_health
-                if last_health is True and not healthy:
-                    # A reconnect must not inherit an active latch from the
-                    # dead subscription.  The current documentation burst may
-                    # continue under frame-difference fallback.
-                    self._onvif_motion_active = False
-
-                if now >= next_tick_at or health_changed or self._monitor_wake.is_set():
-                    self._monitor_wake.clear()
-                    try:
-                        if healthy:
-                            await self._onvif_tick()
-                        else:
-                            await super()._tick()
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        log.exception("camera security monitoring tick failed")
-
-                    healthy = bool(self.dvr.events_healthy)
-                    if healthy:
-                        interval = (
-                            self.settings.camera_motion_burst_interval_seconds
-                            if self._burst_until is not None
-                            else min(60, self.settings.camera_baseline_interval_seconds)
-                        )
-                    else:
-                        interval = (
-                            self.settings.camera_motion_burst_interval_seconds
-                            if self._burst_until is not None
-                            else self.settings.camera_monitor_interval_seconds
-                        )
-                    next_tick_at = time.monotonic() + max(1, interval)
-                    last_health = healthy
-
-                wait_seconds = min(
-                    _EVENT_HEALTH_POLL_SECONDS,
-                    max(0.05, next_tick_at - time.monotonic()),
-                )
-                try:
-                    await asyncio.wait_for(self._monitor_wake.wait(), timeout=wait_seconds)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            event_task.cancel()
-            await asyncio.gather(event_task, return_exceptions=True)
-
-    async def _supervise_onvif_events(self) -> None:
-        while not self._stopped:
-            try:
-                await self._run_onvif_events()
-                if not self._stopped:
-                    log.warning("ONVIF event consumer ended unexpectedly; restarting")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("ONVIF event consumer failed; restarting")
-            if self._stopped:
-                return
-            self._lose_onvif_authority()
-            await asyncio.sleep(_EVENT_CONSUMER_RESTART_SECONDS)
-
-    async def _run_onvif_events(self) -> None:
-        async for active in self.dvr.motion_states():
-            if self._stopped:
-                return
-            now = time.monotonic()
-            if active:
-                continuing_burst = bool(
-                    self._current_burst_id is not None
-                    and self._burst_until is not None
-                    and now < self._burst_until
-                )
-                starting = not continuing_burst
-                self._onvif_motion_active = True
-                if starting:
-                    self._current_burst_id = self._next_burst_id
-                    self._next_burst_id += 1
-                self._burst_until = now + self.settings.camera_motion_burst_seconds
-                self._monitor_wake.set()
-                if starting:
-                    await self._capture_onvif_opening_frame()
-            else:
-                self._onvif_motion_active = False
-                if self._burst_until is not None:
-                    self._burst_until = min(self._burst_until, now + 20)
-                self._monitor_wake.set()
-
-    async def _capture_onvif_opening_frame(self) -> None:
-        for attempt in range(2):
-            if self._current_burst_id is None:
-                return
-            try:
-                frame = await self.exterior_camera.capture_snapshot()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.warning("ONVIF motion snapshot capture failed", exc_info=True)
-                frame = None
-            if frame is not None:
-                filename = self._write_snapshot(frame.raw, "motion")
-                event_id = self.store.add_camera_event(
-                    trigger="motion",
-                    snapshot_filename=filename,
-                    motion_score=None,
-                    burst_id=self._current_burst_id,
-                )
-                person, vehicle = await self._analyze_security_frame(event_id, frame)
-                if person is True or vehicle is True:
-                    return
-            if attempt == 0:
-                await asyncio.sleep(_SECOND_LOOK_DELAY_SECONDS)
-
-    async def _analyze_security_frame(self, event_id: int, frame) -> tuple[Optional[bool], Optional[bool]]:
-        if not self.router.supports_vision():
-            try:
-                await self.router.ensure_capability(vision=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.warning("could not switch to a vision worker for an ONVIF motion event")
-                return None, None
-        try:
-            raw_caption = await camera_svc.caption_frame(
-                self.router, frame, _SECURITY_ANALYSIS_PROMPT
-            )
-        except Exception:
-            log.warning("ONVIF motion-event captioning failed", exc_info=True)
-            return None, None
-        person, vehicle, description = _parse_security_caption(raw_caption)
-        self.store.update_camera_event_caption(
-            event_id,
-            caption=description,
-            person_detected=person,
-            vehicle_detected=vehicle,
-        )
-        if person or vehicle:
-            delivered = await self._notify_security(description)
-            if delivered > 0:
-                self.store.mark_camera_event_notified(event_id)
-        return person, vehicle
-
-    async def _notify_security(self, description: str) -> int:
-        owner = self.store.get_owner()
-        if not owner:
-            return 0
-        user = self.store.get_user_by_google_sub(owner["google_sub"])
-        if not user:
-            return 0
-        try:
-            return int(await push_notifications.send_push_async(
-                self.store,
-                self.settings,
-                user["id"],
-                "X noticed something",
-                description,
-            ) or 0)
-        except Exception:
-            log.warning("push notification failed", exc_info=True)
-            return 0
-
-    async def _onvif_tick(self) -> None:
-        frame = await self.exterior_camera.capture_snapshot()
-        if frame is None:
-            self._sweep_retention()
-            return
-        # Keep the legacy detector's comparison frame current while ONVIF is
-        # authoritative.  If the subscription degrades, fallback compares a
-        # normal monitoring interval instead of an hours-old pre-ONVIF frame.
-        self._previous_raw = frame.raw
-        now = time.monotonic()
-        is_baseline = (
-            self._last_baseline_at is None
-            or now - self._last_baseline_at >= self.settings.camera_baseline_interval_seconds
-        )
-        if is_baseline:
-            self._last_baseline_at = now
-            filename = self._write_snapshot(frame.raw, "interval")
-            self.store.add_camera_event(trigger="interval", snapshot_filename=filename)
-
-        in_burst = self._burst_until is not None and now < self._burst_until
-        if in_burst and self._current_burst_id is not None:
-            filename = self._write_snapshot(frame.raw, "motion")
-            self.store.add_camera_event(
-                trigger="motion",
-                snapshot_filename=filename,
-                burst_id=self._current_burst_id,
-            )
-        elif self._burst_until is not None:
-            self._burst_until = None
-            self._current_burst_id = None
-        self._sweep_retention()
+# -------------------------------------------------------------------- tools
 
 
-async def camera_event_history(store, args: dict, *, dvr) -> dict[str, Any]:
-    history_args = dict(args)
-    dvr_bounds: dict[str, Optional[str]] = {"since": None, "until": None}
-    for key in ("since", "until"):
-        parsed = _parse_iso(history_args.get(key))
-        if parsed is not None:
-            history_args[key] = parsed.strftime("%Y-%m-%d %H:%M:%S")
-            dvr_bounds[key] = _dvr_iso(parsed)
-        elif args.get(key):
-            dvr_bounds[key] = str(args[key])
-    result = await legacy.camera_event_history(store, history_args)
-    result["dvr_url"] = "/dvr"
+async def camera_event_history(args: dict, *, surveillance) -> dict[str, Any]:
+    """What the recorder actually detected, and whether it is reachable at all."""
+    since = _parse_iso(args.get("since"))
+    until = _parse_iso(args.get("until"))
     try:
-        result["dvr_status"] = await dvr.status()
-        if args.get("include_recordings"):
-            result["recordings"] = await dvr.list_segments(
-                since=dvr_bounds["since"], until=dvr_bounds["until"], limit=40
-            )
-    except Exception as exc:
-        result["dvr_status"] = {
-            "ok": False,
-            "recording": False,
-            "last_error": str(exc),
+        limit = min(max(int(args.get("limit") or DEFAULT_HISTORY_ITEMS), 1), MAX_HISTORY_ITEMS)
+    except (TypeError, ValueError):
+        limit = DEFAULT_HISTORY_ITEMS
+
+    status = await surveillance.status()
+    result: dict[str, Any] = {
+        "source": "frigate",
+        "frigate_status": status,
+        "frigate_url": status.get("base_url"),
+    }
+    try:
+        items = await surveillance.events(since=since, until=until, limit=limit)
+    except FrigateError as exc:
+        result.update(surveillance_svc.error_result(exc))
+        result["items"] = []
+        result["total_count"] = 0
+        result["shown_count"] = 0
+        return result
+
+    for item in items:
+        if item.get("id"):
+            item["snapshot_url"] = snapshot_url(item["id"])
+        item.setdefault("trigger", "detection")
+        item.setdefault("captured_at", item.get("started_at"))
+        item.setdefault("captured_at_local", item.get("started_at_local"))
+
+    result.update(
+        {
+            "ok": True,
+            "state": FrigateState.AVAILABLE if items else FrigateState.NO_EVENT_DATA,
+            "total_count": len(items),
+            "shown_count": len(items),
+            "truncated": len(items) >= limit,
+            "items": items,
         }
+    )
+    if not items:
+        # "Frigate detected nothing" and "there is no recording" are
+        # different facts, and conflating them is how a camera answer
+        # becomes a false reassurance.
+        result["note"] = surveillance_svc.state_message(FrigateState.NO_EVENT_DATA)
+
+    if args.get("include_recordings"):
+        try:
+            result["recordings"] = await surveillance.recordings(
+                since=since, until=until, limit=surveillance_svc.MAX_RECORDING_SPANS
+            )
+        except FrigateError as exc:
+            result["recordings"] = []
+            result["recordings_error"] = surveillance_svc.state_message(exc.state)
     return result
 
 
-async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str, Any]:
-    """Answer temporal security questions from actual DVR frames, never captions."""
+async def camera_footage_analyze(router, args: dict, *, surveillance) -> dict[str, Any]:
+    """Answer temporal security questions from real recorded frames, never captions."""
     event: Optional[dict[str, Any]] = None
     raw_event_id = args.get("event_id")
-    if raw_event_id is not None:
-        try:
-            event = store.get_camera_event(int(raw_event_id))
-        except (TypeError, ValueError):
-            return _temporal_error("event_id must be an integer.", status="invalid_request")
-        if event is None:
-            return _temporal_error("The requested camera event was not found.", status="missing_event")
-
     requested_since = _parse_iso(args.get("since"))
     requested_until = _parse_iso(args.get("until"))
+
     if (requested_since is None) != (requested_until is None):
         return _temporal_error(
-            "Both since and until are required for a DVR temporal-analysis range.",
+            "Both since and until are required for a temporal-analysis range.",
             status="invalid_request",
         )
 
-    selected_events: list[dict[str, Any]] = []
-    # True only when a broad requested range got narrowed to one motion
-    # event's bounded window -- the result must say so, not present that
-    # narrow slice as if it covered the whole request. A camera can miss real
-    # activity (no ONVIF motion trigger fired), so "no motion found" is never
-    # grounds to imply nothing happened in the unexamined remainder.
-    range_narrowed = False
-    if event is not None:
-        try:
-            since, until, selected_events = _temporal_event_window(store, event)
-        except ValueError as exc:
-            return _temporal_error(str(exc), status="invalid_event", event=event)
-    elif requested_since is not None and requested_until is not None:
-        since, until = requested_since, requested_until
-        if (until - since).total_seconds() > mediamtx_dvr.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
-            event = _motion_event_in_range(store, since, until)
-            if event is None:
+    try:
+        if raw_event_id is not None:
+            since, until, event = await surveillance.event_window(str(raw_event_id))
+        elif requested_since is not None and requested_until is not None:
+            since, until = requested_since, requested_until
+        else:
+            recent = await surveillance.events(limit=1)
+            if not recent:
                 return _temporal_error(
-                    "No motion event was detected anywhere in that range, and it is too long to "
-                    "examine directly. The camera's motion detector can miss real activity, so "
-                    "this does not mean nothing happened -- ask about a specific few-minute window "
-                    "and the continuous recording can be checked directly, motion event or not.",
-                    status="range_too_broad",
-                    since=since,
-                    until=until,
+                    surveillance_svc.state_message(FrigateState.NO_EVENT_DATA),
+                    status="missing_event",
                 )
-            range_narrowed = True
-            try:
-                since, until, selected_events = _temporal_event_window(store, event)
-            except ValueError as exc:
-                return _temporal_error(str(exc), status="invalid_event", event=event)
-    else:
-        try:
-            event = store.get_last_camera_event(trigger="motion")
-        except Exception:
-            event = None
-        if event is None:
-            return _temporal_error("No stored motion event is available for DVR analysis.", status="missing_event")
-        try:
-            since, until, selected_events = _temporal_event_window(store, event)
-        except ValueError as exc:
-            return _temporal_error(str(exc), status="invalid_event", event=event)
+            since, until, event = await surveillance.event_window(recent[0]["id"])
+    except FrigateError as exc:
+        return _temporal_error(
+            surveillance_svc.state_message(exc.state, str(exc)), status=exc.state
+        )
 
     if until <= since:
-        return _temporal_error("DVR analysis end time must be after start time.", status="invalid_request", event=event)
+        return _temporal_error(
+            "Analysis end time must be after start time.", status="invalid_request", event=event
+        )
+    duration = (until - since).total_seconds()
+    if duration > surveillance_svc.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS:
+        limit_minutes = surveillance_svc.MAX_FOOTAGE_ANALYSIS_DURATION_SECONDS // 60
+        return _temporal_error(
+            f"That range is too long to examine directly; bounded analysis covers about "
+            f"{limit_minutes} minutes at a time. Ask about a specific few-minute window and "
+            "the continuous recording can be checked directly, detection or not.",
+            status="range_too_broad",
+            since=since,
+            until=until,
+        )
+
     try:
-        samples = await dvr.footage_analysis_samples(since, until)
+        samples = await surveillance.analysis_samples(since, until)
     except asyncio.CancelledError:
         raise
-    except FileNotFoundError:
+    except FrigateError as exc:
         return _temporal_error(
-            "The continuous DVR does not retain a complete recording for that temporal analysis interval.",
+            surveillance_svc.state_message(exc.state, str(exc)),
+            status=exc.state,
             since=since,
             until=until,
             event=event,
         )
-    except mediamtx_dvr.PlaybackPreparationError:
+    except surveillance_svc.FootagePreparationError:
         return _temporal_error(
-            "DVR frame extraction could not complete promptly; no temporal conclusion was made.",
+            "Frame extraction could not complete promptly; no temporal conclusion was made.",
             status="frame_extraction_failed",
             since=since,
             until=until,
             event=event,
         )
-    except ValueError as exc:
-        return _temporal_error(str(exc), status="invalid_request", since=since, until=until, event=event)
     except Exception:
-        log.warning("DVR temporal frame extraction failed", exc_info=True)
+        log.warning("temporal frame extraction failed", exc_info=True)
         return _temporal_error(
-            "DVR frame extraction failed; no temporal conclusion was made.",
+            "Frame extraction failed; no temporal conclusion was made.",
             status="frame_extraction_failed",
             since=since,
             until=until,
@@ -698,9 +426,9 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
             bytes(samples["contact_sheet"]), "image/jpeg"
         )
     except (KeyError, TypeError, ValueError) as exc:
-        log.warning("DVR temporal contact sheet was invalid: %s", exc)
+        log.warning("temporal contact sheet was invalid: %s", exc)
         return _temporal_error(
-            "DVR analysis frames could not be validated; no temporal conclusion was made.",
+            "Analysis frames could not be validated; no temporal conclusion was made.",
             status="frame_validation_failed",
             since=since,
             until=until,
@@ -712,31 +440,28 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
         try:
             question = camera_svc.camera_prompt(question)
         except ValueError as exc:
-            return _temporal_error(str(exc), status="invalid_request", since=since, until=until, event=event)
+            return _temporal_error(
+                str(exc), status="invalid_request", since=since, until=until, event=event
+            )
     prompt = _FOOTAGE_ANALYSIS_PROMPT + (
         f"\nOperator temporal question: {question}" if question else ""
     )
-    if not router.supports_vision():
-        try:
-            await router.ensure_capability(vision=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return _temporal_error(
-                "A vision-capable Omni worker could not be made available for DVR analysis.",
-                status="vision_unavailable",
-                since=since,
-                until=until,
-                event=event,
-            )
+    if not await _vision_ready(router):
+        return _temporal_error(
+            "A vision-capable Omni worker could not be made available for footage analysis.",
+            status="vision_unavailable",
+            since=since,
+            until=until,
+            event=event,
+        )
     try:
         raw_caption = await camera_svc.caption_frame(router, contact_sheet, prompt)
     except asyncio.CancelledError:
         raise
     except Exception:
-        log.warning("DVR temporal vision analysis failed", exc_info=True)
+        log.warning("temporal vision analysis failed", exc_info=True)
         return _temporal_error(
-            "The DVR frames were extracted, but Omni could not analyze them; no temporal conclusion was made.",
+            "The frames were extracted, but Omni could not analyze them; no temporal conclusion was made.",
             status="vision_failed",
             since=since,
             until=until,
@@ -744,7 +469,7 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
         )
     parsed = _parse_footage_analysis_caption(raw_caption)
     if parsed is None:
-        log.warning("DVR temporal vision response did not match its evidence contract")
+        log.warning("temporal vision response did not match its evidence contract")
         return _temporal_error(
             "Omni did not return a complete temporal-evidence result; no temporal conclusion was made.",
             status="unstructured_vision_result",
@@ -756,17 +481,16 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
     clip_url: Optional[str] = None
     playback_error: Optional[str] = None
     try:
-        path = await dvr.range_clip(
-            since,
-            until,
-            cache_name=f"range-{int(since.timestamp())}-{int(until.timestamp())}",
+        playback = await surveillance.playback(since, until)
+        clip_url = playback["clip_url"]
+    except FrigateError as exc:
+        playback_error = (
+            "The analyzed frames are available, but playable footage is not: "
+            + surveillance_svc.state_message(exc.state)
         )
-        clip_url = f"/dvr/api/clips/{path.name}"
-    except mediamtx_dvr.PlaybackPreparationError:
-        playback_error = "The analyzed frames are available, but a playable DVR clip could not be prepared promptly."
     except Exception:
-        log.info("DVR temporal analysis playback clip was unavailable", exc_info=True)
-        playback_error = "The analyzed frames are available, but a playable DVR clip is unavailable."
+        log.info("temporal analysis playback was unavailable", exc_info=True)
+        playback_error = "The analyzed frames are available, but playable footage is unavailable."
 
     def detected(value: str) -> Optional[bool]:
         return True if value == "yes" else False if value == "no" else None
@@ -776,12 +500,13 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
     sufficient = parsed["SUFFICIENCY"] == "sufficient"
     result: dict[str, Any] = {
         "ok": True,
+        "state": FrigateState.AVAILABLE,
         "analysis_status": "sufficient" if sufficient else "insufficient_evidence",
-        "source": "continuous_dvr",
+        "source": "frigate",
         "analyzed_started_at": samples["analyzed_started_at"],
         "analyzed_ended_at": samples["analyzed_ended_at"],
-        "started_at_local": since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
-        "ended_at_local": until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+        "started_at_local": _local(since),
+        "ended_at_local": _local(until),
         "sample_count": int(samples["sample_count"]),
         "sampled_at": list(samples["sampled_at"]),
         "source_segments": list(samples["source_segments"]),
@@ -789,8 +514,8 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
         "vehicle_detected": detected(parsed["VEHICLE"]),
         "vehicle_movement_observation": movement,
         "person_interaction_observation": interaction,
-        # Only an observed positive becomes a boolean conclusion.  Absence in
-        # sparse samples is deliberately represented by the explicit enum.
+        # Only an observed positive becomes a boolean conclusion. Absence in
+        # sparse samples stays the explicit enum.
         "vehicle_movement_observed": True if movement == "observed" else None,
         "person_interaction_observed": True if interaction == "observed" else None,
         "description": parsed["DESCRIPTION"],
@@ -801,204 +526,182 @@ async def camera_footage_analyze(store, router, args: dict, *, dvr) -> dict[str,
     }
     if event is not None:
         result["event_id"] = event.get("id")
-        result["burst_id"] = event.get("burst_id")
-    if selected_events:
-        result["event_frame_count"] = len(selected_events)
-    if range_narrowed and requested_since is not None and requested_until is not None:
-        requested_since_local = requested_since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
-        requested_until_local = requested_until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
-        result["range_narrowed"] = True
-        result["requested_started_at"] = _dvr_iso(requested_since)
-        result["requested_ended_at"] = _dvr_iso(requested_until)
-        result["requested_started_at_local"] = requested_since_local
-        result["requested_ended_at_local"] = requested_until_local
-        result["coverage_note"] = (
-            f"This only examined the motion event at {result['started_at_local']}"
-            f"–{result['ended_at_local']}; the rest of the requested "
-            f"{requested_since_local}–{requested_until_local} range was not checked "
-            "because no other motion was detected there. The camera's motion detector can "
-            "miss real activity, so that is not proof nothing else happened -- ask about a "
-            "specific time in that range to check the continuous recording directly."
-        )
     return result
 
 
-async def _continuous_event_clip_result(store, dvr, burst_id: int) -> dict[str, Any]:
-    path = await dvr.event_clip(store, int(burst_id))
-    events = store.list_camera_events_by_burst(int(burst_id))
-    caption = _preferred_burst_caption(events)
-    return {
-        "ok": True,
-        "burst_id": int(burst_id),
-        "clip_url": f"/dvr/api/clips/{path.name}",
-        "frame_count": len(events),
-        "started_at_local": legacy._local_time_str(events[0]["captured_at"]) if events else None,
-        "ended_at_local": legacy._local_time_str(events[-1]["captured_at"]) if events else None,
-        "caption": caption,
-        "source": "continuous_dvr",
-        "cached": True,
-    }
-
-
-async def camera_motion_clip(store, settings, ffmpeg_path, args: dict, *, dvr) -> dict[str, Any]:
+async def camera_motion_clip(args: dict, *, surveillance) -> dict[str, Any]:
+    """Playable recorded footage for a detection or an explicit time range."""
     since = _parse_iso(args.get("since"))
     until = _parse_iso(args.get("until"))
-    if since or until:
-        if since is None or until is None:
-            return {"ok": False, "error": "Both since and until are required for DVR time-range playback."}
-        if (until - since).total_seconds() > mediamtx_dvr.MAX_TOOL_PLAYBACK_DURATION_SECONDS:
-            # A broad history query is useful to find motion, but it is not a
-            # reasonable synchronous browser artifact.  Prefer the actual
-            # motion window it contains rather than holding chat while FFmpeg
-            # transcodes many minutes of HEVC.
-            historical = _motion_event_in_range(store, since, until)
-            if historical is not None and historical.get("burst_id") is not None:
-                try:
-                    selected = await _continuous_event_clip_result(
-                        store, dvr, int(historical["burst_id"])
-                    )
-                    selected["requested_started_at_local"] = since.astimezone().strftime(
-                        "%Y-%m-%d %I:%M:%S %p %Z"
-                    )
-                    selected["requested_ended_at_local"] = until.astimezone().strftime(
-                        "%Y-%m-%d %I:%M:%S %p %Z"
-                    )
-                    selected["selected_motion_event_id"] = historical.get("id")
-                    selected["selected_from_broad_range"] = True
-                    return selected
-                except mediamtx_dvr.PlaybackPreparationError:
-                    return {
-                        "ok": False,
-                        "source": "continuous_dvr",
-                        "error": "DVR playback could not be prepared within the bounded time limit; no video was displayed.",
-                    }
-                except Exception:
-                    log.info("bounded event playback was unavailable", exc_info=True)
-            return {
-                "ok": False,
-                "source": "continuous_dvr",
-                "error": "Continuous DVR playback is limited to five minutes. Select a motion event or a shorter time range.",
-            }
-        playback_since = since
-        playback_until = until
-        partial = False
-        try:
-            path = await dvr.range_clip(
-                playback_since,
-                playback_until,
-                cache_name=(
-                    f"range-{int(playback_since.timestamp())}-"
-                    f"{int(playback_until.timestamp())}"
-                ),
-            )
-        except mediamtx_dvr.PlaybackPreparationError:
-            return {
-                "ok": False,
-                "source": "continuous_dvr",
-                "error": "DVR playback could not be prepared within the bounded time limit; no video was displayed.",
-            }
-        except Exception:
-            # "Around 5:33" commonly expands to a window whose first minute
-            # predates the first retained segment.  Return the truthful
-            # overlapping completed portion instead of discarding available
-            # footage.  range_clip still enforces continuity and source truth.
-            try:
-                overlapping = await dvr.list_segments(
-                    since=_dvr_iso(since),
-                    until=_dvr_iso(until),
-                    limit=mediamtx_dvr.MAX_PLAYBACK_SEGMENTS,
-                    complete_only=True,
-                )
-            except Exception:
-                overlapping = []
-            starts = [
-                value
-                for value in (_parse_iso(row.get("started_at")) for row in overlapping)
-                if value is not None
-            ]
-            ends = [
-                value
-                for value in (_parse_iso(row.get("ended_at")) for row in overlapping)
-                if value is not None
-            ]
-            if starts and ends:
-                playback_since = max(since, min(starts))
-                playback_until = min(until, max(ends))
-            if playback_until <= playback_since or (
-                playback_since == since and playback_until == until
-            ):
-                path = None
-            else:
-                try:
-                    path = await dvr.range_clip(
-                        playback_since,
-                        playback_until,
-                        cache_name=(
-                            f"range-{int(playback_since.timestamp())}-"
-                            f"{int(playback_until.timestamp())}"
-                        ),
-                    )
-                    partial = True
-                except mediamtx_dvr.PlaybackPreparationError:
-                    return {
-                        "ok": False,
-                        "source": "continuous_dvr",
-                        "error": "DVR playback could not be prepared within the bounded time limit; no video was displayed.",
-                    }
-                except Exception:
-                    path = None
-        if path is not None:
-            return {
-                "ok": True,
-                "clip_url": f"/dvr/api/clips/{path.name}",
-                "started_at_local": playback_since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
-                "ended_at_local": playback_until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
-                "requested_started_at_local": since.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
-                "requested_ended_at_local": until.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z"),
-                "partial": partial,
-                "source": "continuous_dvr",
-                "cached": True,
-            }
-        historical = _motion_event_in_range(store, since, until)
-        if historical is not None:
-            fallback = await legacy.camera_motion_clip(
-                store,
-                settings,
-                ffmpeg_path,
-                {"event_id": historical["id"]},
-            )
-            fallback = _decorate_legacy_clip(
-                store, fallback, int(historical["burst_id"])
-            )
-            if fallback.get("ok"):
-                return fallback
+    raw_event_id = args.get("event_id")
+    event: Optional[dict[str, Any]] = None
+
+    try:
+        if since or until:
+            if since is None or until is None:
+                return {
+                    "ok": False,
+                    "source": "frigate",
+                    "state": FrigateState.INVALID_REQUEST,
+                    "error": "Both since and until are required for time-range playback.",
+                }
+            if (until - since).total_seconds() > surveillance_svc.MAX_TOOL_PLAYBACK_DURATION_SECONDS:
+                minutes = surveillance_svc.MAX_TOOL_PLAYBACK_DURATION_SECONDS // 60
+                return {
+                    "ok": False,
+                    "source": "frigate",
+                    "state": FrigateState.INVALID_REQUEST,
+                    "error": (
+                        f"Playback is limited to {minutes} minutes. "
+                        "Pick a detection or a shorter time range."
+                    ),
+                }
+        elif raw_event_id is not None:
+            since, until, event = await surveillance.event_window(str(raw_event_id))
+        else:
+            recent = await surveillance.events(limit=1)
+            if not recent:
+                return {
+                    "ok": False,
+                    "source": "frigate",
+                    "state": FrigateState.NO_EVENT_DATA,
+                    "error": surveillance_svc.state_message(FrigateState.NO_EVENT_DATA),
+                }
+            since, until, event = await surveillance.event_window(recent[0]["id"])
+        playback = await surveillance.playback(since, until)
+    except FrigateError as exc:
+        return surveillance_svc.error_result(exc)
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "source": "frigate",
+        "state": FrigateState.AVAILABLE,
+        "clip_url": playback["clip_url"],
+        "started_at_local": playback["started_at_local"],
+        "ended_at_local": playback["ended_at_local"],
+        "requested_started_at_local": _local(since),
+        "requested_ended_at_local": _local(until),
+        "partial": playback["partial"],
+    }
+    if event is not None:
+        result["event_id"] = event.get("id")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        labels = [str(label) for label in (data.get("objects") or []) if label]
+        if labels:
+            result["labels"] = labels
+    return result
+
+
+async def camera_snapshot_analyze(router, args: dict, *, surveillance) -> dict[str, Any]:
+    """One still -- a detection's snapshot, or the camera's current view."""
+    raw_event_id = args.get("event_id")
+    captured_at = datetime.now(timezone.utc)
+    try:
+        if raw_event_id is not None:
+            event_id = str(raw_event_id)
+            since, _until, event = await surveillance.event_window(event_id)
+            captured_at = since
+            frame_bytes = await surveillance.event_snapshot(event_id)
+            image_url = snapshot_url(event_id)
+            trigger = "detection"
+        else:
+            event_id = None
+            event = None
+            frame_bytes = await surveillance.latest_frame()
+            image_url = latest_frame_url()
+            trigger = "current_view"
+    except FrigateError as exc:
+        return surveillance_svc.error_result(exc)
+
+    try:
+        frame = camera_svc.validate_camera_frame(bytes(frame_bytes), "image/jpeg")
+    except (TypeError, ValueError) as exc:
         return {
             "ok": False,
-            "error": "Continuous DVR footage is unavailable for that time range.",
+            "source": "frigate",
+            "state": FrigateState.UNAVAILABLE,
+            "error": f"The camera image could not be validated: {exc}",
         }
 
-    raw_event_id = args.get("event_id")
-    if raw_event_id is not None:
+    custom_prompt = str(args.get("prompt") or "").strip()
+    if custom_prompt:
         try:
-            event = store.get_camera_event(int(raw_event_id))
-        except (TypeError, ValueError):
-            event = None
-        burst_id = event.get("burst_id") if event else None
-    else:
-        burst_id = store.get_latest_motion_burst_id()
-
-    if burst_id is not None:
-        try:
-            return await _continuous_event_clip_result(store, dvr, int(burst_id))
-        except mediamtx_dvr.PlaybackPreparationError:
+            custom_prompt = camera_svc.camera_prompt(custom_prompt)
+        except ValueError as exc:
             return {
                 "ok": False,
-                "source": "continuous_dvr",
-                "error": "DVR playback could not be prepared within the bounded time limit; no video was displayed.",
+                "source": "frigate",
+                "state": FrigateState.INVALID_REQUEST,
+                "error": str(exc),
             }
-        except Exception:
-            pass
+    prompt = _SECURITY_ANALYSIS_PROMPT + (
+        f"\nOperator question: {custom_prompt}" if custom_prompt else ""
+    )
+    if not await _vision_ready(router):
+        return {
+            "ok": False,
+            "source": "frigate",
+            "state": FrigateState.UNAVAILABLE,
+            "error": "A vision-capable Omni worker could not be made available.",
+            "snapshot_url": image_url,
+        }
+    try:
+        raw_caption = await camera_svc.caption_frame(router, frame, prompt)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning("camera still analysis failed", exc_info=True)
+        return {
+            "ok": False,
+            "source": "frigate",
+            "state": FrigateState.UNAVAILABLE,
+            "error": "The image was retrieved, but Omni could not analyze it.",
+            "snapshot_url": image_url,
+        }
+    person, vehicle, description = _parse_security_caption(raw_caption)
+    result: dict[str, Any] = {
+        "ok": True,
+        "source": "frigate",
+        "state": FrigateState.AVAILABLE,
+        "trigger": trigger,
+        "captured_at": _iso(captured_at),
+        "captured_at_local": _local(captured_at),
+        "caption": description,
+        "person_detected": person,
+        "vehicle_detected": vehicle,
+        "snapshot_url": image_url,
+        "frame_sha256": frame.sha256,
+    }
+    if event_id is not None:
+        result["id"] = event_id
+        result["event_id"] = event_id
+    return result
 
-    fallback = await legacy.camera_motion_clip(store, settings, ffmpeg_path, args)
-    fallback_burst_id = fallback.get("burst_id") if isinstance(fallback, dict) else None
-    return _decorate_legacy_clip(store, fallback, fallback_burst_id or burst_id)
+
+async def exterior_camera_look(router, args: dict, *, surveillance) -> dict[str, Any]:
+    """"Look outside" -- the camera's current frame, described from its pixels.
+
+    Kept under the existing exterior_camera_request tool name. It no longer
+    asks the browser to open a proxied stream: Frigate already holds the
+    current frame, so X fetches it, looks at it, and answers.
+    """
+    result = await camera_snapshot_analyze(router, {"prompt": args.get("prompt")}, surveillance=surveillance)
+    result["camera_source_id"] = "exterior"
+    result["live_frame_url"] = latest_frame_url()
+    status = await surveillance.status()
+    result["frigate_url"] = status.get("base_url")
+    result.setdefault("state", status.get("state"))
+    return result
+
+
+__all__ = [
+    "MAX_HISTORY_ITEMS",
+    "SECURITY_TOOL_SCHEMAS",
+    "camera_event_history",
+    "camera_footage_analyze",
+    "camera_motion_clip",
+    "camera_snapshot_analyze",
+    "exterior_camera_look",
+    "latest_frame_url",
+    "snapshot_url",
+]

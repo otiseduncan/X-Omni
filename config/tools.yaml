@@ -169,11 +169,11 @@ tools:
 
   exterior_camera_request:
     tier: read_only
-    description: "Request the configured local exterior camera inline; returns safe status and starts nothing until the operator uses the card."
+    description: "Look at the exterior camera's current view through the Frigate recorder and describe what is actually visible."
 
   camera_event_history:
     tier: read_only
-    description: "List stored exterior-camera snapshots (baseline and motion events)."
+    description: "List exterior-camera detections the Frigate recorder logged, most recent first."
 
   camera_snapshot_analyze:
     tier: read_only

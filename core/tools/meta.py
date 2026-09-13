@@ -422,7 +422,7 @@ def stage_action_schema(*, allow_unscoped_creates: bool = False) -> dict[str, An
 CAPABILITY_SEARCH_SCHEMA: dict[str, Any] = {
     "description": (
         "Find and unlock capabilities outside the permanent four: calendar, tasks, "
-        "files, exterior camera and DVR footage, ADAS SI document display and "
+        "files, exterior camera and recorded footage, ADAS SI document display and "
         "inventory, knowledge capture, ScrapeX reads and status, service starts, "
         "worker status. Matches become callable for the rest of this turn. Omit "
         "query to list everything. Catalog presence is not execution proof."

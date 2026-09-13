@@ -349,11 +349,9 @@ try {
     if ($owner) {
         Stop-VerifiedCore -Port $corePort
     }
-    # Continuous recording is owned by MediaMTX (an independently-managed
-    # process outside this repo, started by launch-mediamtx.ps1) and the
-    # standalone DVR GUI is its own service (core/dvr_service.py, launched
-    # separately) -- restarting Core must never stop either one. See
-    # install-mediamtx-startup.ps1 for how MediaMTX starts at logon.
+    # Surveillance recording lives on the Frigate machine, not here. This
+    # launcher starts and stops X Omni Core only; there is no recorder, no
+    # watchdog, and no camera process on Omega to keep alive or shut down.
 
     if (-not $setupRepaired) {
         Invoke-UiRebuild

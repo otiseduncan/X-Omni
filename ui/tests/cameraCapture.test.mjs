@@ -9,7 +9,6 @@ import {
   encodeCameraPromptHeader,
   fitCameraFrame,
   safeCameraObservationArtifact,
-  safeExteriorCameraSession,
   startCameraPreview,
   stopCameraPreview,
 } from "../src/lib/cameraCapture.js";
@@ -141,38 +140,6 @@ test("live preview stays open across explicit frame analysis and stop clears eve
   assert.equal(calls.stopped, 2);
 });
 
-test("exterior camera sessions accept only opaque IDs and same-origin stream URLs", () => {
-  const locationRef = { origin: "http://127.0.0.1:8100" };
-  assert.deepEqual(
-    safeExteriorCameraSession({
-      session_id: "exterior_12345678",
-      stream_url: "http://127.0.0.1:8100/api/cameras/exterior/sessions/exterior_12345678/stream?view=live",
-      status: "connected",
-      label: "Driveway",
-    }, locationRef),
-    {
-      session_id: "exterior_12345678",
-      stream_url: "/api/cameras/exterior/sessions/exterior_12345678/stream?view=live",
-      status: "connected",
-      label: "Driveway",
-    }
-  );
-  assert.throws(
-    () => safeExteriorCameraSession({
-      session_id: "short",
-      stream_url: "/api/cameras/exterior/stream",
-    }, locationRef),
-    /invalid exterior camera session/
-  );
-  assert.throws(
-    () => safeExteriorCameraSession({
-      session_id: "exterior_12345678",
-      stream_url: "https://example.com/camera.mjpeg",
-    }, locationRef),
-    /unsafe exterior camera stream URL/
-  );
-});
-
 test("a stream is stoppable immediately while preview frame readiness is still pending", async () => {
   let stopped = false;
   let releaseFrame;
@@ -265,6 +232,9 @@ test("camera observation state keeps only bounded answer and provenance", () => 
   assert.equal("data_url" in artifact.data, false);
   assert.equal("arbitrary_secret" in artifact.data, false);
 
+  // The exterior camera belongs to the Frigate recorder now. Its frames are
+  // read through the camera routes, never submitted through this path, so a
+  // payload claiming to be one is not an accepted observation source.
   const exterior = safeCameraObservationArtifact({
     type: "camera_observation",
     data: {
@@ -275,10 +245,7 @@ test("camera observation state keeps only bounded answer and provenance", () => 
       capture_transport: "mjpeg",
     },
   });
-  assert.equal(exterior.data.source, "exterior_camera_still");
-  assert.equal(exterior.data.camera_source_id, "exterior");
-  assert.equal(exterior.data.camera_label, "Driveway");
-  assert.equal(exterior.data.capture_transport, "mjpeg");
+  assert.notEqual(exterior.data.source, "exterior_camera_still");
 
   const timeline = timelineFromHistory([{
     id: 7,

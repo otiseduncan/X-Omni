@@ -165,8 +165,9 @@ core\
     chat.py            chat WebSocket
     routes.py          REST + voice transcription
   services\            weather, calendar, research, Google auth, camera vision,
-                       website preview, sequential image generation, bounded
-                       procedural video, sequential Wan image-to-video
+                       Frigate NVR client, website preview, sequential image
+                       generation, bounded procedural video, sequential Wan
+                       image-to-video
   state\               SQLite schema and access
   tools\               capability gateway, builtin tools
 ui\                    React + Vite, mobile-first PWA
@@ -176,6 +177,8 @@ config\
   .env.local           secrets (gitignored)
 data\                  SQLite lives here
 ```
+
+Surveillance lives outside this repository entirely: a Frigate NVR on its own Ubuntu machine owns the exterior camera, continuous recording, detection, and playback. X Omni reads its authenticated API on port `8971` at `FRIGATE_BASE_URL` and records nothing locally. Register X's Frigate account password with `scripts\configure-frigate.ps1`; it is sealed with Windows DPAPI, never stored in `.env`.
 
 Model weights and the llama.cpp runtime stay where they are under `X:\XV12\...`. X Omni reads them by absolute path and never writes into that tree. X11 and XV12 source trees are also reference-only file-search roots. To move model assets, edit `config\workers.json`.
 
@@ -199,7 +202,7 @@ Model weights and the llama.cpp runtime stay where they are under `X:\XV12\...`.
 
 ## What isn't built
 
-Arbitrary URL fetching/full-page extraction, arbitrary image attachments, finance quotes, autonomous continuous camera interpretation, image-to-image editing, reusable 3D-mesh reconstruction, and automatic model routing are not built. The PC webcam and configured exterior camera have operator-controlled live in-chat previews, but Omni analyzes only explicitly submitted current frames. Video creation has two explicit non-interchangeable modes: the proved deterministic `exact_source_animation` treatment and an `image_to_video` Wan2.2 TI2V-5B diffusion path. The Wan path is source-conditioned 2D video with depth-like motion, not a reusable 3D object; its three installed official model files pass pinned size and SHA-256 proof. A live 10-second, 240-frame Wan run completed on Omega with authenticated in-chat playback and verified Omni restoration. Frame analysis proved localized generative orb motion against a stable background rather than a whole-frame wobble, while also showing the current quality limitation: surface shimmer/morphing can replace fine source details and is not the same as a clean rigid 3D rotation. A Wan failure never falls back to procedural motion. Current web search is deliberately source-snippet bounded. Routing remains manual because a model swap is a real, visible operation.
+Arbitrary URL fetching/full-page extraction, arbitrary image attachments, finance quotes, autonomous continuous camera interpretation, image-to-image editing, reusable 3D-mesh reconstruction, and automatic model routing are not built. The PC webcam has an operator-controlled live in-chat preview and Omni analyzes only explicitly submitted current frames. The exterior camera belongs to the Frigate NVR; X reads its current frame, detections, and recorded footage through Frigate's API and never records or proxies the camera itself. Video creation has two explicit non-interchangeable modes: the proved deterministic `exact_source_animation` treatment and an `image_to_video` Wan2.2 TI2V-5B diffusion path. The Wan path is source-conditioned 2D video with depth-like motion, not a reusable 3D object; its three installed official model files pass pinned size and SHA-256 proof. A live 10-second, 240-frame Wan run completed on Omega with authenticated in-chat playback and verified Omni restoration. Frame analysis proved localized generative orb motion against a stable background rather than a whole-frame wobble, while also showing the current quality limitation: surface shimmer/morphing can replace fine source details and is not the same as a clean rigid 3D rotation. A Wan failure never falls back to procedural motion. Current web search is deliberately source-snippet bounded. Routing remains manual because a model swap is a real, visible operation.
 
 ---
 

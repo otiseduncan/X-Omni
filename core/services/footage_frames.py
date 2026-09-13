@@ -1,12 +1,15 @@
-"""Bounded, on-demand frame extraction for temporal DVR visual analysis.
+"""Bounded, on-demand frame extraction for temporal visual analysis.
 
-This is the one place X Omni still runs FFmpeg for the DVR, and it is
-deliberately narrow: given one already-bounded clip MediaMTX's Playback API
-already built (see mediamtx_client.fetch_clip_bytes), pull a handful of
-still frames out of it and assemble them into one chronological contact
-sheet for the existing vision worker. It never decodes continuously, never
-runs against a live/growing recording, and is only ever invoked for an
-explicit temporal question -- not on every frame, not on a schedule.
+This is the one place X Omni runs FFmpeg against recorded video, and it is
+deliberately narrow: given one already-bounded clip the recorder produced,
+pull a handful of still frames out of it and assemble them into one
+chronological contact sheet for the existing vision worker. It never
+decodes continuously, never runs against a live or growing recording, and
+is only ever invoked for an explicit temporal question -- not on every
+frame, not on a schedule.
+
+Nothing here knows which NVR produced the clip. It takes bytes and returns
+frames, so the recorder can change without this changing.
 """
 
 from __future__ import annotations
@@ -91,10 +94,10 @@ async def extract_frames(
 ) -> list[tuple[datetime, bytes]]:
     """Extract one still JPEG per requested time from a local clip file.
 
-    A requested offset landing exactly on (or near) a server-side segment
-    stitch boundary can occasionally fail to decode even though the
+    A requested offset landing exactly on (or near) a segment boundary in
+    the recorder's export can occasionally fail to decode even though the
     surrounding footage is fine -- nudging a few seconds earlier before
-    giving up on that one sample keeps a transient stitch artifact from
+    giving up on that one sample keeps a transient boundary artifact from
     silently costing the "after" evidence frame the analysis prompt
     depends on.
     """
@@ -110,14 +113,14 @@ async def extract_frames(
                     extracted.append((captured_at, frame_path.read_bytes()))
                     break
     if len(extracted) < MIN_SAMPLES:
-        raise FrameExtractionError("Insufficient DVR frames were extracted for temporal analysis.")
+        raise FrameExtractionError("Insufficient frames were extracted for temporal analysis.")
     return extracted
 
 
 def contact_sheet(samples: list[tuple[datetime, bytes]]) -> bytes:
     """Build one bounded chronological JPEG for the existing vision worker."""
     if not samples:
-        raise FrameExtractionError("No DVR frames were available for analysis.")
+        raise FrameExtractionError("No frames were available for analysis.")
     columns = min(3, len(samples))
     tile_width, tile_height, label_height, gutter = 400, 225, 24, 8
     rows = math.ceil(len(samples) / columns)
