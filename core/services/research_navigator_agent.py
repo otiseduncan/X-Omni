@@ -276,6 +276,42 @@ PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
 }
 
 
+async def _target_already_selected(
+    settings: Any, provider: str, target: dict[str, Any]
+) -> Optional[bool]:
+    """Whether the live provider session is on this exact vehicle, or None.
+
+    Best effort: a provider without the read, an unreachable service, or a
+    malformed answer all mean "not known", never "not selected".
+    """
+    reader = getattr(scrapex_svc, "navigator_current_target_signal", None)
+    if reader is None:
+        return None
+    try:
+        result = await reader(settings, provider, target)
+    except Exception as exc:  # noqa: BLE001 - a missing fact is not a failure
+        log.debug("target signal unavailable for %s: %s", provider, exc)
+        return None
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return None
+    selected = (result.get("data") or {}).get("selected")
+    return bool(selected) if isinstance(selected, bool) else None
+
+
+def _vehicle_selection_note(selected: Optional[bool], target: dict[str, Any]) -> str:
+    if selected is True:
+        return " The provider session already has this exact vehicle selected."
+    if selected is False:
+        note = (
+            " The provider session does NOT currently have this vehicle selected; the page "
+            "below belongs to whatever vehicle was open last."
+        )
+        if target.get("vin"):
+            note += " select_vehicle with the VIN above selects it exactly."
+        return note
+    return ""
+
+
 def _target_label(target: dict[str, Any]) -> str:
     parts = [
         str(target.get(key)).strip()
@@ -1143,6 +1179,14 @@ async def _run_task(
         }
 
     current_observation_id: Optional[str] = initial_summary.get("observation_id")
+    # Whether the provider session already has the requested vehicle selected
+    # is a mechanical fact the provider's own selection check can answer
+    # before any turn is spent. Measured on 2026-09-13: every baseline task
+    # ran its whole budget inside whichever vehicle happened to be open,
+    # because nothing ever said so. Stated as an observation; what to do
+    # about it stays the model's decision. Best effort -- an unavailable
+    # read simply says nothing rather than guessing.
+    initial_vehicle_selected = await _target_already_selected(settings, provider, target)
     initial_screenshot = await _task_screenshot(settings, task_id, current_observation_id)
     messages: list[dict[str, Any]] = [
         {
@@ -1152,7 +1196,8 @@ async def _run_task(
         {
             "role": "user",
             "content": _visual_observation_content(
-                f"Find the ALLDATA procedure for {_target_label(target)}: {topic}.",
+                f"Find the ALLDATA procedure for {_target_label(target)}: {topic}."
+                + _vehicle_selection_note(initial_vehicle_selected, target),
                 initial_summary,
                 initial_screenshot,
             ),
@@ -1164,6 +1209,7 @@ async def _run_task(
             "action": "observe",
             "attempts": initial_observe_attempts,
             "observation_id": current_observation_id,
+            "vehicle_already_selected": initial_vehicle_selected,
             "result": initial_summary,
         }
     ]
@@ -1825,6 +1871,7 @@ async def _run_task(
         "extracted_text": (evidence.get("extracted_text") or "")[:20_000],
         "extracted_text_sha256": evidence.get("extracted_text_sha256"),
         "stats": {
+            "vehicle_already_selected": initial_vehicle_selected,
             "model_calls": model_calls,
             "browser_actions": action_ordinal,
             "stale_rejections": stale_rejections,

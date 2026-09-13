@@ -134,6 +134,22 @@ async def _screenshot(settings, task_id, observation_id=None):  # noqa: ARG001
 _screenshot.calls = []
 
 
+async def _target_signal(settings, provider, target):  # noqa: ARG001
+    _target_signal.calls.append((provider, dict(target)))
+    return {
+        "service": "ScrapeX",
+        "action": "current_target_signal",
+        "status": "read",
+        "success": True,
+        "verified": True,
+        "data": {"provider": provider, "selected": _target_signal.selected, "reason": None},
+    }
+
+
+_target_signal.calls = []
+_target_signal.selected = False
+
+
 class _Client:
     def __init__(self, turns: list[list[tuple[str, dict]] | None]):
         self._turns = list(turns)
@@ -157,7 +173,18 @@ def wired(monkeypatch):
     navigator = _Navigator()
     _capture.calls.clear()
     _screenshot.calls.clear()
-    monkeypatch.setattr(agent, "scrapex_svc", type("_S", (), {"navigator": navigator, "navigator_capture": _capture, "navigator_screenshot": _screenshot}))
+    _target_signal.calls.clear()
+    _target_signal.selected = False
+    monkeypatch.setattr(
+        agent,
+        "scrapex_svc",
+        type("_S", (), {
+            "navigator": navigator,
+            "navigator_capture": _capture,
+            "navigator_screenshot": _screenshot,
+            "navigator_current_target_signal": _target_signal,
+        }),
+    )
     return navigator
 
 
@@ -238,6 +265,47 @@ async def test_stale_target_refusal_returns_a_fresh_observation_never_a_substitu
     heading = json.dumps(client.messages_seen[1][-1], default=str)
     assert "rejected and did not execute" in heading
     assert result["research_receipt"]["stale_action_rejections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_first_message_says_whether_the_session_is_on_the_right_vehicle(wired):
+    """Every 2026-09-13 baseline task spent its whole budget inside whichever
+    vehicle happened to be open, because nothing ever said so."""
+    client = _Client([None])
+    await _run(client)
+    opening = client.messages_seen[0][1]["content"]
+    text = opening[0]["text"] if isinstance(opening, list) else opening
+    assert "does NOT currently have this vehicle selected" in text
+    assert "select_vehicle with the VIN above" in text
+    # The provider's own selection check answered it, with no task action and
+    # no model turn spent, against the exact requested identity.
+    assert _target_signal.calls[0][0] == "alldata"
+    assert _target_signal.calls[0][1]["vin"] == TARGET["vin"]
+    assert "verify" not in [call["action"] for call in wired.calls][:1]
+
+
+@pytest.mark.asyncio
+async def test_a_session_already_on_the_right_vehicle_is_said_so(wired):
+    _target_signal.selected = True
+    client = _Client([None])
+    await _run(client)
+    opening = client.messages_seen[0][1]["content"]
+    text = opening[0]["text"] if isinstance(opening, list) else opening
+    assert "already has this exact vehicle selected" in text
+
+
+@pytest.mark.asyncio
+async def test_an_unavailable_selection_check_says_nothing_rather_than_guessing(monkeypatch):
+    navigator = _Navigator()
+    # A provider or a service without the read: the run proceeds and the
+    # opening states the goal only.
+    monkeypatch.setattr(agent, "scrapex_svc", type("_S", (), {"navigator": navigator}))
+    client = _Client([None])
+    result = await _run(client)
+    opening = client.messages_seen[0][1]["content"]
+    text = opening[0]["text"] if isinstance(opening, list) else opening
+    assert "vehicle selected" not in text
+    assert result["attempted"] is True
 
 
 @pytest.mark.asyncio

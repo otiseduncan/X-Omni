@@ -689,3 +689,58 @@ async def test_a_malformed_observation_id_or_mark_never_reaches_scrapex(monkeypa
     )
     assert bad_observation["status"] == "invalid_request"
     assert bad_mark["status"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_the_target_signal_asks_the_provider_about_the_exact_vehicle(monkeypatch):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "provider": "alldata",
+                "target": {"year": 2025, "make": "Kia", "model": "K4"},
+                "selected": False,
+                "reason": "ALLDATA vehicle selection was not confirmed.",
+            },
+        )
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.navigator_current_target_signal(
+        FakeSettings(),
+        "alldata",
+        {"year": 2025, "make": "Kia", "model": "K4", "vin": "KNAF24A28S5000001"},
+    )
+
+    assert "/api/navigator/providers/alldata/current-target-signal" in seen[0]
+    assert "vin=KNAF24A28S5000001" in seen[0]
+    assert result["success"] is True
+    assert result["data"]["selected"] is False
+    assert result["data"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_target_signal_without_a_selected_flag_is_a_contract_failure(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"provider": "alldata", "reason": "unknown"})
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.navigator_current_target_signal(
+        FakeSettings(), "alldata", {"year": 2025, "make": "Kia", "model": "K4"}
+    )
+    assert result["success"] is False
+    assert result["error"]["contract_code"] == "navigator_signals_malformed"
+
+
+@pytest.mark.asyncio
+async def test_a_target_signal_for_another_provider_is_refused(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"provider": "somewhere-else", "selected": True})
+
+    _install_transport(monkeypatch, handler)
+    result = await scrapex.navigator_current_target_signal(
+        FakeSettings(), "alldata", {"year": 2025, "make": "Kia", "model": "K4"}
+    )
+    assert result["error"]["contract_code"] == "navigator_provider_mismatch"

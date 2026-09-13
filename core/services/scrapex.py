@@ -2888,6 +2888,66 @@ async def navigator_current_page_signals(settings: Any, provider: str) -> dict[s
 
 
 
+def _validate_navigator_target_signal_contract(
+    payload: Any, *, expected_provider: str
+) -> dict[str, Any]:
+    signal = _contract_mapping(payload, "navigator target signal")
+    if signal.get("provider") != expected_provider:
+        raise ScrapeXContract(
+            "navigator_provider_mismatch",
+            "ScrapeX returned a target signal for a different provider.",
+        )
+    if type(signal.get("selected")) is not bool:
+        raise ScrapeXContract(
+            "navigator_signals_malformed",
+            "ScrapeX omitted whether the target is selected.",
+        )
+    return signal
+
+
+async def navigator_current_target_signal(
+    settings: Any, provider: str, target: dict[str, Any]
+) -> dict[str, Any]:
+    """Is the provider session currently on this exact vehicle?
+
+    A bounded read of the live session, with no task and no browser action:
+    the provider's own selection check against one candidate identity. Used
+    to state that fact before a research run spends a turn on it.
+    """
+    action = "current_target_signal"
+    try:
+        provider_value = _text(provider, "provider", maximum=40)
+        assert provider_value is not None
+        if provider_value not in NAVIGATOR_PROVIDERS:
+            raise ScrapeXInput(f"Unsupported navigator provider: {provider_value}.")
+        clean_target = _navigator_target(target)
+        params = {
+            key: str(value)
+            for key, value in clean_target.items()
+            if value not in (None, "")
+        }
+        query = "&".join(f"{key}={quote(str(value), safe='')}" for key, value in params.items())
+        path = (
+            f"/api/navigator/providers/{quote(provider_value, safe='')}/current-target-signal"
+            + (f"?{query}" if query else "")
+        )
+        data = await _request(settings, "GET", path, timeout=READ_TIMEOUT, may_mutate=False)
+        signal = _validate_navigator_target_signal_contract(
+            data, expected_provider=provider_value
+        )
+        return _success(action, signal, status="read", verified=True)
+    except ScrapeXInput as exc:
+        return _input_failure(action, exc)
+    except ScrapeXConfiguration as exc:
+        return _configuration_failure(action, exc)
+    except ScrapeXRemote as exc:
+        return _remote_failure(action, exc)
+    except ScrapeXTransport as exc:
+        return _transport_failure(action, exc)
+    except ScrapeXContract as exc:
+        return _contract_failure(action, exc, may_mutate=False)
+
+
 async def navigator_screenshot(
     settings: Any, task_id: str, observation_id: str | None = None
 ) -> tuple[bytes, str]:
