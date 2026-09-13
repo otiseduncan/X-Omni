@@ -349,6 +349,22 @@ async def test_unresolved_dependency_is_reported_as_incompleteness(wired):
 
 
 @pytest.mark.asyncio
+async def test_a_dependency_the_reviewer_rejects_on_sight_is_dismissed_not_missing(wired):
+    reviewer = _Reviewer([
+        _accept(decision="ACCEPT_WITH_DEPENDENCIES", dependencies=[{"title": "Removal and Replacement", "reason": "linked at the foot of the page"}]),
+        _accept(classification="REMOVAL_REPLACEMENT", decision="REJECT", evidence_summary="Removal steps only; not needed to perform the aiming."),
+    ])
+    client = _Client([[("extract", {})], [("extract", {})], None])
+    result = await _run(client, reviewer=reviewer, capture=True)
+    assert result["dependencies"][0]["status"] == "dismissed"
+    assert "not needed" in result["dependencies"][0]["reason_dismissed"]
+    assert result["status"] == "verified" and result["complete"] is True
+    assert result["incomplete_reasons"] == []
+    # Only the accepted procedure was filed.
+    assert [call["task_id"] for call in _capture.calls] == ["task-1"]
+
+
+@pytest.mark.asyncio
 async def test_dependency_limit_is_a_resource_bound_not_a_depth_rule(wired):
     dependencies = [{"title": f"Doc {index}", "reason": "needed"} for index in range(5)]
     reviewer = _Reviewer([_accept(decision="ACCEPT_WITH_DEPENDENCIES", dependencies=dependencies)])

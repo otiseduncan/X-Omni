@@ -2063,12 +2063,26 @@ async def _run_objective(
         budget.progress_events.extend(sub_budget.progress_events)
         tasks.append(outcome)
         dependency["task_id"] = outcome.get("task_id")
+        dependency_review = outcome.get("review") if isinstance(outcome.get("review"), dict) else {}
         if outcome.get("accepted"):
             dependency["status"] = "resolved"
             dependency["resolved_artifact"] = outcome.get("artifact") if outcome.get("captured") else None
             dependency["resolved_url"] = outcome.get("source_url")
             dependency["resolved_title"] = outcome.get("title")
             enqueue(outcome.get("review"), outcome)
+        elif (
+            outcome.get("mechanically_verified")
+            and dependency_review.get("decision") == "REJECT"
+            and dependency_review.get("malformed") is not True
+        ):
+            # The reviewer reached the named document and, seeing it, judged
+            # it the wrong kind of document for the objective. Its own later
+            # verdict overrides its earlier naming: the objective does not
+            # need it. Recorded, never counted as missing.
+            dependency["status"] = "dismissed"
+            dependency["reason_dismissed"] = str(dependency_review.get("evidence_summary") or "")
+            dependency["resolved_url"] = outcome.get("source_url")
+            dependency["resolved_title"] = outcome.get("title")
         else:
             dependency["status"] = "unresolved"
             dependency["reason_unresolved"] = str(outcome.get("verification_reason") or outcome.get("reason") or outcome.get("agent_stopped_reason") or "")
