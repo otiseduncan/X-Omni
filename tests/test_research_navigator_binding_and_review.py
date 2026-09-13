@@ -108,6 +108,7 @@ class _Navigator:
             if action in {"click_mark", "click_visual"}:
                 data["action_target"] = {"kind": "mark" if action == "click_mark" else "visual", "observation_id": args.get("observation_id")}
             if action == "select_vehicle":
+                _target_signal.selected = True
                 data["action_target"] = {"kind": "vehicle", "selected": True, "vin": args.get("vin"), "label": "2025 Kia K4"}
             return _navigator_result(action, status="acted", work_complete=(action == "done"), data=data)
         if action == "verify":
@@ -205,12 +206,14 @@ async def test_ref_actions_carry_the_observation_they_were_chosen_from(wired):
     await _run(client)
     click = next(call for call in wired.calls if call["action"] == "click")
     typed = next(call for call in wired.calls if call["action"] == "type")
-    assert click["observation_id"] == "obs_1"
+    # obs_1 is the stale vehicle page; the exact-VIN preflight selects the
+    # target and returns obs_2 before the first model-chosen action.
+    assert click["observation_id"] == "obs_2"
     # After the click a new observation arrived; the next action binds to it.
-    assert typed["observation_id"] != "obs_1"
+    assert typed["observation_id"] != "obs_2"
     assert typed["text"] == "KNAF24A28S5000001"
     # Screenshots are requested for exactly the observation they accompany.
-    assert _screenshot.calls[0] == ("task-1", "obs_1")
+    assert _screenshot.calls[0] == ("task-1", "obs_2")
 
 
 @pytest.mark.asyncio
@@ -268,20 +271,28 @@ async def test_stale_target_refusal_returns_a_fresh_observation_never_a_substitu
 
 
 @pytest.mark.asyncio
-async def test_the_first_message_says_whether_the_session_is_on_the_right_vehicle(wired):
+async def test_the_first_message_preselects_the_vin_before_the_model_sees_the_page(wired):
     """Every 2026-09-13 baseline task spent its whole budget inside whichever
     vehicle happened to be open, because nothing ever said so."""
     client = _Client([None])
     await _run(client)
     opening = client.messages_seen[0][1]["content"]
     text = opening[0]["text"] if isinstance(opening, list) else opening
-    assert "does NOT currently have this vehicle selected" in text
-    assert "select_vehicle with the VIN above" in text
-    # The provider's own selection check answered it, with no task action and
-    # no model turn spent, against the exact requested identity.
+    assert "already has this exact vehicle selected" in text
+    # The provider's own selection check first reports the stale page; the
+    # runtime then uses the VIN fast path and rechecks before a model turn.
     assert _target_signal.calls[0][0] == "alldata"
     assert _target_signal.calls[0][1]["vin"] == TARGET["vin"]
-    assert "verify" not in [call["action"] for call in wired.calls][:1]
+    assert _target_signal.calls == [
+        ("alldata", TARGET),
+        ("alldata", TARGET),
+    ]
+    selection_call = next(call for call in wired.calls if call["action"] == "select_vehicle")
+    assert selection_call == {
+        "action": "select_vehicle",
+        "task_id": "task-1",
+        "vin": TARGET["vin"],
+    }
 
 
 @pytest.mark.asyncio
@@ -292,6 +303,7 @@ async def test_a_session_already_on_the_right_vehicle_is_said_so(wired):
     opening = client.messages_seen[0][1]["content"]
     text = opening[0]["text"] if isinstance(opening, list) else opening
     assert "already has this exact vehicle selected" in text
+    assert not any(call["action"] == "select_vehicle" for call in wired.calls)
 
 
 @pytest.mark.asyncio
@@ -304,7 +316,8 @@ async def test_an_unavailable_selection_check_says_nothing_rather_than_guessing(
     result = await _run(client)
     opening = client.messages_seen[0][1]["content"]
     text = opening[0]["text"] if isinstance(opening, list) else opening
-    assert "vehicle selected" not in text
+    assert "already has this exact vehicle selected" in text
+    assert any(call["action"] == "select_vehicle" for call in navigator.calls)
     assert result["attempted"] is True
 
 
@@ -581,8 +594,13 @@ async def test_receipt_records_actions_observations_urls_decisions_and_artifacts
     assert receipt["objective"]["vehicle"]["vin"] == TARGET["vin"]
     assert receipt["provider"] == "alldata"
     assert receipt["task_ids"] == ["task-1"]
-    assert [item["action"] for item in receipt["actions"]] == ["click", "extract"]
-    assert receipt["actions"][0]["observation_id"] == "obs_1"
+    assert [item["action"] for item in receipt["actions"]] == [
+        "select_vehicle",
+        "click",
+        "extract",
+    ]
+    assert receipt["actions"][0]["mechanical_preflight"] is True
+    assert receipt["actions"][1]["observation_id"] == "obs_2"
     assert len(receipt["observation_ids"]) >= 2
     assert "https://my.alldata.com/page" in receipt["visited_urls"]
     assert receipt["candidates"][0]["mechanically_verified"] is True

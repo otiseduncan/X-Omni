@@ -153,8 +153,10 @@ def _trace_measures(trace: list[dict[str, Any]]) -> dict[str, Any]:
     actions = [
         item
         for item in trace
-        if isinstance(item.get("turn"), int)
-        and item.get("turn", -1) >= 0
+        if (
+            (isinstance(item.get("turn"), int) and item.get("turn", -1) >= 0)
+            or item.get("mechanical_preflight") is True
+        )
         and item.get("action") not in _NON_ACTION_TRACE
     ]
     errors = [str(item.get("error") or "") for item in actions if item.get("error")]

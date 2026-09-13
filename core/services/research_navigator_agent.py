@@ -1178,15 +1178,70 @@ async def _run_task(
             "stats": {},
         }
 
-    current_observation_id: Optional[str] = initial_summary.get("observation_id")
-    # Whether the provider session already has the requested vehicle selected
-    # is a mechanical fact the provider's own selection check can answer
-    # before any turn is spent. Measured on 2026-09-13: every baseline task
-    # ran its whole budget inside whichever vehicle happened to be open,
-    # because nothing ever said so. Stated as an observation; what to do
-    # about it stays the model's decision. Best effort -- an unavailable
-    # read simply says nothing rather than guessing.
+    first_summary = initial_summary
+    first_observation_id: Optional[str] = initial_summary.get("observation_id")
+    current_observation_id = first_observation_id
+    # Whether the provider session already has the requested vehicle family
+    # selected is a mechanical fact the provider can answer before any turn
+    # is spent. When CIQ supplied a VIN, selection itself is mechanical too:
+    # use ScrapeX's exact-VIN fast path before asking the model to interpret
+    # the page. The live 2023 Accord run otherwise ignored the VIN, saw two
+    # standard/hybrid choices, and eventually clicked an unrelated 2024
+    # recent vehicle. Powertrain variants remain equivalent once year/make/
+    # model match; a different year or VIN is never silently accepted.
     initial_vehicle_selected = await _target_already_selected(settings, provider, target)
+    vehicle_selected_before_preflight = initial_vehicle_selected
+    preflight_selection: Optional[dict[str, Any]] = None
+    vin = "".join(str(target.get("vin") or "").split()).upper()
+    if vin and initial_vehicle_selected is not True:
+        selection_result = await scrapex_svc.navigator(
+            settings,
+            {"action": "select_vehicle", "task_id": task_id, "vin": vin},
+        )
+        selection_summary = _observation_summary(selection_result)
+        selection_target = selection_summary.get("action_target")
+        selection_claimed = bool(
+            isinstance(selection_target, dict)
+            and selection_target.get("selected") is True
+            and str(selection_target.get("vin") or "").upper() == vin
+        )
+        if selection_result.get("success") and _observation_ready(selection_summary):
+            initial_summary = selection_summary
+            current_observation_id = selection_summary.get("observation_id")
+        refreshed_selection = await _target_already_selected(settings, provider, target)
+        if refreshed_selection is not None:
+            initial_vehicle_selected = refreshed_selection
+        elif selection_claimed:
+            # ScrapeX's fast path now proves the exact VIN in the rendered
+            # vehicle header before it emits selected=True, so that receipt is
+            # sufficient when the separate current-target read is unavailable.
+            initial_vehicle_selected = True
+        preflight_selection = {
+            "turn": -1,
+            "action": "select_vehicle",
+            "args": {"vin": vin},
+            "mechanical_preflight": True,
+            "observation_id": current_observation_id,
+            "selected": initial_vehicle_selected,
+            "error": (
+                None
+                if (
+                    selection_result.get("success")
+                    and selection_claimed
+                    and initial_vehicle_selected is not False
+                )
+                else str(
+                    selection_summary.get("action_detail")
+                    or (
+                        "The exact VIN was selected, but its rendered year/make/model "
+                        "did not match the requested vehicle."
+                        if selection_claimed and initial_vehicle_selected is False
+                        else _navigator_failure_message(selection_result, "select_vehicle")
+                    )
+                )
+            ),
+            "result": selection_summary,
+        }
     initial_screenshot = await _task_screenshot(settings, task_id, current_observation_id)
     messages: list[dict[str, Any]] = [
         {
@@ -1208,11 +1263,13 @@ async def _run_task(
             "turn": -1,
             "action": "observe",
             "attempts": initial_observe_attempts,
-            "observation_id": current_observation_id,
-            "vehicle_already_selected": initial_vehicle_selected,
-            "result": initial_summary,
+            "observation_id": first_observation_id,
+            "vehicle_already_selected": vehicle_selected_before_preflight,
+            "result": first_summary,
         }
     ]
+    if preflight_selection is not None:
+        trace.append(preflight_selection)
     stopped_reason = "model_finished"
     last_failed_call: Optional[tuple[str, tuple[tuple[str, Any], ...]]] = None
     repeated_failure_count = 0
@@ -1228,9 +1285,13 @@ async def _run_task(
     prompt_tokens: list[int] = []
     stale_rejections = 0
     visited_urls: list[str] = []
-    observation_ids: list[str] = [current_observation_id] if current_observation_id else []
-    if initial_summary.get("url"):
-        visited_urls.append(str(initial_summary["url"]))
+    observation_ids: list[str] = []
+    for observation_id in (first_observation_id, current_observation_id):
+        if observation_id and observation_id not in observation_ids:
+            observation_ids.append(observation_id)
+    for summary in (first_summary, initial_summary):
+        if summary.get("url") and str(summary["url"]) not in visited_urls:
+            visited_urls.append(str(summary["url"]))
 
     # Which messages hold a full observation, and the one line each collapses
     # to once a newer one arrives. The opening message carries the goal as
@@ -1245,7 +1306,7 @@ async def _run_task(
     }
     previous_fingerprint = _observation_fingerprint(initial_summary)
     previous_page_state = _page_state(initial_summary)
-    action_ordinal = 0
+    action_ordinal = 1 if preflight_selection is not None else 0
     context_degraded = False
     # A working scroll on a lazily-loaded procedure is its own trap: the live
     # Palisade article grew from 15,676px to 18,116px while being scrolled, so
@@ -1871,7 +1932,8 @@ async def _run_task(
         "extracted_text": (evidence.get("extracted_text") or "")[:20_000],
         "extracted_text_sha256": evidence.get("extracted_text_sha256"),
         "stats": {
-            "vehicle_already_selected": initial_vehicle_selected,
+            "vehicle_already_selected": vehicle_selected_before_preflight,
+            "vehicle_selected_after_preflight": initial_vehicle_selected,
             "model_calls": model_calls,
             "browser_actions": action_ordinal,
             "stale_rejections": stale_rejections,
@@ -1938,7 +2000,11 @@ def _receipt(
             if url not in visited:
                 visited.append(url)
         for item in task.get("agent_trace") or []:
-            if not isinstance(item.get("turn"), int) or item.get("turn") < 0:
+            mechanical_preflight = item.get("mechanical_preflight") is True
+            if (
+                (not isinstance(item.get("turn"), int) or item.get("turn") < 0)
+                and not mechanical_preflight
+            ):
                 continue
             if item.get("action") in {"verify_after_extract", "semantic_review"}:
                 continue
@@ -1949,6 +2015,7 @@ def _receipt(
                     "action": item.get("action"),
                     "args": item.get("args"),
                     "observation_id": item.get("observation_id"),
+                    "mechanical_preflight": mechanical_preflight,
                     "error": (str(item.get("error"))[:200] if item.get("error") else None),
                 }
             )
