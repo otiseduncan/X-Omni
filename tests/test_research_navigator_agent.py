@@ -154,8 +154,8 @@ class _FakeNavigator:
                 work_complete=verified,
                 data={
                     "vehicle_verified": True,
-                    "subject_verified": verified,
-                    "procedure_leaf_verified": verified,
+                    "navigation_performed": verified,
+                    "candidate_extracted": verified,
                     "content_extracted": verified,
                     "verified": verified,
                     "reason": None if verified else "Not enough evidence.",
@@ -1299,4 +1299,3 @@ async def test_a_click_that_answers_before_the_page_lands_is_waited_out(monkeypa
     assert "ALLDATA Collision - Home" in last
     assert "f8e396" in last
     assert "settled_after_observations" in last
-

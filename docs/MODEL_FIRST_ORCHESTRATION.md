@@ -27,7 +27,7 @@ rereads, provenance, audit, bounded serialization, and terminal media safety.
 | Tool | Owns | Expands to |
 |---|---|---|
 | `query_ciq` | every Calibration IQ read: one RO, board count/list, phase list, RO requirements, ADAS Map inventory, sweep progress, service status | `calibration_iq_ro`, `_summary`, `_read`, `_work_prep`, `_status` (pure structural expansion in `Registry.invoke` and the loop) |
-| `delegate_research` | one research objective over local ADAS SI, durable knowledge, licensed ALLDATA (ScrapeX Navigator, model-driven inside the call, every candidate judged by an independent semantic review), public OEM web; provenance-bearing findings; any vehicle, RO or not; never writes CIQ | `core/services/research_delegate.py` |
+| `delegate_research` | ad-hoc research over local ADAS SI, durable knowledge, licensed ALLDATA (ScrapeX Navigator, model-driven inside the call, every candidate judged by an independent semantic review), and public OEM web; any vehicle, but never satisfies or attaches SI to a CIQ RO | `core/services/research_delegate.py` |
 | `stage_action` | the only write path: fresh exact-RO read, then `stage=staged` (current version, valid targets, argument contract, exact `next_call`) or `stage=executed` (receipt + final snapshot); one-RO ADAS Map acquisition; `sweep_adas_maps` for a scope; `research_si` for background service-information research | `calibration_iq_operator`, `calibration_iq_destructive` (approval-gated), `scrapex_adas_map`, `adas_map_sweep`, `adas_si_research`, all through `Registry.invoke` with the exact-RO write binding |
 | `capability_search` | ranks the profile's discoverable tools against a structured query and unlocks matches for the rest of the turn | `core/tools/builtin/system.py::make_capability_search` |
 
@@ -101,7 +101,7 @@ The production path is `stage_action` operation `research_si` starting
    what else is required. Provider notes (Recent Vehicles, the ADAS Quick
    Reference, "<Make> Truck" shelving) are offered as non-binding hints.
 3. When X marks a page, ScrapeX proves the mechanics (vehicle selected,
-   navigation happened, leaf reached, text extracted) and an **independent
+   navigation happened, candidate marked, text extracted and hashed) and an **independent
    semantic review** (`research_semantic_review.py`) judges the evidence in a
    fresh model context that never sees the Navigator's transcript. It returns
    a structured verdict -- classification, procedure type, an evidence table

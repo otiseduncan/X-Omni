@@ -149,12 +149,22 @@ def normalize_make(value: Any) -> str:
     return _MAKE_SPELLINGS.get(text.casefold(), text)
 
 
-def short_model(value: Any) -> str:
-    """The model name without trim words: the picker offers "Tucson", not
-    "Tucson SE FWD". Prefix matching downstream keeps "ES" finding "ES 350".
+def normalize_model(value: Any, trim: Any = None) -> str:
+    """Preserve the complete model identity Calibration IQ supplied.
+
+    A multiword model is not a model plus trim: ``Santa Fe``, ``Grand
+    Cherokee``, and ``Range Rover`` must remain intact. When CIQ supplies a
+    separate trim field and also appends that exact trim to the model string,
+    remove only that explicit suffix. ScrapeX receives the trim separately.
     """
-    words = _clean(value, 120).split()
-    return words[0] if words else ""
+    model = _clean(value, 120)
+    trim_text = _clean(trim, 80)
+    if not model or not trim_text:
+        return model
+    suffix = f" {trim_text}"
+    if model.casefold().endswith(suffix.casefold()):
+        return model[: -len(suffix)].strip()
+    return model
 
 
 def vin_from_read(read: dict[str, Any]) -> str:
@@ -188,7 +198,11 @@ def target_from_read(read: dict[str, Any]) -> Optional[dict[str, Any]]:
     except (TypeError, ValueError):
         year_value = None
     make = normalize_make(vehicle_raw.get("make") or _dig(raw, "make", "repair_order.make"))
-    model = short_model(vehicle_raw.get("model") or _dig(raw, "model", "repair_order.model"))
+    trim = _clean(vehicle_raw.get("trim") or _dig(raw, "trim", "repair_order.trim"), 80)
+    model = normalize_model(
+        vehicle_raw.get("model") or _dig(raw, "model", "repair_order.model"),
+        trim,
+    )
     calibrations: list[dict[str, Any]] = []
     for item in _dig(raw, "calibrations", "calibration_items", "repair_order.calibrations") or []:
         if not isinstance(item, dict):
@@ -209,11 +223,14 @@ def target_from_read(read: dict[str, Any]) -> Optional[dict[str, Any]]:
         )
     if not ro_number or not ro_id or not year_value or not make or not model:
         return None
+    vehicle = {"year": year_value, "make": make, "model": model}
+    if trim:
+        vehicle["trim"] = trim
     return {
         "ro_number": ro_number,
         "repair_order_id": ro_id,
-        "vehicle": {"year": year_value, "make": make, "model": model},
-        "vehicle_label": f"{year_value} {make} {model}",
+        "vehicle": vehicle,
+        "vehicle_label": " ".join(str(part) for part in (year_value, make, model, trim) if part),
         "vin": vin_from_read(read),
         "phase": _dig(repair_order, "Phase") or _dig(raw, "phase", "workflow.phase"),
         "shop": _clean(_dig(repair_order, "Shop") or _dig(raw, "shop.name", "shop"), 60) or None,

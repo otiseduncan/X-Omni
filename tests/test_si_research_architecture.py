@@ -96,6 +96,16 @@ def test_the_navigator_loop_holds_no_page_classifier():
     assert "len(page_text)" not in source and "len(text) >" not in source
 
 
+def test_scrapex_contract_carries_mechanical_gates_not_semantic_scores():
+    contract = _source(SERVICES / "scrapex.py")
+    navigator = _source(SERVICES / "research_navigator_agent.py")
+    for field in ("navigation_performed", "candidate_extracted", "content_extracted"):
+        assert field in contract
+    for removed in ("subject_verified", "procedure_leaf_verified", "matched_terms"):
+        assert removed not in contract
+        assert removed not in navigator
+
+
 def test_the_reviewer_decides_type_and_python_only_validates_structure():
     source = _source(SERVICES / "research_semantic_review.py")
     # No regex or keyword table decides the classification or the procedure type.

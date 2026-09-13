@@ -113,7 +113,7 @@ class _Navigator:
             return _navigator_result(action, status="acted", work_complete=(action == "done"), data=data)
         if action == "verify":
             verified = self.extracted
-            return _navigator_result("verify", status="verified" if verified else "unverified", success=verified, verified=verified, work_complete=verified, data={"vehicle_verified": True, "subject_verified": verified, "procedure_leaf_verified": verified, "content_extracted": verified, "verified": verified, "reason": None if verified else "no extract yet", "provider": "alldata", "source_url": "https://my.alldata.com/page/3", "title": "Front Radar (ADAS) - Adjustment"})
+            return _navigator_result("verify", status="verified" if verified else "unverified", success=verified, verified=verified, work_complete=verified, data={"vehicle_verified": True, "navigation_performed": verified, "candidate_extracted": verified, "content_extracted": verified, "verified": verified, "reason": None if verified else "no extract yet", "provider": "alldata", "source_url": "https://my.alldata.com/page/3", "title": "Front Radar (ADAS) - Adjustment"})
         if action == "get_evidence":
             return _navigator_result("get_evidence", status="read", data={"task_id": f"task-{self.tasks}", "provider": "alldata", "source_url": "https://my.alldata.com/page/3", "title": "Front Radar (ADAS) - Adjustment", "observation_id": f"obs_{self.observations}", "breadcrumb": ["Collision Avoidance Sensor", "Adjustment"], "extracted_text": "Install the reflector 2.5 m from the bumper. " * 40, "extracted_text_sha256": "a" * 64, "referenced_links": ["Removal and Replacement", "Wheel Alignment"], "verified": self.extracted})
         raise AssertionError(f"unexpected action {action}")

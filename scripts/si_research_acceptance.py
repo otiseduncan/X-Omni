@@ -9,13 +9,16 @@ before a change and re-measured after it with the same cases.
 
 Nothing here judges relevance. The report carries the evidence (title, URL,
 text head, review result when present) for a person to judge and records the
-mechanical measures the runtime can prove.
+mechanical measures the runtime can prove. By default the command exits nonzero
+unless every selected case has an exact VIN, X's accepted semantic review, a
+complete dependency set, extracted evidence, and (with ``--capture``) a saved
+capture. ``--allow-incomplete`` is only for diagnostic/baseline recording.
 
 Usage::
 
     .venv\Scripts\python.exe scripts\si_research_acceptance.py ^
-        --cases scripts\si_research_cases.json --out data\acceptance\baseline.json ^
-        --label baseline [--capture] [--max-turns 40] [--only case-id]
+        --cases scripts\si_research_cases.json --out data\acceptance\phase-b.json ^
+        --label phase-b --capture --vin-from-ciq [--max-turns 40] [--only case-id]
 
 Requires the local worker, ScrapeX, and an authenticated ALLDATA Navigator
 profile. A case that cannot run reports its blocker; nothing is invented.
@@ -236,12 +239,17 @@ async def run_case(
         }
     started = time.perf_counter()
     started_at = datetime.now(UTC).isoformat()
-    try:
-        result = await agent.run_navigator_search(**kwargs)
-        error = None
-    except Exception as exc:  # noqa: BLE001 - the harness records, never hides
+    preflight_error = str(case.get("_preflight_error") or "").strip()
+    if preflight_error:
         result = {}
-        error = f"{type(exc).__name__}: {exc}"
+        error = f"PreflightError: {preflight_error}"
+    else:
+        try:
+            result = await agent.run_navigator_search(**kwargs)
+            error = None
+        except Exception as exc:  # noqa: BLE001 - the harness records, never hides
+            result = {}
+            error = f"{type(exc).__name__}: {exc}"
     wall = time.perf_counter() - started
     trace = result.get("agent_trace") or []
     measures = _trace_measures(trace)
@@ -257,6 +265,7 @@ async def run_case(
         "error": error,
         "status": result.get("status"),
         "verified": result.get("verified"),
+        "complete": result.get("complete"),
         "stopped_reason": result.get("agent_stopped_reason"),
         "verification_reason": result.get("verification_reason"),
         "captured": result.get("captured"),
@@ -291,14 +300,56 @@ async def run_case(
     }
 
 
+def acceptance_failures(
+    item: dict[str, Any], *, capture: bool, require_vin: bool
+) -> list[str]:
+    """Strict, non-semantic definition of a completed acceptance case.
+
+    This never re-judges the procedure. It requires X's independent semantic
+    acceptance plus complete mechanical/capture evidence, leaving the case's
+    explicit ``expect`` text visible for the senior human accuracy review.
+    """
+    failures: list[str] = []
+    case = item.get("case") if isinstance(item.get("case"), dict) else {}
+    if item.get("error"):
+        failures.append(str(item["error"]))
+    if require_vin and not str(case.get("vin") or "").strip():
+        failures.append("exact VIN was not resolved from Calibration IQ")
+    if item.get("verified") is not True:
+        failures.append("X did not accept a mechanically verified procedure")
+    if item.get("complete") is not True:
+        failures.append("the procedure/dependency set is incomplete")
+    review = item.get("semantic_review") if isinstance(item.get("semantic_review"), dict) else {}
+    accepted_decisions = {"ACCEPT", "ACCEPT_WITH_DEPENDENCIES"}
+    documents = item.get("documents") if isinstance(item.get("documents"), list) else []
+    review_accepted = review.get("decision") in accepted_decisions or any(
+        isinstance(document, dict)
+        and document.get("accepted") is True
+        and document.get("decision") in accepted_decisions
+        for document in documents
+    )
+    if not review_accepted:
+        failures.append("independent semantic review did not accept the candidate")
+    if not str(item.get("evidence_title") or "").strip():
+        failures.append("no evidence title was returned")
+    if int(item.get("evidence_chars") or 0) <= 0:
+        failures.append("no extracted evidence text was returned")
+    if capture and item.get("captured") is not True:
+        failures.append("accepted evidence was not captured")
+    return list(dict.fromkeys(failures))
+
+
 def markdown_summary(report: dict[str, Any]) -> str:
     lines = [
         f"# SI research acceptance: {report['label']}",
         "",
         f"Run at {report['run_at']} against {report['worker']} with capture={report['capture']}.",
         "",
-        "| case | verified | stop | rounds | actions | repeats | stale | ctx max | wall s | evidence title |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        f"Operational result: **{report['passed_cases']} / {report['total_cases']} passed**.",
+        "Procedure accuracy still requires comparing each evidence set with the explicit expected result below.",
+        "",
+        "| case | pass | verified | stop | rounds | actions | repeats | stale | ctx max | wall s | evidence title |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in report["results"]:
         case = item["case"]
@@ -308,11 +359,25 @@ def markdown_summary(report: dict[str, Any]) -> str:
         if decision:
             verified += f" / {decision}"
         lines.append(
-            f"| {case['id']} | {verified} | "
+            f"| {case['id']} | {item.get('acceptance_pass')} | {verified} | "
             f"{item.get('stopped_reason') or item.get('error') or '-'} | {item.get('model_rounds')} | "
             f"{item.get('browser_actions')} | {item.get('repeated_actions')} | "
             f"{item.get('stale_target_failures')} | {item.get('prompt_tokens_max')} | "
             f"{item.get('wall_s')} | {(item.get('evidence_title') or '')[:60]} |"
+        )
+    lines.extend(["", "## Accuracy review", ""])
+    for item in report["results"]:
+        case = item["case"]
+        failures = item.get("acceptance_failures") or []
+        lines.extend(
+            [
+                f"### {case['id']}",
+                "",
+                f"- Expected: {case.get('expect') or 'not specified'}",
+                f"- Retrieved: {item.get('evidence_title') or 'none'}",
+                f"- Operational failures: {'; '.join(failures) if failures else 'none'}",
+                "",
+            ]
         )
     return "\n".join(lines) + "\n"
 
@@ -325,6 +390,11 @@ async def main() -> int:
     parser.add_argument("--capture", action="store_true")
     parser.add_argument("--max-turns", type=int, default=40)
     parser.add_argument("--only", action="append", default=[])
+    parser.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="Diagnostic mode: write the report but return success even when cases fail.",
+    )
     parser.add_argument(
         "--vin-from-ciq",
         action="store_true",
@@ -349,12 +419,16 @@ async def main() -> int:
             try:
                 read = await calibration_iq.get_repair_order(settings, {"repair_order_id": case["ro"]})
             except Exception as exc:  # noqa: BLE001
-                print(f"[{args.label}] {case['id']}: VIN lookup failed ({type(exc).__name__})", flush=True)
+                case["_preflight_error"] = f"VIN lookup failed ({type(exc).__name__})"
+                print(f"[{args.label}] {case['id']}: {case['_preflight_error']}", flush=True)
                 continue
             vin = adas_si_research.vin_from_read(read) if isinstance(read, dict) else ""
             if vin:
                 case["vin"] = vin
                 print(f"[{args.label}] {case['id']}: VIN {vin} from Calibration IQ", flush=True)
+            else:
+                case["_preflight_error"] = "Calibration IQ did not return a valid 17-character VIN"
+                print(f"[{args.label}] {case['id']}: {case['_preflight_error']}", flush=True)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
@@ -364,6 +438,8 @@ async def main() -> int:
         "capture": args.capture,
         "max_turns": args.max_turns,
         "results": [],
+        "total_cases": len(cases),
+        "passed_cases": 0,
     }
     for case in cases:
         print(
@@ -379,7 +455,14 @@ async def main() -> int:
             capture=args.capture,
             max_turns=args.max_turns,
         )
+        item["acceptance_failures"] = acceptance_failures(
+            item, capture=args.capture, require_vin=args.vin_from_ciq
+        )
+        item["acceptance_pass"] = not item["acceptance_failures"]
         report["results"].append(item)
+        report["passed_cases"] = sum(
+            1 for result in report["results"] if result.get("acceptance_pass") is True
+        )
         print(
             f"[{args.label}] {case['id']}: verified={item.get('verified')} "
             f"stop={item.get('stopped_reason') or item.get('error')} "
@@ -390,7 +473,8 @@ async def main() -> int:
         )
         out.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
         out.with_suffix(".md").write_text(markdown_summary(report), encoding="utf-8")
-    return 0
+    all_passed = report["passed_cases"] == report["total_cases"] and report["total_cases"] > 0
+    return 0 if all_passed or args.allow_incomplete else 1
 
 
 if __name__ == "__main__":

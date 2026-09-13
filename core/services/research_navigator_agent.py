@@ -1484,10 +1484,9 @@ async def _run_task(
                             "verified": mechanically_verified,
                             "reason": candidate_proof.get("reason"),
                             "vehicle_verified": candidate_proof.get("vehicle_verified"),
-                            "subject_verified": candidate_proof.get("subject_verified"),
-                            "procedure_leaf_verified": candidate_proof.get("procedure_leaf_verified"),
+                            "navigation_performed": candidate_proof.get("navigation_performed"),
+                            "candidate_extracted": candidate_proof.get("candidate_extracted"),
                             "content_extracted": candidate_proof.get("content_extracted"),
-                            "matched_terms": candidate_proof.get("matched_terms"),
                         }
                         trace.append(
                             {

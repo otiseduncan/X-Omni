@@ -244,8 +244,8 @@ async def test_verify_reports_unverified_without_failing_the_call(monkeypatch):
             200,
             json={
                 "vehicle_verified": True,
-                "subject_verified": False,
-                "procedure_leaf_verified": False,
+                "navigation_performed": False,
+                "candidate_extracted": False,
                 "content_extracted": False,
                 "verified": False,
                 "reason": "No target-scoped search/navigation action was submitted.",
@@ -271,8 +271,8 @@ async def test_verify_reports_verified_when_all_gates_pass(monkeypatch):
             200,
             json={
                 "vehicle_verified": True,
-                "subject_verified": True,
-                "procedure_leaf_verified": True,
+                "navigation_performed": True,
+                "candidate_extracted": True,
                 "content_extracted": True,
                 "verified": True,
                 "reason": None,

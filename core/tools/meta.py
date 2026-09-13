@@ -239,8 +239,9 @@ DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
         "ALLDATA task) with excerpts. Any vehicle, with or without an RO; give "
         "year/make/model when known. sources sets preference order; exclude_sources "
         "honors Otis's exclusions. Never changes Calibration IQ; preserve=true only "
-        "captures verified external evidence into ADAS SI. A miss is only a miss in "
-        "the sources checked."
+        "captures verified external evidence into ADAS SI. It never satisfies or "
+        "attaches SI to a CIQ RO; use stage_action research_si. A miss is only a miss in the "
+        "sources checked."
     ),
     "parameters": {
         "type": "object",
@@ -343,7 +344,7 @@ def stage_operations(*, allow_unscoped_creates: bool = False) -> tuple[str, ...]
 def stage_action_schema(*, allow_unscoped_creates: bool = False) -> dict[str, Any]:
     return {
         "description": (
-            "The only way to change Calibration IQ or acquire an ADAS Map; only for a "
+            "The only way to change Calibration IQ or acquire an RO's ADAS Map or SI; only for a "
             "direct current-turn command. Reads the exact RO fresh first. Missing or "
             "stale ids, versions, or arguments return stage=staged with the current "
             "version, valid target ids, and the argument contract -- nothing changes; "
