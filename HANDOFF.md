@@ -254,7 +254,87 @@ No code change. `X:\Calibration IQ` (bd8ce75) already has
 `oem_procedure`, and RO reads report `service_information_document_count`.
 Backend suite: 191 passed, 1 skipped.
 
-__ACCEPTANCE_SECTION__
+### Acceptance measurement
+
+**Phase A, the baseline.** Ten deliberately varied real SI objectives
+(static/dynamic camera, front radar, BSM/rear radar, surround view, a
+learn/initialization case, a title that never says "calibration", a
+multi-document case, five OEM structures) were run through the **unchanged**
+Navigator at commit 22fee7f against the live ALLDATA session and the live
+Qwen3-Omni worker, from a frozen worktree, before any behaviour changed.
+Harness: `scripts/si_research_acceptance.py`, cases in
+`scripts/si_research_cases.json`, report kept with the run.
+
+| case | correct procedure | stopped because | model rounds | browser actions | identical repeats | max prompt tokens | wall s |
+|---|---|---|---|---|---|---|---|
+| honda-accord-radar | no | turn budget exhausted | 40 | 40 | 39 | 17624 | 619.1 |
+| hyundai-tucson-camera | no | model error | 16 | 14 | 2 | 8943 | 239.8 |
+| kia-k4-front-radar | no | turn budget exhausted | 40 | 40 | 39 | 17167 | 607.4 |
+| kia-sorento-corner-radar | no | model finished | 19 | 19 | 18 | 11929 | 328.3 |
+| nissan-kicks-icc-radar | no | turn budget exhausted | 40 | 40 | 1 | 15433 | 586.3 |
+| chevrolet-tahoe-camera-learn | no | model finished | 17 | 16 | 15 | 10432 | 278.7 |
+| toyota-camry-bsm | no | turn budget exhausted | 40 | 30 | 0 | 16356 | 598.3 |
+| volvo-xc40-camera | no | turn budget exhausted | 40 | 40 | 39 | 17368 | 622.4 |
+| ford-explorer-360 | no | model finished | 20 | 20 | 19 | 12325 | 391.3 |
+
+Of the ten cases, 9 had finished when this report was written.
+Totals over those: **0 procedures found**, 259 browser actions,
+172 of them an identical repeat of the previous action, 10
+extracts attempted, 0 stale-target failures, 1 missing-ref
+failures, peak prompt 17624 tokens, 71.2 minutes of wall time.
+
+The failure was the same in every case and it was not subtle: the verification
+reason was `ALLDATA vehicle selection was not confirmed` for all of them, and
+every visited URL sat under **one** vehicle id (`/vehicle/65270`) -- whichever
+vehicle the session happened to have open. Nothing in the loop told the model
+the session was on the wrong vehicle, and nothing stopped it from clicking the
+same ref up to 39 times in a row with no error and no page change. No candidate
+ever reached an extract in 8 of the 9 finished cases, so the old
+path's verification gates were never even exercised.
+
+That baseline is what the changes above answer, and each answer is mechanical
+rather than semantic:
+
+- the provider's own selection check now states, before the first turn, whether
+  the session is on the requested vehicle, and `select_vehicle` takes the VIN
+  the repair order already carries;
+- an action that executes cleanly and leaves the page identical (viewport
+  included) is said so on the second repeat and stops the task on the third;
+- a target that moved or changed is refused rather than clicked;
+- a control with no usable ref is reachable by mark or, last, by a
+  region-checked point.
+
+**Phase B, after the change.** Not yet run to completion. The harness and cases
+are identical (`--vin-from-ciq` additionally fills each case's VIN from its
+repair order), so the two runs are directly comparable. This is the one item of
+the definition of done that remains open, and it needs a live authenticated
+ALLDATA session plus roughly an hour of worker time.
+
+**Live probe of the semantic reviewer** (Qwen3-Omni, real evidence, 2026-09-13):
+a genuine Honda millimeter-wave radar aiming text returned
+`ACTUAL_PROCEDURE / STATIC_RADAR / ACCEPT`, confidence 0.95, its evidence table
+fully `PRESENT`, in ~4 s and ~1.7k prompt tokens. The matching
+removal/replacement page for the same component returned
+`REMOVAL_REPLACEMENT / FOLLOW_DEPENDENCY` naming "Millimeter Wave Radar Aiming",
+quoting the sentence that requires it. That is the exact discrimination the
+scripted harvester could not make.
+
+### Test results
+
+| suite | result |
+|---|---|
+| X Omni backend (`pytest`) | 1310 passed, 1 skipped (the opt-in live suite); 1240 before this work |
+| X Omni frontend (`node --test`) | 128 passed |
+| X Omni production build (Vite) | passed |
+| ScrapeX (`pytest`) | 309 passed; 258 before this work |
+| Calibration IQ backend (`pytest`) | 191 passed, 1 skipped (unchanged by this work) |
+
+No test was weakened to pass. Four budget thresholds were raised with the
+measurement that justifies them (the permanent catalog grew ~500 characters for
+the `research_si` and `adas_si_research` contracts), and the work-prep
+description assertion was inverted because service information is no longer
+dormant.
+
 
 ## Permanent meta-tool surface and cache-stable prompt (2026-09-11)
 
