@@ -365,6 +365,16 @@ async def test_a_dependency_the_reviewer_rejects_on_sight_is_dismissed_not_missi
 
 
 @pytest.mark.asyncio
+async def test_documents_listed_under_a_plain_accept_are_noted_not_pursued(wired):
+    reviewer = _Reviewer([_accept(dependencies=[{"title": "Wheel Alignment", "reason": "related information", "quote": "Related information: Wheel Alignment"}])])
+    client = _Client([[("extract", {})], None])
+    result = await _run(client, reviewer=reviewer)
+    assert result["status"] == "verified" and result["complete"] is True
+    assert result["dependencies"][0]["status"] == "noted"
+    assert [call["topic"] for call in wired.calls if call["action"] == "create_task"] == ["front radar sensor calibration"]
+
+
+@pytest.mark.asyncio
 async def test_dependency_limit_is_a_resource_bound_not_a_depth_rule(wired):
     dependencies = [{"title": f"Doc {index}", "reason": "needed"} for index in range(5)]
     reviewer = _Reviewer([_accept(decision="ACCEPT_WITH_DEPENDENCIES", dependencies=dependencies)])

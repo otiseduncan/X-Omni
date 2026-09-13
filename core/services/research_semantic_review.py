@@ -117,8 +117,14 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
                         "properties": {
                             "title": {"type": "string", "minLength": 1, "maxLength": 160},
                             "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+                            "quote": {
+                                "type": "string",
+                                "minLength": 8,
+                                "maxLength": 240,
+                                "description": "The exact sentence on this page that requires that document.",
+                            },
                         },
-                        "required": ["title", "reason"],
+                        "required": ["title", "reason", "quote"],
                         "additionalProperties": False,
                     },
                 },
@@ -159,10 +165,11 @@ REVIEW_SYSTEM_PROMPT = (
     "otherwise MISSING_OR_UNCERTAIN. Name a dependency ONLY when this page's own text "
     "says another document must be performed or consulted to complete the procedure "
     "(for example 'perform the wheel alignment first', 'set up the target as described "
-    "in ...', 'then perform the initialization in ...'). A related-information link, a "
-    "removal/replacement article, a parts page, or a document that merely 'may' apply "
-    "is not a dependency; leave dependencies empty when the page says nothing of the "
-    "kind. Decide: ACCEPT when this page alone "
+    "in ...', 'then perform the initialization in ...'), and quote that exact sentence "
+    "from the page text in the dependency's quote; a dependency whose quote is not on "
+    "the page is discarded. A related-information link, a removal/replacement article, "
+    "a parts page, or a document that merely 'may' apply is not a dependency; leave "
+    "dependencies empty when the page says nothing of the kind. Decide: ACCEPT when this page alone "
     "satisfies the objective; ACCEPT_WITH_DEPENDENCIES when it is the procedure but "
     "needs the named documents too; FOLLOW_DEPENDENCY when this page is not the "
     "procedure but names the document that is; CONTINUE_SEARCH when it is related but "
@@ -251,12 +258,19 @@ def build_review_messages(
     ]
 
 
-def validate_review(payload: Any) -> dict[str, Any]:
+def _normalized_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def validate_review(payload: Any, *, page_text: Optional[str] = None) -> dict[str, Any]:
     """Return a normalized verdict, or raise SemanticReviewError.
 
     Structural only. Enumerations, ranges, required fields, and the
     consistency between the verdict and the reviewer's own evidence table
-    are checked; the meaning of the page is not re-judged here.
+    are checked; the meaning of the page is not re-judged here. A dependency
+    must cite the sentence on the page that requires it; when ``page_text``
+    is given, a citation that is not on the page discards that dependency --
+    a check that the reviewer's claim is grounded, not a judgement of it.
     """
     if not isinstance(payload, dict):
         raise SemanticReviewError("review is not an object")
@@ -293,14 +307,23 @@ def validate_review(payload: Any) -> dict[str, Any]:
     if not isinstance(raw_dependencies, list):
         raise SemanticReviewError("dependencies must be a list")
     dependencies: list[dict[str, str]] = []
+    unsupported: list[dict[str, str]] = []
+    folded_page = _normalized_text(page_text) if page_text else None
     for item in raw_dependencies[:REVIEW_MAX_DEPENDENCIES]:
         if not isinstance(item, dict):
             raise SemanticReviewError("a dependency is not an object")
         title = _clean(item.get("title"), 160)
         reason = _clean(item.get("reason"), 300)
+        quote = _clean(item.get("quote"), 240)
         if not title or not reason:
             raise SemanticReviewError("a dependency lacks a title or reason")
-        dependencies.append({"title": title, "reason": reason})
+        entry = {"title": title, "reason": reason, "quote": quote}
+        if folded_page is not None:
+            cited = _normalized_text(quote)
+            if len(cited) < 8 or cited not in folded_page:
+                unsupported.append({**entry, "dropped": "the quoted sentence is not on the page"})
+                continue
+        dependencies.append(entry)
     summary = _clean(payload.get("evidence_summary"), 1200)
     if not summary:
         raise SemanticReviewError("evidence_summary is missing")
@@ -332,10 +355,18 @@ def validate_review(payload: Any) -> dict[str, Any]:
             inconsistencies.append(
                 f"decision accepts a page whose execution_steps are {evidence['execution_steps']}"
             )
+    if unsupported:
+        verdict["unsupported_dependencies"] = unsupported
+        if decision == "ACCEPT_WITH_DEPENDENCIES" and not dependencies:
+            # The page was accepted on its own evidence; only the ungrounded
+            # dependency claims fall away.
+            verdict["original_decision"] = decision
+            verdict["decision"] = "ACCEPT"
+            decision = "ACCEPT"
     if decision in DEPENDENCY_DECISIONS and not dependencies:
         inconsistencies.append(f"decision {decision} names no dependency")
     if inconsistencies:
-        verdict["original_decision"] = decision
+        verdict["original_decision"] = verdict.get("original_decision", decision)
         verdict["decision"] = "UNCERTAIN"
         verdict["inconsistent"] = inconsistencies
     return verdict
@@ -422,7 +453,7 @@ async def review_candidate(
             verdict = malformed_review(parse_error)
         else:
             try:
-                verdict = validate_review(payload)
+                verdict = validate_review(payload, page_text=str(candidate.get("text") or ""))
             except SemanticReviewError as exc:
                 verdict = malformed_review(str(exc))
     if isinstance(usage, dict):

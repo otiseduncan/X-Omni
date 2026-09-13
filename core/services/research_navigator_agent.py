@@ -1995,6 +1995,11 @@ async def _run_objective(
     # what came of pursuing it. Bounded by slots and by the shared turn
     # budget; a limit reached is reported, never papered over.
     def enqueue(verdict: Optional[dict[str, Any]], origin: dict[str, Any]) -> None:
+        # Only a verdict that says the objective *needs* another document
+        # opens a dependency. A plain ACCEPT that also lists documents is
+        # complete on its own; those are recorded as noted, never pursued.
+        decision = str((verdict or {}).get("decision") or "")
+        required = decision in {"ACCEPT_WITH_DEPENDENCIES", "FOLLOW_DEPENDENCY"}
         for item in (verdict or {}).get("dependencies") or []:
             title = str(item.get("title") or "").strip()
             if not title or any(dep["title"].casefold() == title.casefold() for dep in dependencies):
@@ -2003,10 +2008,11 @@ async def _run_objective(
                 {
                     "title": title,
                     "reason": str(item.get("reason") or "").strip(),
+                    "quote": str(item.get("quote") or "").strip() or None,
                     "originating_document": origin.get("title"),
                     "originating_url": origin.get("url"),
                     "originating_task_id": origin.get("task_id"),
-                    "status": "pending",
+                    "status": "pending" if required else "noted",
                     "resolved_artifact": None,
                     "task_id": None,
                 }
@@ -2018,6 +2024,8 @@ async def _run_objective(
     while index < len(dependencies):
         dependency = dependencies[index]
         index += 1
+        if dependency["status"] != "pending":
+            continue
         if budget.dependency_slots <= 0:
             dependency["status"] = "not_pursued"
             dependency["reason_not_pursued"] = f"dependency limit of {max_dependencies} reached"

@@ -57,11 +57,35 @@ def test_review_messages_hold_only_the_evidence_packet_and_the_stance():
 
 
 def test_valid_verdicts_are_normalized_and_bounded():
-    verdict = review.validate_review(_payload(confidence=0.912345, dependencies=[{"title": " Wheel Alignment ", "reason": "required first"}]))
+    verdict = review.validate_review(_payload(confidence=0.912345, dependencies=[{"title": " Wheel Alignment ", "reason": "required first", "quote": "Perform the wheel alignment first."}]))
     assert verdict["decision"] == "ACCEPT"
     assert verdict["confidence"] == 0.912
-    assert verdict["dependencies"] == [{"title": "Wheel Alignment", "reason": "required first"}]
+    assert verdict["dependencies"] == [{"title": "Wheel Alignment", "reason": "required first", "quote": "Perform the wheel alignment first."}]
     assert verdict["malformed"] is False
+
+
+def test_a_dependency_must_cite_a_sentence_that_is_on_the_page():
+    page = "Before aiming, perform the wheel alignment first. Place the target 2.5 m ahead. RELATED INFORMATION: Removal and Replacement."
+    grounded = {"title": "Wheel Alignment", "reason": "required first", "quote": "perform the wheel alignment first"}
+    invented = {"title": "Removal and Replacement", "reason": "it is linked", "quote": "the sensor must be removed and replaced before aiming"}
+    verdict = review.validate_review(_payload(decision="ACCEPT_WITH_DEPENDENCIES", dependencies=[grounded, invented]), page_text=page)
+    assert [item["title"] for item in verdict["dependencies"]] == ["Wheel Alignment"]
+    assert verdict["unsupported_dependencies"][0]["title"] == "Removal and Replacement"
+    assert verdict["decision"] == "ACCEPT_WITH_DEPENDENCIES"
+
+    # Every claimed dependency ungrounded: the page stays accepted on its own
+    # evidence, without dependencies.
+    only_invented = review.validate_review(_payload(decision="ACCEPT_WITH_DEPENDENCIES", dependencies=[invented]), page_text=page)
+    assert only_invented["decision"] == "ACCEPT" and only_invented["dependencies"] == []
+    assert only_invented["original_decision"] == "ACCEPT_WITH_DEPENDENCIES"
+    assert review.accepted(only_invented) is True
+
+    # FOLLOW_DEPENDENCY with nothing grounded cannot be followed.
+    nothing_to_follow = review.validate_review(_payload(classification="GENERAL_DESCRIPTION", decision="FOLLOW_DEPENDENCY", dependencies=[invented]), page_text=page)
+    assert nothing_to_follow["decision"] == "UNCERTAIN"
+    # Without page text there is nothing to check against; the claim stands.
+    unchecked = review.validate_review(_payload(decision="ACCEPT_WITH_DEPENDENCIES", dependencies=[invented]))
+    assert [item["title"] for item in unchecked["dependencies"]] == ["Removal and Replacement"]
 
 
 @pytest.mark.parametrize(
@@ -74,7 +98,7 @@ def test_valid_verdicts_are_normalized_and_bounded():
         {"confidence": "high"},
         {"confidence": 1.4},
         {"evidence_summary": ""},
-        {"dependencies": [{"title": "x"}]},
+        {"dependencies": [{"title": "x", "quote": "some quoted sentence here"}]},
         {"procedure_type": "RADAR"},
     ],
 )
@@ -100,6 +124,7 @@ def test_an_accept_its_own_evidence_does_not_support_is_downgraded_never_promote
 
     no_dependency = review.validate_review(_payload(decision="ACCEPT_WITH_DEPENDENCIES"))
     assert no_dependency["decision"] == "UNCERTAIN"
+    assert no_dependency["original_decision"] == "ACCEPT_WITH_DEPENDENCIES"
 
     # A REJECT is never upgraded, whatever the table says.
     rejected = review.validate_review(_payload(decision="REJECT"))
