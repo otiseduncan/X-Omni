@@ -414,22 +414,90 @@ async def test_review_can_be_switched_off_for_mechanical_comparison(wired):
 # ----------------------------------------------------------- budgets
 
 
-@pytest.mark.asyncio
-async def test_repeated_non_progress_stalls_before_the_hard_ceiling(monkeypatch):
-    class _StuckNavigator(_Navigator):
-        def _page(self, *, with_marks=False, url="https://my.alldata.com/page"):
-            self.observations += 1
-            return {
-                "observation_id": "obs_same", "url": "https://my.alldata.com/same", "title": "Same",
-                "viewport": {"width": 10, "height": 10}, "page_text": "same page",
-                "elements": [{"ref": "e1", "role": "link", "name": "Same", "expanded": None}],
-                "loop_warning": None, "backtrack_available": False,
-            }
+class _StuckNavigator(_Navigator):
+    """A page that never changes, however it is acted on."""
 
+    def _page(self, *, with_marks=False, url="https://my.alldata.com/page"):
+        self.observations += 1
+        return {
+            "observation_id": "obs_same",
+            "url": "https://my.alldata.com/same",
+            "title": "Same",
+            "viewport": {"width": 1280, "height": 720},
+            "page_text": "same page",
+            "elements": [{"ref": "e1", "role": "link", "name": "Same", "expanded": None}],
+            "scroll_position": {"scroll_y": 0, "scroll_height": 4000, "viewport_height": 720, "at_page_bottom": False},
+            "loop_warning": None,
+            "backtrack_available": False,
+        }
+
+
+@pytest.mark.asyncio
+async def test_the_same_action_that_changes_nothing_is_not_sent_forever(monkeypatch):
+    """The 2026-09-13 baseline's dominant waste: one ref clicked 39 times, no
+    error each time, the page identical throughout, the budget gone."""
     navigator = _StuckNavigator()
     monkeypatch.setattr(agent, "scrapex_svc", type("_S", (), {"navigator": navigator}))
-    client = _Client([[("scroll", {"delta_y": 1600})]] * 30)
+    client = _Client([[("click", {"ref": "e1"})]] * 30)
     result = await _run(client, max_turns=30)
+
+    assert result["agent_stopped_reason"] == "repeated_no_effect"
+    clicks = [call for call in navigator.calls if call["action"] == "click"]
+    assert len(clicks) == 3, clicks
+    # The model is told what was observed, not what it should have meant.
+    receipts = [
+        json.loads(message["content"])
+        for message in client.messages_seen[-1]
+        if message.get("role") == "tool"
+    ]
+    notice = next(item["no_effect_repeat"] for item in receipts if item.get("no_effect_repeat"))
+    assert "has not changed at all" in notice
+    assert "same scroll position" in notice
+
+
+@pytest.mark.asyncio
+async def test_a_working_scroll_down_a_long_page_is_never_called_no_effect(monkeypatch):
+    """The Palisade procedure needs about ten scrolls to reach its bottom, and
+    its element list does not change on the way down."""
+
+    class _ScrollingNavigator(_StuckNavigator):
+        def __init__(self):
+            super().__init__()
+            self.scroll_y = 0
+
+        def _page(self, *, with_marks=False, url="https://my.alldata.com/page"):
+            page = super()._page(with_marks=with_marks, url=url)
+            page["scroll_position"] = {
+                "scroll_y": self.scroll_y,
+                "scroll_height": 20000,
+                "viewport_height": 720,
+                "at_page_bottom": False,
+            }
+            return page
+
+        async def __call__(self, settings, args):
+            if args.get("action") == "scroll":
+                self.scroll_y += 1600
+            return await super().__call__(settings, args)
+
+    navigator = _ScrollingNavigator()
+    monkeypatch.setattr(agent, "scrapex_svc", type("_S", (), {"navigator": navigator}))
+    client = _Client([[("scroll", {"delta_y": 1600})]] * 8 + [None])
+    result = await _run(client, max_turns=12)
+
+    assert result["agent_stopped_reason"] == "model_finished"
+    assert len([call for call in navigator.calls if call["action"] == "scroll"]) == 8
+
+
+@pytest.mark.asyncio
+async def test_varied_actions_that_get_nowhere_still_run_out_of_progress(monkeypatch):
+    navigator = _StuckNavigator()
+    monkeypatch.setattr(agent, "scrapex_svc", type("_S", (), {"navigator": navigator}))
+    # Each action differs, so no single one repeats -- but none of them moves
+    # the page, and the task stops well before the hard ceiling.
+    client = _Client([[("scroll", {"delta_y": 100 + index * 10})] for index in range(30)])
+    result = await _run(client, max_turns=30)
+
     assert result["agent_stopped_reason"] == "stalled"
     assert result["research_receipt"]["metrics"]["turns_used"] < 30
     assert "stalled" in " ".join(result["incomplete_reasons"])

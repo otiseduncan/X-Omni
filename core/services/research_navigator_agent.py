@@ -596,6 +596,33 @@ def _observation_fingerprint(summary: dict[str, Any]) -> str:
     )
 
 
+def _page_state(summary: dict[str, Any]) -> str:
+    """Page identity plus where the viewport sits.
+
+    A scroll that moves down a long procedure leaves url, title and the
+    element list identical, so the fingerprint alone would call it an action
+    that did nothing. Reading is what scrolling is for; position is part of
+    the state.
+    """
+    position = summary.get("scroll_position") or {}
+    return json.dumps(
+        [_observation_fingerprint(summary), position.get("scroll_y"), position.get("scroll_height")],
+        default=str,
+    )
+
+
+# Actions whose whole point is to change the page. Repeating one that leaves
+# the page exactly as it was is the 2026-09-13 baseline's dominant waste: the
+# same ref clicked 39 times, no error each time, the whole budget gone.
+_EFFECT_EXPECTED_ACTIONS = frozenset(
+    {"click", "click_mark", "click_visual", "fill", "type", "press", "back", "open", "scroll", "select_vehicle"}
+)
+# How many identical no-effect repeats before the loop says so, and before it
+# stops. Two is a statement of fact; three is a task going nowhere.
+_NO_EFFECT_NOTICE_AT = 2
+_NO_EFFECT_LIMIT = 3
+
+
 def _observation_ready(summary: dict[str, Any]) -> bool:
     """Whether ScrapeX has exposed enough rendered state for a real action.
 
@@ -771,6 +798,7 @@ def _tool_receipt(
     for key in (
         "verification_after_extract",
         "semantic_review",
+        "no_effect_repeat",
         "next_instruction",
         "action_target",
         "action_detail",
@@ -1142,6 +1170,8 @@ async def _run_task(
     stopped_reason = "model_finished"
     last_failed_call: Optional[tuple[str, tuple[tuple[str, Any], ...]]] = None
     repeated_failure_count = 0
+    last_no_effect_call: Optional[tuple[str, tuple[tuple[str, Any], ...]]] = None
+    no_effect_count = 0
     model_called_done = False
     candidate_verified = False
     accepted_review: Optional[dict[str, Any]] = None
@@ -1168,6 +1198,7 @@ async def _run_task(
         )[:_DIGEST_CHAR_CAP]
     }
     previous_fingerprint = _observation_fingerprint(initial_summary)
+    previous_page_state = _page_state(initial_summary)
     action_ordinal = 0
     context_degraded = False
     # A working scroll on a lazily-loaded procedure is its own trap: the live
@@ -1526,6 +1557,39 @@ async def _run_task(
             if call_error and repeated_failure_count >= 3:
                 turn_hit_repeat_limit = True
 
+            # An action that executed cleanly and left the page exactly as it
+            # was, sent again unchanged, is a fact worth stating plainly. This
+            # says only what was observed -- same url, same title, same
+            # elements, same viewport -- and never what the model should have
+            # meant instead.
+            if (
+                call_index == 0
+                and dispatched
+                and not call_error
+                and action in _EFFECT_EXPECTED_ACTIONS
+                and isinstance(result, dict)
+                and not result.get("error")
+            ):
+                if _page_state(result) == previous_page_state:
+                    if call_signature == last_no_effect_call:
+                        no_effect_count += 1
+                    else:
+                        no_effect_count = 1
+                    last_no_effect_call = call_signature
+                    if no_effect_count >= _NO_EFFECT_NOTICE_AT:
+                        result["no_effect_repeat"] = (
+                            f"You have now sent this exact action {no_effect_count} times and the page "
+                            "has not changed at all: same URL, same title, same elements, same scroll "
+                            "position. Sending it again will do the same. Act on a different element, "
+                            "go back, or reach the content another way."
+                        )
+                    if no_effect_count >= _NO_EFFECT_LIMIT:
+                        turn_hit_repeat_limit = True
+                        stopped_reason = "repeated_no_effect"
+                else:
+                    no_effect_count = 0
+                    last_no_effect_call = None
+
             if action == "done" and dispatched and not call_error:
                 model_called_done = True
 
@@ -1567,8 +1631,15 @@ async def _run_task(
             next_observation_id = latest_visual_summary.get("observation_id")
             current_screenshot = await _task_screenshot(settings, task_id, next_observation_id)
             fingerprint = _observation_fingerprint(latest_visual_summary)
-            unchanged = fingerprint == previous_fingerprint
+            page_state = _page_state(latest_visual_summary)
+            # "Unchanged" means the reader is exactly where it was, viewport
+            # included: scrolling into the rest of a long procedure is the job,
+            # not drift. The bare fingerprint still decides whether a click
+            # needs waiting out, since that asks a different question -- has
+            # this become a different page yet?
+            unchanged = page_state == previous_page_state
             previous_fingerprint = fingerprint
+            previous_page_state = page_state
             if next_observation_id:
                 current_observation_id = next_observation_id
                 observation_ids.append(next_observation_id)
@@ -1660,7 +1731,8 @@ async def _run_task(
             stopped_reason = "model_done"
             break
         if turn_hit_repeat_limit:
-            stopped_reason = "repeated_tool_error"
+            if stopped_reason != "repeated_no_effect":
+                stopped_reason = "repeated_tool_error"
             break
         if budget.stalled:
             stopped_reason = "stalled"

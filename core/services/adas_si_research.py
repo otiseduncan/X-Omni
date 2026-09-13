@@ -274,9 +274,9 @@ def classify_objective(objective: dict[str, Any]) -> str:
     if attachments and all(item.get("attached") for item in attachments):
         return "attached" if result.get("complete") else "incomplete"
     if result.get("captured"):
-        return "captured_not_attached" if not objective.get("repair_order_id") or attachments else (
-            "captured_not_attached"
-        )
+        # Filed in ADAS SI, but Calibration IQ does not show it on the RO --
+        # whether the attachment failed, was refused, or was never attempted.
+        return "captured_not_attached"
     return "found_not_captured"
 
 
