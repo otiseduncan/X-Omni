@@ -27,7 +27,7 @@ profiles:
     # and expands to them inside the gateway, where the exact-RO write binding,
     # approvals, and receipts still apply. create_ro and create_location cannot
     # be bound to an existing RO, so they stay in the explicit `full` profile.
-    description: "Daily ADAS technician surface: query_ciq, delegate_research, stage_action, capability_search."
+    description: "Daily ADAS technician surface: query_ciq, delegate_research for ad-hoc facts, stage_action for CIQ work including SI, capability_search."
     permanent:
       - query_ciq
       - delegate_research
@@ -106,7 +106,9 @@ tools:
     description: >-
       Bounded multi-source research worker: local ADAS SI, durable knowledge,
       licensed ALLDATA Navigator, public OEM web. Never writes to Calibration IQ;
-      preserve=true captures verified evidence into ADAS SI.
+      preserve=true captures verified evidence into ADAS SI. It never satisfies
+      or attaches SI to a Calibration IQ RO; stage_action research_si is the
+      canonical production route for that work.
 
   stage_action:
     tier: operator_authorized
@@ -114,6 +116,8 @@ tools:
       Fresh exact-RO read, then a staged contract or a bound execution through
       the concrete Calibration IQ operator/destructive or ScrapeX acquisition
       tools, each under its own tier, binding, approval, and receipt rules.
+      research_si is the canonical production route for acquiring, filing, and
+      attaching service information to a CIQ RO.
 
   capability_search:
     tier: read_only
@@ -423,8 +427,9 @@ tools:
     description: >-
       Prepare active Calibration IQ field work from the authoritative RO queue:
       list an explicitly named phase or read/reconcile one RO's governing ADAS Map
-      requirements. Service-information acquisition runs through stage_action
-      research_si (background, model-driven) and delegate_research.
+      requirements. Service-information acquisition for a CIQ RO runs only
+      through stage_action research_si (background, model-driven); delegate_research
+      remains for ad-hoc facts and vehicles outside the CIQ attachment workflow.
 
   calibration_iq_destructive:
     tier: confirm_required

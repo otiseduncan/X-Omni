@@ -416,11 +416,36 @@ rather than semantic:
 - a control with no usable ref is reachable by mark or, last, by a
   region-checked point.
 
+**Focused authority cleanup (2026-09-13).** ScrapeX's remaining semantic gate
+was removed after the initial refactor: its Navigator contract now proves only
+selected vehicle, browser navigation, candidate extraction, extracted content,
+URL/time, and hashes. It no longer calls `match_terms`, carries an OEM concept
+vocabulary, calculates a relevance score, or declares a procedure leaf. X's
+fresh semantic reviewer is the sole acceptance/classification authority. X Omni
+also preserves complete multiword CIQ model names and removes a trim suffix only
+when CIQ provides that same trim separately. Normal CIQ-attached SI acquisition
+is now explicitly routed through `stage_action research_si`; `delegate_research`
+is ad-hoc and non-attaching.
+
 **Phase B, after the change.** Not yet run to completion. The harness and cases
 are identical (`--vin-from-ciq` additionally fills each case's VIN from its
 repair order), so the two runs are directly comparable. This is the one item of
 the definition of done that remains open, and it needs a live authenticated
 ALLDATA session plus roughly an hour of worker time.
+
+The Phase B command is strict: it returns nonzero unless all ten cases resolve
+an exact CIQ VIN, receive X's accepted independent review, finish every named
+dependency, expose extracted evidence, and save the capture. Its Markdown report
+places each retrieved title beside the case's expected procedure for final human
+accuracy review:
+
+```powershell
+Set-Location 'X:\X Omni'
+.\.venv\Scripts\python.exe scripts\si_research_acceptance.py `
+  --cases scripts\si_research_cases.json `
+  --out data\acceptance\phase-b.json `
+  --label phase-b --capture --vin-from-ciq
+```
 
 **Live probe of the semantic reviewer** (Qwen3-Omni, real evidence, 2026-09-13):
 a genuine Honda millimeter-wave radar aiming text returned
@@ -547,4 +572,3 @@ drops. Evidence: `logs/launcher/core-20260911-051028.err.log` ("Model requested
   ScrapeX ADAS Map session was signed out and the active board had 45 ROs
   missing a map (141 active). The first real sweep will open the sign-in
   window and report that sign-in is required; after signing in, ask again.
-

@@ -125,7 +125,9 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # estimator tokens total (exact: 992 system + ~2,481 permanent tools).
     # 2026-09-12: the setup-measurement rule above carries this to ~4,225. The
     # turn headroom below is the figure that actually matters and is unchanged.
-    assert metrics["total_input_used_tokens"] < 4_400
+    # 2026-09-13: making research_si the canonical CIQ-attached SI route spelled
+    # out that contract in the catalog; measured 4,405 tokens after the merge.
+    assert metrics["total_input_used_tokens"] < 4_450
     assert metrics["remaining_normal_turn_tokens"] > 26_800
 
 

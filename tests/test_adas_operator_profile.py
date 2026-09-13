@@ -388,11 +388,15 @@ def test_meta_tool_descriptions_expose_distinct_contracts() -> None:
     assert "never changes calibration iq" in research
     assert "with or without an ro" in research
     assert "exclude_sources" in research
+    assert "never satisfies or attaches si to a ciq ro" in research
+    assert "stage_action research_si" in research
     assert "only way to change calibration iq" in stage
     assert "stage=staged" in stage
     assert "raise otis's approval card when executed" in stage
     assert "sweep_adas_maps" in stage
     assert "never loop acquire_adas_map over a list" in stage
+    assert "ro's adas map or si" in stage
+    assert "research_si" in stage
     assert "adas_map_sweep" in query
     assert "take no target_id" in stage
     assert "nothing continues automatically after sign-in" in stage

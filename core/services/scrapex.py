@@ -1759,8 +1759,8 @@ def _validate_navigator_verification_contract(payload: Any) -> dict[str, Any]:
     proof = _contract_mapping(payload, "navigator verification")
     for key in (
         "vehicle_verified",
-        "subject_verified",
-        "procedure_leaf_verified",
+        "navigation_performed",
+        "candidate_extracted",
         "content_extracted",
         "verified",
     ):

@@ -132,13 +132,28 @@ def test_target_identity_comes_from_calibration_iq_only():
     target = target_from_read(_ro_read())
     assert target["ro_number"] == "2400711902"
     assert target["repair_order_id"] == "id-2400711902"
-    assert target["vehicle"] == {"year": 2025, "make": "Kia", "model": "K4"}
+    assert target["vehicle"] == {"year": 2025, "make": "Kia", "model": "K4 LX FWD"}
     assert target["vin"] == "KNAF24A28S5000001"
     assert [item["title"] for item in target["calibrations"]] == ["Front Radar Sensor - SCC / AEB / FCW"]
     assert target_from_read({"status": "not_found"}) is None
     assert research_mod.normalize_make("VW") == "Volkswagen"
     assert research_mod.normalize_make("BENZ") == "Mercedes-Benz"
-    assert research_mod.short_model("Santa Fe Limited") == "Santa"
+    assert research_mod.normalize_model("Santa Fe Limited") == "Santa Fe Limited"
+    assert research_mod.normalize_model("Santa Fe Limited", "Limited") == "Santa Fe"
+    assert research_mod.normalize_model("Grand Cherokee L", "Limited") == "Grand Cherokee L"
+
+
+def test_target_preserves_multiword_model_and_separate_trim():
+    read = _ro_read()
+    read["raw"]["vehicle"].update({"model": "Santa Fe Limited", "trim": "Limited"})
+    target = target_from_read(read)
+    assert target["vehicle"] == {
+        "year": 2025,
+        "make": "Kia",
+        "model": "Santa Fe",
+        "trim": "Limited",
+    }
+    assert target["vehicle_label"] == "2025 Kia Santa Fe Limited"
 
 
 def test_objectives_are_one_per_requirement_and_carry_no_navigation_decisions():
@@ -182,7 +197,12 @@ async def test_job_researches_each_requirement_attaches_accepted_documents_and_r
 
     # The Navigator was given the exact identity and the requirement, nothing more.
     call = navigator.calls[0]
-    assert call["target"] == {"year": 2025, "make": "Kia", "model": "K4", "vin": "KNAF24A28S5000001"}
+    assert call["target"] == {
+        "year": 2025,
+        "make": "Kia",
+        "model": "K4 LX FWD",
+        "vin": "KNAF24A28S5000001",
+    }
     assert call["capture"] is True
     assert call["objective"]["repair_order"] == "2400711902"
     assert call["objective"]["calibration_item_id"] == "cal-radar"
