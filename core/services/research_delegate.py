@@ -58,6 +58,12 @@ def _vehicle(args: dict[str, Any]) -> dict[str, Any]:
         value = _clean(raw.get(field), 120)
         if value:
             vehicle[field] = value
+    # A VIN identifies one vehicle including trim and engine, which a
+    # year/make/model cascade cannot. Kept apart from the label so it never
+    # becomes part of a search phrase.
+    vin = "".join(_clean(raw.get("vin"), 32).split()).upper()
+    if vin:
+        vehicle["vin"] = vin
     label = " ".join(
         str(vehicle[field]) for field in ("year", "make", "model", "trim") if field in vehicle
     )
@@ -264,9 +270,8 @@ def make_delegate_research(
                             part for part in (vehicle.get("model"), vehicle.get("trim")) if part
                         ),
                     }
-                    vin = _clean(args.get("vin"), 32)
-                    if vin:
-                        target["vin"] = vin
+                    if vehicle.get("vin"):
+                        target["vin"] = vehicle["vin"]
                     research_objective = {
                         "objective": objective,
                         "system": _clean(args.get("system"), 200) or None,

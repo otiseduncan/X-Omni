@@ -260,6 +260,12 @@ DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
                     "make": {"type": "string", "minLength": 1, "maxLength": 80},
                     "model": {"type": "string", "minLength": 1, "maxLength": 120},
                     "trim": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "vin": {
+                        "type": "string",
+                        "minLength": 11,
+                        "maxLength": 32,
+                        "description": "The RO's VIN when a read returned one; it selects the exact vehicle.",
+                    },
                 },
             },
             "system": {"type": "string", "maxLength": 200},

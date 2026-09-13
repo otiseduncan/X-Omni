@@ -738,6 +738,43 @@ def test_delegate_research_honors_exclusions_preferences_and_exhaustive() -> Non
     assert preferred["findings"][0]["source"] == "web"
 
 
+def test_delegate_research_passes_the_exact_vehicle_and_its_vin_to_alldata() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def navigator(**kwargs):
+        seen.append(kwargs)
+        return {
+            "verified": True, "complete": True, "task_id": "t-1", "task_ids": ["t-1"],
+            "source_url": "https://alldata.test/p", "evidence_title": "Front Radar (ADAS) - Adjustment",
+            "extracted_text": "Procedure text", "provenance": {"provider": "alldata"},
+            "semantic_review": {"classification": "ACTUAL_PROCEDURE", "decision": "ACCEPT", "confidence": 0.9},
+            "documents": [{"role": "primary", "title": "Front Radar (ADAS) - Adjustment", "accepted": True, "captured": False}],
+            "dependencies": [],
+        }
+
+    handler = research_delegate.make_delegate_research(
+        SimpleNamespace(),
+        adas_search=lambda a: {"status": "no_result", "results": []},
+        knowledge_search=lambda a: {"status": "no_result", "records": []},
+        navigator_search=navigator,
+        public_search=lambda *_a, **_k: {"verified": False, "sources": [], "read_results": [], "result_count": 0},
+    )
+    result = _run(handler, {
+        "objective": "front radar calibration",
+        "system": "Front Radar Sensor - SCC / AEB / FCW",
+        "vehicle": {"year": 2025, "make": "Kia", "model": "K4", "vin": " knaf24a28s5000001 "},
+    })
+    assert seen[0]["target"]["vin"] == "KNAF24A28S5000001"
+    assert seen[0]["objective"]["system"] == "Front Radar Sensor - SCC / AEB / FCW"
+    # The VIN identifies the vehicle; it never becomes part of the search text.
+    assert "KNAF" not in seen[0]["topic"]
+    finding = result["findings"][0]
+    assert finding["semantic_review"]["decision"] == "ACCEPT"
+    assert finding["documents"][0]["accepted"] is True
+    vehicle_schema = meta.DELEGATE_RESEARCH_SCHEMA["parameters"]["properties"]["vehicle"]["properties"]
+    assert "vin" in vehicle_schema
+
+
 def test_delegate_research_reports_alldata_auth_boundary_and_skips_without_vehicle() -> None:
     handler = research_delegate.make_delegate_research(
         SimpleNamespace(),
