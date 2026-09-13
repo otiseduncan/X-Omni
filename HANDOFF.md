@@ -339,10 +339,10 @@ restarted ScrapeX, no model involved, 2026-09-13):
 
 | suite | result |
 |---|---|
-| X Omni backend (`pytest`) | 1310 passed, 1 skipped (the opt-in live suite); 1240 before this work |
+| X Omni backend (`pytest`) | 1314 passed, 1 skipped (the opt-in live suite); 1240 before this work |
 | X Omni frontend (`node --test`) | 128 passed |
 | X Omni production build (Vite) | passed |
-| ScrapeX (`pytest`) | 309 passed; 258 before this work |
+| ScrapeX (`pytest`) | 310 passed; 258 before this work |
 | Calibration IQ backend (`pytest`) | 191 passed, 1 skipped (unchanged by this work) |
 
 No test was weakened to pass. Four budget thresholds were raised with the
