@@ -319,6 +319,22 @@ removal/replacement page for the same component returned
 quoting the sentence that requires it. That is the exact discrimination the
 scripted harvester could not make.
 
+**Live proof of the observation contract** (real ALLDATA session through the
+restarted ScrapeX, no model involved, 2026-09-13):
+
+- the provider's selection check answered `selected: false` for a 2025 Kia K4
+  with the reason ALLDATA gives, before any task action;
+- one observation came back with `observation_id`, a page identity, a 1280x720
+  viewport, 25 elements of which 3 carried on-screen boxes, and **10 visible
+  controls no usable ref covered** -- numbered as marks `[m21]` Return to
+  ALLDATA Portal, `[m22]` Portal Home, `[m23]` Otis, `[m24]` Help Options,
+  `[m25]` Message Center, `[m26]` Application Switcher: exactly the icon and
+  menu controls the accessibility tree hides;
+- the annotated still (72,940 bytes) came back bound to that observation id;
+- a click carrying the superseded observation was **refused 409
+  `stale_observation`**, naming the current observation, with nothing clicked;
+- an unknown mark was refused 422.
+
 ### Test results
 
 | suite | result |
