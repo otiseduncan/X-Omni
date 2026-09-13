@@ -31,7 +31,7 @@ HARVESTER_SEMANTICS = (
     "MAX_DEPTH",
     "procedure_children",
     "QUICK_REFERENCE",
-    "select-vehicle",
+    "PICKER_URL",
 )
 
 

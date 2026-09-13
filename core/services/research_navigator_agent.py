@@ -269,7 +269,9 @@ PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
         "Some Nissan/Infiniti radar material has been filed under Cruise Control.",
         "Procedure titles vary by make: Aiming, Adjustment, Alignment, Programming and "
         "Relearning, Initialization, Learn, Zero Point.",
-        "The vehicle search box ignores programmatic fills; typing keystrokes works.",
+        "The vehicle picker is https://my.alldata.com/repair/#/select-vehicle (open it "
+        "to change vehicle); its search box ignores programmatic fills but reacts to "
+        "typed keystrokes, and a typed VIN resolves the exact vehicle on its own.",
     ),
 }
 

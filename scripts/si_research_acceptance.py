@@ -323,6 +323,11 @@ async def main() -> int:
     parser.add_argument("--capture", action="store_true")
     parser.add_argument("--max-turns", type=int, default=40)
     parser.add_argument("--only", action="append", default=[])
+    parser.add_argument(
+        "--vin-from-ciq",
+        action="store_true",
+        help="Fill each case's VIN from its repair order in Calibration IQ (exact identity only).",
+    )
     args = parser.parse_args()
 
     from core.config import Settings
@@ -333,6 +338,21 @@ async def main() -> int:
     if args.only:
         wanted = set(args.only)
         cases = [case for case in cases if case["id"] in wanted]
+    if args.vin_from_ciq:
+        from core.services import adas_si_research, calibration_iq
+
+        for case in cases:
+            if case.get("vin") or not case.get("ro"):
+                continue
+            try:
+                read = await calibration_iq.get_repair_order(settings, {"repair_order_id": case["ro"]})
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{args.label}] {case['id']}: VIN lookup failed ({type(exc).__name__})", flush=True)
+                continue
+            vin = adas_si_research.vin_from_read(read) if isinstance(read, dict) else ""
+            if vin:
+                case["vin"] = vin
+                print(f"[{args.label}] {case['id']}: VIN {vin} from Calibration IQ", flush=True)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
