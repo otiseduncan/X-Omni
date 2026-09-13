@@ -149,6 +149,113 @@ One non-fatal Windows `WinError 10054` Proactor callback was logged during expec
 
 The shared-node Tailscale contract is now explicit: `https://omega.<tailnet>.ts.net/` (port 443) proxies Calibration IQ on loopback 8084, while `https://omega.<tailnet>.ts.net:8443/` proxies X Omni on loopback 8100. `scripts\tailscale-serve.ps1` changes only 8443 and deliberately preserves Calibration IQ's 443 handler. Re-check live Serve status before relying on it because external routing state can drift.
 
+## Agentic service-information research (2026-09-13)
+
+X owns meaning; ScrapeX observes and executes; Calibration IQ records truth.
+This section records what moved to which side and what was measured.
+
+### Removed or demoted deterministic behavior
+
+- `core/services/adas_si_harvest.py` is **legacy, experimental, non-default,
+  not authoritative**. It chose ALLDATA links from `PROCEDURE_WORDS`, called a
+  page a document at `DOCUMENT_CHARS` / `DOCUMENT_WITH_LINKS_CHARS`, walked to
+  `MAX_DEPTH`, and verified each capture against the candidate page's own
+  title. Its tools register only with `XOMNI_LEGACY_SI_HARVEST=1`; no heuristic
+  is added to it. `tests/test_si_research_architecture.py` keeps those knobs
+  out of the production modules.
+- No new keyword router, phrase table, title matcher, page-length rule,
+  navigation-depth rule, or deterministic procedure classifier was added.
+  Python validates the reviewer's *structure* (enums, ranges, consistency
+  between verdict and evidence table); it never decides what a page is.
+
+### What changed in ScrapeX (`X:\ScrapeX`, 511a5c6)
+
+- Observations carry `observation_id`, `page_identity`, `viewport`, the
+  measured box of every on-screen interactive ref, and the visible DOM
+  controls the accessibility tree does not expose (`navigator_observation.py`).
+- Actions bind to the observation they were chosen from
+  (`navigator_actions.py`): ref actions are checked against the ref's observed
+  box and label; `observe` with `marks` numbers ref-less controls (bounded
+  Set-of-Mark, 24 per page, only on request) for `click_mark`, which
+  re-locates that control by path, box, and signature before clicking its
+  current centre; `click_visual` takes fractions of the screenshot of the
+  named observation and compares the target-local region (64 px window,
+  mean grey difference) of the frame ScrapeX served with the same region now
+  (`navigator_visual.py`, a dependency-free PNG decoder). A moved, changed,
+  covered, or unverifiable target is refused (HTTP 409 `stale_observation` /
+  `stale_target` / `stale_visual_target` / `visual_frame_missing`) with a
+  fresh-observation instruction. Nothing is ever redirected to another element.
+- `type` sends real keystrokes; `select_vehicle` is the ALLDATA exact-VIN fast
+  path; `extract` records the page's full text (up to 60k chars) and its
+  referenced links; `evidence` returns them; `capture` names the file after
+  the page, writes `<name>.text.txt` beside the page-image PDF, and carries
+  the caller's `semantic_review` and `objective` into the `.source.json`
+  provenance with `capture_method: rendered_page_images` and an explicit
+  `provider_export.attempted: false` (ALLDATA's print control ends in
+  `window.print()`, which no driven browser can complete).
+- Suite: 309 passed (was 258).
+
+### What changed in X Omni
+
+- `core/services/research_navigator_agent.py`: model-facing actions
+  `observe_marks`, `click_mark`, `click_visual`, `type`, `select_vehicle`;
+  every ref action carries the current `observation_id`; stale refusals come
+  back as fresh observations with a mark/visual fallback hint; progress-aware
+  budget (stall at 8 non-progress points, hard ceiling unchanged); after each
+  ScrapeX-verified `extract` the candidate goes to the independent reviewer;
+  dependencies the reviewer names run as their own ScrapeX tasks under the
+  same budget (3 slots, half the turns), a dependency the reviewer later
+  rejects on sight is dismissed, one it cannot resolve is reported as
+  incompleteness; every run returns a `research_receipt`. One run at a time
+  holds the provider browser (`NAVIGATOR_LOCK`); a second caller gets
+  `navigator_busy`, never a silent wait.
+- `core/services/research_semantic_review.py`: the reviewer. Fresh context
+  (system stance + evidence packet + screenshot), never the Navigator's
+  transcript. Structured verdict via a single grammar-constrained tool call:
+  classification (actual procedure / required supporting / removal /
+  diagnostic / description / wiring / unrelated / uncertain), procedure type,
+  vehicle match, a seven-field evidence table (`PRESENT` / `NOT_APPLICABLE` /
+  `REFERENCED_ELSEWHERE` / `MISSING_OR_UNCERTAIN`), dependencies with reasons,
+  decision (`ACCEPT` / `ACCEPT_WITH_DEPENDENCIES` / `FOLLOW_DEPENDENCY` /
+  `CONTINUE_SEARCH` / `REJECT` / `UNCERTAIN`), confidence, summary. An
+  acceptance its own table does not support (no execution steps, wrong
+  vehicle, wrong classification) is downgraded to `UNCERTAIN`; a prose or
+  unreadable reply is `UNCERTAIN`. Probed live on the Qwen worker: a real
+  Honda radar aiming text came back `ACTUAL_PROCEDURE / STATIC_RADAR / ACCEPT`
+  (confidence 0.95, ~11 s); the matching removal/replacement page came back
+  `REMOVAL_REPLACEMENT / FOLLOW_DEPENDENCY -> "Millimeter Wave Radar Aiming"`.
+- `core/services/adas_si_research.py`: the background job behind
+  `stage_action` operation `research_si` (status through `query_ciq` kind
+  `adas_si_research`). It reads exact RO / VIN / requirements from Calibration
+  IQ, builds one objective per requirement (or per named system), runs the
+  Navigator with capture, attaches accepted documents through
+  `ensure_case_workspace` + `import_document` bound to the calibration item
+  under the job's own invocation identity, and lets a fresh Calibration IQ
+  reread alone decide "attached". Research state is never marked complete by
+  the job. Jobs persist in `state_records` (`adas_si_research`), resume after
+  restart, post an `adas_si_research` card plus push and live event, and keep
+  every objective's research receipt.
+- `delegate_research` (chat) passes the objective's system/component and VIN
+  to the Navigator and returns the reviewer's verdict, the documents, the
+  dependencies, and a compact receipt with each ALLDATA finding.
+- Descriptions: service information is described as live in `tools.yaml`,
+  the work-prep schema, and the registry; the "dormant" wording is gone from
+  everything the model reads.
+- UI: `AdasSiResearchCard` (per-objective outcome from Core's classification,
+  attachment result, dependencies, reasons); the research findings card shows
+  the reviewer's verdict and the document set.
+- Measurement: `scripts/si_research_acceptance.py` with
+  `scripts/si_research_cases.json` (ten varied cases from the live board).
+
+### Calibration IQ
+
+No code change. `X:\Calibration IQ` (bd8ce75) already has
+`SERVICE_INFORMATION_INTEGRATION_ENABLED = True`, `import_document` accepts
+`oem_procedure`, and RO reads report `service_information_document_count`.
+Backend suite: 191 passed, 1 skipped.
+
+__ACCEPTANCE_SECTION__
+
 ## Permanent meta-tool surface and cache-stable prompt (2026-09-11)
 
 Root-cause review of the three-model architecture analysis confirmed two
