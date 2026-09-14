@@ -100,6 +100,37 @@ async def test_repairs_tool_call_with_missing_action_before_loop_sees_it():
 
 
 @pytest.mark.asyncio
+async def test_legacy_stream_signature_is_unchanged_on_normal_turns():
+    class _LegacyClient:
+        def __init__(self):
+            self.calls = []
+
+        async def stream(self, messages, tools=None, max_tokens=None):
+            self.calls.append((messages, tools, max_tokens))
+            yield {
+                "type": "tool_call",
+                "id": "call-legacy",
+                "name": "navigator_browse",
+                "arguments": '{"action":"extract"}',
+            }
+
+    delegate = _LegacyClient()
+    client = repair.NavigatorToolRepairClient(delegate)
+    events = [
+        event
+        async for event in client.stream(
+            [{"role": "user", "content": "current page"}],
+            tools=NAV_TOOL,
+            max_tokens=500,
+        )
+    ]
+
+    assert len(delegate.calls) == 1
+    assert events[0]["arguments"] == '{"action":"extract"}'
+    assert client.navigator_tool_json_repairs == 0
+
+
+@pytest.mark.asyncio
 async def test_does_not_retry_non_navigator_or_non_parse_failure():
     class _Client:
         async def stream(self, messages, tools=None, max_tokens=None, *, tool_choice=None):  # noqa: ARG002
