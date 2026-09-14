@@ -173,11 +173,20 @@ def install(review_module: Any, navigator_module: Any) -> None:
         out["objective_match"] = match
         category = match["match"]
         if category == "EXACT_MATCH":
+            # A finer reviewer can confirm an otherwise acceptable result, but
+            # it may not override an earlier hard veto such as radar-vs-camera.
             return out
 
-        original_decision = str(out.get("decision") or "")
-        out.setdefault("original_decision", original_decision)
-        out["decision"] = "UNCERTAIN" if category == "UNCERTAIN" else "CONTINUE_SEARCH"
+        current_decision = str(out.get("decision") or "")
+        out.setdefault("original_decision", current_decision)
+        if category == "UNCERTAIN":
+            # Preserve a stronger already-proven negative decision from the
+            # coarse system-family guard. The second reviewer adds precision;
+            # it never weakens an established mismatch back to ambiguity.
+            if current_decision not in {"CONTINUE_SEARCH", "REJECT"}:
+                out["decision"] = "UNCERTAIN"
+        else:
+            out["decision"] = "CONTINUE_SEARCH"
         inconsistent = list(out.get("inconsistent") or [])
         inconsistent.append(f"objective_match={category}: {match['reason']}")
         out["inconsistent"] = inconsistent
