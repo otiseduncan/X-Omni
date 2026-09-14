@@ -1,4 +1,4 @@
-"""Force each Navigator task to begin from an exact-VIN vehicle anchor.
+"""Force each managed Navigator task to begin from an exact-VIN vehicle anchor.
 
 The ALLDATA browser profile is persistent, so a completed task can leave the
 browser sitting deep inside the previous procedure. ``research_navigator_agent``
@@ -9,10 +9,15 @@ new task inherit the previous article as its starting context.
 ScrapeX's existing ``select_vehicle`` fast path is the correct reset primitive:
 it always opens ALLDATA's vehicle picker, types the exact VIN, and proves the
 rendered vehicle page shows that VIN. This installer therefore forces only the
-*first* target-signal check inside each Navigator task to report "not selected"
-when a valid VIN is present. The agent then runs its normal ``select_vehicle``
-preflight. Later target checks in the same task delegate to the real live
-signal so verification remains unchanged.
+*first* target-signal check inside each managed Navigator task to report
+"not selected" when a valid VIN is present. The agent then runs its normal
+``select_vehicle`` preflight. Later target checks in the same task delegate to
+the real live signal so verification remains unchanged.
+
+The forced anchor is intentionally limited to settings that explicitly identify
+a managed ScrapeX project. Hermetic adapter/unit callers that provide only a
+bare settings object retain their original transport semantics; production
+Settings.load() carries ``scrapex_project_path`` and therefore gets the reset.
 
 No procedure meaning, menu choice, or provider hierarchy is decided here.
 """
@@ -39,8 +44,13 @@ def _exact_vin(target: Any) -> str:
     return vin if _VIN_RE.fullmatch(vin) else ""
 
 
+def _managed_settings(settings: Any) -> bool:
+    value = getattr(settings, "scrapex_project_path", None)
+    return value is not None and bool(str(value).strip())
+
+
 def install(module: Any) -> None:
-    """Force one exact-VIN reselection at the beginning of every Navigator task."""
+    """Force one exact-VIN reselection at the beginning of each managed task."""
     if getattr(module, _INSTALLED_ATTR, False):
         return
 
@@ -52,7 +62,12 @@ def install(module: Any) -> None:
         settings: Any, provider: str, target: dict[str, Any]
     ):
         state = _ANCHOR_STATE.get()
-        if state is not None and not state.get("forced") and _exact_vin(target):
+        if (
+            state is not None
+            and not state.get("forced")
+            and _managed_settings(settings)
+            and _exact_vin(target)
+        ):
             # The agent interprets False by invoking ScrapeX's existing exact-VIN
             # select_vehicle fast path. That path itself opens the vehicle picker,
             # so this is the reset without adding a new browser action or endpoint.
