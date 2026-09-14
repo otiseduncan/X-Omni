@@ -83,3 +83,25 @@ def test_phase_b_set_is_exactly_ten_named_real_ro_cases():
     assert len({case["id"] for case in cases}) == 10
     for case in cases:
         assert all(case.get(field) for field in ("id", "year", "make", "model", "ro", "topic", "expect"))
+
+
+def test_a_repair_order_without_a_vin_is_named_as_such():
+    """The two VIN preflight failures must not read the same.
+
+    A repair order that Calibration IQ does not have, and one it has with an
+    empty VIN field, are different problems with different fixes. Both used
+    to print "did not return a valid 17-character VIN", which reads like an
+    outage: on 2026-09-14 that cost a morning restarting healthy services
+    when the real answer was that three live repair orders simply carry no
+    VIN. Research is VIN-bound, so refusing is correct -- saying why is the
+    part that was missing.
+    """
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "si_research_acceptance.py").read_text(
+        encoding="utf-8"
+    )
+    assert "but no VIN recorded on it" in source
+    assert "did not return repair order" in source
+    # The old undifferentiated sentence must not survive anywhere.
+    assert "Calibration IQ did not return a valid 17-character VIN" not in source
+    # And the guard itself stays: no fallback VIN, ever.
+    assert "case[\"vin\"] = vin" in source

@@ -462,7 +462,31 @@ async def main() -> int:
                 case["vin"] = vin
                 print(f"[{args.label}] {case['id']}: VIN {vin} from Calibration IQ", flush=True)
             else:
-                case["_preflight_error"] = "Calibration IQ did not return a valid 17-character VIN"
+                # Say which of the two very different things went wrong. A
+                # read that never landed and a repair order with an empty VIN
+                # field both used to print "did not return a valid
+                # 17-character VIN", which reads like a Calibration IQ outage
+                # and sends you to restart services that were fine. On
+                # 2026-09-14 three cases failed this way and the real answer
+                # was that the repair orders simply carry no VIN.
+                detail = read.get("repair_order") if isinstance(read, dict) else None
+                detail = detail if isinstance(detail, dict) else {}
+                found = str(read.get("status") or "") == "verified" if isinstance(read, dict) else False
+                vehicle = str(detail.get("Vehicle") or "").strip()
+                if found and vehicle:
+                    case["_preflight_error"] = (
+                        f"Calibration IQ has RO {case['ro']} ({vehicle}) but no VIN recorded on it. "
+                        "Service-information research is VIN-bound, so this case cannot run until "
+                        "the VIN is entered in Calibration IQ."
+                    )
+                elif found:
+                    case["_preflight_error"] = (
+                        f"Calibration IQ returned RO {case['ro']} with no VIN and no vehicle detail."
+                    )
+                else:
+                    case["_preflight_error"] = (
+                        f"Calibration IQ did not return repair order {case['ro']}."
+                    )
                 print(f"[{args.label}] {case['id']}: {case['_preflight_error']}", flush=True)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
