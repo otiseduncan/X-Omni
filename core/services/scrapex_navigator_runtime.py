@@ -1,14 +1,10 @@
-"""Runtime preflight for ScrapeX Navigator task creation.
+"""Contract-preserving runtime preflight for ScrapeX Navigator task creation.
 
-Navigator task creation is the first mutating call in an SI-research session.  If
-ScrapeX is not already listening, issuing that POST first produces an
-indeterminate mutation result and the model never receives a task id.  X Omni
-already owns a revision-aware ``scrapex.start_native`` lifecycle, so use that
-before the first task is created instead of requiring a separate manually kept
-PowerShell process.
-
-This module changes no navigation or semantic decisions.  It only ensures the
-mechanical ScrapeX service is available before task creation.
+Production X Omni owns a local ScrapeX checkout and may start it when Navigator
+research needs it. The preflight must never run before request validation: an
+unsupported provider or malformed create request is still a pure adapter error
+and must not touch the runtime. Lightweight/hermetic callers that do not declare
+a managed ScrapeX project keep the original adapter behaviour.
 """
 
 from __future__ import annotations
@@ -20,10 +16,11 @@ _INSTALLED_ATTR = "__xomni_navigator_runtime_preflight_installed__"
 
 def _startup_failure(startup: Any) -> dict[str, Any]:
     detail = startup if isinstance(startup, dict) else {}
+    error = detail.get("error") if isinstance(detail.get("error"), dict) else {}
     message = str(
         detail.get("message")
         or detail.get("detail")
-        or (detail.get("error") or {}).get("message")
+        or error.get("message")
         or "ScrapeX could not be started for Navigator research."
     )
     return {
@@ -38,15 +35,65 @@ def _startup_failure(startup: Any) -> dict[str, Any]:
     }
 
 
+def _managed_project(settings: Any) -> bool:
+    """Only production-style settings opt into native runtime ownership."""
+    value = getattr(settings, "scrapex_project_path", None)
+    return value is not None and str(value).strip() != ""
+
+
+def _valid_create_task(module: Any, args: Any) -> bool:
+    """Prove enough create-task shape before allowing a lifecycle side effect.
+
+    The canonical adapter remains the authoritative validator. This gate only
+    decides whether starting a local process is allowed before delegation.
+    """
+    if not isinstance(args, dict) or args.get("action") != "create_task":
+        return False
+
+    provider = args.get("provider")
+    providers = getattr(module, "NAVIGATOR_PROVIDERS", frozenset({"alldata"}))
+    if not isinstance(provider, str) or provider not in providers:
+        return False
+
+    target = args.get("target")
+    if not isinstance(target, dict):
+        return False
+    allowed_target = {"year", "make", "model", "trim", "vin"}
+    if set(target) - allowed_target:
+        return False
+    year = target.get("year")
+    if year is not None and (
+        isinstance(year, bool) or not isinstance(year, int) or not 1900 <= year <= 2100
+    ):
+        return False
+    for field in ("make", "model", "trim", "vin"):
+        value = target.get(field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            return False
+
+    topic = args.get("topic")
+    max_topic = int(getattr(module, "MAX_TOPIC_CHARS", 400))
+    if not isinstance(topic, str) or not topic.strip() or len(topic.strip()) > max_topic:
+        return False
+
+    budget = args.get("action_budget")
+    if budget is not None and (
+        isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= 80
+    ):
+        return False
+
+    return True
+
+
 def install(module: Any) -> None:
-    """Ensure ScrapeX is healthy before every Navigator ``create_task`` call."""
+    """Auto-start managed ScrapeX only for a validated Navigator create request."""
     if getattr(module, _INSTALLED_ATTR, False):
         return
 
     original_navigator = module.navigator
 
     async def navigator_with_runtime_preflight(settings: Any, args: dict[str, Any]):
-        if isinstance(args, dict) and args.get("action") == "create_task":
+        if _managed_project(settings) and _valid_create_task(module, args):
             startup = await module.start_native(settings)
             if not isinstance(startup, dict) or startup.get("success") is not True:
                 return _startup_failure(startup)
