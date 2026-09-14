@@ -180,7 +180,12 @@ def vin_from_read(read: dict[str, Any]) -> str:
 
 
 def target_from_read(read: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """The exact identity one Calibration IQ read carries, and nothing more."""
+    """The exact identity one Calibration IQ read carries, and nothing more.
+
+    Service-information navigation is VIN-bound. Year/make/model without a
+    valid 17-character VIN is not an exact target and must never inherit the
+    browser's previously selected vehicle.
+    """
     if not isinstance(read, dict) or read.get("status") != "verified":
         return None
     raw = read.get("raw") if isinstance(read.get("raw"), dict) else {}
@@ -203,6 +208,7 @@ def target_from_read(read: dict[str, Any]) -> Optional[dict[str, Any]]:
         vehicle_raw.get("model") or _dig(raw, "model", "repair_order.model"),
         trim,
     )
+    vin = vin_from_read(read)
     calibrations: list[dict[str, Any]] = []
     for item in _dig(raw, "calibrations", "calibration_items", "repair_order.calibrations") or []:
         if not isinstance(item, dict):
@@ -221,7 +227,7 @@ def target_from_read(read: dict[str, Any]) -> Optional[dict[str, Any]]:
                 "version": item.get("version"),
             }
         )
-    if not ro_number or not ro_id or not year_value or not make or not model:
+    if not ro_number or not ro_id or not year_value or not make or not model or not vin:
         return None
     vehicle = {"year": year_value, "make": make, "model": model}
     if trim:
@@ -231,7 +237,7 @@ def target_from_read(read: dict[str, Any]) -> Optional[dict[str, Any]]:
         "repair_order_id": ro_id,
         "vehicle": vehicle,
         "vehicle_label": " ".join(str(part) for part in (year_value, make, model, trim) if part),
-        "vin": vin_from_read(read),
+        "vin": vin,
         "phase": _dig(repair_order, "Phase") or _dig(raw, "phase", "workflow.phase"),
         "shop": _clean(_dig(repair_order, "Shop") or _dig(raw, "shop.name", "shop"), 60) or None,
         "calibrations": calibrations,
@@ -291,8 +297,6 @@ def classify_objective(objective: dict[str, Any]) -> str:
     if attachments and all(item.get("attached") for item in attachments):
         return "attached" if result.get("complete") else "incomplete"
     if result.get("captured"):
-        # Filed in ADAS SI, but Calibration IQ does not show it on the RO --
-        # whether the attachment failed, was refused, or was never attempted.
         return "captured_not_attached"
     return "found_not_captured"
 
@@ -547,8 +551,6 @@ class AdasSiResearchService:
         self._tasks: dict[str, asyncio.Task] = {}
         self._start_lock = asyncio.Lock()
 
-    # ------------------------------------------------------------ records
-
     def _save(self, record: dict[str, Any]) -> dict[str, Any]:
         record["updated_at"] = _iso(self.clock())
         self.store.put_record(NAMESPACE, record["job_id"], record, user_id=record["user_id"])
@@ -569,8 +571,6 @@ class AdasSiResearchService:
             if record.get("state") in ACTIVE_STATES:
                 return record
         return None
-
-    # ----------------------------------------------------------- handlers
 
     def _not_started(self, status: str, message: str, **extra: Any) -> dict[str, Any]:
         return {
@@ -634,7 +634,14 @@ class AdasSiResearchService:
                 continue
             target = target_from_read(read)
             if target is None:
-                problems.append(f"RO {identifier}: {(read or {}).get('message') if isinstance(read, dict) else 'not readable'}")
+                vin = vin_from_read(read) if isinstance(read, dict) else ""
+                if isinstance(read, dict) and read.get("status") == "verified" and not vin:
+                    problems.append(
+                        f"RO {identifier}: Calibration IQ did not return a valid 17-character VIN; "
+                        "service-information research was not started for this vehicle."
+                    )
+                else:
+                    problems.append(f"RO {identifier}: {(read or {}).get('message') if isinstance(read, dict) else 'not readable'}")
                 continue
             if any(item["ro_number"] == target["ro_number"] for item in targets):
                 continue
@@ -644,7 +651,6 @@ class AdasSiResearchService:
         return targets, problems, label
 
     async def start(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Handler for the concrete ``adas_si_research`` tool (via stage_action)."""
         payload = dict(args or {})
         context = payload.pop(INVOCATION_KEY, None)
         if not isinstance(context, dict) or not context.get("conversation_id"):
@@ -678,7 +684,7 @@ class AdasSiResearchService:
             if not targets:
                 return self._not_started(
                     "no_targets",
-                    "No readable repair order with an exact vehicle was found for "
+                    "No readable repair order with an exact vehicle and valid VIN was found for "
                     f"{label}; nothing was started." + (" " + "; ".join(problems[:4]) if problems else ""),
                     problems=problems,
                 )
@@ -782,8 +788,6 @@ class AdasSiResearchService:
         self._tasks[job_id] = asyncio.create_task(
             self._drive(job_id, record["user_id"]), name=f"adas-si-research-{job_id}"
         )
-
-    # -------------------------------------------------------------- driver
 
     def _model_ready(self) -> bool:
         if self.navigator_search is not None and self.client is None:
@@ -929,8 +933,6 @@ class AdasSiResearchService:
                 objective["outcome"] = classify_objective(objective)
                 objective["finished_at"] = _iso(self.clock())
                 self._save(record)
-                # Between objectives, re-read the record: a shutdown or a
-                # restart may have changed it under us.
                 await self.sleep(0)
         except asyncio.CancelledError:
             raise
@@ -960,8 +962,6 @@ class AdasSiResearchService:
         record["result"] = {"counts": counts}
         self._save(record)
         await self._post_result(record)
-
-    # ------------------------------------------------------------- views
 
     def public_view(self, record: dict[str, Any]) -> dict[str, Any]:
         objectives = record.get("objectives") or []
