@@ -1,34 +1,30 @@
-"""Keep required SI dependencies from being starved by the primary search.
+"""Reserve part of one SI objective's hard turn ceiling for required documents.
 
-The Navigator objective budget historically used one shared turn counter for the
-primary procedure and every supporting document.  A difficult primary could use
-all 40 turns before an ACCEPT_WITH_DEPENDENCIES verdict was even available, so
-perfectly valid prerequisites were immediately marked ``not_pursued`` without a
-browser task.
+The Navigator owns one hard model-turn ceiling per research objective. Before
+this guard, the primary procedure could consume all of that ceiling and only
+then return ``ACCEPT_WITH_DEPENDENCIES``; the required supporting documents
+were therefore marked ``not_pursued`` without ever receiving a browser task.
 
-The module already exposes ``DEPENDENCY_TURN_SHARE`` (currently 0.5), which is
-intended to bound supporting-document work.  This installer makes that share a
-real reserve *after* the primary has been judged: when the reviewer says the
-objective requires another document, the objective budget is expanded so the
-original primary allowance remains intact and the configured dependency share
-is available for the dependency tasks.  The primary itself never gets access to
-that reserve because expansion happens only after it returns.
+``research_navigator_agent`` already defines ``DEPENDENCY_TURN_SHARE`` and
+``MAX_DEPENDENCIES``. This installer makes those existing limits real without
+raising the objective ceiling: it gives the primary task only the non-reserved
+portion of the budget, then returns the turns it actually used to the shared
+objective budget. The untouched reserve is available to the dependency queue
+that the agent already implements.
 
 Dependency titles are also de-duplicated mechanically (case/spacing/punctuation
-only) before the objective queue sees them.  Nothing here decides whether a
+only) before that queue sees them. Nothing here decides whether a supporting
 document is semantically required or where to navigate; X's independent review
-still owns those decisions.
+still owns both decisions.
 """
 
 from __future__ import annotations
 
-import math
 import re
 from functools import wraps
 from typing import Any
 
 _INSTALLED_ATTR = "__xomni_dependency_completion_guard_installed__"
-_REQUIRED_DECISIONS = frozenset({"ACCEPT_WITH_DEPENDENCIES", "FOLLOW_DEPENDENCY"})
 _TITLE_SEPARATORS = re.compile(r"[^a-z0-9]+")
 
 
@@ -53,15 +49,14 @@ def _dedupe_dependencies(items: Any) -> list[dict[str, Any]]:
         key = _dependency_key(title)
         if not key:
             continue
-        existing_index = by_key.get(key)
-        if existing_index is None:
+        index = by_key.get(key)
+        if index is None:
             by_key[key] = len(out)
             out.append(item)
             continue
-        existing = out[existing_index]
-        # The same reviewer sometimes names the same prerequisite twice with
-        # one entry carrying a better explanation. Preserve the more useful
-        # evidence without creating a second browser task.
+        existing = out[index]
+        # Preserve the more informative grounded explanation when the same
+        # dependency is emitted twice with punctuation/spacing variation.
         for field in ("reason", "quote"):
             current = str(existing.get(field) or "").strip()
             candidate = str(item.get(field) or "").strip()
@@ -70,81 +65,52 @@ def _dedupe_dependencies(items: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _normalize_verdict(verdict: Any) -> Any:
-    if not isinstance(verdict, dict):
-        return verdict
-    if "dependencies" not in verdict:
-        return verdict
-    verdict["dependencies"] = _dedupe_dependencies(verdict.get("dependencies"))
-    return verdict
-
-
 def _normalize_outcome(outcome: Any) -> Any:
     if not isinstance(outcome, dict):
         return outcome
     seen: set[int] = set()
     verdicts: list[dict[str, Any]] = []
-    for value in (outcome.get("review"), *(outcome.get("reviews") or [])):
-        if isinstance(value, dict) and id(value) not in seen:
-            seen.add(id(value))
-            verdicts.append(value)
+    values: list[Any] = [outcome.get("review")]
+    values.extend(outcome.get("reviews") or [])
     for candidate in outcome.get("candidates") or []:
-        if not isinstance(candidate, dict):
+        if isinstance(candidate, dict):
+            values.append(candidate.get("review"))
+    for verdict in values:
+        if not isinstance(verdict, dict) or id(verdict) in seen:
             continue
-        value = candidate.get("review")
-        if isinstance(value, dict) and id(value) not in seen:
-            seen.add(id(value))
-            verdicts.append(value)
+        seen.add(id(verdict))
+        verdicts.append(verdict)
     for verdict in verdicts:
-        _normalize_verdict(verdict)
+        if "dependencies" in verdict:
+            verdict["dependencies"] = _dedupe_dependencies(verdict.get("dependencies"))
     return outcome
 
 
-def _required_dependencies(outcome: Any) -> list[dict[str, Any]]:
-    if not isinstance(outcome, dict):
-        return []
-    verdict = outcome.get("review") if isinstance(outcome.get("review"), dict) else {}
-    if str(verdict.get("decision") or "") not in _REQUIRED_DECISIONS:
-        return []
-    return _dedupe_dependencies(verdict.get("dependencies"))
-
-
-def _reserve_dependency_budget(module: Any, budget: Any, *, primary_limit: int) -> None:
-    slots = int(getattr(budget, "dependency_slots", 0) or 0)
-    if slots <= 0 or primary_limit <= 0:
-        return
+def _dependency_reserve(module: Any, budget: Any) -> tuple[int, int]:
+    """Return (primary_turn_cap, reserved_dependency_turns)."""
+    total = max(1, int(getattr(budget, "max_turns", 1) or 1))
+    slots = max(0, int(getattr(budget, "dependency_slots", 0) or 0))
+    if slots <= 0 or total <= 4:
+        return total, 0
     try:
         share = float(getattr(module, "DEPENDENCY_TURN_SHARE", 0.5))
     except (TypeError, ValueError):
         share = 0.5
     if not 0.0 < share < 1.0:
-        return
+        return total, 0
 
-    # If dependencies are configured to receive 50% of the objective budget,
-    # a 40-turn primary needs an 80-turn total envelope: 40 primary + 40
-    # reserved dependency capacity. Expansion happens only after the primary
-    # returns, so those extra turns cannot make the primary wander longer.
-    expanded_limit = int(math.ceil(primary_limit / (1.0 - share)))
-    current_limit = int(getattr(budget, "max_turns", primary_limit) or primary_limit)
-    if expanded_limit <= current_limit:
-        return
-    budget.max_turns = expanded_limit
-    events = getattr(budget, "progress_events", None)
-    if isinstance(events, list):
-        events.append(
-            {
-                "kind": "dependency_budget_reserved",
-                "progress": True,
-                "primary_turn_limit": primary_limit,
-                "objective_turn_limit": expanded_limit,
-                "dependency_share": share,
-                "dependency_slots": slots,
-            }
-        )
+    # Match the agent's existing per-dependency calculation exactly. For the
+    # current 40-turn / 3-slot / 0.5 contract this is 6 turns per dependency,
+    # 18 reserved total, 22 available to the primary. The hard 40-turn ceiling
+    # never changes.
+    per_dependency = max(4, int(total * share / slots))
+    reserved = min(total - 4, per_dependency * slots)
+    primary_cap = max(4, total - reserved)
+    return primary_cap, reserved
 
 
 def install(module: Any) -> None:
-    """Install dependency de-duplication and post-primary turn reservation."""
+    """Install hard-ceiling dependency reservation and mechanical de-duplication."""
     if getattr(module, _INSTALLED_ATTR, False):
         return
 
@@ -152,22 +118,40 @@ def install(module: Any) -> None:
 
     @wraps(original_run_task)
     async def run_task_with_dependency_completion(*args: Any, **kwargs: Any):
-        budget = kwargs.get("budget")
+        parent_budget = kwargs.get("budget")
         role = str(kwargs.get("role") or "primary")
-        try:
-            primary_limit = int(getattr(budget, "max_turns", 0) or 0)
-        except (TypeError, ValueError):
-            primary_limit = 0
 
-        outcome = await original_run_task(*args, **kwargs)
-        outcome = _normalize_outcome(outcome)
+        # Only the primary needs a reservation. Dependency tasks are already
+        # handed a bounded sub-budget by _run_objective and must not recursively
+        # reserve from themselves.
+        if role != "primary" or parent_budget is None:
+            return _normalize_outcome(await original_run_task(*args, **kwargs))
 
-        if (
-            role == "primary"
-            and budget is not None
-            and _required_dependencies(outcome)
-        ):
-            _reserve_dependency_budget(module, budget, primary_limit=primary_limit)
+        primary_cap, reserved = _dependency_reserve(module, parent_budget)
+        if reserved <= 0:
+            return _normalize_outcome(await original_run_task(*args, **kwargs))
+
+        primary_budget = module._Budget(
+            max_turns=primary_cap,
+            dependency_slots=0,
+        )
+        delegated = dict(kwargs)
+        delegated["budget"] = primary_budget
+        outcome = _normalize_outcome(await original_run_task(*args, **delegated))
+
+        parent_budget.turns_used += primary_budget.turns_used
+        parent_budget.stall_points = primary_budget.stall_points
+        parent_budget.progress_events.extend(primary_budget.progress_events)
+        parent_budget.progress_events.append(
+            {
+                "kind": "dependency_budget_reserved",
+                "progress": True,
+                "hard_turn_limit": parent_budget.max_turns,
+                "primary_turn_limit": primary_cap,
+                "reserved_dependency_turns": reserved,
+                "dependency_slots": parent_budget.dependency_slots,
+            }
+        )
         return outcome
 
     module._run_task = run_task_with_dependency_completion
