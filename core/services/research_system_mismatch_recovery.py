@@ -2,13 +2,13 @@
 
 The semantic system guard correctly vetoes a camera-for-radar or radar-for-
 camera acceptance, but the generic Navigator instruction says only "keep
-searching from the current page".  On a provider tree that can leave the model
+searching from the current page". On a provider tree that can leave the model
 inside the wrong sensor's sub-tree, where every subsequent article is still the
-wrong family.  The 2026-09-14 Nissan rear-side-radar QA run demonstrated this:
+wrong family. The 2026-09-14 Nissan rear-side-radar QA run demonstrated this:
 X reached the front ICC Distance Sensor alignment procedure, correctly rejected
 it, but never escaped that family to reach the rear blind-spot radar.
 
-This module does not choose a menu, label, ref, OEM path, or document.  It turns
+This module does not choose a menu, label, ref, OEM path, or document. It turns
 X's own structured reviewer fact (``system_family_check``) into a navigation
 constraint: leave the current sensor-family branch and return to a live page
 where alternative ADAS systems/components can be chosen, then reason again.
@@ -55,18 +55,21 @@ def install(module: Any) -> None:
 
     @wraps(original_instruction)
     def next_instruction_with_family_recovery(review: dict[str, Any]) -> str:
-        base = original_instruction(review)
         check = _mismatch(review)
         if check is None:
-            return base
+            return original_instruction(review)
         expected = str(check.get("objective_family") or "requested")
         candidate = str(check.get("candidate_family") or "different")
+        reviewer_summary = " ".join(str(review.get("evidence_summary") or "").split())[:320]
         return (
-            f"{base} The reviewer proved a SENSOR-FAMILY MISMATCH: the current branch is "
-            f"{candidate}, while the objective is {expected}. Leave this sensor-family branch "
-            "now. Backtrack using the live page until you can see alternative ADAS "
-            "systems/components, then choose the requested family from that rendered state. "
-            "Do not continue deeper under this rejected family and do not extract this page again."
+            "Independent review proved a SENSOR-FAMILY MISMATCH: this candidate/branch is "
+            f"{candidate}, while the requested objective is {expected}. "
+            + (f"Reviewer: {reviewer_summary} " if reviewer_summary else "")
+            + "Do not extract this page again and do not continue deeper under this rejected "
+            "sensor family. Leave this sensor-family branch now. Backtrack using only the "
+            "live rendered controls until you reach a page that exposes alternative ADAS "
+            "systems/components, then choose the requested family from that observed state. "
+            "Do not invent provider-specific labels, refs, or a fixed menu path."
         )
 
     @wraps(original_prompt)
