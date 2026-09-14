@@ -29,7 +29,9 @@ from . import research_bottom_decision_guard as _research_bottom_decision_guard
 from . import research_navigator_tool_repair as _research_navigator_tool_repair
 from . import research_semantic_review as _research_semantic_review
 from . import research_semantic_system_guard as _research_semantic_system_guard
+from . import research_system_mismatch_recovery as _research_system_mismatch_recovery
 from . import research_navigator_vehicle_anchor as _research_navigator_vehicle_anchor
+from . import research_dependency_completion_guard as _research_dependency_completion_guard
 from . import research_operator as _research_operator
 from . import research_capture as _research_capture
 from . import research_setup as _research_setup
@@ -62,7 +64,9 @@ _scrapex_navigator_runtime.install(_scrapex)
 _research_bottom_decision_guard.install(_research_navigator_agent, _scrapex)
 _research_navigator_tool_repair.install(_research_navigator_agent)
 _research_semantic_system_guard.install(_research_semantic_review, _research_navigator_agent)
+_research_system_mismatch_recovery.install(_research_navigator_agent)
 _research_navigator_vehicle_anchor.install(_research_navigator_agent)
+_research_dependency_completion_guard.install(_research_navigator_agent)
 _research_operator.install()
 _research_route_compat.install()
 _research_vault.install()
