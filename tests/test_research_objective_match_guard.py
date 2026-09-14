@@ -105,6 +105,24 @@ async def test_same_component_wrong_procedure_stays_in_component_branch():
 
 
 @pytest.mark.asyncio
+async def test_uncertain_fine_review_does_not_weaken_an_existing_hard_veto():
+    review = _review_module(decision="CONTINUE_SEARCH")
+    navigator = _navigator_module()
+    guard.install(review, navigator)
+
+    verdict = await review.review_candidate(
+        client=_Client("UNCERTAIN"),
+        objective={"objective": "front radar aiming"},
+        vehicle={"year": 2023, "make": "Honda", "model": "Accord"},
+        candidate={"title": "Multipurpose Camera Aiming", "text": "camera aiming steps"},
+        provider="alldata",
+    )
+
+    assert verdict["decision"] == "CONTINUE_SEARCH"
+    assert verdict["objective_match"]["match"] == "UNCERTAIN"
+
+
+@pytest.mark.asyncio
 async def test_dependency_context_does_not_regrade_against_primary_component():
     class _Explode:
         async def stream(self, *args, **kwargs):
