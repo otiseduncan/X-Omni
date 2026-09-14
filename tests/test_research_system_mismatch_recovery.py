@@ -19,13 +19,14 @@ def _module():
     return module
 
 
-def test_family_mismatch_tells_x_to_leave_the_rejected_sensor_branch():
+def test_family_mismatch_replaces_generic_keep_searching_with_branch_exit():
     module = _module()
     recovery.install(module)
 
     instruction = module._next_instruction_for_review(
         {
             "decision": "CONTINUE_SEARCH",
+            "evidence_summary": "Wrong ADAS sensor family: camera instead of radar.",
             "system_family_check": {
                 "objective_family": "radar",
                 "candidate_family": "camera",
@@ -34,11 +35,12 @@ def test_family_mismatch_tells_x_to_leave_the_rejected_sensor_branch():
         }
     )
 
-    assert instruction.startswith("base instruction")
+    assert not instruction.startswith("base instruction")
     assert "SENSOR-FAMILY MISMATCH" in instruction
     assert "Leave this sensor-family branch" in instruction
     assert "alternative ADAS systems/components" in instruction
-    assert "Do not continue deeper under this rejected family" in instruction
+    assert "do not continue deeper" in instruction.casefold()
+    assert "camera" in instruction and "radar" in instruction
 
 
 def test_non_mismatch_review_keeps_existing_instruction():
