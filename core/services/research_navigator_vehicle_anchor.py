@@ -64,6 +64,8 @@ def install(module: Any) -> None:
         state = _ANCHOR_STATE.get()
         if not isinstance(state, dict) or state.get("role") != "primary":
             return result
+        if not _managed_settings(settings):
+            return result
         if state.get("mode") != "year_make_model" or state.get("picker_opened"):
             return result
         if str((args or {}).get("action") or "") != "create_task":
