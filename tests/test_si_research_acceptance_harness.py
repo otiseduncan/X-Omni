@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import httpx
+
 from scripts import si_research_acceptance as acceptance
 
 
@@ -17,6 +19,14 @@ def _item(**overrides):
     }
     item.update(overrides)
     return item
+
+
+def _response(status: int, text: str) -> httpx.Response:
+    return httpx.Response(
+        status,
+        text=text,
+        request=httpx.Request("POST", "http://worker/v1/chat/completions"),
+    )
 
 
 def test_strict_acceptance_requires_complete_reviewed_captured_exact_vin_case():
@@ -52,6 +62,18 @@ def test_followed_dependency_passes_when_the_dependency_document_was_accepted():
         documents=[{"accepted": True, "decision": "ACCEPT", "captured": True}],
     )
     assert acceptance.acceptance_failures(item, capture=True, require_vin=True) == []
+
+
+def test_phase_b_retries_only_known_llamacpp_tool_json_500():
+    assert acceptance._retryable_tool_json_response(
+        _response(500, "Failed to parse tool call arguments as JSON")
+    ) is True
+    assert acceptance._retryable_tool_json_response(
+        _response(500, "internal allocation failure")
+    ) is False
+    assert acceptance._retryable_tool_json_response(
+        _response(400, "Failed to parse tool call arguments as JSON")
+    ) is False
 
 
 def test_phase_b_set_is_exactly_ten_named_real_ro_cases():
