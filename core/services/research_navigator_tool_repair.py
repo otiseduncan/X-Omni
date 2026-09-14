@@ -15,6 +15,7 @@ small, schema-valid ``navigator_browse`` call.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from functools import wraps
@@ -81,16 +82,54 @@ def _malformed_navigator_event(events: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _supports_tool_choice(delegate: Any) -> bool:
+    """Whether delegate.stream accepts the optional tool_choice keyword.
+
+    The production ModelClient does; many deterministic test clients and small
+    adapters intentionally implement the older three-argument stream contract.
+    The repair wrapper must be invisible to those clients during normal turns.
+    """
+    try:
+        parameters = inspect.signature(delegate.stream).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == "tool_choice"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 class NavigatorToolRepairClient:
     """Delegate model client with one final, constrained Navigator repair turn."""
 
     def __init__(self, delegate: Any):
         self._delegate = delegate
+        self._delegate_supports_tool_choice = _supports_tool_choice(delegate)
         self.navigator_tool_json_repairs = 0
         setattr(self, _REPAIR_ATTR, True)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
+
+    def _stream_delegate(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: Any,
+        max_tokens: int | None,
+        tool_choice: Any = None,
+    ):
+        kwargs: dict[str, Any] = {
+            "tools": tools,
+            "max_tokens": max_tokens,
+        }
+        # Do not even pass tool_choice=None to legacy/scripted clients. Their
+        # narrower stream signatures are valid and were used throughout the
+        # Navigator test suite before this repair layer existed.
+        if tool_choice is not None and self._delegate_supports_tool_choice:
+            kwargs["tool_choice"] = tool_choice
+        return self._delegate.stream(messages, **kwargs)
 
     async def _repair(
         self,
@@ -116,7 +155,7 @@ class NavigatorToolRepairClient:
         repair_max_tokens = min(int(max_tokens or 192), 192)
         repaired = [
             event
-            async for event in self._delegate.stream(
+            async for event in self._stream_delegate(
                 repaired_messages,
                 tools=tools,
                 max_tokens=repair_max_tokens,
@@ -138,7 +177,7 @@ class NavigatorToolRepairClient:
         tool_choice: Any = None,
     ):
         if not _is_navigator_toolset(tools):
-            async for event in self._delegate.stream(
+            async for event in self._stream_delegate(
                 messages,
                 tools=tools,
                 max_tokens=max_tokens,
@@ -153,7 +192,7 @@ class NavigatorToolRepairClient:
         try:
             events = [
                 event
-                async for event in self._delegate.stream(
+                async for event in self._stream_delegate(
                     messages,
                     tools=tools,
                     max_tokens=max_tokens,
