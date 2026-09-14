@@ -1,24 +1,26 @@
-"""Force each managed Navigator task to begin from an exact-VIN vehicle anchor.
+"""Force each managed *primary* Navigator task to begin from an exact-VIN anchor.
 
-The ALLDATA browser profile is persistent, so a completed task can leave the
-browser sitting deep inside the previous procedure. ``research_navigator_agent``
-already has a mechanical exact-VIN preflight, but it skips that preflight when
-the current page still proves the requested vehicle is selected. That makes a
-new task inherit the previous article as its starting context.
+The ALLDATA browser profile is persistent, so a completed top-level objective can
+leave the browser sitting deep inside the previous procedure. The Navigator's
+mechanical exact-VIN preflight normally skips reselection when the current page
+still proves the requested vehicle is selected, which can make a new primary
+objective inherit stale article context.
 
-ScrapeX's existing ``select_vehicle`` fast path is the correct reset primitive:
-it always opens ALLDATA's vehicle picker, types the exact VIN, and proves the
-rendered vehicle page shows that VIN. This installer therefore forces only the
-*first* target-signal check inside each managed Navigator task to report
-"not selected" when a valid VIN is present. The agent then runs its normal
-``select_vehicle`` preflight. Later target checks in the same task delegate to
-the real live signal so verification remains unchanged.
+ScrapeX's existing ``select_vehicle`` fast path is the correct primary reset
+primitive: it opens ALLDATA's vehicle picker, types the exact VIN, and proves the
+rendered vehicle page shows that VIN. This installer forces only the *first*
+target-signal check inside each managed **primary** task to report "not
+selected" when a valid VIN is present. Later checks delegate to the live signal.
 
-The forced anchor is intentionally limited to settings that explicitly identify
-a managed ScrapeX project. Hermetic adapter/unit callers that provide only a
-bare settings object retain their original transport semantics; production
-Settings.load() carries ``scrapex_project_path`` and therefore gets the reset.
+Dependency tasks are different. They belong to the same already-verified vehicle
+and are created because the accepted procedure just named a supporting document.
+Resetting those tasks through the vehicle picker throws away the useful current
+procedure/reference context and spends their small bounded turn budget getting
+back to where they started. Dependency tasks therefore retain the live vehicle
+context while still being mechanically re-verified by the normal target signal.
 
+The forced anchor remains limited to settings that explicitly identify a managed
+ScrapeX project. Hermetic adapter/unit callers retain their original behavior.
 No procedure meaning, menu choice, or provider hierarchy is decided here.
 """
 
@@ -50,7 +52,7 @@ def _managed_settings(settings: Any) -> bool:
 
 
 def install(module: Any) -> None:
-    """Force one exact-VIN reselection at the beginning of each managed task."""
+    """Force one exact-VIN reselection at the beginning of each managed primary."""
     if getattr(module, _INSTALLED_ATTR, False):
         return
 
@@ -68,16 +70,19 @@ def install(module: Any) -> None:
             and _managed_settings(settings)
             and _exact_vin(target)
         ):
-            # The agent interprets False by invoking ScrapeX's existing exact-VIN
-            # select_vehicle fast path. That path itself opens the vehicle picker,
-            # so this is the reset without adding a new browser action or endpoint.
+            # False makes the existing agent invoke ScrapeX select_vehicle,
+            # whose exact-VIN proof remains the authority on the new page.
             state["forced"] = True
             return False
         return await original_target_signal(settings, provider, target)
 
     @wraps(original_run_task)
     async def run_task_with_vehicle_anchor(*args: Any, **kwargs: Any):
-        token = _ANCHOR_STATE.set({"forced": False})
+        role = str(kwargs.get("role") or "primary")
+        # A dependency is already inside the same objective/vehicle and should
+        # keep the procedure context that named it. Mark its anchor as already
+        # consumed so the normal live target check decides identity.
+        token = _ANCHOR_STATE.set({"forced": role != "primary"})
         try:
             return await original_run_task(*args, **kwargs)
         finally:
