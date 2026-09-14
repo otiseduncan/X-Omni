@@ -108,38 +108,5 @@
     "component": "front camera (R242)",
     "topic": "driver assistance systems front camera calibration procedure",
     "expect": "multi-document: the calibration references installing the VAS 721 001 calibration setup"
-  },
-  {
-    "id": "gmc-acadia-front-camera",
-    "year": 2023,
-    "make": "GMC",
-    "model": "Acadia",
-    "ro": "2400711895",
-    "system": "Front View Camera",
-    "component": "front view camera (windshield)",
-    "topic": "front view camera calibration / setup procedure after windshield or camera replacement",
-    "expect": "GM front view camera calibration; class: camera calibration (static targets and/or dynamic drive learn). Exact OEM title not asserted."
-  },
-  {
-    "id": "hyundai-sonata-front-radar",
-    "year": 2023,
-    "make": "Hyundai",
-    "model": "Sonata",
-    "ro": "2400711868",
-    "system": "Front Radar Sensor - SCC / AEB / FCW",
-    "component": "front radar sensor",
-    "topic": "front radar sensor (SCC / AEB / FCW) calibration or adjustment procedure after radar replacement",
-    "expect": "Hyundai front radar adjustment/calibration; class: radar calibration. Exact OEM title not asserted."
-  },
-  {
-    "id": "nissan-sentra-bsm-radar",
-    "year": 2022,
-    "make": "Nissan",
-    "model": "Sentra",
-    "ro": "2400711896",
-    "system": "Blind Spot Side Radar - Rear",
-    "component": "rear side radar (blind spot warning)",
-    "topic": "rear side radar (blind spot warning) alignment or calibration procedure after radar replacement",
-    "expect": "Nissan rear side radar alignment; class: blind-spot/rear-side radar calibration. Exact OEM title not asserted."
   }
 ]
