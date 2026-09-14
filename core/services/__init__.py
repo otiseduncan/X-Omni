@@ -20,6 +20,7 @@ from . import adas_calibration_depth as _adas_calibration_depth
 from . import adas_calibration_identity as _adas_calibration_identity
 from . import adas_si_research as _adas_si_research
 from . import adas_si_research_identity as _adas_si_research_identity
+from . import adas_si_research_vehicle_identity as _adas_si_research_vehicle_identity
 from . import calibration_iq as _calibration_iq
 from . import calibration_iq_endpoint_discovery as _calibration_iq_endpoint_discovery
 from . import scrapex as _scrapex
@@ -29,7 +30,9 @@ from . import research_bottom_decision_guard as _research_bottom_decision_guard
 from . import research_navigator_tool_repair as _research_navigator_tool_repair
 from . import research_semantic_review as _research_semantic_review
 from . import research_semantic_system_guard as _research_semantic_system_guard
+from . import research_objective_match_guard as _research_objective_match_guard
 from . import research_navigator_vehicle_anchor as _research_navigator_vehicle_anchor
+from . import research_dependency_budget_extension as _research_dependency_budget_extension
 from . import research_operator as _research_operator
 from . import research_capture as _research_capture
 from . import research_setup as _research_setup
@@ -57,12 +60,15 @@ _adas_identity_guard.install(_adas_si)
 _adas_calibration_depth.install(_adas_si)
 _adas_calibration_identity.install(_adas_si)
 _adas_si_research_identity.install(_adas_si_research)
+_adas_si_research_vehicle_identity.install(_adas_si_research)
 _calibration_iq_endpoint_discovery.install(_calibration_iq)
 _scrapex_navigator_runtime.install(_scrapex)
 _research_bottom_decision_guard.install(_research_navigator_agent, _scrapex)
 _research_navigator_tool_repair.install(_research_navigator_agent)
 _research_semantic_system_guard.install(_research_semantic_review, _research_navigator_agent)
+_research_objective_match_guard.install(_research_semantic_review, _research_navigator_agent)
 _research_navigator_vehicle_anchor.install(_research_navigator_agent)
+_research_dependency_budget_extension.install(_research_navigator_agent)
 _research_operator.install()
 _research_route_compat.install()
 _research_vault.install()
