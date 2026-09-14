@@ -24,6 +24,25 @@ class ModelError(RuntimeError):
     pass
 
 
+def _retryable_tool_json_error(exc: BaseException) -> bool:
+    """Whether llama.cpp rejected a turn before emitting any tool action.
+
+    Qwen occasionally produces a malformed tool-call argument object and
+    llama.cpp answers the whole /chat/completions request with HTTP 500 rather
+    than a normal assistant turn. No tool call has reached Core at that point,
+    so one retry of the same reasoning turn is safe. Keep this deliberately
+    narrow: arbitrary HTTP 500s and any failure after output was emitted are
+    never replayed.
+    """
+    text = str(exc).casefold()
+    return (
+        "http 500" in text
+        and "tool call" in text
+        and "json" in text
+        and ("parse" in text or "argument" in text)
+    )
+
+
 class ModelClient:
     # Production turns support one bounded same-model evidence review before
     # Core accepts an initial prose-only draft. Lightweight test clients opt in
@@ -57,6 +76,11 @@ class ModelClient:
         dead we relaunch it once and retry -- and only retry when no tokens
         have been emitted yet, so a mid-stream failure can't duplicate
         output the user already saw.
+
+        A second, narrower recovery covers llama.cpp's malformed-tool-call
+        HTTP 500. That response is generated before Core receives any tool
+        call, so the same model turn may be retried exactly once without
+        replaying browser work.
         """
         emitted = False
         try:
@@ -70,6 +94,22 @@ class ModelClient:
                     emitted = True
                     yield event
             return
+        except ModelError as exc:
+            if emitted or not _retryable_tool_json_error(exc):
+                raise
+            log.warning("Worker rejected malformed tool-call JSON; retrying the model turn once.")
+            try:
+                async with self.router.inference_session():
+                    async for event in self._stream_once(
+                        messages,
+                        tools,
+                        max_tokens,
+                        tool_choice=tool_choice,
+                    ):
+                        yield event
+                return
+            except ModelError:
+                raise
         except (httpx.ConnectError, WorkerSwapError):
             if emitted:
                 raise ModelError(
