@@ -23,6 +23,7 @@ from . import adas_si_research_identity as _adas_si_research_identity
 from . import adas_si_research_vehicle_identity as _adas_si_research_vehicle_identity
 from . import calibration_iq as _calibration_iq
 from . import calibration_iq_endpoint_discovery as _calibration_iq_endpoint_discovery
+from . import calibration_iq_data_plane_guard as _calibration_iq_data_plane_guard
 from . import scrapex as _scrapex
 from . import scrapex_navigator_runtime as _scrapex_navigator_runtime
 from . import research_navigator_agent as _research_navigator_agent
@@ -63,6 +64,7 @@ _adas_calibration_identity.install(_adas_si)
 _adas_si_research_identity.install(_adas_si_research)
 _adas_si_research_vehicle_identity.install(_adas_si_research)
 _calibration_iq_endpoint_discovery.install(_calibration_iq)
+_calibration_iq_data_plane_guard.install(_calibration_iq)
 _scrapex_navigator_runtime.install(_scrapex)
 _research_bottom_decision_guard.install(_research_navigator_agent, _scrapex)
 _research_navigator_tool_repair.install(_research_navigator_agent)
