@@ -19,8 +19,8 @@ class _ScrapeX:
     async def navigator(self, settings, args):  # noqa: ARG002
         self.calls.append(dict(args))
         if args.get("action") == "create_task":
-            return {"success": True, "verified": True, "data": {"task_id": "task-1"}}
-        return {"success": True, "verified": True, "data": {"task_id": "task-1"}}
+            return {"success": True, "verified": True, "data": {"id": "task-1"}}
+        return {"success": True, "verified": True, "data": {"id": "task-1"}}
 
 
 def _module():
