@@ -8,6 +8,8 @@ from core.services import research_navigator_vehicle_anchor as anchor
 
 
 VIN = "1HGCY1F35PA033515"
+MANAGED = SimpleNamespace(scrapex_project_path=r"X:\ScrapeX")
+UNMANAGED = object()
 
 
 def _module():
@@ -18,9 +20,9 @@ def _module():
         calls.append(dict(target))
         return True
 
-    async def run_task(*, target):
-        first = await module._target_already_selected(object(), "alldata", target)
-        second = await module._target_already_selected(object(), "alldata", target)
+    async def run_task(*, target, settings=MANAGED):
+        first = await module._target_already_selected(settings, "alldata", target)
+        second = await module._target_already_selected(settings, "alldata", target)
         return first, second
 
     module._target_already_selected = target_already_selected
@@ -44,7 +46,7 @@ async def test_valid_vin_forces_one_reselection_then_uses_real_signal():
 
 
 @pytest.mark.asyncio
-async def test_each_new_task_gets_a_fresh_vehicle_anchor():
+async def test_each_new_managed_task_gets_a_fresh_vehicle_anchor():
     module = _module()
     anchor.install(module)
 
@@ -65,3 +67,15 @@ async def test_task_without_exact_vin_keeps_existing_behavior():
     assert first is True
     assert second is True
     assert len(module.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_exact_vin_keeps_hermetic_behavior():
+    module = _module()
+    anchor.install(module)
+
+    first, second = await module._run_task(target={"vin": VIN}, settings=UNMANAGED)
+
+    assert first is True
+    assert second is True
+    assert module.calls == [{"vin": VIN}, {"vin": VIN}]
