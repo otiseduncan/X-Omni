@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.models.client import ModelClient
+from core.models.client import ModelClient, ModelError
 from core.models.router import WorkerSwapError
 
 
@@ -70,6 +70,52 @@ async def test_stream_releases_lease_before_recovery_and_retries_once(monkeypatc
     assert events[0]["text"] == "recovered"
     assert router.recoveries == 1
     assert router.sessions == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_retries_llamacpp_tool_json_500_once_without_worker_recovery(monkeypatch):
+    router = LeaseRouter()
+    client = ModelClient(router)
+    attempts = 0
+
+    async def fake_stream_once(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert router.held is True
+        if attempts == 1:
+            raise ModelError(
+                "Worker returned HTTP 500: Failed to parse tool call arguments as JSON"
+            )
+        yield {"type": "tool_call", "name": "navigator_browse", "arguments": "{\"action\":\"observe\"}"}
+
+    monkeypatch.setattr(client, "_stream_once", fake_stream_once)
+    events = [event async for event in client.stream([{"role": "user", "content": "navigate"}])]
+
+    assert attempts == 2
+    assert events == [
+        {"type": "tool_call", "name": "navigator_browse", "arguments": "{\"action\":\"observe\"}"}
+    ]
+    assert router.sessions == 2
+    assert router.recoveries == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_does_not_retry_unrelated_model_500(monkeypatch):
+    router = LeaseRouter()
+    client = ModelClient(router)
+    attempts = 0
+
+    async def fake_stream_once(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise ModelError("Worker returned HTTP 500: internal allocation failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(client, "_stream_once", fake_stream_once)
+    with pytest.raises(ModelError, match="allocation failure"):
+        _ = [event async for event in client.stream([{"role": "user", "content": "hi"}])]
+    assert attempts == 1
+    assert router.sessions == 1
 
 
 @pytest.mark.asyncio
