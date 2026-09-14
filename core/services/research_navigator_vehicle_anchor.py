@@ -76,7 +76,7 @@ def install(module: Any) -> None:
             return result
 
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        task_id = str(data.get("task_id") or "").strip()
+        task_id = str(data.get("id") or data.get("task_id") or "").strip()
         if not task_id:
             return result
         state["picker_opened"] = True
