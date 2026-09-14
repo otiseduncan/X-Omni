@@ -22,6 +22,8 @@ from . import adas_si_research as _adas_si_research
 from . import adas_si_research_identity as _adas_si_research_identity
 from . import calibration_iq as _calibration_iq
 from . import calibration_iq_endpoint_discovery as _calibration_iq_endpoint_discovery
+from . import scrapex as _scrapex
+from . import scrapex_navigator_runtime as _scrapex_navigator_runtime
 from . import research_operator as _research_operator
 from . import research_capture as _research_capture
 from . import research_setup as _research_setup
@@ -50,6 +52,7 @@ _adas_calibration_depth.install(_adas_si)
 _adas_calibration_identity.install(_adas_si)
 _adas_si_research_identity.install(_adas_si_research)
 _calibration_iq_endpoint_discovery.install(_calibration_iq)
+_scrapex_navigator_runtime.install(_scrapex)
 _research_operator.install()
 _research_route_compat.install()
 _research_vault.install()
