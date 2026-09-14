@@ -31,6 +31,7 @@ import asyncio
 import inspect
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import UTC, datetime
@@ -42,6 +43,30 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+def _retryable_tool_json_response(response: httpx.Response) -> bool:
+    text = response.text.casefold()
+    return (
+        response.status_code == 500
+        and "tool call" in text
+        and "json" in text
+        and ("parse" in text or "argument" in text)
+    )
+
+
+def _git_revision(path: Path | str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 class MeasuredModelClient:
@@ -62,18 +87,24 @@ class MeasuredModelClient:
         self.timeout = timeout
         self.temperature = temperature
         self.calls: list[dict[str, Any]] = []
+        self.tool_json_retries = 0
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         with httpx.Client(
             timeout=httpx.Timeout(15.0, read=self.timeout, write=60.0, pool=15.0),
             trust_env=False,
         ) as client:
-            response = client.post(f"{self.endpoint}/chat/completions", json=payload)
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"worker returned HTTP {response.status_code}: {response.text[:800]}"
-            )
-        return response.json()
+            for attempt in range(2):
+                response = client.post(f"{self.endpoint}/chat/completions", json=payload)
+                if response.status_code == 200:
+                    return response.json()
+                if attempt == 0 and _retryable_tool_json_response(response):
+                    self.tool_json_retries += 1
+                    continue
+                raise RuntimeError(
+                    f"worker returned HTTP {response.status_code}: {response.text[:800]}"
+                )
+        raise RuntimeError("worker request ended without a response")  # pragma: no cover
 
     async def stream(self, messages, tools=None, max_tokens=None, *, tool_choice=None):
         payload: dict[str, Any] = {
@@ -283,6 +314,7 @@ async def run_case(
         "dependencies": result.get("dependencies"),
         "receipt": receipt,
         "model_calls": len(client.calls),
+        "tool_json_retries": client.tool_json_retries,
         "prompt_tokens_max": max(prompt_tokens) if prompt_tokens else 0,
         "prompt_tokens_total": sum(prompt_tokens),
         "model_wall_s": round(sum(call.get("wall_s") or 0 for call in client.calls), 1),
@@ -340,16 +372,18 @@ def acceptance_failures(
 
 
 def markdown_summary(report: dict[str, Any]) -> str:
+    revisions = report.get("revisions") or {}
     lines = [
         f"# SI research acceptance: {report['label']}",
         "",
         f"Run at {report['run_at']} against {report['worker']} with capture={report['capture']}.",
+        f"Revisions: X Omni `{revisions.get('x_omni') or 'unknown'}`; ScrapeX `{revisions.get('scrapex') or 'unknown'}`.",
         "",
         f"Operational result: **{report['passed_cases']} / {report['total_cases']} passed**.",
         "Procedure accuracy still requires comparing each evidence set with the explicit expected result below.",
         "",
-        "| case | pass | verified | stop | rounds | actions | repeats | stale | ctx max | wall s | evidence title |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| case | pass | verified | stop | rounds | actions | repeats | stale | retries | ctx max | wall s | evidence title |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in report["results"]:
         case = item["case"]
@@ -362,8 +396,9 @@ def markdown_summary(report: dict[str, Any]) -> str:
             f"| {case['id']} | {item.get('acceptance_pass')} | {verified} | "
             f"{item.get('stopped_reason') or item.get('error') or '-'} | {item.get('model_rounds')} | "
             f"{item.get('browser_actions')} | {item.get('repeated_actions')} | "
-            f"{item.get('stale_target_failures')} | {item.get('prompt_tokens_max')} | "
-            f"{item.get('wall_s')} | {(item.get('evidence_title') or '')[:60]} |"
+            f"{item.get('stale_target_failures')} | {item.get('tool_json_retries')} | "
+            f"{item.get('prompt_tokens_max')} | {item.get('wall_s')} | "
+            f"{(item.get('evidence_title') or '')[:60]} |"
         )
     lines.extend(["", "## Accuracy review", ""])
     for item in report["results"]:
@@ -431,10 +466,15 @@ async def main() -> int:
                 print(f"[{args.label}] {case['id']}: {case['_preflight_error']}", flush=True)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    scrapex_path = getattr(settings, "scrapex_project_path", None) or Path("X:/ScrapeX")
     report: dict[str, Any] = {
         "label": args.label,
         "run_at": datetime.now(UTC).isoformat(),
         "worker": f"{endpoint} ({model})",
+        "revisions": {
+            "x_omni": _git_revision(ROOT),
+            "scrapex": _git_revision(scrapex_path),
+        },
         "capture": args.capture,
         "max_turns": args.max_turns,
         "results": [],
@@ -467,8 +507,8 @@ async def main() -> int:
             f"[{args.label}] {case['id']}: verified={item.get('verified')} "
             f"stop={item.get('stopped_reason') or item.get('error')} "
             f"rounds={item.get('model_rounds')} actions={item.get('browser_actions')} "
-            f"ctx_max={item.get('prompt_tokens_max')} wall={item.get('wall_s')}s "
-            f"title={item.get('evidence_title')}",
+            f"retries={item.get('tool_json_retries')} ctx_max={item.get('prompt_tokens_max')} "
+            f"wall={item.get('wall_s')}s title={item.get('evidence_title')}",
             flush=True,
         )
         out.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
