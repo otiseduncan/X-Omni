@@ -1,17 +1,20 @@
 """Give X an explicit recovery move after a reviewer-proven system mismatch.
 
-The semantic system guard correctly vetoes a camera-for-radar or radar-for-
-camera acceptance, but the generic Navigator instruction says only "keep
-searching from the current page". On a provider tree that can leave the model
-inside the wrong sensor's sub-tree, where every subsequent article is still the
-wrong family. The 2026-09-14 Nissan rear-side-radar QA run demonstrated this:
-X reached the front ICC Distance Sensor alignment procedure, correctly rejected
-it, but never escaped that family to reach the rear blind-spot radar.
+A rejected candidate can be wrong at two different levels:
 
-This module does not choose a menu, label, ref, OEM path, or document. It turns
-X's own structured reviewer fact (``system_family_check``) into a navigation
-constraint: leave the current sensor-family branch and return to a live page
-where alternative ADAS systems/components can be chosen, then reason again.
+* the coarse sensor family is wrong (camera vs radar), which the semantic
+  system guard records in ``system_family_check``; or
+* the candidate is a real calibration procedure for the exact vehicle, but
+  X's independent reviewer says it does not satisfy the requested objective.
+  The 2026-09-14 Nissan rear-side-radar QA run demonstrated this second form:
+  X reached the front ICC Distance Sensor alignment procedure, correctly did
+  not accept it, but then stayed in that component branch instead of returning
+  to the ADAS component choice and finding rear blind-spot radar.
+
+This module never infers those meanings from titles, keywords, OEMs, or menu
+paths. It reacts only to the reviewer's structured semantic result and turns
+that result into a navigation constraint: leave the rejected procedure/component
+branch, return to a live page where alternatives can be chosen, and reason again.
 """
 
 from __future__ import annotations
@@ -20,21 +23,20 @@ from functools import wraps
 from typing import Any
 
 _INSTALLED_ATTR = "__xomni_system_mismatch_recovery_installed__"
+_BRANCH_EXIT_DECISIONS = frozenset({"CONTINUE_SEARCH", "REJECT"})
 _PROMPT_SUFFIX = (
-    "\n\nSYSTEM-FAMILY RECOVERY CONTRACT: If independent review says the candidate is "
-    "for a different ADAS sensor family than the objective, that is a branch-level "
-    "correction, not an invitation to inspect more documents under the same sensor. "
-    "Do not extract that page again and do not keep drilling deeper in the rejected "
-    "family. Use the live controls to backtrack until you reach a page that exposes "
-    "alternative ADAS systems/components, then choose the requested family from the "
-    "rendered state. You still decide the path from what is actually on screen; never "
-    "invent provider-specific labels or refs."
+    "\n\nWRONG-PROCEDURE RECOVERY CONTRACT: When independent review says a candidate is "
+    "a real procedure but does not satisfy the requested system/component, or proves "
+    "that it belongs to a different ADAS sensor family, treat that as a branch-level "
+    "correction. Do not extract it again and do not keep drilling deeper under the "
+    "rejected component. Use the live controls to backtrack until you reach a page "
+    "that exposes alternative ADAS systems/components, then choose the requested "
+    "component from the rendered state. You still decide the route from what is "
+    "actually on screen; never invent provider-specific labels, refs, or a fixed path."
 )
 
 
-def _mismatch(review: Any) -> dict[str, Any] | None:
-    if not isinstance(review, dict) or review.get("decision") != "CONTINUE_SEARCH":
-        return None
+def _family_mismatch(review: dict[str, Any]) -> dict[str, Any] | None:
     check = review.get("system_family_check")
     if not isinstance(check, dict):
         return None
@@ -45,8 +47,40 @@ def _mismatch(review: Any) -> dict[str, Any] | None:
     return check
 
 
+def _branch_mismatch(review: Any) -> dict[str, Any] | None:
+    """Return model-owned facts proving this procedure branch is not the goal.
+
+    Python does not re-judge the candidate. ``ACTUAL_PROCEDURE`` plus a
+    non-accepting branch-exit decision means the independent reviewer itself
+    concluded that a genuine procedure does not satisfy the objective. That
+    catches component-level mismatches such as front ICC radar vs rear BSM
+    radar even though both share the coarse ``radar`` family.
+    """
+    if not isinstance(review, dict):
+        return None
+    decision = str(review.get("decision") or "")
+    if decision not in _BRANCH_EXIT_DECISIONS:
+        return None
+
+    family = _family_mismatch(review)
+    if family is not None:
+        return {
+            "kind": "sensor_family",
+            "expected": str(family.get("objective_family") or "requested component"),
+            "candidate": str(family.get("candidate_family") or "different component"),
+        }
+
+    if str(review.get("classification") or "") == "ACTUAL_PROCEDURE":
+        return {
+            "kind": "procedure_component",
+            "expected": "the requested system/component",
+            "candidate": "a different procedure/component",
+        }
+    return None
+
+
 def install(module: Any) -> None:
-    """Install prompt and per-review recovery guidance for wrong-family pages."""
+    """Install prompt and per-review branch-exit guidance."""
     if getattr(module, _INSTALLED_ATTR, False):
         return
 
@@ -54,31 +88,36 @@ def install(module: Any) -> None:
     original_prompt = module._system_prompt
 
     @wraps(original_instruction)
-    def next_instruction_with_family_recovery(review: dict[str, Any]) -> str:
-        check = _mismatch(review)
-        if check is None:
+    def next_instruction_with_branch_recovery(review: dict[str, Any]) -> str:
+        mismatch = _branch_mismatch(review)
+        if mismatch is None:
             return original_instruction(review)
-        expected = str(check.get("objective_family") or "requested")
-        candidate = str(check.get("candidate_family") or "different")
-        reviewer_summary = " ".join(str(review.get("evidence_summary") or "").split())[:320]
+        expected = mismatch["expected"]
+        candidate = mismatch["candidate"]
+        reviewer_summary = " ".join(str(review.get("evidence_summary") or "").split())[:360]
+        label = (
+            "SENSOR-FAMILY MISMATCH"
+            if mismatch["kind"] == "sensor_family"
+            else "WRONG PROCEDURE/COMPONENT BRANCH"
+        )
         return (
-            "Independent review proved a SENSOR-FAMILY MISMATCH: this candidate/branch is "
-            f"{candidate}, while the requested objective is {expected}. "
+            f"Independent review proved a {label}: this candidate is {candidate}, while "
+            f"the objective is {expected}. "
             + (f"Reviewer: {reviewer_summary} " if reviewer_summary else "")
             + "Do not extract this page again and do not continue deeper under this rejected "
-            "sensor family. Leave this sensor-family branch now. Backtrack using only the "
-            "live rendered controls until you reach a page that exposes alternative ADAS "
-            "systems/components, then choose the requested family from that observed state. "
-            "Do not invent provider-specific labels, refs, or a fixed menu path."
+            "procedure/component. Leave this branch now. Backtrack using only the live "
+            "rendered controls until you reach a page that exposes alternative ADAS "
+            "systems/components, then choose the requested component from that observed "
+            "state. Do not invent provider-specific labels, refs, or a fixed menu path."
         )
 
     @wraps(original_prompt)
-    def system_prompt_with_family_recovery(*args: Any, **kwargs: Any) -> str:
+    def system_prompt_with_branch_recovery(*args: Any, **kwargs: Any) -> str:
         text = str(original_prompt(*args, **kwargs))
         if _PROMPT_SUFFIX.strip() in text:
             return text
         return text + _PROMPT_SUFFIX
 
-    module._next_instruction_for_review = next_instruction_with_family_recovery
-    module._system_prompt = system_prompt_with_family_recovery
+    module._next_instruction_for_review = next_instruction_with_branch_recovery
+    module._system_prompt = system_prompt_with_branch_recovery
     setattr(module, _INSTALLED_ATTR, True)
