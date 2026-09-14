@@ -63,6 +63,43 @@ async def test_repairs_malformed_navigator_tool_json_once():
 
 
 @pytest.mark.asyncio
+async def test_repairs_tool_call_with_missing_action_before_loop_sees_it():
+    class _Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def stream(self, messages, tools=None, max_tokens=None, *, tool_choice=None):  # noqa: ARG002
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "type": "tool_call",
+                    "id": "bad",
+                    "name": "navigator_browse",
+                    "arguments": "{}",
+                }
+                return
+            yield {
+                "type": "tool_call",
+                "id": "good",
+                "name": "navigator_browse",
+                "arguments": '{"action":"extract"}',
+            }
+
+    delegate = _Client()
+    client = repair.NavigatorToolRepairClient(delegate)
+    events = [event async for event in client.stream([], tools=NAV_TOOL, max_tokens=500)]
+
+    assert delegate.calls == 2
+    assert client.navigator_tool_json_repairs == 1
+    assert events == [{
+        "type": "tool_call",
+        "id": "good",
+        "name": "navigator_browse",
+        "arguments": '{"action":"extract"}',
+    }]
+
+
+@pytest.mark.asyncio
 async def test_does_not_retry_non_navigator_or_non_parse_failure():
     class _Client:
         async def stream(self, messages, tools=None, max_tokens=None, *, tool_choice=None):  # noqa: ARG002
