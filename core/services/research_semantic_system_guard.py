@@ -1,14 +1,14 @@
 """Veto internally contradictory ADAS semantic-review acceptances.
 
-X remains the semantic judge.  The independent reviewer already declares a
-``procedure_type`` such as STATIC_RADAR or DYNAMIC_CAMERA.  This guard never
+X remains the semantic judge. The independent reviewer already declares a
+``procedure_type`` such as STATIC_RADAR or DYNAMIC_CAMERA. This guard never
 promotes a candidate and never chooses a browser path; it only refuses an
 acceptance when that declared type directly contradicts an explicit system
 family in the research objective.
 
 The motivating live failure was a 2023 Honda Accord front millimeter-wave radar
 objective that successfully captured ``Multipurpose Camera Aiming (Dynamic
-Aiming)``.  The review layer could call that page an actual procedure and accept
+Aiming)``. The review layer could call that page an actual procedure and accept
 it because its consistency checks covered vehicle, classification, and
 execution steps, but not requested system versus declared procedure type.
 """
@@ -42,7 +42,7 @@ def _fold(value: Any) -> str:
 def objective_family(objective: Any) -> str | None:
     """Return only an explicitly stated radar/camera family.
 
-    This is intentionally conservative and veto-only.  Ambiguous objectives
+    This is intentionally conservative and veto-only. Ambiguous objectives
     return None, which means Python makes no semantic decision at all.
     """
 
@@ -70,7 +70,13 @@ def candidate_family(procedure_type: Any) -> str | None:
 
 
 def apply_system_consistency(verdict: Any, *, objective: Any) -> Any:
-    """Downgrade only a direct objective/procedure-family contradiction."""
+    """Veto only a direct objective/procedure-family contradiction.
+
+    A direct radar-vs-camera mismatch is not ambiguous: the candidate may be a
+    real ADAS procedure, but it cannot satisfy this objective. CONTINUE_SEARCH
+    preserves model-first navigation while giving Navigator the correct recovery
+    instruction instead of leaving the model on the rejected page as UNCERTAIN.
+    """
 
     if not isinstance(verdict, dict):
         return verdict
@@ -85,7 +91,7 @@ def apply_system_consistency(verdict: Any, *, objective: Any) -> Any:
     out = dict(verdict)
     original = str(out.get("decision") or "")
     out["original_decision"] = out.get("original_decision", original)
-    out["decision"] = "UNCERTAIN"
+    out["decision"] = "CONTINUE_SEARCH"
     inconsistent = list(out.get("inconsistent") or [])
     inconsistent.append(
         "decision accepts a candidate whose declared procedure_type "
@@ -99,6 +105,11 @@ def apply_system_consistency(verdict: Any, *, objective: Any) -> Any:
         "procedure_type": out.get("procedure_type"),
         "veto_only": True,
     }
+    out["evidence_summary"] = (
+        f"Wrong ADAS sensor family: this candidate is a {candidate} procedure, "
+        f"but the requested objective is {expected}. Do not extract this page again; "
+        f"navigate away and continue searching for the requested {expected} procedure."
+    )
     return out
 
 
