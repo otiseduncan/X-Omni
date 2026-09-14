@@ -18,13 +18,13 @@ def _module():
         calls.append(dict(target))
         return True
 
-    async def run_one_task(*, target):
+    async def run_task(*, target):
         first = await module._target_already_selected(object(), "alldata", target)
         second = await module._target_already_selected(object(), "alldata", target)
         return first, second
 
     module._target_already_selected = target_already_selected
-    module._run_one_task = run_one_task
+    module._run_task = run_task
     module.calls = calls
     return module
 
@@ -34,7 +34,7 @@ async def test_valid_vin_forces_one_reselection_then_uses_real_signal():
     module = _module()
     anchor.install(module)
 
-    first, second = await module._run_one_task(target={"vin": VIN})
+    first, second = await module._run_task(target={"vin": VIN})
 
     assert first is False
     assert second is True
@@ -48,8 +48,8 @@ async def test_each_new_task_gets_a_fresh_vehicle_anchor():
     module = _module()
     anchor.install(module)
 
-    assert await module._run_one_task(target={"vin": VIN}) == (False, True)
-    assert await module._run_one_task(target={"vin": VIN}) == (False, True)
+    assert await module._run_task(target={"vin": VIN}) == (False, True)
+    assert await module._run_task(target={"vin": VIN}) == (False, True)
     assert len(module.calls) == 2
 
 
@@ -58,7 +58,9 @@ async def test_task_without_exact_vin_keeps_existing_behavior():
     module = _module()
     anchor.install(module)
 
-    first, second = await module._run_one_task(target={"year": 2025, "make": "Kia", "model": "K4"})
+    first, second = await module._run_task(
+        target={"year": 2025, "make": "Kia", "model": "K4"}
+    )
 
     assert first is True
     assert second is True
