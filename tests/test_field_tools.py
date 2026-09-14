@@ -282,6 +282,10 @@ async def test_collection_pages_in_one_call(settings, monkeypatch):
     board = [{"ro_number": str(i), "status": "New Arrival"} for i in range(150)]
 
     async def fake_get(self, url, params=None, **kw):
+        # Endpoint discovery probes /health first; only collection pages count.
+        if "/collection/" not in str(url):
+            return httpx.Response(200, json={"ok": True},
+                                  request=httpx.Request("GET", url))
         calls.append(dict(params or {}))
         offset = int((params or {}).get("offset") or 0)
         limit = int((params or {}).get("limit") or 100)
@@ -306,6 +310,10 @@ async def test_upstream_short_pages_continue_to_authoritative_total(settings, mo
              for i in range(59)]
 
     async def fake_get(self, url, params=None, **kw):
+        # Endpoint discovery probes /health first; only collection pages count.
+        if "/collection/" not in str(url):
+            return httpx.Response(200, json={"ok": True},
+                                  request=httpx.Request("GET", url))
         offset = int((params or {}).get("offset") or 0)
         calls.append(offset)
         return httpx.Response(
@@ -336,6 +344,10 @@ async def test_duplicate_rows_across_pages_do_not_inflate_total(settings, monkey
     }
 
     async def fake_get(self, url, params=None, **kw):
+        # Endpoint discovery probes /health first; only collection pages count.
+        if "/collection/" not in str(url):
+            return httpx.Response(200, json={"ok": True},
+                                  request=httpx.Request("GET", url))
         offset = int((params or {}).get("offset") or 0)
         calls.append(offset)
         return httpx.Response(
@@ -379,14 +391,18 @@ async def test_collection_cap_never_reports_partial_count_as_verified(
 
 @pytest.mark.asyncio
 async def test_early_empty_page_is_incomplete_not_a_false_total(settings, monkeypatch):
-    calls = 0
+    pages = 0
 
     async def fake_get(self, url, params=None, **kw):
-        nonlocal calls
-        calls += 1
+        # Endpoint discovery probes /health first; only collection pages count.
+        nonlocal pages
+        if "/collection/" not in str(url):
+            return httpx.Response(200, json={"ok": True},
+                                  request=httpx.Request("GET", url))
+        pages += 1
         items = ([{"id": "1", "status": "New Arrival"},
                   {"id": "2", "status": "New Arrival"}]
-                 if calls == 1 else [])
+                 if pages == 1 else [])
         return httpx.Response(200, json={"items": items, "count": 3},
                               request=httpx.Request("GET", url))
 
@@ -413,12 +429,19 @@ async def test_empty_collection_is_a_verified_zero(settings, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_later_page_error_discards_partial_total_claim(settings, monkeypatch):
-    calls = 0
+    # Answer by URL, not by call order. Endpoint discovery probes /health
+    # before the first collection page, so a blind call counter handed the
+    # 503 to page one and the test stopped exercising the partial-collection
+    # path it is named for.
+    pages = 0
 
     async def fake_get(self, url, params=None, **kw):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
+        nonlocal pages
+        if "/collection/" not in str(url):
+            return httpx.Response(200, json={"ok": True},
+                                  request=httpx.Request("GET", url))
+        pages += 1
+        if pages == 1:
             items = [{"id": str(i), "status": "New Arrival"} for i in range(100)]
             return httpx.Response(200, json={"items": items, "count": 150},
                                   request=httpx.Request("GET", url))

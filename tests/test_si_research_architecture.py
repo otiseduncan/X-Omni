@@ -76,8 +76,14 @@ def test_the_scheduler_never_chooses_an_alldata_branch_or_grades_a_page():
     target = adas_si_research.target_from_read(
         {
             "status": "verified",
-            "repair_order": {"RO": "1", "id": "x"},
-            "raw": {"id": "x", "ro_number": "1", "vehicle": {"year": 2024, "make": "Honda", "model": "Civic"},
+            # A target is only exact with a VIN; year/make/model alone is
+            # deliberately not one, so the fixture carries a real 17-character
+            # VIN rather than relying on the looser identity that predated the
+            # exact-VIN guard.
+            "repair_order": {"RO": "1", "id": "x", "vin": "2HGFC2F69KH000001"},
+            "raw": {"id": "x", "ro_number": "1",
+                    "vehicle": {"year": 2024, "make": "Honda", "model": "Civic",
+                                "vin": "2HGFC2F69KH000001"},
                     "calibrations": [{"id": "c", "title": "Millimeter Wave Radar", "determination": "REQUIRED"}]},
         }
     )
