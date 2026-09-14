@@ -18,6 +18,8 @@ from . import adas_ocr as _adas_ocr
 from . import adas_identity_guard as _adas_identity_guard
 from . import adas_calibration_depth as _adas_calibration_depth
 from . import adas_calibration_identity as _adas_calibration_identity
+from . import adas_si_research as _adas_si_research
+from . import adas_si_research_identity as _adas_si_research_identity
 from . import research_operator as _research_operator
 from . import research_capture as _research_capture
 from . import research_setup as _research_setup
@@ -44,6 +46,7 @@ _adas_ocr.install_class(_adas_si.AdasSI)
 _adas_identity_guard.install(_adas_si)
 _adas_calibration_depth.install(_adas_si)
 _adas_calibration_identity.install(_adas_si)
+_adas_si_research_identity.install(_adas_si_research)
 _research_operator.install()
 _research_route_compat.install()
 _research_vault.install()
