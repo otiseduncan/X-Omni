@@ -2,7 +2,8 @@
 
 The model still owns intent, references, source choice, and tool arguments. This
 installer rewrites existing prompt sentences in place after live conversation
-failures; it does not inspect user text, force a tool, or grow the static prompt.
+failures; it does not inspect user text, force a tool, or grow the static prompt
+with duplicated routing machinery.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ def install() -> None:
     prompt.MODEL_FIRST_CONTRACT = _replace_once(
         prompt.MODEL_FIRST_CONTRACT,
         "An RO's OEM procedures are always `research_si` here—not `delegate_research`;",
-        "Only CIQ-attached RO procedure work is `research_si` here—not `delegate_research`;",
+        "Only CIQ-attached RO procedure work is `research_si` here—not `delegate_research`; a follow-up asking whether an already-started `research_si` job finished is a status read of that job, not a new `delegate_research` request;",
     )
     prompt.TRUTH_AND_AUTHORIZATION = _replace_once(
         prompt.TRUTH_AND_AUTHORIZATION,
