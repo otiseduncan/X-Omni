@@ -110,6 +110,9 @@ def test_agent_prompt_and_observation_require_a_bottom_decision():
     guard.install(agent, scrapex)
 
     prompt = agent._system_prompt({}, "topic")
+    assert "CANDIDATE-SUBMISSION INVARIANT" in prompt
+    assert "extract is not a declaration" in prompt.lower()
+    assert "independent reviewer" in prompt
     assert "END-OF-PAGE INVARIANT" in prompt
     assert "call extract" in prompt
     assert "Do not request another downward scroll" in prompt
@@ -129,7 +132,9 @@ def test_agent_prompt_and_observation_require_a_bottom_decision():
     contract = summary["bottom_decision_contract"]
     assert contract["scroll_down_allowed"] is False
     assert contract["decision_required"] is True
+    assert contract["extract_is_candidate_submission"] is True
     assert "call extract now" in contract["instruction"]
+    assert "independent review" in contract["instruction"]
 
     delta_description = agent.NAVIGATOR_AGENT_TOOL_SCHEMA["function"]["parameters"]["properties"]["delta_y"]["description"]
     assert "at_page_bottom=true" in delta_description
