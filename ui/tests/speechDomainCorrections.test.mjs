@@ -81,7 +81,7 @@ test("mishearings observed in the 2026-09-15 field conversation are corrected", 
   );
   assert.equal(
     correctDomainVocabulary("take a bath SSI and make sure you're right"),
-    "take ADAS SI and make sure you're right",
+    "check ADAS SI and make sure you're right",
   );
   assert.equal(
     correctDomainVocabulary("show me the Addus map"),
@@ -94,6 +94,14 @@ test("mishearings observed in the 2026-09-15 field conversation are corrected", 
   assert.equal(
     correctDomainVocabulary("how many active ROs did we show for making"),
     "how many active ROs did we show for Macon",
+  );
+  assert.equal(
+    correctDomainVocabulary("service information SI that's attached to the Ross"),
+    "service information SI that's attached to the ROs",
+  );
+  assert.equal(
+    correctDomainVocabulary("blind spot inspection on a Honda key or Genesis product"),
+    "blind spot inspection on a Hyundai Kia or Genesis product",
   );
 });
 
@@ -115,6 +123,10 @@ test("words that are also legitimate shop language survive uncorrected", () => {
   assert.equal(
     correctDomainVocabulary("the paint is still making bubbles"),
     "the paint is still making bubbles",
+  );
+  assert.equal(
+    correctDomainVocabulary("Ross is bringing the part"),
+    "Ross is bringing the part",
   );
 });
 
