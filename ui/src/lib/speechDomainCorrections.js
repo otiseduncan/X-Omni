@@ -7,6 +7,19 @@
  * they're spotted rather than guessing ahead of real evidence.
  */
 const DOMAIN_TERM_CORRECTIONS = [
+  // Observed 2026-09-15: "check a gas SI", "a bath SSI", "Addus map",
+  // "v i n", and "making" for Macon.  Keep every correction phrase-scoped
+  // where the mistaken word is also normal English.
+  { pattern: /\ba\s+gas\s+si\b/gi, replacement: "ADAS SI" },
+  { pattern: /\ba\s+bath\s+s{1,2}i\b/gi, replacement: "ADAS SI" },
+  { pattern: /\baddus\s+si\b/gi, replacement: "ADAS SI" },
+  { pattern: /\baddus\s+map\b/gi, replacement: "ADAS Map" },
+  { pattern: /\bv\s+i\s+n\b/gi, replacement: "VIN" },
+  {
+    pattern: /\b(for|in)\s+making\b/gi,
+    replacement: (_m, prep = "in") => `${prep} Macon`,
+  },
+
   // Observed 2026-09-11: "missing a dash map" for "missing ADAS Map". Only the
   // two-word phrase is corrected; a bare "a dash" (a dash cam) is left alone.
   { pattern: /\ba\s+dash\s+map\b/gi, replacement: "ADAS Map" },
