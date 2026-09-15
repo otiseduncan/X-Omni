@@ -34,6 +34,7 @@ from . import research_semantic_system_guard as _research_semantic_system_guard
 from . import research_objective_match_guard as _research_objective_match_guard
 from . import research_navigator_vehicle_anchor as _research_navigator_vehicle_anchor
 from . import research_dependency_budget_extension as _research_dependency_budget_extension
+from . import research_delegate_vin_guard as _research_delegate_vin_guard
 from . import research_operator as _research_operator
 from . import research_capture as _research_capture
 from . import research_setup as _research_setup
@@ -74,6 +75,7 @@ _research_semantic_system_guard.install(_research_semantic_review, _research_nav
 _research_objective_match_guard.install(_research_semantic_review, _research_navigator_agent)
 _research_navigator_vehicle_anchor.install(_research_navigator_agent)
 _research_dependency_budget_extension.install(_research_navigator_agent)
+_research_delegate_vin_guard.install()
 _research_operator.install()
 _research_route_compat.install()
 _research_vault.install()
