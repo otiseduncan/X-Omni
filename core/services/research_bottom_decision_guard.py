@@ -1,11 +1,12 @@
 """Keep Navigator reasoning alive at the end of a fully-read procedure page.
 
 This is an execution guard, not a semantic router.  X still decides whether the
-current page is the requested service-information procedure.  The guard only
-records the mechanical fact that the live task is already at the bottom and
-refuses another downward scroll on that unchanged task.  That prevents an
-impossible browser action from consuming the repeated-no-effect budget before X
-gets to make the actual semantic choice: extract this page or leave it.
+current page is a plausible candidate for the requested service-information
+procedure.  The guard only records the mechanical fact that the live task is
+already at the bottom and refuses another downward scroll on that unchanged
+task.  That prevents an impossible browser action from consuming the repeated-
+no-effect budget before X can submit the candidate to the independent reviewer
+or leave it.
 """
 
 from __future__ import annotations
@@ -34,8 +35,9 @@ def _bottom_scroll_failure(task_id: str) -> dict[str, Any]:
     message = (
         "The current Navigator observation is already at the bottom of this page. "
         "Another downward scroll cannot reveal new content. X must decide from the "
-        "page already observed: call extract if it is the requested procedure, or "
-        "leave this page and continue searching if it is not."
+        "page already observed: call extract to submit it for independent review if "
+        "it could be the requested procedure, or leave this page and continue "
+        "searching if it clearly is not."
     )
     return {
         "service": "ScrapeX",
@@ -115,13 +117,23 @@ def _install_agent(agent_module: Any) -> None:
     def system_prompt_with_bottom_contract(*args: Any, **kwargs: Any) -> str:
         base = str(original_system_prompt(*args, **kwargs))
         return base + (
-            "\n\nBROWSER END-OF-PAGE INVARIANT: when the latest observation says "
+            "\n\nCANDIDATE-SUBMISSION INVARIANT: `extract` is not a declaration that the "
+            "page is correct and it does not itself save the page. It submits the current "
+            "page as a candidate to ScrapeX mechanical verification and an independent "
+            "semantic reviewer. Only an accepted review can trigger capture. Therefore, "
+            "after you have read a page fully, if it could plausibly be the requested "
+            "procedure for the exact vehicle/system, call extract and let the independent "
+            "reviewer decide. Do not back out merely because the title uses aiming, "
+            "adjustment, initialization, relearn, setup, or other OEM wording instead of "
+            "the word calibration, and do not revisit the same plausible page repeatedly "
+            "without ever submitting it.\n\n"
+            "BROWSER END-OF-PAGE INVARIANT: when the latest observation says "
             "at_page_bottom=true or carries page_bottom_reached, there is no more "
             "content below. Do not request another downward scroll. Make the semantic "
-            "decision yourself from the page you have read: if it is the requested "
-            "procedure, call extract; if it is not, leave the page and continue the "
-            "search. Repeating an unchanged browser action is never a substitute for "
-            "that decision."
+            "candidate decision from the page you have read: if it could plausibly be "
+            "the requested procedure, call extract for independent review; if it clearly "
+            "is not, leave the page and continue the search. Repeating an unchanged "
+            "browser action is never a substitute for that decision."
         )
 
     def observation_summary_with_bottom_contract(result: dict[str, Any]) -> dict[str, Any]:
@@ -131,10 +143,13 @@ def _install_agent(agent_module: Any) -> None:
             summary["bottom_decision_contract"] = {
                 "scroll_down_allowed": False,
                 "decision_required": True,
+                "extract_is_candidate_submission": True,
                 "instruction": (
-                    "The entire current page has been reached. Decide whether it is the "
-                    "requested procedure. If yes, call extract now. If no, leave this page "
-                    "and continue searching. Do not scroll down again."
+                    "The entire current page has been reached. If this page could plausibly "
+                    "be the requested procedure, call extract now to submit it for independent "
+                    "review; extract is not a claim that it is correct. If the page clearly is "
+                    "not the procedure, leave it and continue searching. Do not scroll down "
+                    "again or revisit the same page without submitting a plausible candidate."
                 ),
             }
         return summary
@@ -145,8 +160,10 @@ def _install_agent(agent_module: Any) -> None:
     try:
         function = agent_module.NAVIGATOR_AGENT_TOOL_SCHEMA["function"]
         function["description"] = str(function.get("description") or "") + (
-            " Once the latest observation reports the bottom of the page, another "
-            "downward scroll is invalid; decide whether to extract or leave the page."
+            " Extract submits a plausible fully-read page for independent review; it is "
+            "not a declaration of correctness. Once the latest observation reports the "
+            "bottom of the page, another downward scroll is invalid; submit a plausible "
+            "candidate with extract or leave the page."
         )
         delta = function["parameters"]["properties"]["delta_y"]
         delta["description"] = str(delta.get("description") or "") + (
