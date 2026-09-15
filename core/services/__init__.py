@@ -35,6 +35,7 @@ from . import research_navigator_tool_repair as _research_navigator_tool_repair
 from . import research_semantic_review as _research_semantic_review
 from . import research_semantic_system_guard as _research_semantic_system_guard
 from . import research_objective_match_guard as _research_objective_match_guard
+from . import research_dependency_semantic_guard as _research_dependency_semantic_guard
 from . import research_navigator_vehicle_anchor as _research_navigator_vehicle_anchor
 from . import research_dependency_budget_extension as _research_dependency_budget_extension
 from . import research_operator as _research_operator
@@ -77,6 +78,7 @@ _research_bottom_decision_guard.install(_research_navigator_agent, _scrapex)
 _research_navigator_tool_repair.install(_research_navigator_agent)
 _research_semantic_system_guard.install(_research_semantic_review, _research_navigator_agent)
 _research_objective_match_guard.install(_research_semantic_review, _research_navigator_agent)
+_research_dependency_semantic_guard.install(_research_semantic_review)
 _research_navigator_vehicle_anchor.install(_research_navigator_agent)
 _research_dependency_budget_extension.install(_research_navigator_agent)
 _adas_si_research_source_cascade.install(_adas_si_research)
