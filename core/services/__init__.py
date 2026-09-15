@@ -21,6 +21,7 @@ from . import adas_calibration_identity as _adas_calibration_identity
 from . import adas_si_research as _adas_si_research
 from . import adas_si_research_identity as _adas_si_research_identity
 from . import adas_si_research_adas_map_vin_repair as _adas_si_research_adas_map_vin_repair
+from . import adas_si_research_source_cascade as _adas_si_research_source_cascade
 from . import calibration_iq as _calibration_iq
 from . import calibration_iq_endpoint_discovery as _calibration_iq_endpoint_discovery
 from . import calibration_iq_data_plane_guard as _calibration_iq_data_plane_guard
@@ -74,6 +75,7 @@ _research_semantic_system_guard.install(_research_semantic_review, _research_nav
 _research_objective_match_guard.install(_research_semantic_review, _research_navigator_agent)
 _research_navigator_vehicle_anchor.install(_research_navigator_agent)
 _research_dependency_budget_extension.install(_research_navigator_agent)
+_adas_si_research_source_cascade.install(_adas_si_research)
 _research_operator.install()
 _research_route_compat.install()
 _research_vault.install()
