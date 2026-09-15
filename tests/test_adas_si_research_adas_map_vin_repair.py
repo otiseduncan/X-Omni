@@ -65,7 +65,7 @@ def _read(*, vin=None, adas_map=True):
 
 
 @pytest.mark.asyncio
-async def test_missing_ciq_vin_is_repaired_from_proven_attached_adas_map(monkeypatch):
+async def test_missing_ciq_vin_is_repaired_from_proven_adas_map(monkeypatch):
     reads = [_read(vin=None), _read(vin=VIN)]
     calls = []
 
@@ -101,19 +101,75 @@ async def test_missing_ciq_vin_is_repaired_from_proven_attached_adas_map(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_missing_vin_without_attached_adas_map_does_not_attempt_repair(monkeypatch):
-    async def get_ro(_settings, _args):
-        return _read(vin=None, adas_map=False)
+async def test_missing_vin_does_not_depend_on_ciq_document_projection(monkeypatch):
+    """The proof service, not CIQ's current document JSON shape, owns eligibility."""
+    reads = [_read(vin=None, adas_map=False), _read(vin=VIN, adas_map=False)]
+    calls = []
 
-    async def should_not_start(_settings):
-        raise AssertionError("ScrapeX repair must not run without an attached ADAS Map")
+    async def get_ro(_settings, _args):
+        return reads.pop(0)
+
+    async def start_native(_settings):
+        return {"success": True, "verified": True}
+
+    async def request(_settings, method, path, **kwargs):
+        calls.append((method, path, kwargs.get("body")))
+        return {
+            "requested_count": 1,
+            "repaired_count": 1,
+            "results": [{"ro_number": RO, "status": "repaired", "vin": VIN}],
+        }
 
     monkeypatch.setattr(calibration_iq, "get_repair_order", get_ro)
-    monkeypatch.setattr(scrapex, "start_native", should_not_start)
+    monkeypatch.setattr(scrapex, "start_native", start_native)
+    monkeypatch.setattr(scrapex, "_request", request)
 
     reader = research.default_ro_reader(SimpleNamespace())
     result = await reader({"repair_order_id": RO})
+
+    assert research.vin_from_read(result) == VIN
+    assert calls == [
+        (
+            "POST",
+            "/api/adas-map/repair-proven-vins",
+            {"ro_numbers": [RO]},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_missing_vin_without_scrapex_proof_stays_blocked(monkeypatch):
+    calls = []
+
+    async def get_ro(_settings, _args):
+        return _read(vin=None, adas_map=False)
+
+    async def start_native(_settings):
+        return {"success": True, "verified": True}
+
+    async def request(_settings, method, path, **kwargs):
+        calls.append((method, path, kwargs.get("body")))
+        return {
+            "requested_count": 1,
+            "repaired_count": 0,
+            "results": [{"ro_number": RO, "status": "unverified"}],
+        }
+
+    monkeypatch.setattr(calibration_iq, "get_repair_order", get_ro)
+    monkeypatch.setattr(scrapex, "start_native", start_native)
+    monkeypatch.setattr(scrapex, "_request", request)
+
+    reader = research.default_ro_reader(SimpleNamespace())
+    result = await reader({"repair_order_id": RO})
+
     assert research.vin_from_read(result) == ""
+    assert calls == [
+        (
+            "POST",
+            "/api/adas-map/repair-proven-vins",
+            {"ro_numbers": [RO]},
+        )
+    ]
 
 
 @pytest.mark.asyncio
