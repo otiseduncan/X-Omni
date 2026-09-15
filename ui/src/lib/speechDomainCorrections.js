@@ -7,14 +7,17 @@
  * they're spotted rather than guessing ahead of real evidence.
  */
 const DOMAIN_TERM_CORRECTIONS = [
-  // Observed 2026-09-15: "check a gas SI", "a bath SSI", "Addus map",
-  // "v i n", and "making" for Macon.  Keep every correction phrase-scoped
-  // where the mistaken word is also normal English.
+  // Observed 2026-09-15: "check a gas SI", "take a bath SSI", "Addus map",
+  // spaced "v i n", "Ross" for ROs, and "making" for Macon. Keep every
+  // correction phrase-scoped where the mistaken word is also normal English.
+  { pattern: /\btake\s+a\s+bath\s+s{1,2}i\b/gi, replacement: "check ADAS SI" },
   { pattern: /\ba\s+gas\s+si\b/gi, replacement: "ADAS SI" },
   { pattern: /\ba\s+bath\s+s{1,2}i\b/gi, replacement: "ADAS SI" },
   { pattern: /\baddus\s+si\b/gi, replacement: "ADAS SI" },
   { pattern: /\baddus\s+map\b/gi, replacement: "ADAS Map" },
   { pattern: /\bv\s+i\s+n\b/gi, replacement: "VIN" },
+  { pattern: /\battached\s+to\s+the\s+ross\b/gi, replacement: "attached to the ROs" },
+  { pattern: /\bhonda\s+key\s+or\s+genesis\b/gi, replacement: "Hyundai Kia or Genesis" },
   {
     pattern: /\b(for|in)\s+making\b/gi,
     replacement: (_m, prep = "in") => `${prep} Macon`,
