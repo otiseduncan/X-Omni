@@ -20,6 +20,7 @@ from . import adas_calibration_depth as _adas_calibration_depth
 from . import adas_calibration_identity as _adas_calibration_identity
 from . import adas_si_research as _adas_si_research
 from . import adas_si_research_identity as _adas_si_research_identity
+from . import adas_si_research_adas_map_vin_repair as _adas_si_research_adas_map_vin_repair
 from . import calibration_iq as _calibration_iq
 from . import calibration_iq_endpoint_discovery as _calibration_iq_endpoint_discovery
 from . import calibration_iq_data_plane_guard as _calibration_iq_data_plane_guard
@@ -60,7 +61,10 @@ _adas_identity_guard.install(_adas_si)
 _adas_calibration_depth.install(_adas_si)
 _adas_calibration_identity.install(_adas_si)
 _adas_si_research_identity.install(_adas_si_research)
+_adas_si_research_adas_map_vin_repair.install(_adas_si_research)
 # SI research is intentionally VIN-bound. No year/make/model fallback is installed.
+# If an older RO has an attached ADAS Map but no stored CIQ VIN, the adapter
+# above may restore only the VIN already proven by that exact ScrapeX map result.
 _calibration_iq_endpoint_discovery.install(_calibration_iq)
 _calibration_iq_data_plane_guard.install(_calibration_iq)
 _scrapex_navigator_runtime.install(_scrapex)
