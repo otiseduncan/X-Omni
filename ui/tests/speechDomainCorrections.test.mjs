@@ -74,6 +74,29 @@ test("mishearings observed on the desktop far-field mic are corrected", () => {
   assert.equal(correctDomainVocabulary("need a Das map"), "need ADAS Map");
 });
 
+test("mishearings observed in the 2026-09-15 field conversation are corrected", () => {
+  assert.equal(
+    correctDomainVocabulary("check a gas SI for accuracy"),
+    "check ADAS SI for accuracy",
+  );
+  assert.equal(
+    correctDomainVocabulary("take a bath SSI and make sure you're right"),
+    "take ADAS SI and make sure you're right",
+  );
+  assert.equal(
+    correctDomainVocabulary("show me the Addus map"),
+    "show me the ADAS Map",
+  );
+  assert.equal(
+    correctDomainVocabulary("pull the v i n from the Addus map"),
+    "pull the VIN from the ADAS Map",
+  );
+  assert.equal(
+    correctDomainVocabulary("how many active ROs did we show for making"),
+    "how many active ROs did we show for Macon",
+  );
+});
+
 test("words that are also legitimate shop language survive uncorrected", () => {
   // Each of these shares a word with a correction above; the corrections are
   // anchored to the phrase they were observed in so ordinary usage is safe.
@@ -88,6 +111,10 @@ test("words that are also legitimate shop language survive uncorrected", () => {
   assert.equal(
     correctDomainVocabulary("draw arrows on the diagram"),
     "draw arrows on the diagram",
+  );
+  assert.equal(
+    correctDomainVocabulary("the paint is still making bubbles"),
+    "the paint is still making bubbles",
   );
 });
 
