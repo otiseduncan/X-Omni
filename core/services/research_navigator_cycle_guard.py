@@ -136,11 +136,14 @@ def install(agent_module: Any) -> None:
                 "revisited_page_state": True,
                 "revisit_count": int(state.get("revisit_count") or 0),
             }
+            # A cycle is at least as costly as a repeated failed action.  Four
+            # ignored cycle warnings are enough to hit the base stall limit;
+            # this prevents A/B menu ping-pong from consuming all 40 turns.
             return original_budget_note(
                 self,
                 "revisited_page_state",
                 progress=False,
-                cost=max(1, int(cost)),
+                cost=max(2, int(cost)),
                 **detail,
             )
         return original_budget_note(
