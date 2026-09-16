@@ -34,13 +34,7 @@ from . import conversation_contract_guard as _conversation_contract_guard
 from . import scrapex as _scrapex
 from . import scrapex_navigator_runtime as _scrapex_navigator_runtime
 from . import research_navigator_agent as _research_navigator_agent
-from . import research_bottom_decision_guard as _research_bottom_decision_guard
-from . import research_navigator_cycle_guard as _research_navigator_cycle_guard
-from . import research_navigator_completion_guard as _research_navigator_completion_guard
-from . import research_navigator_tool_repair as _research_navigator_tool_repair
 from . import research_semantic_review as _research_semantic_review
-from . import research_navigator_vehicle_anchor as _research_navigator_vehicle_anchor
-from . import research_dependency_budget_extension as _research_dependency_budget_extension
 from . import research_operator as _research_operator
 from . import research_capture as _research_capture
 from . import research_setup as _research_setup
@@ -78,12 +72,6 @@ _calibration_iq_data_plane_guard.install(_calibration_iq)
 _calibration_iq_projection_guard.install(_calibration_iq)
 _conversation_contract_guard.install()
 _scrapex_navigator_runtime.install(_scrapex)
-_research_bottom_decision_guard.install(_research_navigator_agent, _scrapex)
-_research_navigator_tool_repair.install(_research_navigator_agent)
-_research_navigator_vehicle_anchor.install(_research_navigator_agent)
-_research_dependency_budget_extension.install(_research_navigator_agent)
-_research_navigator_cycle_guard.install(_research_navigator_agent)
-_research_navigator_completion_guard.install(_research_navigator_agent, _scrapex)
 _adas_si_research_source_cascade.install(_adas_si_research)
 _adas_si_research_provenance_guard.install(
     _adas_si_research_source_cascade, _adas_si_research

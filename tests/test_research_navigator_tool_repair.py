@@ -144,20 +144,19 @@ async def test_does_not_retry_non_navigator_or_non_parse_failure():
 
 
 @pytest.mark.asyncio
-async def test_installer_preserves_run_search_signature_and_wraps_client():
+async def test_navigator_search_builds_the_repair_client_itself(monkeypatch):
+    """The repair client is part of the entry point, not a wrapper installed on it."""
+    from core.services import research_navigator_agent as agent
+
     seen = {}
 
-    async def run_navigator_search(*, client, settings, provider, target, topic, objective=None):  # noqa: ARG001
-        seen["client"] = client
+    async def run_objective(**kwargs):
+        seen["client"] = kwargs["client"]
         return {"ok": True}
 
-    original_signature = inspect.signature(run_navigator_search)
-    module = SimpleNamespace(run_navigator_search=run_navigator_search)
-    repair.install(module)
-
-    assert inspect.signature(module.run_navigator_search) == original_signature
+    monkeypatch.setattr(agent, "_run_objective", run_objective)
     delegate = _MalformedThenGoodClient()
-    result = await module.run_navigator_search(
+    result = await agent.run_navigator_search(
         client=delegate,
         settings=object(),
         provider="alldata",
@@ -167,3 +166,11 @@ async def test_installer_preserves_run_search_signature_and_wraps_client():
     )
     assert result == {"ok": True}
     assert isinstance(seen["client"], repair.NavigatorToolRepairClient)
+
+    # An already-wrapped client is not wrapped twice.
+    wrapped = repair.NavigatorToolRepairClient(delegate)
+    await agent.run_navigator_search(
+        client=wrapped, settings=object(), provider="alldata", target={}, topic="radar",
+    )
+    assert seen["client"] is wrapped
+    assert not hasattr(repair, "install")

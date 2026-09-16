@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from core.services import research_navigator_agent as agent
+from core.services import research_navigator_contract as contract
 from core.services import research_semantic_review as review_mod
 from tests.test_research_navigator_agent import _navigator_result
 
@@ -283,7 +284,7 @@ async def test_the_first_message_preselects_the_vin_before_the_model_sees_the_pa
     # runtime then uses the VIN fast path and rechecks before a model turn.
     assert _target_signal.calls[0][0] == "alldata"
     assert _target_signal.calls[0][1]["vin"] == TARGET["vin"]
-    assert _target_signal.calls == [
+    assert _target_signal.calls[:2] == [
         ("alldata", TARGET),
         ("alldata", TARGET),
     ]
@@ -329,7 +330,7 @@ async def test_select_vehicle_fast_path_is_dispatched_with_the_vin(wired):
     assert call == {"action": "select_vehicle", "task_id": "task-1", "vin": "KNAF24A28S5000001"}
     prompt = client.messages_seen[0][0]["content"]
     assert "VIN: KNAF24A28S5000001" in prompt
-    assert "Historical provider notes (non-binding" in prompt
+    assert "PROVIDER NOTES (how this site is built; non-binding" in prompt
 
 
 # ------------------------------------------------------------- critic
@@ -376,7 +377,10 @@ async def test_review_reject_and_continue_keep_the_loop_going_and_never_accept(w
     assert result["verified"] is False
     assert result["captured"] is False
     assert _capture.calls == []
-    assert [call["decision"] for call in result["research_receipt"]["critic_decisions"]] == ["REJECT", "CONTINUE_SEARCH"]
+    # The same page submitted again is not re-reviewed: the reviewer's
+    # earlier verdict stands and the loop still keeps going.
+    assert len(reviewer.calls) == 1
+    assert [call["decision"] for call in result["research_receipt"]["critic_decisions"]] == ["REJECT", "REJECT"]
     second_turn = json.dumps(client.messages_seen[1], default=str)
     assert "REJECTED" in second_turn and "removal and installation" in second_turn
     assert "semantic review did not accept" in " ".join(result["incomplete_reasons"]).casefold()
@@ -524,7 +528,10 @@ async def test_the_same_action_that_changes_nothing_is_not_sent_forever(monkeypa
 
     assert result["agent_stopped_reason"] == "repeated_no_effect"
     clicks = [call for call in navigator.calls if call["action"] == "click"]
-    assert len(clicks) == 3, clicks
+    # Three identical no-effect clicks end a task. The objective may try again
+    # in a fresh VIN-anchored task, but each attempt is bounded the same way.
+    assert len([call for call in clicks if call["task_id"] == "task-1"]) == 3, clicks
+    assert len(clicks) <= 3 * contract.MAX_PRIMARY_ATTEMPTS
     # The model is told what was observed, not what it should have meant.
     receipts = [
         json.loads(message["content"])

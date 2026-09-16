@@ -204,6 +204,20 @@ class _ScriptedClient:
             }
 
 
+def _first_task_transcript(client: "_ScriptedClient") -> list[dict[str, Any]]:
+    """The last prompt of the objective's first task.
+
+    A primary task that ends without an accepted procedure may continue in a
+    fresh task with a new transcript; assertions about what one task showed
+    the model belong to the task that did the work.
+    """
+    seen = client.messages_seen
+    for index in range(1, len(seen)):
+        if len(seen[index]) < len(seen[index - 1]):
+            return seen[index - 1]
+    return seen[-1]
+
+
 async def _no_sleep(_seconds: float) -> None:
     return None
 
@@ -841,14 +855,15 @@ async def test_transcript_stays_bounded_instead_of_growing_with_every_action(mon
 
     assert len(client.messages_seen) >= 14
     after_first_action = _prompt_chars(client.messages_seen[1])
-    after_last_action = _prompt_chars(client.messages_seen[-1])
+    last_turn_of_task = _first_task_transcript(client)
+    after_last_action = _prompt_chars(last_turn_of_task)
     # Thirteen more browser actions must not multiply the prompt. The only
     # growth allowed is one short digest line per superseded observation.
     assert after_last_action < after_first_action * 2
 
     # Exactly one full element map is ever in context: stale refs are
     # rejected by ScrapeX, so older maps cost context and buy nothing.
-    final = client.messages_seen[-1]
+    final = last_turn_of_task
     full_maps = [
         message
         for message in final
@@ -880,7 +895,7 @@ async def test_superseded_observations_collapse_to_a_digest_of_what_was_tried(mo
         topic="front radar calibration target distance",
     )
 
-    final = client.messages_seen[-1]
+    final = _first_task_transcript(client)
     digests = [
         message["content"]
         for message in final
@@ -919,7 +934,7 @@ async def test_tool_receipt_does_not_repeat_the_observation(monkeypatch):
     )
 
     tool_messages = [
-        message for message in client.messages_seen[-1] if message.get("role") == "tool"
+        message for message in _first_task_transcript(client) if message.get("role") == "tool"
     ]
     assert tool_messages
     for message in tool_messages:
@@ -987,7 +1002,7 @@ async def test_one_oversized_page_is_degraded_rather_than_refused(monkeypatch):
     # degradation is reported rather than silent.
     assert result["context_degraded"] is True
     assert "cut to fit the model's context" in json.dumps(
-        client.messages_seen[-1], default=str
+        _first_task_transcript(client), default=str
     )
 
 
@@ -1109,7 +1124,7 @@ async def test_reaching_the_bottom_says_to_extract(monkeypatch):
         topic="front radar calibration target distance",
     )
 
-    last = json.dumps(client.messages_seen[-1], default=str)
+    last = json.dumps(_first_task_transcript(client), default=str)
     assert "reached the bottom of this page" in last
     assert "call extract" in last
     assert "page_bottom_reached" in last
@@ -1141,7 +1156,7 @@ async def test_reading_between_scrolls_resets_the_count(monkeypatch):
     )
 
     # The click breaks the run, so the scroll after it is not turn four of a drift.
-    last = json.dumps(client.messages_seen[-1], default=str)
+    last = json.dumps(_first_task_transcript(client), default=str)
     assert "times in a row" not in last
 
 
@@ -1171,10 +1186,15 @@ async def test_the_same_rejected_extract_is_not_submitted_forever(monkeypatch):
         topic="front radar calibration target distance",
     )
 
-    assert result["agent_stopped_reason"] == "repeated_tool_error"
-    assert navigator.extract_count <= 3, navigator.extract_count
+    assert "stopped: repeated_tool_error" in json.dumps(result["incomplete_reasons"])
+    first_task = navigator.calls[: next(
+        (i for i, call in enumerate(navigator.calls) if i and call["action"] == "create_task"),
+        len(navigator.calls),
+    )]
+    first_task_extracts = [call for call in first_task if call["action"] == "extract"]
+    assert len(first_task_extracts) <= 3, first_task_extracts
     # The verification feedback must survive being counted as a repeat.
-    context = json.dumps(client.messages_seen[-1], default=str)
+    context = json.dumps(_first_task_transcript(client), default=str)
     assert "verification_after_extract" in context
     assert "REPEATED MISTAKE" in context
 
@@ -1205,7 +1225,7 @@ async def test_the_receipt_names_the_action_it_closes(monkeypatch):
     )
 
     tool_messages = [
-        m for m in client.messages_seen[-1] if m.get("role") == "tool"
+        m for m in _first_task_transcript(client) if m.get("role") == "tool"
     ]
     assert tool_messages
     payload = json.loads(tool_messages[-1]["content"])
@@ -1295,7 +1315,7 @@ async def test_a_click_that_answers_before_the_page_lands_is_waited_out(monkeypa
 
     # The model must be shown the page that actually arrived, with refs it can
     # use -- not the page the click was leaving.
-    last = json.dumps(client.messages_seen[-1], default=str)
+    last = json.dumps(_first_task_transcript(client), default=str)
     assert "ALLDATA Collision - Home" in last
     assert "f8e396" in last
     assert "settled_after_observations" in last

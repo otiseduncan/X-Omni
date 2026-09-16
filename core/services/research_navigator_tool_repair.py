@@ -7,7 +7,8 @@ browser action has executed and one constrained retry is safe. Qwen can also
 emit a nominal tool call whose arguments decode to an empty/missing action;
 that is caught here before the browser loop sees it.
 
-This wrapper is deliberately scoped to Navigator. It does not change generic
+This client is deliberately scoped to Navigator; run_navigator_search builds it
+around the model client it is given. It does not change generic
 model/tool behavior and it does not choose the semantic action for X. The
 repair turn only asks the same model to express its intended next action as one
 small, schema-valid ``navigator_browse`` call.
@@ -18,12 +19,10 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from functools import wraps
 from typing import Any
 
 log = logging.getLogger("xomni.research_navigator_tool_repair")
 
-_INSTALLED_ATTR = "__xomni_navigator_tool_json_repair_installed__"
 _REPAIR_ATTR = "__xomni_navigator_tool_json_repair_client__"
 _NAV_ACTIONS = frozenset({
     "observe", "observe_marks", "click", "type", "fill", "press", "back",
@@ -209,21 +208,3 @@ class NavigatorToolRepairClient:
 
         for event in events:
             yield event
-
-
-def install(module: Any) -> None:
-    """Wrap only ``run_navigator_search`` clients; preserve its public signature."""
-    if getattr(module, _INSTALLED_ATTR, False):
-        return
-
-    original = module.run_navigator_search
-
-    @wraps(original)
-    async def run_navigator_search_with_tool_repair(*args: Any, **kwargs: Any):
-        client = kwargs.get("client")
-        if client is not None and not getattr(client, _REPAIR_ATTR, False):
-            kwargs["client"] = NavigatorToolRepairClient(client)
-        return await original(*args, **kwargs)
-
-    module.run_navigator_search = run_navigator_search_with_tool_repair
-    setattr(module, _INSTALLED_ATTR, True)

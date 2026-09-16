@@ -45,7 +45,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import research_navigator_contract as contract
 from . import scrapex as scrapex_svc
+from .research_navigator_tool_repair import NavigatorToolRepairClient
 from .research_semantic_review import accepted as review_accepted
 from .research_semantic_review import review_candidate
 
@@ -86,6 +88,11 @@ MAX_MODEL_TURNS = 40
 # as the budget holds, and running out is reported as incompleteness.
 MAX_DEPENDENCIES = 3
 DEPENDENCY_TURN_SHARE = 0.5
+# Turns added per document a primary procedure requires, and the ceiling on
+# the whole objective once they are added. The primary search keeps its full
+# budget; required documents get capacity of their own afterwards.
+DEPENDENCY_TURNS_EACH = 12
+MAX_OBJECTIVE_TURNS = 76
 # Non-progress accounting. Progress is a new page, a new candidate, a new
 # dependency, a capture; non-progress is the same page again, a repeated or
 # failed action, a stale-target refusal. Each non-progress turn costs one
@@ -191,11 +198,15 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
             "observation you chose it from; if the page changed you get a fresh observation "
             "instead, so choose again from that. After each action the browser is "
             "re-observed. Keep the exact requested vehicle as a hard requirement; "
-            "select_vehicle with the VIN selects it exactly when one is given. Call extract "
-            "only when actual procedure content is on screen rather than a menu or results "
-            "list; it is then checked mechanically by ScrapeX and judged by an independent "
-            "reviewer, and you get both verdicts back. Call done only when the observed site "
-            "state shows the exact goal is not reachable."
+            "select_vehicle with the VIN selects it exactly when one is given. extract submits "
+            "the current, fully read page as a candidate: it is not a claim that the page is "
+            "right, it is checked mechanically by ScrapeX and judged by an independent "
+            "reviewer, and you get both verdicts back. Once the observation reports the bottom "
+            "of the page, a downward scroll is refused -- extract a plausible page or leave it. "
+            "done is refused on a component landing page or an article page from which nothing "
+            "has been submitted; call it only when you have genuinely explored and the "
+            "procedure is not reachable. Always act through this tool: a prose reply does not "
+            "end the task."
         ),
         "parameters": {
             "type": "object",
@@ -221,7 +232,10 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
                     "type": "integer",
                     "minimum": -1600,
                     "maximum": 1600,
-                    "description": "Only used by scroll; positive scrolls down, negative scrolls up.",
+                    "description": (
+                        "Only used by scroll; positive scrolls down, negative scrolls up. "
+                        "Do not use a positive value after at_page_bottom=true."
+                    ),
                 },
                 "milliseconds": {
                     "type": "integer",
@@ -259,6 +273,14 @@ NAVIGATOR_AGENT_TOOL_SCHEMA = {
 
 # Non-binding provider notes: what this provider has been observed to do.
 # They are offered as context and may be ignored; nothing here routes.
+#
+# These describe how the provider's site is built, never what a procedure is
+# called. An earlier version listed title words ("Programming and Relearning,
+# Initialization, Learn...") and the live Tacoma BSM runs followed that list
+# straight into a generic Programming and Relearning menu and submitted a
+# "Repair Instruction - Initialization" page four times; Toyota's actual
+# procedure is titled "Operation Check". Naming is the model's job, from the
+# manufacturer's own terms, so no vocabulary lives here.
 PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
     "alldata": (
         "Recent Vehicles on the picker reaches a vehicle worked on before in one click.",
@@ -266,12 +288,13 @@ PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
         "under 'Hyundai Truck' rather than 'Hyundai'.",
         "Every vehicle page has an 'ADAS Quick Reference' in its Reference panel: a table of "
         "ADAS components with links into each component's procedures.",
-        "Some Nissan/Infiniti radar material has been filed under Cruise Control.",
-        "Procedure titles vary by make: Aiming, Adjustment, Alignment, Programming and "
-        "Relearning, Initialization, Learn, Zero Point.",
+        "Nissan/Infiniti front distance-sensor (ICC radar) material has been filed under "
+        "Cruise Control.",
         "The vehicle picker is https://my.alldata.com/repair/#/select-vehicle (open it "
         "to change vehicle); its search box ignores programmatic fills but reacts to "
         "typed keystrokes, and a typed VIN resolves the exact vehicle on its own.",
+        "Search boxes on ALLDATA pages respond to typed keystrokes: type the text, then "
+        "press Enter.",
     ),
 }
 
@@ -331,22 +354,25 @@ def _system_prompt(
 ) -> str:
     label = _target_label(target)
     objective = objective or {}
-    system_line = ""
-    if objective.get("system") or objective.get("component"):
-        system_line = (
-            f"System: {objective.get('system') or ''}"
-            + (f" / Component: {objective.get('component')}" if objective.get("component") else "")
-            + "\n"
-        )
+    requirement = str(
+        objective.get("requirement_label") or objective.get("system") or ""
+    ).strip()
+    component = str(objective.get("component") or "").strip()
     vin_line = (
-        f"VIN: {target.get('vin')} -- select_vehicle with this VIN selects the exact vehicle.\n"
+        f"VIN: {target.get('vin')} -- the exact vehicle; select_vehicle with it selects that vehicle.\n"
         if target.get("vin")
         else ""
     )
+    requirement_line = (
+        f"Requirement (the shop's own label, from Calibration IQ): {requirement}\n"
+        if requirement
+        else ""
+    )
+    component_line = f"Component noted by the shop: {component}\n" if component else ""
     hints = PROVIDER_HINTS.get(provider, ())
     hint_block = (
-        "\n\nHistorical provider notes (non-binding; verify on the live page rather than "
-        "assuming any of them):\n- " + "\n- ".join(hints)
+        "\n\nPROVIDER NOTES (how this site is built; non-binding, verify on the live page):\n- "
+        + "\n- ".join(hints)
         if hints
         else ""
     )
@@ -355,41 +381,64 @@ def _system_prompt(
         "You are operating a licensed ALLDATA Repair/Collision browser session for a "
         "collision repair technician, through a bounded Navigator action interface. The "
         "session is already authenticated. Your very first tool call has already been "
-        "answered with an initial observation of the current page -- read it before acting. "
-        f"Find the exact OEM procedure for:\nVehicle: {label}\n{vin_line}{system_line}Topic: {topic}\n\n"
+        "answered with an observation of the current page -- read it before acting.\n\n"
+        f"TASK\nVehicle: {label}\n{vin_line}{requirement_line}{component_line}Goal: {topic}\n\n"
+        "TERMINOLOGY\n"
+        "A requirement label is the repair shop's own wording. It is not ALLDATA's term and "
+        "usually not the manufacturer's. Before you search or choose a menu, work out which "
+        "system and component this manufacturer means by it, and what the manufacturer calls "
+        "the service procedure a technician performs for that system after a repair or "
+        "replacement. Search and navigate with the manufacturer's and ALLDATA's own names, and "
+        "switch to the names the live pages show for this vehicle as soon as you see them. "
+        "Use the shop's label as a search term only when it is also what the manufacturer "
+        "calls the system.\n\n"
+        "HOW TO FIND IT\n"
+        "- When a search box is available for the selected vehicle, use it: type the "
+        "manufacturer's name for the system or component and open results that belong to it.\n"
+        "- ALLDATA's ADAS Quick Reference, when visible on this exact vehicle's page, is a "
+        "manufacturer-native index of ADAS components with links into their procedures. It is "
+        "often a better entry point than generic service menus. It is an option, not a route "
+        "you must take.\n"
+        "- A component page, a category list, or an article index is somewhere to keep going "
+        "from, not an answer. Reaching the right system name is not completion.\n\n"
+        "JUDGING A PAGE\n"
+        "Manufacturer titles mislead in both directions. A page titled 'Operation Check', "
+        "'Inspection', or 'Confirmation' can be the executable procedure, and a page titled "
+        "'Initialization' can be unrelated generic material. Judge a page by what it actually "
+        "has you do for this vehicle and system -- setup, tools, targets or reflectors, "
+        "distances or angles, scan-tool steps, completion criteria -- not by whether its title "
+        "repeats a word you were sent to find. A procedure page may never use the word "
+        "'calibration' at all. When a page could be the procedure, read all of it: scroll to "
+        "the bottom, then extract it.\n\n"
+        "CANDIDATES\n"
+        "extract submits the fully read current page as a CANDIDATE. It is not a claim that "
+        "the page is right. ScrapeX checks it mechanically and an independent reviewer who "
+        "sees only the evidence judges it; you get both verdicts back. If it is accepted, stop. "
+        "If the reviewer names a required document, that is pursued next. If it is not "
+        "accepted, the reviewer says why and which direction to take -- continue from there. "
+        "Never submit a page that has already been reviewed and not accepted.\n\n"
+        "COMPLETION\n"
+        "done is refused on a component landing page, and on an article page, until you have "
+        "submitted something for review from this task. Call done only when you have genuinely "
+        "explored and the procedure is not reachable, and say plainly what you tried. A prose "
+        "reply never ends the task -- always act through navigator_browse.\n\n"
+        "MOVEMENT\n"
+        "Changing pages is not automatically progress. If you return to a page state you have "
+        "already seen, that is a cycle: change approach instead of drilling the same menus "
+        "again. After the bottom of a page is reached, a downward scroll is refused; decide "
+        "whether to extract the page or leave it.\n\n"
+        "VEHICLE AND ACTIONS\n"
         "Do not substitute a different model, trim, or year, and do not answer from general "
-        "knowledge -- only from what you actually observe. You are the navigation reasoner: "
-        "choose the next browser action from the live page state and reassess after every turn. "
-        "A task-bound annotated screenshot accompanies each "
-        "observation when available; labels such as [e12] on the image are the same exact refs "
-        "listed in the structured observation, and [m21]-style labels are marks you asked for. "
-        "Use pixels to understand layout, grouping, "
-        "selected state, menus, and drill-down context, but act by ref first, by mark when a "
-        "visible control has no ref, and by click_visual only as a last resort. The "
-        "browser will be re-observed after each executed action, so choose one action at a time "
-        "and then reassess. A procedure page's own text may never contain the word you "
-        "were sent to find: this provider's Hyundai front-radar procedure is titled 'How "
-        "to check/adjust front radar installation angle', never uses the word "
-        "'calibration' once, and still is the calibration procedure -- with its target "
-        "distance in the last few paragraphs. Judge a page by what it actually describes "
-        "for the requested vehicle and system, not by whether it repeats your topic's "
-        "words back to you. When such a page is the procedure, the whole page is the "
-        "source: scroll to its bottom and extract it. "
-        "Do not require exact article-title wording: OEMs may express the same "
-        "intent as calibration, aiming, alignment, adjustment, initialization, relearn, setup, "
-        "registration, learn, or zero-point procedures, and system names also vary. Use the live "
-        "page context to reason semantically while preserving the exact requested vehicle/system. "
-        "Your final claim is independently checked against the real page and reviewed by an "
-        "independent reader who sees only the evidence. After extract, read both verdicts; if "
-        "the candidate is rejected or the reviewer wants another document, correct course "
-        "instead of declaring success. "
-        "If a tool call returns an error, adapt to the observed state rather than repeating it. "
-        "On ALLDATA's vehicle picker, prefer its full-vehicle search box (for example, "
-        "'Search by Year, Make, Model, Engine, or VIN') when that box is visible. Fill it "
-        "with the exact requested year, make, and model and let ALLDATA resolve its own "
-        "make taxonomy; do not invent or hardcode make aliases to drive separate dropdowns. "
-        "If the exact vehicle/topic cannot be found after reasonable exploration, call 'done' "
-        "and say so plainly instead of guessing."
+        "knowledge -- only from what you observe. On ALLDATA's vehicle picker, prefer its "
+        "full-vehicle search box (for example, 'Search by Year, Make, Model, Engine, or VIN') "
+        "and let ALLDATA resolve its own make taxonomy; do not invent or hardcode make aliases "
+        "to drive separate dropdowns. A task-bound annotated screenshot accompanies each "
+        "observation when available; labels such as [e12] on it are the exact refs in the "
+        "structured observation, and [m21]-style labels are marks you asked for. Use the "
+        "pixels to understand layout, grouping, selected state, and menus, but act by ref first, "
+        "by mark when a visible control has no ref, and by click_visual only as a last resort. "
+        "Choose one action at a time; the browser is re-observed after each one. If an action "
+        "returns an error, adapt to the observed state rather than repeating it."
         + hint_block
         + goal_block
     )
@@ -535,6 +584,17 @@ def _observation_summary(navigator_result: dict[str, Any]) -> dict[str, Any]:
             "If this page is the procedure for the requested vehicle and system, "
             "it is the source -- call extract now."
         )
+        summary["bottom_decision_contract"] = {
+            "scroll_down_allowed": False,
+            "decision_required": True,
+            "extract_is_candidate_submission": True,
+            "instruction": (
+                "The whole page has been reached. If it could plausibly be the requested "
+                "procedure, extract it for independent review -- extract is not a claim that it "
+                "is right. If it clearly is not, leave it and keep searching. Do not scroll down "
+                "again, and do not come back to it without submitting it."
+            ),
+        }
     if summary.get("page_text_truncated") or more_below:
         parts = []
         if summary.get("page_text_truncated"):
@@ -1087,10 +1147,16 @@ async def _run_task(
     reviewer: Any,
     goal_note: str = "",
     role: str = "primary",
+    reviewed: Optional[contract.ReviewedCandidates] = None,
 ) -> dict[str, Any]:
     """Drive one ScrapeX task to a verdict and return everything that happened."""
 
     started = time.perf_counter()
+    # Candidates this objective has already had reviewed, shared with every
+    # other task of the same objective; and the page states this one task has
+    # shown X. Both are plain data owned by this call, not import-time state.
+    reviewed = reviewed if reviewed is not None else contract.ReviewedCandidates()
+    memory = contract.TaskMemory()
     create_body: dict[str, Any] = {
         "action": "create_task",
         "provider": provider,
@@ -1206,7 +1272,17 @@ async def _run_task(
     # standard/hybrid choices, and eventually clicked an unrelated 2024
     # recent vehicle. Powertrain variants remain equivalent once year/make/
     # model match; a different year or VIN is never silently accepted.
-    initial_vehicle_selected = await _target_already_selected(settings, provider, target)
+    #
+    # A new primary task in the managed runtime always reselects its exact VIN,
+    # even when the page already looks like the right vehicle: ALLDATA keeps
+    # browser state between tasks, and a new objective must not start inside
+    # the previous objective's article. A dependency task keeps the verified
+    # vehicle and page, so a supporting document is followed from where the
+    # primary procedure named it.
+    if contract.must_anchor_vehicle(settings, target, role):
+        initial_vehicle_selected: Optional[bool] = False
+    else:
+        initial_vehicle_selected = await _target_already_selected(settings, provider, target)
     vehicle_selected_before_preflight = initial_vehicle_selected
     preflight_selection: Optional[dict[str, Any]] = None
     vin = "".join(str(target.get("vin") or "").split()).upper()
@@ -1269,7 +1345,8 @@ async def _run_task(
             "role": "user",
             "content": _visual_observation_content(
                 f"Find the ALLDATA procedure for {_target_label(target)}: {topic}."
-                + _vehicle_selection_note(initial_vehicle_selected, target),
+                + _vehicle_selection_note(initial_vehicle_selected, target)
+                + (f"\n\n{reviewed.briefing()}" if reviewed.briefing() else ""),
                 initial_summary,
                 initial_screenshot,
             ),
@@ -1323,6 +1400,12 @@ async def _run_task(
     }
     previous_fingerprint = _observation_fingerprint(initial_summary)
     previous_page_state = _page_state(initial_summary)
+    memory.record(initial_summary.get("observation_id"), previous_page_state)
+    # The observation X is currently acting from. The completion and
+    # end-of-page contracts are judged against exactly this page.
+    latest_observed_summary: dict[str, Any] = initial_summary
+    candidate_submitted = False
+    prose_reminders = 0
     action_ordinal = 1 if preflight_selection is not None else 0
     context_degraded = False
     # A working scroll on a lazily-loaded procedure is its own trap: the live
@@ -1360,8 +1443,23 @@ async def _run_task(
         content = _extract_content(events)
         calls = _extract_tool_calls(events)
         if not calls:
+            # A prose reply is not a way to end research. The completion
+            # contract refuses `done` on untested pages, and a reply with no
+            # action used to walk straight past it: the Tacoma BSM dependency
+            # tasks ended at zero browser actions this way. X is reminded once
+            # that the task is still open; a second prose reply in a row ends
+            # the task, explicitly, as model_finished.
+            if prose_reminders < contract.PROSE_REMINDERS_ALLOWED and budget.turns_left > 0:
+                prose_reminders += 1
+                if content:
+                    messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": contract.prose_reminder()})
+                trace.append({"turn": turn, "action": "prose_reply_refused", "reminder": prose_reminders})
+                budget.note("prose_reply", progress=False, turn=turn, task_id=task_id)
+                continue
             stopped_reason = "model_finished"
             break
+        prose_reminders = 0
 
         wire_calls = [
             {
@@ -1403,6 +1501,18 @@ async def _run_task(
                 }
             elif validation_error:
                 result = {"error": validation_error}
+            elif action == "done" and (
+                refusal := contract.done_refusal(
+                    latest_observed_summary.get("url"), candidate_submitted=candidate_submitted
+                )
+            ):
+                # Refused before anything reaches ScrapeX: the page X is on was
+                # deliberately navigated into and has not been tested.
+                result = refusal
+            elif action == "scroll" and (
+                refusal := contract.bottom_scroll_refusal(latest_observed_summary, args.get("delta_y"))
+            ):
+                result = refusal
             else:
                 dispatch_args: dict[str, Any] = {"action": action, "task_id": task_id}
                 if action == "observe_marks":
@@ -1488,6 +1598,9 @@ async def _run_task(
                     # semantic one. Both verdicts go straight back to X while
                     # the live page and navigation history are still available.
                     if action == "extract":
+                        # X has put a page up for review from this task, so the
+                        # completion contract no longer holds `done` back.
+                        candidate_submitted = True
                         candidate_check = await scrapex_svc.navigator(
                             settings, {"action": "verify", "task_id": task_id}
                         )
@@ -1542,18 +1655,34 @@ async def _run_task(
                                 else {}
                             )
                             candidate = _candidate_from_evidence(evidence, result)
-                            review_screenshot = await _task_screenshot(
-                                settings, task_id, result.get("observation_id")
-                            )
-                            verdict = await reviewer(
-                                client=client,
-                                objective=objective,
-                                vehicle=target,
-                                candidate=candidate,
-                                provider=provider,
-                                screenshot=review_screenshot,
-                            )
-                            verdict = verdict if isinstance(verdict, dict) else {"decision": "UNCERTAIN", "malformed": True}
+                            # The same page with the same text has already been
+                            # reviewed for this objective and turned down --
+                            # possibly by an earlier task. Asking again cannot
+                            # change the answer; it only spends a review. The
+                            # live BSM run extracted one "Initialization" page
+                            # four times in a row and paid for four reviews.
+                            prior = reviewed.prior(candidate.get("url"), candidate.get("text_sha256"))
+                            if prior is not None and not review_accepted(prior.get("verdict")):
+                                verdict = contract.repeated_candidate_verdict(prior)
+                            else:
+                                review_screenshot = await _task_screenshot(
+                                    settings, task_id, result.get("observation_id")
+                                )
+                                verdict = await reviewer(
+                                    client=client,
+                                    objective=objective,
+                                    vehicle=target,
+                                    candidate=candidate,
+                                    provider=provider,
+                                    screenshot=review_screenshot,
+                                )
+                                verdict = verdict if isinstance(verdict, dict) else {"decision": "UNCERTAIN", "malformed": True}
+                                reviewed.remember(
+                                    candidate.get("url"),
+                                    candidate.get("text_sha256"),
+                                    candidate.get("title"),
+                                    verdict,
+                                )
                             latest_review = verdict
                             reviews.append(verdict)
                             candidate_record["review"] = verdict
@@ -1580,8 +1709,10 @@ async def _run_task(
                                     "action": "semantic_review",
                                     "decision": verdict.get("decision"),
                                     "classification": verdict.get("classification"),
+                                    "objective_match": verdict.get("objective_match"),
                                     "confidence": verdict.get("confidence"),
                                     "malformed": verdict.get("malformed"),
+                                    "repeated_candidate": verdict.get("repeated_candidate") is True,
                                     "dependencies": verdict.get("dependencies"),
                                 }
                             )
@@ -1735,6 +1866,7 @@ async def _run_task(
                 "args": {k: v for k, v in args.items() if k != "action"},
                 "observation_id": current_observation_id,
                 "error": call_error,
+                "refused": ((result.get("refused") or {}).get("code") if isinstance(result, dict) else None),
             })
             # A receipt, not a second copy of the observation: the full
             # page state rides in the visual user message appended below, so
@@ -1765,6 +1897,12 @@ async def _run_task(
             unchanged = page_state == previous_page_state
             previous_fingerprint = fingerprint
             previous_page_state = page_state
+            latest_observed_summary = latest_visual_summary
+            # A return to a state this task already showed X -- through any
+            # route, not only the previous page -- is a cycle. Comparing with
+            # the previous page alone let A -> B -> A menu ping-pong look like
+            # steady progress and keep refunding the stall budget.
+            revisit = (not unchanged) and memory.record(next_observation_id, page_state)
             if next_observation_id:
                 current_observation_id = next_observation_id
                 observation_ids.append(next_observation_id)
@@ -1773,10 +1911,14 @@ async def _run_task(
             if new_url:
                 visited_urls.append(url)
             if turn_progress is None:
-                turn_progress = not unchanged
-                turn_progress_kind = (
-                    "new_url" if new_url else ("new_page_state" if not unchanged else "page_unchanged")
-                )
+                if revisit:
+                    turn_progress = False
+                    turn_progress_kind = "revisited_page_state"
+                else:
+                    turn_progress = not unchanged
+                    turn_progress_kind = (
+                        "new_url" if new_url else ("new_page_state" if not unchanged else "page_unchanged")
+                    )
             heading = (
                 (
                     "The requested browser action was rejected and did not execute. "
@@ -1819,6 +1961,8 @@ async def _run_task(
                     "title, same elements. Repeating it will not change anything -- "
                     "act on a different element, or go back."
                 )
+            if revisit:
+                heading += " " + contract.cycle_warning(memory.revisit_count)
             messages.append(
                 {
                     "role": "user",
@@ -1844,7 +1988,13 @@ async def _run_task(
             budget.note(
                 turn_progress_kind or ("progress" if turn_progress else "no_progress"),
                 progress=turn_progress,
-                cost=2 if turn_progress_kind == "repeated_failure" else 1,
+                cost=(
+                    2
+                    if turn_progress_kind == "repeated_failure"
+                    else contract.REVISIT_STALL_COST
+                    if turn_progress_kind == "revisited_page_state"
+                    else 1
+                ),
                 turn=turn,
                 task_id=task_id,
             )
@@ -1955,6 +2105,8 @@ async def _run_task(
             "model_calls": model_calls,
             "browser_actions": action_ordinal,
             "stale_rejections": stale_rejections,
+            "page_state_revisits": memory.revisit_count,
+            "candidate_submitted": candidate_submitted,
             "prompt_tokens_max": max(prompt_tokens) if prompt_tokens else None,
             "prompt_tokens_total": sum(prompt_tokens) if prompt_tokens else None,
             "observation_ids": observation_ids,
@@ -2068,6 +2220,16 @@ def _receipt(
         "critic_decisions": decisions,
         "dependencies": dependencies,
         "stale_action_rejections": stale,
+        # Objective-level decisions the loop took on X's behalf: a fresh
+        # primary attempt, or turns added for required dependencies.
+        "objective_events": [
+            event
+            for event in budget.progress_events
+            if event.get("kind") in {"primary_attempt_restarted", "dependency_capacity_added"}
+        ],
+        "page_state_revisits": sum(
+            1 for event in budget.progress_events if event.get("kind") == "revisited_page_state"
+        ),
         "artifacts": artifacts,
         "final_status": status,
         "incomplete_reasons": incomplete_reasons,
@@ -2122,6 +2284,11 @@ async def run_navigator_search(
                 "nothing was started for this objective."
             ),
         }
+    # Qwen occasionally emits malformed Navigator tool JSON; the repair client
+    # gives that one constrained retry. It is part of this entry point, not a
+    # wrapper installed around it.
+    if client is not None and not isinstance(client, NavigatorToolRepairClient):
+        client = NavigatorToolRepairClient(client)
     async with NAVIGATOR_LOCK:
         return await _run_objective(
             client=client,
@@ -2161,25 +2328,97 @@ async def _run_objective(
     tasks: list[dict[str, Any]] = []
     dependencies: list[dict[str, Any]] = []
     incomplete: list[str] = []
+    # Every candidate this objective has had reviewed, across all of its
+    # primary attempts. Dependency tasks keep their own: a page that is wrong
+    # for the primary objective can be exactly the supporting document a
+    # dependency task was created to fetch.
+    reviewed = contract.ReviewedCandidates()
 
-    primary = await _run_task(
-        client=client,
-        settings=settings,
-        provider=provider,
-        target=target,
-        topic=topic,
-        objective=objective_record,
-        budget=budget,
-        action_budget=action_budget,
-        capture=capture,
-        review=review,
-        reviewer=reviewer,
-        role="primary",
-    )
-    tasks.append(primary)
-    if not primary.get("task_id") or primary.get("agent_stopped_reason") in {
-        "task_not_created", "authentication_required", "initial_observe_failed", "initial_page_not_ready",
-    }:
+    # The primary search. One task used to be all an objective got: when X
+    # stalled on a menu or quit, the objective was simply unverified, and the
+    # only recovery was re-running the whole job. A primary attempt that ends
+    # without an accepted procedure for a reason another attempt can improve
+    # on continues in a fresh, VIN-anchored task that knows which pages were
+    # already turned down -- bounded by the objective's turn budget and an
+    # attempt limit, never by navigation depth.
+    primary_attempts = 0
+    goal_note = ""
+    while True:
+        primary_attempts += 1
+        primary = await _run_task(
+            client=client,
+            settings=settings,
+            provider=provider,
+            target=target,
+            topic=topic,
+            objective=objective_record,
+            budget=budget,
+            action_budget=action_budget,
+            capture=capture,
+            review=review,
+            reviewer=reviewer,
+            goal_note=goal_note,
+            role="primary",
+            reviewed=reviewed,
+        )
+        tasks.append(primary)
+        primary_review = primary.get("review") if isinstance(primary.get("review"), dict) else {}
+        if primary.get("accepted"):
+            break
+        if primary_review.get("decision") == "FOLLOW_DEPENDENCY" and primary_review.get("dependencies"):
+            break
+        stop = str(primary.get("agent_stopped_reason") or "")
+        if (
+            stop not in contract.RECOVERABLE_STOPS
+            or primary_attempts >= contract.MAX_PRIMARY_ATTEMPTS
+            or budget.turns_left < contract.MIN_TURNS_FOR_ANOTHER_ATTEMPT
+        ):
+            break
+        budget.stall_points = 0
+        budget.progress_events.append(
+            {
+                "kind": "primary_attempt_restarted",
+                "progress": True,
+                "attempt": primary_attempts + 1,
+                "previous_stop": stop,
+                "reviewed_not_accepted": len(reviewed.not_accepted()),
+            }
+        )
+        goal_note = contract.retry_goal_note(primary_attempts + 1, primary, reviewed)
+
+    # A primary procedure that says it needs other documents gets turns for
+    # them on top of its own; the primary search never gave any up.
+    primary_review = primary.get("review") if isinstance(primary.get("review"), dict) else {}
+    if primary_review.get("decision") in {"ACCEPT_WITH_DEPENDENCIES", "FOLLOW_DEPENDENCY"}:
+        required = min(
+            budget.dependency_slots,
+            len(
+                {
+                    " ".join(str(item.get("title") or "").casefold().split())
+                    for item in primary_review.get("dependencies") or []
+                    if isinstance(item, dict) and str(item.get("title") or "").strip()
+                }
+            ),
+        )
+        extended = min(MAX_OBJECTIVE_TURNS, budget.max_turns + DEPENDENCY_TURNS_EACH * required)
+        if required > 0 and extended > budget.max_turns:
+            budget.progress_events.append(
+                {
+                    "kind": "dependency_capacity_added",
+                    "progress": True,
+                    "primary_turn_limit": budget.max_turns,
+                    "objective_turn_limit": extended,
+                    "required_dependencies": required,
+                    "dependency_turns_each": DEPENDENCY_TURNS_EACH,
+                }
+            )
+            budget.max_turns = extended
+
+    if len(tasks) == 1 and (
+        not primary.get("task_id")
+        or primary.get("agent_stopped_reason")
+        in {"task_not_created", "authentication_required", "initial_observe_failed", "initial_page_not_ready"}
+    ):
         result = dict(primary)
         result.pop("role", None)
         result["status"] = result.get("status") or "unverified"
@@ -2335,16 +2574,43 @@ async def _run_objective(
     else:
         verified = False
     unresolved = [dep for dep in dependencies if dep["status"] in {"unresolved", "not_pursued", "pending"}]
+    # A later attempt that never reached review must not erase what the
+    # reviewer said about an earlier attempt's candidate.
+    reviewed_primary = next(
+        (
+            task
+            for task in reversed(tasks)
+            if task.get("role") == "primary" and isinstance(task.get("review"), dict) and task.get("review")
+        ),
+        primary,
+    )
     if not verified:
         status = "unverified"
         if primary.get("agent_stopped_reason") == "stalled":
             incomplete.append("navigation stalled without progress")
         if primary.get("agent_stopped_reason") == "turn_budget_exhausted":
             incomplete.append("turn budget exhausted before a procedure was accepted")
-        if review and primary.get("mechanically_verified") and not primary.get("accepted"):
-            incomplete.append(str(primary.get("verification_reason") or "semantic review did not accept the candidate"))
-        if review and (primary.get("review") or {}).get("decision") == "UNCERTAIN":
+        if review and reviewed_primary.get("mechanically_verified") and not reviewed_primary.get("accepted"):
+            incomplete.append(str(reviewed_primary.get("verification_reason") or "semantic review did not accept the candidate"))
+        if review and (reviewed_primary.get("review") or {}).get("decision") == "UNCERTAIN":
             status = "uncertain"
+        # A failure has to say what happened: how each attempt ended and
+        # which pages were actually reviewed and turned down, and why.
+        stops = [
+            str(task.get("agent_stopped_reason") or "unknown")
+            for task in tasks
+            if task.get("role") == "primary"
+        ]
+        incomplete.append(
+            f"{primary_attempts} primary attempt(s) ended without an accepted procedure "
+            f"(stopped: {', '.join(stops)})"
+        )
+        for entry in reviewed.not_accepted()[:5]:
+            incomplete.append(
+                f"reviewed and not accepted: \"{entry['title'] or entry['url']}\" -- "
+                f"{entry['decision']}"
+                + (f": {entry['reason']}" if entry.get("reason") else "")
+            )
     elif unresolved:
         status = "incomplete"
     else:
@@ -2354,17 +2620,18 @@ async def _run_objective(
         incomplete.append("an accepted document was not captured")
 
     accepted_primary = next((task for task in tasks if task.get("accepted")), None) or primary
-    review_out = primary.get("review")
+    review_out = primary.get("review") if verified else reviewed_primary.get("review")
     result: dict[str, Any] = {
         "status": status,
         "attempted": True,
         "searched": bool(primary.get("searched")),
+        "primary_attempts": primary_attempts,
         "verified": verified,
         "complete": status == "verified",
         "mechanically_verified": bool(accepted_primary.get("mechanically_verified")),
         "captured": bool(accepted_primary.get("captured")),
         "capture": accepted_primary.get("capture"),
-        "verification_reason": primary.get("verification_reason"),
+        "verification_reason": primary.get("verification_reason") or reviewed_primary.get("verification_reason"),
         "verification": accepted_primary.get("verification"),
         "semantic_review": review_out,
         "task_id": primary.get("task_id"),
