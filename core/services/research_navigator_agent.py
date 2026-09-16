@@ -295,6 +295,13 @@ PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
         "typed keystrokes, and a typed VIN resolves the exact vehicle on its own.",
         "Search boxes on ALLDATA pages respond to typed keystrokes: type the text, then "
         "press Enter.",
+        "A component's own procedures are in that component's subsections -- Testing and "
+        "Inspection (Programming and Relearning is inside it), Service and Repair, Removal "
+        "and Replacement. The vehicle-wide Testing and Inspection lists only general items.",
+        "A Parts and Labor page lists labor operations and times, never procedure steps. "
+        "An operation named there is the manufacturer's name for the work: search for "
+        "that name, or open the component's Testing and Inspection, instead of clicking on "
+        "the labor page.",
     ),
 }
 
