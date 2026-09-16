@@ -127,8 +127,11 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # turn headroom below is the figure that actually matters and is unchanged.
     # 2026-09-13: making research_si the canonical CIQ-attached SI route spelled
     # out that contract in the catalog; measured 4,405 tokens after the merge.
-    assert metrics["total_input_used_tokens"] < 4_450
-    assert metrics["remaining_normal_turn_tokens"] > 26_800
+    # 2026-09-16: saying that getting missing maps (or "map reports") is the
+    # sweep, even right after an inventory answer, cost 54 tokens: 4,458. Live
+    # X answered that request with the read-only inventory 3 of 3 times.
+    assert metrics["total_input_used_tokens"] < 4_500
+    assert metrics["remaining_normal_turn_tokens"] > 26_750
 
 
 def test_budget_reserve_covers_permanent_plus_largest_unlockable_set() -> None:
@@ -365,4 +368,5 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     assert abs(metrics["fixed_prompt"]["tokens"] - summed_sections) <= 2
     # Measured 2026-09-11 after the ADAS Map sweep contract: 24,985.
     # 2026-09-13 after the research_si contract: 24,649.
-    assert metrics["remaining_normal_turn_tokens"] >= 24_550
+    # 2026-09-16 after the get-missing-map-reports sweep wording: 24,546.
+    assert metrics["remaining_normal_turn_tokens"] >= 24_500

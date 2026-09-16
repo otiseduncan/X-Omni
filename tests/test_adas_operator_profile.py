@@ -545,7 +545,8 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # roughly 24.5k of headroom, which still holds -- trimming a safety rule
     # further to recover three tokens would be the wrong trade.
     # 2026-09-13 after the research_si contract: 24,4xx measured.
-    assert metrics["remaining_normal_turn_tokens"] > 24_300
+    # 2026-09-16 after the get-missing-map-reports sweep wording: 24,248.
+    assert metrics["remaining_normal_turn_tokens"] > 24_200
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

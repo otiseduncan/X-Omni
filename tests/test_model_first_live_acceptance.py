@@ -230,6 +230,37 @@ SWEEP_MISSING = [
 ]
 
 
+def _si_research_card(status: str) -> dict[str, Any]:
+    """A stored research_si card for RO 2400711895, as conversation 255 held it."""
+
+    done = status == "completed"
+    objectives = [
+        {
+            "ro_number": "2400711895",
+            "calibration": calibration,
+            "outcome": (outcome if done else "not_run"),
+        }
+        for calibration, outcome in (
+            ("Front View Camera", "attached"),
+            ("Steering Angle Sensor", "not_found"),
+        )
+    ]
+    return {
+        "type": "adas_si_research",
+        "data": {
+            "action": "adas_si_research",
+            "job_id": "0316e38690a14825",
+            "status": status,
+            "executed": True,
+            "work_complete": done,
+            "scope": "RO 2400711895",
+            "objective_count": 2,
+            "progress": {"finished": 2 if done else 0, "total": 2, "attached": 1 if done else 0},
+            "objectives": objectives,
+        },
+    }
+
+
 def _sweep_group(outcome: str, label: str, ros: list[str], reason: str | None = None) -> dict[str, Any]:
     by_ro = {row["ro_number"]: row for row in SWEEP_MISSING}
     return {
@@ -780,6 +811,9 @@ class Scenario:
     name: str
     category: str
     turns: tuple[Turn, ...]
+    # Messages already in the conversation, as (role, content, artifacts), for
+    # a follow-up that depends on what X actually answered before.
+    history: tuple[tuple[str, str, list[dict[str, Any]]], ...] = ()
 
 
 NEGATIVE_TRUTH_DESCRIPTIONS = {
@@ -1183,6 +1217,93 @@ SCENARIOS: tuple[Scenario, ...] = (
         ),
     ),
     Scenario(
+        # Conversation 255 (2026-09-16), both turns verbatim. "Get the missing
+        # ... reports" is an acquisition, not a count; live X answered both
+        # turns with the inventory and the second with no tool at all.
+        "adas_map_get_missing_reports",
+        "adas_map_routine",
+        (
+            Turn(
+                "get the missing ADAS map reports for phase 4,5,6 and 7",
+                calls=(Call("stage_action", _sweep({"4", "5", "6", "7"})),),
+                alternatives=(
+                    (
+                        Call("calibration_iq_work_prep", _inventory({"4", "5", "6", "7"})),
+                        Call("stage_action", _sweep({"4", "5", "6", "7"})),
+                    ),
+                ),
+                forbidden=frozenset({"delegate_research", "calibration_iq_operator"}),
+                forbidden_operations=frozenset({"acquire_adas_map"}),
+                contracts=frozenset({"started_is_not_attached", "no_invented_data"}),
+            ),
+        ),
+    ),
+    Scenario(
+        # Same conversation's second turn, after the inventory-only answer X
+        # actually gave to the first: X made no call and repeated that answer.
+        "adas_map_inventory_answer_then_go_get_reports",
+        "adas_map_routine",
+        (
+            Turn(
+                "go get the missing reports",
+                calls=(Call("stage_action", _sweep({"4", "5", "6", "7"})),),
+                forbidden=frozenset({"delegate_research", "calibration_iq_operator"}),
+                forbidden_operations=frozenset({"acquire_adas_map"}),
+                contracts=frozenset({"started_is_not_attached", "no_invented_data"}),
+            ),
+        ),
+        # The SI research exchange that opened the conversation matters: with
+        # only the inventory exchange X started the sweep 3 of 3 times, and
+        # with it X wrote "acquisition has started" and called nothing, 5 of 5.
+        history=(
+            ("user", "2400711895 get the missing si", []),
+            (
+                "assistant",
+                "Service-information research for RO 2400711895 has started. It is checking "
+                "both the Front View Camera and Steering Angle Sensor calibration "
+                "requirements. The process is running and will post results when complete.",
+                [_si_research_card("running")],
+            ),
+            (
+                "assistant",
+                "Service-information research for RO 2400711895 finished: 1 of 2 "
+                "procedure(s) filed and attached across 1 repair order(s). Also: 1 no "
+                "procedure accepted.",
+                [_si_research_card("completed")],
+            ),
+            ("user", "get the missing ADAS map reports for phase 4,5,6 and 7", []),
+            (
+                "assistant",
+                "ADAS Map inventory for phases 4, 5, 6, and 7 is complete. Of 90 active "
+                "ROs across these phases, 3 are missing their ADAS Maps: RO 2400911797 "
+                "(phase 4), RO 2400911793 (phase 6), and RO 2400711846 (phase 7). The "
+                "missing ROs are listed in the inventory report.",
+                [
+                    {
+                        "type": "calibration_iq_work_prep",
+                        "data": {
+                            "status": "verified",
+                            "mode": "adas_map_inventory",
+                            "read_only": True,
+                            "scrapex_called": False,
+                            "phase_scope": ["4", "5", "6", "7"],
+                            "queue_count": 90,
+                            "adas_map_present_count": 87,
+                            "adas_map_missing_count": 3,
+                            "missing_repair_orders": [
+                                row for row in SWEEP_MISSING if row["phase"] in {"4", "5", "6", "7"}
+                            ],
+                            "message": (
+                                "Calibration IQ ADAS Map inventory completed for phases 4, 5, 6, 7: "
+                                "3 missing, 87 present, 0 unverified."
+                            ),
+                        },
+                    }
+                ],
+            ),
+        ),
+    ),
+    Scenario(
         "adas_map_upload_paraphrase",
         "adas_map_routine",
         (
@@ -1496,6 +1617,14 @@ class LiveHarness:
 
     def run_scenario(self, scenario: Scenario) -> list[TurnResult]:
         conversation_id = self.store.create_conversation(scenario.name)
+        for role, content, artifacts in scenario.history:
+            self.store.add_message(
+                conversation_id,
+                role,
+                content,
+                worker_used="omni" if role == "assistant" else None,
+                artifacts=deepcopy(artifacts),
+            )
         results: list[TurnResult] = []
         for index, turn in enumerate(scenario.turns):
             if turn.before_turn is not None:

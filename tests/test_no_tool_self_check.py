@@ -9,6 +9,7 @@ import pytest
 from core.models.client import ModelClient
 from core.orchestrator.loop import (
     ADAS_SI_POST_TOOL_SELF_CHECK_MESSAGE,
+    IDLE_BACKGROUND_REVIEW_PREFIX,
     NO_TOOL_SELF_CHECK_ACCEPT,
     NO_TOOL_SELF_CHECK_FALLBACK,
     NO_TOOL_SELF_CHECK_MESSAGE,
@@ -17,6 +18,9 @@ from core.orchestrator.loop import (
 )
 from core.state.db import Store
 from core.tools.registry import Registry
+
+# With nothing running, Core's idle record leads the review.
+IDLE_REVIEW_MESSAGE = f"{IDLE_BACKGROUND_REVIEW_PREFIX} {NO_TOOL_SELF_CHECK_MESSAGE}"
 
 
 def test_production_model_client_enables_bounded_no_tool_self_check() -> None:
@@ -65,7 +69,7 @@ async def test_model_owned_self_check_accepts_only_exact_protocol_marker() -> No
     assert observed["messages"][-2] == {
         "role": "assistant", "content": "Torque is rotational force.",
     }
-    assert observed["messages"][-1]["content"] == NO_TOOL_SELF_CHECK_MESSAGE
+    assert observed["messages"][-1]["content"] == IDLE_REVIEW_MESSAGE
 
 
 @pytest.mark.asyncio
@@ -129,7 +133,7 @@ async def test_first_round_unsupported_draft_is_replaced_by_model_selected_tool(
                 # active subject: tool_choice stays automatic and the model
                 # itself decides fresh evidence is needed.
                 assert tool_choice is None
-                assert messages[-1]["content"] == NO_TOOL_SELF_CHECK_MESSAGE
+                assert messages[-1]["content"] == IDLE_REVIEW_MESSAGE
                 advertised = {item["function"]["name"] for item in tools}
                 assert "query_ciq" in advertised
                 assert advertised.isdisjoint({
@@ -368,7 +372,7 @@ async def test_active_subject_never_forces_a_tool_and_a_casual_draft_survives(
             if self.calls == 1:
                 yield {"type": "content", "text": draft}
                 return
-            assert messages[-1]["content"] == NO_TOOL_SELF_CHECK_MESSAGE
+            assert messages[-1]["content"] == IDLE_REVIEW_MESSAGE
             # The subject rides in the turn context, but nothing tells the
             # model it must call a tool because of it.
             assert not any(
@@ -481,3 +485,25 @@ def test_no_tool_review_forbids_accepting_a_draft_that_reports_work_as_done() ->
     # reason to call a tool -- the coercion that made every casual answer
     # after one RO lookup get replaced by a forced tool pick.
     assert "active conversation subject is memory" in message
+
+
+@pytest.mark.asyncio
+async def test_background_record_leads_the_review_and_idle_record_when_nothing_runs() -> None:
+    seen: list[str] = []
+
+    class _Client:
+        async def stream(self, messages, *, tools=None, **_: Any):
+            seen.append(messages[-1]["content"])
+            yield {"type": "content", "text": NO_TOOL_SELF_CHECK_ACCEPT}
+
+    messages = [{"role": "user", "content": "go get the missing reports"}]
+    await model_owned_no_tool_self_check(_Client(), messages, [], "It has started.")
+    await model_owned_no_tool_self_check(
+        _Client(), messages, [], "It is running.", background="ADAS Map sweep: running."
+    )
+
+    assert seen[0].startswith(IDLE_BACKGROUND_REVIEW_PREFIX)
+    assert "no ADAS Map sweep or SI research is running" in seen[0]
+    assert seen[1].startswith("Internal evidence check;")
+    assert "ADAS Map sweep: running." in seen[1]
+    assert IDLE_BACKGROUND_REVIEW_PREFIX not in seen[1]
