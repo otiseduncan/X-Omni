@@ -307,3 +307,23 @@ async def test_review_candidate_applies_the_dependency_role_from_the_task_record
         vehicle={}, candidate={"title": "t", "url": "u", "text": "body"}, provider="alldata",
     )
     assert dependency["decision"] == "ACCEPT"
+
+
+def test_the_page_role_is_generated_after_the_observations_it_depends_on():
+    """Grammar-constrained generation cannot revisit a property. The live Tacoma
+    run classified the OCS Initialization page as supporting material before
+    filling the evidence that made it an exact match, then refused it."""
+    order = list(review.REVIEW_TOOL_SCHEMA["function"]["parameters"]["properties"])
+    assert order.index("evidence") < order.index("classification")
+    assert order.index("objective_match") < order.index("classification")
+    assert order.index("classification") < order.index("decision")
+    required = review.REVIEW_TOOL_SCHEMA["function"]["parameters"]["required"]
+    assert required.index("objective_match") < required.index("classification")
+
+
+def test_the_prompt_defines_the_actual_procedure_by_the_work_not_the_word():
+    prompt = review.REVIEW_SYSTEM_PROMPT
+    assert "ACTUAL_PROCEDURE: the page performs the work the requirement needs" in prompt
+    for operation in ("calibration", "aiming", "initialization", "zero-point"):
+        assert operation in prompt
+    assert "EXACT_MATCH with its execution steps present is the ACTUAL_PROCEDURE" in prompt

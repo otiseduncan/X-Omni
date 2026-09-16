@@ -126,8 +126,6 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
         "parameters": {
             "type": "object",
             "properties": {
-                "classification": {"type": "string", "enum": list(CLASSIFICATIONS)},
-                "procedure_type": {"type": "string", "enum": list(PROCEDURE_TYPES)},
                 "vehicle_match": {"type": "string", "enum": list(VEHICLE_MATCH)},
                 "evidence": {
                     "type": "object",
@@ -146,6 +144,15 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
                         "system and operation."
                     ),
                 },
+                "classification": {
+                    "type": "string",
+                    "enum": list(CLASSIFICATIONS),
+                    "description": (
+                        "The page's role, judged after the evidence and the objective match: "
+                        "ACTUAL_PROCEDURE when it performs the requested work."
+                    ),
+                },
+                "procedure_type": {"type": "string", "enum": list(PROCEDURE_TYPES)},
                 "dependencies": {
                     "type": "array",
                     "maxItems": REVIEW_MAX_DEPENDENCIES,
@@ -170,11 +177,11 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
                 "evidence_summary": {"type": "string", "minLength": 1, "maxLength": 1200},
             },
             "required": [
-                "classification",
-                "procedure_type",
                 "vehicle_match",
                 "evidence",
                 "objective_match",
+                "classification",
+                "procedure_type",
                 "dependencies",
                 "decision",
                 "confidence",
@@ -217,6 +224,13 @@ REVIEW_SYSTEM_PROMPT = (
     "DIFFERENT_SENSOR_FAMILY: a different kind of sensor -- a camera procedure never "
     "satisfies a radar requirement and a radar procedure never satisfies a camera one. "
     "UNCERTAIN: the evidence does not let you tell.\n\n"
+    "CLASSIFICATION. ACTUAL_PROCEDURE: the page performs the work the requirement needs "
+    "for that system, whatever the manufacturer calls it -- calibration, aiming, "
+    "adjustment, initialization, zero-point or neutral learning, registration, or an "
+    "operation check that performs the confirmation. REQUIRED_SUPPORTING_PROCEDURE: a "
+    "different procedure that work depends on, such as a wheel alignment before aiming. "
+    "A page you judged EXACT_MATCH with its execution steps present is the "
+    "ACTUAL_PROCEDURE, not supporting material.\n\n"
     "WORKFLOW ROLE. When the evidence packet has no dependency_context you are reviewing "
     "the PRIMARY objective, which only the actual procedure can satisfy; a required "
     "supporting procedure is useful but cannot close it, so decide CONTINUE_SEARCH for "
