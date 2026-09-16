@@ -238,7 +238,9 @@ async def _review_local(
         "calibration_item_id": objective.get("calibration_id"),
     }
     candidate = {
-        "title": row.get("title") or path.stem,
+        # The capture sidecar keeps the provider's own page title; the file
+        # name is only a storage identity with a timestamp on it.
+        "title": _clean(metadata.get("title"), 300) or row.get("title") or path.stem,
         "breadcrumb": list(Path(row["relative_path"]).parts[:-1]),
         "url": row.get("url") or f"adas-si:///{quote(row['relative_path'])}",
         "text": text,

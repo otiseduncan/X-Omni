@@ -308,3 +308,29 @@ async def test_an_escalated_objective_reports_what_the_library_reviewer_said(tmp
     ]
     compact = research.AdasSiResearchService._compact_result(result)
     assert compact["library_reviews"][0]["decision"] == "CONTINUE_SEARCH"
+
+
+@pytest.mark.asyncio
+async def test_a_reused_capture_is_named_by_its_page_title_not_its_file_name(tmp_path, monkeypatch):
+    import json as _json
+
+    adas = FolderAdas(tmp_path, [("Blind Spot Monitor System - Operation Check 11 2017 ALLDATA 20260916-095125", "cal-bsm")])
+    sidecar = tmp_path / adas.rows[0]["relative_path"]
+    meta = _json.loads(sidecar.with_suffix(".source.json").read_text(encoding="utf-8"))
+    meta["title"] = "Blind Spot Monitor System - Operation Check [11/2017 - ] (Blind Spot Module)"
+    sidecar.with_suffix(".source.json").write_text(_json.dumps(meta), encoding="utf-8")
+    seen = []
+
+    async def review(**kwargs):
+        seen.append(kwargs["candidate"]["title"])
+        return {
+            "classification": "ACTUAL_PROCEDURE", "procedure_type": "BLIND_SPOT_RADAR",
+            "vehicle_match": "MATCHES", "objective_match": "EXACT_MATCH", "evidence": {},
+            "dependencies": [], "decision": "ACCEPT", "confidence": 0.9,
+            "evidence_summary": "Steps.", "malformed": False,
+        }
+
+    monkeypatch.setattr(research_semantic_review, "review_candidate", review)
+    result = await service(tmp_path, adas, FakeNavigator())._research(dict(OBJECTIVE))
+    assert seen == ["Blind Spot Monitor System - Operation Check [11/2017 - ] (Blind Spot Module)"]
+    assert result["evidence_title"] == seen[0]
