@@ -1,10 +1,10 @@
 """Keep failed SI objective rows identifiable in the structured card payload.
 
 A failed Navigator objective may preserve a source URL even when the provider
-returns no usable page title.  The card previously rendered that as an external-
-link icon with no text, leaving two failed objectives visually anonymous.  This
+returns no usable page title. The card previously rendered that as an external-
+link icon with no text, leaving two failed objectives visually anonymous. This
 adapter adds only presentation identity already present in the objective: the
-calibration name plus "last reviewed candidate".  It does not change research
+calibration name plus "last reviewed candidate". It does not change research
 outcomes, reviewer decisions, URLs, or attachment truth.
 """
 
@@ -18,7 +18,8 @@ _FAILURE_OUTCOMES = frozenset({"not_found", "uncertain", "incomplete", "found_no
 
 
 def _clean(value: Any, limit: int = 240) -> str:
-    return " ".join(str(value or "").split())[:limit]
+    text = str(value or "").replace("\u200b", "").replace("\ufeff", "")
+    return " ".join(text.split())[:limit]
 
 
 def _repair_row(row: Any) -> None:
