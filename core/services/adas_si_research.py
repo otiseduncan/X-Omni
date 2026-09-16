@@ -20,11 +20,18 @@ what else is required; an independent semantic review judges every candidate;
 ScrapeX proves the mechanics, captures, and hashes. Nothing in this module
 inspects a page, a title, or a link name.
 
+Each objective checks the shared Year/Make/Model ADAS SI library first
+(``adas_si_research_source_cascade``); only a requirement without a reviewed,
+provenance-compatible actual procedure there escalates to ALLDATA with the
+exact VIN.
+
 Attachment goes through the existing Calibration IQ operator path
-(``ensure_case_workspace`` + ``import_document`` bound to the calibration item
-the objective was researched for) with a fresh authoritative reread deciding
-"attached". Research state is never marked complete here; that remains a
-separate, evidence-gated operation.
+(``ensure_case_workspace`` + ``import_document``, or ``link_document`` when the
+same library document is already on the RO) bound to the calibration item the
+objective was researched for. A fresh authoritative reread decides "attached",
+and it counts only when that exact calibration item is linked to the document.
+Research state is never marked complete here; that remains a separate,
+evidence-gated operation.
 
 Jobs persist in ``state_records`` (namespace ``adas_si_research``) and resume
 after a Core restart; the research receipt of every objective is kept with the
@@ -71,6 +78,25 @@ _MAKE_SPELLINGS = {
 }
 # Requirement dispositions Calibration IQ treats as work to do.
 _ACTIVE_DETERMINATIONS = frozenset({"required", "likely_required", "needs_research"})
+# Calibration IQ requirements that are physical field checks with no written
+# procedure to retrieve. They stay real CIQ / ADAS Map requirements; they only
+# never become an SI objective or a missing-SI count. The match is exact on the
+# folded label: "Seat Belt Pretensioner Initialization" is still researched.
+_NON_PROCEDURAL_REQUIREMENTS = frozenset(
+    {
+        "seat belt",
+        "seat belts",
+        "seat belt inspection",
+        "seat belts inspection",
+        "seat belt tug test",
+        "seat belts tug test",
+    }
+)
+# Bumped when a change makes earlier in-flight results untrustworthy; a running
+# job saved under an older contract is re-run from the start on resume.
+RESEARCH_CONTRACT_VERSION = 2
+_ACCEPTING = frozenset({"ACCEPT", "ACCEPT_WITH_DEPENDENCIES"})
+_FAILURE_OUTCOMES = frozenset({"not_found", "uncertain", "incomplete", "found_not_captured"})
 
 OUTCOME_ORDER = (
     "attached",
@@ -168,15 +194,54 @@ def normalize_model(value: Any, trim: Any = None) -> str:
 
 
 def vin_from_read(read: dict[str, Any]) -> str:
-    raw = read.get("raw") if isinstance(read.get("raw"), dict) else {}
-    candidate = _dig(raw, "vin", "vehicle.vin", "repair_order.vin", "repair_order.vehicle.vin")
+    """The exact 17-character VIN of a verified Calibration IQ read, or ''.
+
+    The normalized ``repair_order`` summary X Omni publishes comes first; raw
+    operator shapes are fallbacks for older CIQ revisions. The final bounded
+    scan finds a VIN nested in a new response shape without relaxing VIN syntax.
+    """
+    if not isinstance(read, dict):
+        return ""
+    candidate = _dig(
+        read,
+        "repair_order.vin",
+        "vin",
+        "vehicle.vin",
+        "raw.vin",
+        "raw.vehicle.vin",
+        "raw.vehicle_vin",
+        "raw.repair_order.vin",
+        "raw.repair_order.vehicle.vin",
+    )
     text = _clean(candidate, 32).upper()
-    if _VIN_RE.match(text):
+    if _VIN_RE.fullmatch(text):
         return text
     import json as _json
 
-    match = _VIN_IN_TEXT.search(_json.dumps(raw, default=str))
+    match = _VIN_IN_TEXT.search(_json.dumps(read, default=str).upper())
     return match.group(0) if match else ""
+
+
+def _fold_label(value: Any) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).split())
+
+
+def requires_written_si(title: Any) -> bool:
+    """Whether a requirement belongs in procedure retrieval and SI coverage."""
+    return _fold_label(title) not in _NON_PROCEDURAL_REQUIREMENTS
+
+
+def research_goal(requirement: str) -> str:
+    """What an objective asks for, in words that steer no navigation.
+
+    The requirement is the shop's label. It deliberately carries no procedure
+    vocabulary ("calibration / aiming / initialization"): the manufacturer's
+    and ALLDATA's names for the system and its procedure are X's to work out.
+    """
+    return (
+        f"the vehicle manufacturer's service procedure a technician performs for the "
+        f"\"{requirement}\" requirement after a repair or replacement"
+    )
 
 
 def target_from_read(read: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -250,7 +315,8 @@ def objectives_for(target: dict[str, Any], *, systems: Optional[list[str]] = Non
     The objective text is the requirement as Calibration IQ names it, plus
     the research goal. It is the *question*; the model decides how ALLDATA
     answers it. When the caller names systems explicitly, those are the
-    objectives instead.
+    objectives instead. A requirement with no written procedure (see
+    ``requires_written_si``) is never an objective, even when named.
     """
     objectives: list[dict[str, Any]] = []
     if systems:
@@ -259,7 +325,7 @@ def objectives_for(target: dict[str, Any], *, systems: Optional[list[str]] = Non
         sources = list(target.get("calibrations") or [])
     for calibration in sources:
         title = calibration.get("title")
-        if not title:
+        if not title or not requires_written_si(title):
             continue
         objective_id = hashlib.sha1(
             f"{target['ro_number']}|{calibration.get('id') or ''}|{title}".encode("utf-8")
@@ -272,7 +338,8 @@ def objectives_for(target: dict[str, Any], *, systems: Optional[list[str]] = Non
                 "calibration_id": calibration.get("id"),
                 "calibration_title": title,
                 "system": title,
-                "topic": f"{title} calibration / aiming / initialization procedure",
+                "requirement_label": title,
+                "topic": research_goal(title),
                 "vehicle": dict(target["vehicle"]),
                 "vehicle_label": target.get("vehicle_label"),
                 "vin": target.get("vin") or "",
@@ -416,13 +483,41 @@ def default_board_reader(settings: Any) -> Callable[[dict[str, Any]], Awaitable[
     return read
 
 
-def default_attach(settings: Any, adas: Any) -> Callable[..., Awaitable[dict[str, Any]]]:
-    """Attach one captured document to its RO through the operator path.
+def _linked_calibration_ids(document: Any) -> set[str]:
+    if not isinstance(document, dict):
+        return set()
+    return {
+        _clean(item, 120)
+        for item in (document.get("calibration_item_ids") or [])
+        if _clean(item, 120)
+    }
 
-    ``ensure_case_workspace`` then ``import_document`` bound to the exact
-    calibration item the objective was researched for, under the job's own
-    invocation identity (exact-once, receipted), followed by an authoritative
-    reread that alone decides "attached". Research state is left alone.
+
+def _document_on_ro(
+    documents: list[dict[str, Any]], source_uri: str
+) -> Optional[dict[str, Any]]:
+    return next(
+        (
+            item
+            for item in documents
+            if str(item.get("source_uri") or "").strip().casefold() == source_uri.casefold()
+        ),
+        None,
+    )
+
+
+def default_attach(settings: Any, adas: Any) -> Callable[..., Awaitable[dict[str, Any]]]:
+    """Attach one library document to its RO calibration item, and prove it.
+
+    The document is identified by its ADAS SI library path. What "attached"
+    means is exact: after a fresh Calibration IQ reread, a research document
+    with that source exists on the RO *and* this objective's calibration item
+    is linked to it. A document already on the RO for a different calibration
+    is linked to this one through ``link_document`` under CIQ's optimistic
+    concurrency, never counted as attached because it merely exists. A new
+    document goes through ``ensure_case_workspace`` + ``import_document`` bound
+    to the calibration item. Every write runs under the job's own invocation
+    identity (exact-once, receipted). Research state is left alone.
     """
 
     async def attach(
@@ -430,86 +525,201 @@ def default_attach(settings: Any, adas: Any) -> Callable[..., Awaitable[dict[str
     ) -> dict[str, Any]:
         from . import calibration_iq
 
-        artifact = document.get("artifact") or {}
+        artifact = document.get("artifact") if isinstance(document.get("artifact"), dict) else {}
         relative = str(artifact.get("relative_path") or "").strip().replace("\\", "/")
         if not relative:
             return {"attached": False, "status": "no_artifact"}
-        try:
-            source_path = adas.resolve_relative(relative)
-        except Exception as exc:  # noqa: BLE001
-            return {"attached": False, "status": "artifact_unresolvable", "error": f"{type(exc).__name__}: {exc}"[:200]}
         source_uri = f"adas-si:///{quote(relative)}"
-        ro_id = str(objective.get("repair_order_id") or "")
+        ro_id = _clean(objective.get("repair_order_id"), 160)
+        calibration_id = _clean(objective.get("calibration_id"), 120)
+        identity = {"source_uri": source_uri, "calibration_item_id": calibration_id or None}
         before = await calibration_iq.get_repair_order(settings, {"repair_order_id": ro_id})
         if before.get("status") != "verified" or not isinstance(before.get("raw"), dict):
-            return {"attached": False, "status": "ro_unreadable", "message": before.get("message")}
-        existing = calibration_iq._existing_research_documents(before["raw"])  # noqa: SLF001
-        already = next(
-            (item for item in existing if str(item.get("source_uri") or "").strip().casefold() == source_uri.casefold()),
-            None,
+            return {"attached": False, "status": "ro_unreadable", "message": before.get("message"), **identity}
+        existing = _document_on_ro(
+            calibration_iq._existing_research_documents(before["raw"]), source_uri  # noqa: SLF001
         )
-        if already is not None:
-            return {
-                "attached": True,
-                "status": "already_attached",
-                "document_id": already.get("id") or already.get("document_id"),
-                "source_uri": source_uri,
-            }
+
         review = document.get("review") if isinstance(document.get("review"), dict) else {}
-        status = (
-            "validated"
-            if review.get("decision") == "ACCEPT" and float(review.get("confidence") or 0) >= 0.8
-            else "candidate"
-        )
-        arguments: dict[str, Any] = {
-            "source_path": str(source_path),
-            "document_type": "oem_procedure",
-            "semantic_type": "OEM_PROCEDURE",
-            "evidence_role": "PROCEDURE",
-            "title": _clean(document.get("title") or artifact.get("title") or objective.get("calibration_title"), 255),
-            "source_uri": source_uri,
-            "source_name": relative.rsplit("/", 1)[-1][:255],
-            "page_references": [],
-            "citation": _clean(f"ALLDATA, {document.get('url') or ''}", 500),
-            "notes": _clean(
-                "Filed by X's service-information research. Reviewer: "
-                f"{review.get('classification') or ''} / {review.get('decision') or ''} "
-                f"({review.get('confidence')}). {review.get('evidence_summary') or ''}",
-                1500,
-            ),
-            "status": status,
-        }
-        if objective.get("calibration_id"):
-            arguments["calibration_item_ids"] = [str(objective["calibration_id"])]
-        actions = [
-            {"operation": "ensure_case_workspace", "repair_order_id": ro_id, "arguments": {}},
-            {"operation": "import_document", "repair_order_id": ro_id, "arguments": arguments},
-        ]
-        digest = str(artifact.get("sha256") or "")[:12]
+        digest = _clean(artifact.get("sha256"), 64)[:12] or "library"
         invocation = dict(context)
-        invocation["tool_call_id"] = f"{context.get('tool_call_id') or 'adas_si_research'}:{objective.get('objective_id')}:{digest}"
+
+        if existing is not None:
+            document_id = _clean(existing.get("id") or existing.get("document_id"), 160) or None
+            if not calibration_id or calibration_id in _linked_calibration_ids(existing):
+                return {"attached": True, "status": "already_attached", "document_id": document_id, **identity}
+            if not document_id:
+                return {"attached": False, "status": "existing_document_unidentified", **identity}
+            try:
+                expected_version = calibration_iq._existing_document_version(  # noqa: SLF001
+                    existing, operation="link_document"
+                )
+            except Exception as exc:  # noqa: BLE001 - no concurrency proof, no write
+                return {
+                    "attached": False,
+                    "status": "existing_document_unversioned",
+                    "document_id": document_id,
+                    "error": f"{type(exc).__name__}: {exc}"[:300],
+                    **identity,
+                }
+            actions = [
+                {
+                    "operation": "link_document",
+                    "target_id": document_id,
+                    "expected_version": expected_version,
+                    "arguments": {"calibration_item_ids": [calibration_id], "evidence_role": "PROCEDURE"},
+                }
+            ]
+            invocation["tool_call_id"] = (
+                f"{context.get('tool_call_id') or 'adas_si_research'}:{objective.get('objective_id')}:link:{digest}"
+            )
+            confirmed_status, unconfirmed_status = "linked_existing", "existing_not_linked"
+            document_status = None
+        else:
+            try:
+                source_path = adas.resolve_relative(relative)
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "attached": False,
+                    "status": "artifact_unresolvable",
+                    "error": f"{type(exc).__name__}: {exc}"[:200],
+                    **identity,
+                }
+            document_status = (
+                "validated"
+                if review.get("decision") in _ACCEPTING and float(review.get("confidence") or 0) >= 0.8
+                else "candidate"
+            )
+            reused = bool(artifact.get("already_present"))
+            provider = _clean(document.get("provider"), 80) or ("ADAS SI" if reused else "ALLDATA")
+            source_url = _clean(document.get("url"), 1000) or source_uri
+            arguments: dict[str, Any] = {
+                "source_path": str(source_path),
+                "document_type": "oem_procedure",
+                "semantic_type": "OEM_PROCEDURE",
+                "evidence_role": "PROCEDURE",
+                "title": _clean(document.get("title") or artifact.get("title") or objective.get("calibration_title"), 255),
+                "source_uri": source_uri,
+                "source_name": relative.rsplit("/", 1)[-1][:255],
+                "page_references": [],
+                "citation": _clean(f"{provider}, {source_url}", 500),
+                "notes": _clean(
+                    ("Reused from the shared ADAS SI library" if reused else "Captured into the shared ADAS SI library")
+                    + " by X's service-information research. Reviewer: "
+                    f"{review.get('classification') or ''} / {review.get('decision') or ''} "
+                    f"({review.get('confidence')}). {review.get('evidence_summary') or ''}",
+                    1500,
+                ),
+                "status": document_status,
+            }
+            if calibration_id:
+                arguments["calibration_item_ids"] = [calibration_id]
+            actions = [
+                {"operation": "ensure_case_workspace", "repair_order_id": ro_id, "arguments": {}},
+                {"operation": "import_document", "repair_order_id": ro_id, "arguments": arguments},
+            ]
+            invocation["tool_call_id"] = (
+                f"{context.get('tool_call_id') or 'adas_si_research'}:{objective.get('objective_id')}:{digest}"
+            )
+            confirmed_status, unconfirmed_status = "attached", "not_confirmed"
+
         result = await calibration_iq.operator_execute(
             settings, adas, {"actions": actions, INVOCATION_KEY: invocation}
         )
         after = await calibration_iq.get_repair_order(settings, {"repair_order_id": ro_id})
-        attached_document = None
+        confirmed = None
+        on_ro = None
         if after.get("status") == "verified" and isinstance(after.get("raw"), dict):
-            for item in calibration_iq._existing_research_documents(after["raw"]):  # noqa: SLF001
-                if str(item.get("source_uri") or "").strip().casefold() == source_uri.casefold():
-                    attached_document = item
-                    break
-        return {
-            "attached": attached_document is not None,
-            "status": "attached" if attached_document is not None else "not_confirmed",
-            "document_id": (attached_document or {}).get("id") or (attached_document or {}).get("document_id"),
-            "document_status": status,
-            "source_uri": source_uri,
+            on_ro = _document_on_ro(
+                calibration_iq._existing_research_documents(after["raw"]), source_uri  # noqa: SLF001
+            )
+            if on_ro is not None and (not calibration_id or calibration_id in _linked_calibration_ids(on_ro)):
+                confirmed = on_ro
+        shown = confirmed or on_ro or existing or {}
+        outcome: dict[str, Any] = {
+            "attached": confirmed is not None,
+            "status": confirmed_status if confirmed is not None else unconfirmed_status,
+            "document_id": _clean(shown.get("id") or shown.get("document_id"), 160) or None,
             "receipt_status": result.get("status") if isinstance(result, dict) else None,
             "receipt_message": _clean((result or {}).get("message") if isinstance(result, dict) else "", 300) or None,
-            "calibration_item_id": objective.get("calibration_id"),
+            **identity,
         }
+        if document_status is not None:
+            outcome["document_status"] = document_status
+        if confirmed is None and on_ro is not None:
+            outcome["reason"] = "The document is on the RO but not linked to this calibration item."
+        return outcome
 
     return attach
+
+
+def reset_outdated_running_record(record: dict[str, Any]) -> bool:
+    """Re-run a running job whose results predate the current contract.
+
+    Results gathered before attachment was bound to exact calibration identity
+    cannot be trusted as-is, so every objective goes back to pending.
+    """
+    if str(record.get("state") or "") != "running":
+        return False
+    try:
+        version = int(record.get("research_contract_version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version >= RESEARCH_CONTRACT_VERSION:
+        return False
+    for objective in record.get("objectives") or []:
+        if not isinstance(objective, dict):
+            continue
+        objective["status"] = "pending"
+        for key in ("result", "attachments", "outcome", "started_at", "finished_at"):
+            objective.pop(key, None)
+    record["research_contract_version"] = RESEARCH_CONTRACT_VERSION
+    record["notified"] = False
+    for key in ("result", "error", "finished_at", "result_message_id"):
+        record.pop(key, None)
+    return True
+
+
+def _visible(value: Any, limit: int = 240) -> str:
+    """Text a person can actually see: format-only characters are not a title."""
+    text = _clean(value, limit)
+    return text if any(ch.isalnum() for ch in text) else ""
+
+
+def _row_identity(row: dict[str, Any]) -> dict[str, Any]:
+    """Every card row names what it is, even when research failed.
+
+    A row with a source link but no usable page title used to render as a bare
+    external-link icon. The row's identity is only what the objective already
+    knows: its calibration, and the last candidate it reviewed.
+    """
+    calibration = _visible(row.get("calibration"), 180) or "Research objective"
+    row["calibration"] = calibration
+    title = _visible(row.get("title"))
+    if title:
+        row["title"] = title
+    elif _clean(row.get("source_url"), 1000):
+        row["title"] = f"{calibration} — last reviewed candidate"
+    else:
+        row["title"] = None
+    if row.get("outcome") in _FAILURE_OUTCOMES:
+        reasons = [_clean(item, 300) for item in (row.get("incomplete_reasons") or []) if _clean(item, 300)]
+        reason = _clean(row.get("reason"), 300)
+        if reason and reason not in reasons:
+            reasons.append(reason)
+        row["incomplete_reasons"] = reasons
+        row["failure_reason"] = reasons[0] if reasons else OUTCOME_LABELS.get(str(row.get("outcome")))
+    review = row.get("review") if isinstance(row.get("review"), dict) else {}
+    row["reviewer_result"] = (
+        " / ".join(str(review[key]) for key in ("decision", "classification") if review.get(key)) or None
+    )
+    attachments = [item for item in (row.get("attachments") or []) if isinstance(item, dict)]
+    row["attachment_status"] = (
+        "attached"
+        if attachments and all(item.get("attached") for item in attachments)
+        else ("not_confirmed" if attachments else None)
+    )
+    return row
 
 
 # ----------------------------------------------------------------- service
@@ -552,6 +762,7 @@ class AdasSiResearchService:
         self._start_lock = asyncio.Lock()
 
     def _save(self, record: dict[str, Any]) -> dict[str, Any]:
+        record["research_contract_version"] = RESEARCH_CONTRACT_VERSION
         record["updated_at"] = _iso(self.clock())
         self.store.put_record(NAMESPACE, record["job_id"], record, user_id=record["user_id"])
         return record
@@ -728,9 +939,12 @@ class AdasSiResearchService:
         view["status"] = "running"
         view["message"] = (
             f"Started service-information research for {label}: {len(objectives)} procedure "
-            f"objective(s) across {len(targets)} repair order(s). X navigates ALLDATA for each, an "
-            "independent review judges every candidate, accepted procedures are filed in ADAS SI "
-            "and attached to the RO. Results post to this chat when it finishes; started is not complete."
+            f"objective(s) across {len(targets)} repair order(s). X checks the shared Year/Make/Model "
+            "ADAS SI library first for each requirement; only requirements without a confirmed actual "
+            "procedure there go to ALLDATA, with the exact RO VIN selected before navigation. An "
+            "independent review judges every candidate; accepted procedures are filed in ADAS SI and "
+            "attached to the exact calibration item on the RO. Results post to this chat when it "
+            "finishes; started is not complete."
         )
         return view
 
@@ -759,6 +973,8 @@ class AdasSiResearchService:
     async def resume(self) -> int:
         resumed = 0
         for record in self._records(None):
+            if reset_outdated_running_record(record):
+                self._save(record)
             if record.get("state") in ACTIVE_STATES:
                 self._ensure_driver(record)
                 resumed += 1
@@ -809,7 +1025,14 @@ class AdasSiResearchService:
         return True
 
     async def _research(self, objective: dict[str, Any]) -> dict[str, Any]:
+        from . import adas_si_research_source_cascade as cascade
         from . import research_navigator_agent as nav_agent
+
+        # The shared Year/Make/Model library first; a reviewed actual procedure
+        # there, captured for this calibration or for none, closes the objective.
+        local = await cascade.local_procedure(self, objective)
+        if local is not None:
+            return local
 
         search = self.navigator_search or nav_agent.run_navigator_search
         target = dict(objective["vehicle"])
@@ -825,6 +1048,7 @@ class AdasSiResearchService:
             capture=True,
             objective={
                 "objective": objective["topic"],
+                "requirement_label": objective.get("requirement_label") or objective.get("calibration_title"),
                 "system": objective.get("system"),
                 "component": objective.get("calibration_title"),
                 "repair_order": objective.get("ro_number"),
@@ -845,7 +1069,7 @@ class AdasSiResearchService:
             "reason": _clean(result.get("reason") or result.get("verification_reason"), 300) or None,
             "title": _clean(result.get("evidence_title"), 200) or None,
             "source_url": result.get("source_url"),
-            "review": {key: review.get(key) for key in ("classification", "procedure_type", "decision", "confidence", "evidence_summary") if review.get(key) is not None},
+            "review": {key: review.get(key) for key in ("classification", "procedure_type", "vehicle_match", "objective_match", "decision", "confidence", "evidence_summary") if review.get(key) is not None},
             "documents": [
                 {key: document.get(key) for key in ("role", "title", "url", "accepted", "classification", "decision", "captured", "artifact", "task_id")}
                 for document in (result.get("documents") or []) if isinstance(document, dict)
@@ -856,6 +1080,7 @@ class AdasSiResearchService:
             ][:8],
             "incomplete_reasons": list(result.get("incomplete_reasons") or [])[:6],
             "task_ids": list(result.get("task_ids") or []),
+            "source": result.get("source") or "alldata",
             "receipt": {
                 "task_ids": receipt.get("task_ids"),
                 "visited_urls": receipt.get("visited_urls"),
@@ -867,6 +1092,8 @@ class AdasSiResearchService:
                 "final_status": receipt.get("final_status"),
                 "incomplete_reasons": receipt.get("incomplete_reasons"),
                 "metrics": receipt.get("metrics"),
+                "objective_events": receipt.get("objective_events"),
+                "page_state_revisits": receipt.get("page_state_revisits"),
                 "action_count": len(receipt.get("actions") or []),
                 "observation_count": len(receipt.get("observation_ids") or []),
             } if receipt else None,
@@ -988,9 +1215,11 @@ class AdasSiResearchService:
                     "attachments": objective.get("attachments"),
                     "reason": result.get("reason"),
                     "task_ids": result.get("task_ids"),
+                    "source": result.get("source"),
                     "metrics": (result.get("receipt") or {}).get("metrics") if result.get("receipt") else None,
                 }
             )
+            _row_identity(rows[-1])
         finished = sum(1 for item in objectives if item.get("status") not in {"pending", "in_progress"})
         attached = sum(1 for item in rows if item.get("outcome") == "attached")
         view: dict[str, Any] = {

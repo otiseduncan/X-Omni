@@ -7,11 +7,21 @@ the ACTUAL_PROCEDURE for that exact vehicle/system. Related requirements,
 R&I pages, descriptions, diagnostics, and supporting information never suppress
 the ALLDATA fallback for a missing calibration procedure.
 
-The existing ALLDATA Navigator remains the fallback. It already receives the
-exact CIQ/ADAS-Map VIN and its vehicle-anchor forces a mechanical VIN selection
-before X is allowed to navigate. Accepted ALLDATA captures are stored by
-ScrapeX in the same shared Year/Make/Model ADAS SI library, then attached from
-that library artifact to the exact RO/calibration item.
+A library shared by Year/Make/Model does not make every procedure in it
+evidence for every calibration on the vehicle. ScrapeX capture sidecars record
+the research objective that produced an artifact, including its
+``calibration_item_id``. That stored id is provenance, not semantics: an
+artifact captured for one CIQ calibration item is never reused for a different
+one. Legacy or manual library files without captured objective provenance stay
+eligible for X's independent review.
+
+The ALLDATA Navigator is the fallback. It receives the exact CIQ VIN and
+reselects that vehicle before X navigates. Accepted ALLDATA captures are stored
+by ScrapeX in the same library, then attached from that library artifact to the
+exact RO calibration item (``adas_si_research.default_attach``).
+
+``AdasSiResearchService._research`` calls ``local_procedure`` directly; nothing
+here is installed or rebinds another module.
 """
 
 from __future__ import annotations
@@ -26,7 +36,6 @@ from urllib.parse import quote
 
 log = logging.getLogger("xomni.adas_si_research_source_cascade")
 
-_INSTALLED_ATTR = "__xomni_adas_si_research_source_cascade_v1__"
 _LOCAL_TEXT_CHARS = 60_000
 _LOCAL_DOC_LIMIT = 5
 _ACCEPTING = frozenset({"ACCEPT", "ACCEPT_WITH_DEPENDENCIES"})
@@ -46,10 +55,33 @@ def _vehicle(objective: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def captured_calibration_id(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    objective = metadata.get("objective")
+    if not isinstance(objective, dict):
+        return ""
+    return _clean(objective.get("calibration_item_id") or objective.get("calibration_id"), 120)
+
+
+def provenance_allows_reuse(metadata: Any, objective: Any) -> bool:
+    """Refuse only a proved captured-objective mismatch; legacy files stay reviewable."""
+    captured = captured_calibration_id(metadata)
+    current = (
+        _clean(objective.get("calibration_id") or objective.get("calibration_item_id"), 120)
+        if isinstance(objective, dict)
+        else ""
+    )
+    return not (captured and current and captured != current)
+
+
 def _search_args(objective: dict[str, Any]) -> dict[str, Any]:
+    requirement = _clean(objective.get("requirement_label") or objective.get("calibration_title"), 200)
     args: dict[str, Any] = {
         "vehicle": _vehicle(objective),
-        "question": _clean(objective.get("topic"), 500),
+        # The library is searched by the requirement itself; the reviewer, not
+        # the query wording, decides whether a hit is the procedure.
+        "question": requirement or _clean(objective.get("topic"), 500),
         "search_mode": "calibration_requirements",
     }
     system = _clean(objective.get("system"), 200)
@@ -177,6 +209,9 @@ async def _review_local(
 
     try:
         path = service.adas.resolve_relative(row["relative_path"])
+        metadata = await asyncio.to_thread(_source_metadata, path)
+        if not provenance_allows_reuse(metadata, objective):
+            return None
         text = await _library_text(service.adas, path)
         shot = await _screenshot(service.adas, path, int(row.get("page") or 1))
     except Exception:  # noqa: BLE001 - one bad library file must not stop fallback
@@ -191,6 +226,7 @@ async def _review_local(
 
     review_objective = {
         "objective": objective.get("topic"),
+        "requirement_label": objective.get("requirement_label") or objective.get("calibration_title"),
         "system": objective.get("system"),
         "component": objective.get("calibration_title"),
         "repair_order": objective.get("ro_number"),
@@ -215,7 +251,6 @@ async def _review_local(
     if not isinstance(review, dict):
         return None
 
-    metadata = await asyncio.to_thread(_source_metadata, path)
     sha256 = await asyncio.to_thread(
         lambda: hashlib.sha256(path.read_bytes()).hexdigest()
     )
@@ -237,6 +272,7 @@ async def _review_local(
         "captured": True,
         "classification": review.get("classification"),
         "decision": review.get("decision"),
+        "review": review,
         "artifact": {
             "relative_path": row["relative_path"],
             "sha256": sha256,
@@ -253,7 +289,7 @@ async def _review_local(
     }
 
 
-async def _local_procedure(
+async def local_procedure(
     service: Any, objective: dict[str, Any]
 ) -> dict[str, Any] | None:
     """Return a production result only for a complete local actual procedure."""
@@ -353,242 +389,3 @@ async def _local_procedure(
             "source": "adas_si",
         }
     return None
-
-
-def _source_aware_attach_factory(research_module: Any):
-    """Preserve the normal CIQ attach/reread gate with truthful provenance."""
-
-    def default_attach(settings: Any, adas: Any):
-        async def attach(
-            objective: dict[str, Any],
-            document: dict[str, Any],
-            context: dict[str, Any],
-        ) -> dict[str, Any]:
-            from . import calibration_iq
-
-            artifact = document.get("artifact") or {}
-            relative = (
-                str(artifact.get("relative_path") or "")
-                .strip()
-                .replace("\\", "/")
-            )
-            if not relative:
-                return {"attached": False, "status": "no_artifact"}
-            try:
-                source_path = adas.resolve_relative(relative)
-            except Exception as exc:  # noqa: BLE001
-                return {
-                    "attached": False,
-                    "status": "artifact_unresolvable",
-                    "error": f"{type(exc).__name__}: {exc}"[:200],
-                }
-
-            source_uri = f"adas-si:///{quote(relative)}"
-            ro_id = str(objective.get("repair_order_id") or "")
-            before = await calibration_iq.get_repair_order(
-                settings, {"repair_order_id": ro_id}
-            )
-            if (
-                before.get("status") != "verified"
-                or not isinstance(before.get("raw"), dict)
-            ):
-                return {
-                    "attached": False,
-                    "status": "ro_unreadable",
-                    "message": before.get("message"),
-                }
-
-            existing = calibration_iq._existing_research_documents(  # noqa: SLF001
-                before["raw"]
-            )
-            already = next(
-                (
-                    item
-                    for item in existing
-                    if str(item.get("source_uri") or "").strip().casefold()
-                    == source_uri.casefold()
-                ),
-                None,
-            )
-            if already is not None:
-                return {
-                    "attached": True,
-                    "status": "already_attached",
-                    "document_id": already.get("id")
-                    or already.get("document_id"),
-                    "source_uri": source_uri,
-                }
-
-            review = (
-                document.get("review")
-                if isinstance(document.get("review"), dict)
-                else {}
-            )
-            status = (
-                "validated"
-                if review.get("decision") in _ACCEPTING
-                and float(review.get("confidence") or 0) >= 0.8
-                else "candidate"
-            )
-            provider = _clean(document.get("provider"), 80) or (
-                "ADAS SI"
-                if artifact.get("already_present")
-                else "ALLDATA"
-            )
-            source_url = _clean(document.get("url"), 1000) or source_uri
-            origin_note = (
-                "Reused from the shared ADAS SI library"
-                if artifact.get("already_present")
-                else "Captured into the shared ADAS SI library"
-            )
-            arguments: dict[str, Any] = {
-                "source_path": str(source_path),
-                "document_type": "oem_procedure",
-                "semantic_type": "OEM_PROCEDURE",
-                "evidence_role": "PROCEDURE",
-                "title": _clean(
-                    document.get("title")
-                    or artifact.get("title")
-                    or objective.get("calibration_title"),
-                    255,
-                ),
-                "source_uri": source_uri,
-                "source_name": relative.rsplit("/", 1)[-1][:255],
-                "page_references": [],
-                "citation": _clean(f"{provider}, {source_url}", 500),
-                "notes": _clean(
-                    f"{origin_note} by X's service-information research. "
-                    f"Reviewer: {review.get('classification') or ''} / "
-                    f"{review.get('decision') or ''} "
-                    f"({review.get('confidence')}). "
-                    f"{review.get('evidence_summary') or ''}",
-                    1500,
-                ),
-                "status": status,
-            }
-            if objective.get("calibration_id"):
-                arguments["calibration_item_ids"] = [
-                    str(objective["calibration_id"])
-                ]
-
-            actions = [
-                {
-                    "operation": "ensure_case_workspace",
-                    "repair_order_id": ro_id,
-                    "arguments": {},
-                },
-                {
-                    "operation": "import_document",
-                    "repair_order_id": ro_id,
-                    "arguments": arguments,
-                },
-            ]
-            digest = str(artifact.get("sha256") or "")[:12]
-            invocation = dict(context)
-            invocation["tool_call_id"] = (
-                f"{context.get('tool_call_id') or 'adas_si_research'}:"
-                f"{objective.get('objective_id')}:{digest or 'library'}"
-            )
-            result = await calibration_iq.operator_execute(
-                settings,
-                adas,
-                {
-                    "actions": actions,
-                    research_module.INVOCATION_KEY: invocation,
-                },
-            )
-            after = await calibration_iq.get_repair_order(
-                settings, {"repair_order_id": ro_id}
-            )
-            attached_document = None
-            if (
-                after.get("status") == "verified"
-                and isinstance(after.get("raw"), dict)
-            ):
-                for item in calibration_iq._existing_research_documents(  # noqa: SLF001
-                    after["raw"]
-                ):
-                    if (
-                        str(item.get("source_uri") or "").strip().casefold()
-                        == source_uri.casefold()
-                    ):
-                        attached_document = item
-                        break
-
-            return {
-                "attached": attached_document is not None,
-                "status": (
-                    "attached"
-                    if attached_document is not None
-                    else "not_confirmed"
-                ),
-                "document_id": (attached_document or {}).get("id")
-                or (attached_document or {}).get("document_id"),
-                "document_status": status,
-                "source_uri": source_uri,
-                "receipt_status": (
-                    result.get("status")
-                    if isinstance(result, dict)
-                    else None
-                ),
-                "receipt_message": _clean(
-                    (
-                        (result or {}).get("message")
-                        if isinstance(result, dict)
-                        else ""
-                    ),
-                    300,
-                )
-                or None,
-                "calibration_item_id": objective.get("calibration_id"),
-            }
-
-        return attach
-
-    return default_attach
-
-
-def install(research_module: Any) -> None:
-    if getattr(research_module, _INSTALLED_ATTR, False):
-        return
-
-    service_class = research_module.AdasSiResearchService
-    original_research = service_class._research
-    original_start = service_class.start
-
-    async def research_library_first(
-        self: Any, objective: dict[str, Any]
-    ) -> dict[str, Any]:
-        local = await _local_procedure(self, objective)
-        if local is not None:
-            return local
-
-        # The existing fallback receives objective["vin"]. The installed
-        # Navigator vehicle-anchor then forces `select_vehicle(vin=...)` before
-        # the model can choose links or interpret the ALLDATA page.
-        return await original_research(self, objective)
-
-    async def start_with_source_cascade(
-        self: Any, args: dict[str, Any]
-    ) -> dict[str, Any]:
-        result = await original_start(self, args)
-        if isinstance(result, dict) and result.get("status") == "running":
-            count = int(result.get("objective_count") or 0)
-            result["message"] = (
-                f"Started service-information research: {count} procedure "
-                "objective(s). X checks the shared Year/Make/Model ADAS SI "
-                "library first for each requirement. Only objectives without "
-                "a semantically confirmed actual procedure escalate to "
-                "ALLDATA, where the exact RO VIN is selected before navigation. "
-                "Accepted external procedures are saved back into ADAS SI and "
-                "the library artifact is attached to the RO. Results post here "
-                "when the background job finishes."
-            )
-        return result
-
-    service_class._research = research_library_first
-    service_class.start = start_with_source_cascade
-    research_module.default_attach = _source_aware_attach_factory(
-        research_module
-    )
-    setattr(research_module, _INSTALLED_ATTR, True)

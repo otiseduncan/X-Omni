@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import adas_artifact_catalog
+from . import adas_si_research
 from . import calibration_iq
 from . import calibration_iq_weekly_queue as weekly_queue
 from . import research_alldata_navigation as nav
@@ -918,10 +919,14 @@ async def _catalog_coverage(
     snapshot: dict[str, Any],
     map_info: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    # A requirement with no written procedure (a Seat Belt inspection) is a real
+    # map requirement but never missing service information.
     labels = [
         str(item.get("label") or "").strip()
         for item in (map_info.get("requirements") or [])
-        if isinstance(item, dict) and str(item.get("label") or "").strip()
+        if isinstance(item, dict)
+        and str(item.get("label") or "").strip()
+        and adas_si_research.requires_written_si(item.get("label"))
     ]
     if not labels or map_info.get("status") != "verified":
         return []
@@ -994,6 +999,12 @@ async def _catalog_coverage(
 
 
 async def _adas_coverage(adas: Any, vehicle: str, requirements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    requirements = [
+        item
+        for item in requirements
+        if isinstance(item, dict) and adas_si_research.requires_written_si(_requirement_label(item))
+    ]
+
     async def one(item: dict[str, Any]) -> dict[str, Any]:
         label = _requirement_label(item)
         query = f"{vehicle} {label}".strip()

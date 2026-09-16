@@ -19,12 +19,7 @@ from . import adas_identity_guard as _adas_identity_guard
 from . import adas_calibration_depth as _adas_calibration_depth
 from . import adas_calibration_identity as _adas_calibration_identity
 from . import adas_si_research as _adas_si_research
-from . import adas_si_research_identity as _adas_si_research_identity
 from . import adas_si_research_adas_map_vin_repair as _adas_si_research_adas_map_vin_repair
-from . import adas_si_research_scope_guard as _adas_si_research_scope_guard
-from . import adas_si_research_source_cascade as _adas_si_research_source_cascade
-from . import adas_si_research_provenance_guard as _adas_si_research_provenance_guard
-from . import adas_si_research_presentation_guard as _adas_si_research_presentation_guard
 from . import adas_si_background_truth_guard as _adas_si_background_truth_guard
 from . import calibration_iq as _calibration_iq
 from . import calibration_iq_endpoint_discovery as _calibration_iq_endpoint_discovery
@@ -61,9 +56,7 @@ _adas_ocr.install_class(_adas_si.AdasSI)
 _adas_identity_guard.install(_adas_si)
 _adas_calibration_depth.install(_adas_si)
 _adas_calibration_identity.install(_adas_si)
-_adas_si_research_identity.install(_adas_si_research)
 _adas_si_research_adas_map_vin_repair.install(_adas_si_research)
-_adas_si_research_scope_guard.install(_adas_si_research, _calibration_iq_work_prep)
 # SI research is intentionally VIN-bound. No year/make/model fallback is installed.
 # If an older RO has an attached ADAS Map but no stored CIQ VIN, the adapter
 # above may restore only the VIN already proven by that exact ScrapeX map result.
@@ -72,11 +65,6 @@ _calibration_iq_data_plane_guard.install(_calibration_iq)
 _calibration_iq_projection_guard.install(_calibration_iq)
 _conversation_contract_guard.install()
 _scrapex_navigator_runtime.install(_scrapex)
-_adas_si_research_source_cascade.install(_adas_si_research)
-_adas_si_research_provenance_guard.install(
-    _adas_si_research_source_cascade, _adas_si_research
-)
-_adas_si_research_presentation_guard.install(_adas_si_research)
 _adas_si_background_truth_guard.install(_adas_si_research)
 _research_operator.install()
 _research_route_compat.install()

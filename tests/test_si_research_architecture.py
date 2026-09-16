@@ -88,7 +88,8 @@ def test_the_scheduler_never_chooses_an_alldata_branch_or_grades_a_page():
         }
     )
     objective = adas_si_research.objectives_for(target)[0]
-    assert objective["topic"] == "Millimeter Wave Radar calibration / aiming / initialization procedure"
+    assert objective["requirement_label"] == "Millimeter Wave Radar"
+    assert objective["topic"] == adas_si_research.research_goal("Millimeter Wave Radar")
 
 
 def test_the_navigator_loop_holds_no_page_classifier():

@@ -164,7 +164,8 @@ def test_objectives_are_one_per_requirement_and_carry_no_navigation_decisions():
     assert objective["calibration_id"] == "cal-radar"
     assert objective["calibration_title"] == "Front Radar Sensor - SCC / AEB / FCW"
     assert objective["vin"] == "KNAF24A28S5000001"
-    assert objective["topic"].startswith("Front Radar Sensor - SCC / AEB / FCW")
+    assert '"Front Radar Sensor - SCC / AEB / FCW"' in objective["topic"]
+    assert objective["requirement_label"] == "Front Radar Sensor - SCC / AEB / FCW"
     # No URL, branch, menu, or keyword appears in an objective: X decides those.
     assert not any(key in objective for key in ("url", "branch", "route", "keywords", "path"))
     named = objectives_for(target, systems=["Blind Spot Monitor"])
