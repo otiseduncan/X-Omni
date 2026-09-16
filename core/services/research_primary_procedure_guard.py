@@ -1,13 +1,19 @@
 """Keep supporting documents from satisfying a primary SI objective.
 
 The independent reviewer is allowed to classify a page as a
-``REQUIRED_SUPPORTING_PROCEDURE`` because dependencies genuinely exist.  But a
+``REQUIRED_SUPPORTING_PROCEDURE`` because dependencies genuinely exist. But a
 supporting page is not the primary calibration/aiming/initialization procedure.
 The live Tacoma run exposed the missing boundary when an Occupant Classification
 System initialization/support page was allowed to close the primary ``Seat Belt``
 objective.
 
-This guard does not decide page meaning.  It trusts the reviewer's own
+A second live Tacoma run exposed the opposite classification risk: Toyota's Blind
+Spot Monitor ``Operation Check`` is itself an executable beam-axis inspection /
+confirmation procedure. The title does not make it supporting material. The
+reviewer must classify from the page's actual steps and role in the requested
+operation, not from labels such as ``Operation Check`` or ``Inspection``.
+
+This guard does not decide page meaning. It trusts the reviewer's own
 classification and applies the workflow role Core already knows:
 
 * primary task -> only ``ACTUAL_PROCEDURE`` may be accepted;
@@ -33,9 +39,17 @@ _PROMPT_SUFFIX = (
     "supporting evidence but cannot satisfy that primary objective by itself. For a primary "
     "task, ACCEPT/ACCEPT_WITH_DEPENDENCIES only when classification is ACTUAL_PROCEDURE; if "
     "the page is only supporting material, use CONTINUE_SEARCH (or FOLLOW_DEPENDENCY only "
-    "when the page itself names the actual required procedure). When dependency_context is "
-    "present, the task exists specifically to retrieve a required supporting document, so a "
-    "REQUIRED_SUPPORTING_PROCEDURE may be accepted there."
+    "when the page itself names the actual required procedure). Do NOT decide that a page is "
+    "merely supporting material because its OEM title says Operation Check, Inspection, Beam "
+    "Axis Inspection, Confirmation, Verification, or another check-oriented label. If that "
+    "page itself contains the executable setup, scan-tool actions, target/measurement steps, "
+    "beam-axis work, adjustment/confirmation steps, and completion criteria that directly "
+    "perform or verify the requested calibration/aiming/initialization operation, classify "
+    "it as ACTUAL_PROCEDURE. Judge the page's functional role from its steps, not its title. "
+    "A check page that only tells the technician whether another procedure is needed remains "
+    "supporting material. When dependency_context is present, the task exists specifically "
+    "to retrieve a required supporting document, so a REQUIRED_SUPPORTING_PROCEDURE may be "
+    "accepted there."
 )
 
 
