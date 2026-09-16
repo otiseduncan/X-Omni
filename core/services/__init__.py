@@ -35,6 +35,7 @@ from . import scrapex as _scrapex
 from . import scrapex_navigator_runtime as _scrapex_navigator_runtime
 from . import research_navigator_agent as _research_navigator_agent
 from . import research_bottom_decision_guard as _research_bottom_decision_guard
+from . import research_navigator_cycle_guard as _research_navigator_cycle_guard
 from . import research_navigator_tool_repair as _research_navigator_tool_repair
 from . import research_semantic_review as _research_semantic_review
 from . import research_semantic_system_guard as _research_semantic_system_guard
@@ -88,6 +89,7 @@ _research_dependency_semantic_guard.install(_research_semantic_review)
 _research_primary_procedure_guard.install(_research_semantic_review, _research_navigator_agent)
 _research_navigator_vehicle_anchor.install(_research_navigator_agent)
 _research_dependency_budget_extension.install(_research_navigator_agent)
+_research_navigator_cycle_guard.install(_research_navigator_agent)
 _adas_si_research_source_cascade.install(_adas_si_research)
 _adas_si_research_provenance_guard.install(
     _adas_si_research_source_cascade, _adas_si_research
