@@ -821,7 +821,10 @@ async def test_no_tool_review_carries_the_background_record():
     )
     assert seen["instruction"].startswith("Internal evidence check")
     assert line in seen["instruction"]
-    assert "call query_ciq with kind=adas_map_sweep" in seen["instruction"]
+    # The review names the read for each kind of background job it covers.
+    assert "call query_ciq" in seen["instruction"]
+    assert "kind=adas_map_sweep" in seen["instruction"]
+    assert "kind=adas_si_research" in seen["instruction"]
 
 
 @pytest.mark.asyncio

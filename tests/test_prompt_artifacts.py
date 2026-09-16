@@ -224,3 +224,28 @@ def test_artifact_context_respects_total_prompt_budget():
     assert total <= 2_800 - 400 + 16
     assert messages[0]["content"] == prompt.system_prompt(FakeRouter())
     assert len(context_message(messages)["content"]) < prompt.ARTIFACT_CONTEXT_MAX_CHARS + 500
+
+
+def test_si_research_card_keeps_every_objective_identity_for_the_model():
+    rows = [
+        {
+            "objective_id": f"o{index}",
+            "ro_number": "2400911761",
+            "calibration": f"Calibration {index}",
+            "outcome": "attached",
+            "title": f"Procedure title {index}",
+            "source_url": "https://my.alldata.com/repair/#/article/" + "x" * 400,
+            "reviewer_result": "ACCEPT / ACTUAL_PROCEDURE",
+            "attachment_status": "attached",
+            "documents": [{"artifact": {"relative_path": "a" * 500}}] * 4,
+            "metrics": {"model_calls": 30},
+        }
+        for index in range(6)
+    ]
+    message = {"id": 9, "artifacts": [{"type": "adas_si_research", "data": {"status": "completed", "scope": "RO 2400911761", "attached_count": 6, "objective_count": 6, "objectives": rows}}]}
+    summary = prompt._artifact_summary(message, message["artifacts"][0])
+    assert "truncated" not in summary
+    objectives = summary["data"]["objectives"]
+    assert [row["title"] for row in objectives] == [f"Procedure title {index}" for index in range(6)]
+    assert all(row["attachment_status"] == "attached" for row in objectives)
+    assert all("documents" not in row and "metrics" not in row for row in objectives)

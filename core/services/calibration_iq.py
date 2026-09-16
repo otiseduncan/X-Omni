@@ -1338,9 +1338,36 @@ async def get_repair_order(settings, args: dict) -> dict[str, Any]:
         },
         # Everything the service returned, so nothing is hidden from the
         # detail card just because this mapper didn't anticipate a field.
-        "raw": _map_document_urls(detail),
+        "raw": _bounded_history(_map_document_urls(detail)),
         "evidence": {"source": "calibration_iq_authenticated_api", "read_only": True},
     }
+
+
+# An RO's audit trail grows with every edit. A long-lived RO's trail alone
+# passed the tool gateway's result limit, which replaced the whole verified
+# read with a truncation envelope and rendered "Repair order not found." The
+# newest entries are kept; the omission is stated, never silent.
+RO_AUDIT_ENTRIES_KEPT = 25
+
+
+def _bounded_history(detail: Any) -> Any:
+    if not isinstance(detail, dict):
+        return detail
+    audit = detail.get("audit")
+    if not isinstance(audit, list) or len(audit) <= RO_AUDIT_ENTRIES_KEPT:
+        return detail
+
+    def when(entry: Any) -> str:
+        if not isinstance(entry, dict):
+            return ""
+        return str(entry.get("created_at") or entry.get("timestamp") or entry.get("at") or "")
+
+    ordered = sorted(audit, key=when, reverse=True) if all(when(e) for e in audit) else audit[-RO_AUDIT_ENTRIES_KEPT:][::-1]
+    bounded = dict(detail)
+    bounded["audit"] = ordered[:RO_AUDIT_ENTRIES_KEPT]
+    bounded["audit_total"] = len(audit)
+    bounded["audit_omitted"] = len(audit) - RO_AUDIT_ENTRIES_KEPT
+    return bounded
 
 
 # --------------------------------------------------------------------------

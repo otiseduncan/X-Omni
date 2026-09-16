@@ -1,10 +1,7 @@
 from core.orchestrator import prompt
-from core.services import conversation_contract_guard as guard
 
 
 def test_oem_questions_require_evidence_without_inheriting_active_ro():
-    guard.install()
-
     model_contract = prompt.MODEL_FIRST_CONTRACT
     truth_contract = prompt.TRUTH_AND_AUTHORIZATION
 

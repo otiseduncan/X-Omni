@@ -536,9 +536,16 @@ function ciqDocumentDownloadUrl(doc) {
 export function CalibrationRoCard({ data }) {
   const ro = data?.repair_order;
   if (!ro) {
+    // Only a read that actually found nothing says so. A result the tool
+    // gateway cut for size, or a read that failed, is reported as what it is.
+    const fallback = data?.truncated
+      ? `The repair order was read, but the result (${data?.original_bytes ?? "unknown"} bytes) was too large to display here.`
+      : data?.status && data.status !== "no_result"
+        ? `The repair order read did not complete (${data.status}).`
+        : "Repair order not found.";
     return (
       <Card icon={ClipboardList} title="Repair order" tone="warn">
-        <p className="card-note">{data?.message || "Repair order not found."}</p>
+        <p className="card-note">{data?.message || fallback}</p>
       </Card>
     );
   }
@@ -1427,30 +1434,40 @@ function ResearchObjectiveRow({ row }) {
   const attachments = Array.isArray(row?.attachments) ? row.attachments : [];
   const dependencies = Array.isArray(row?.dependencies) ? row.dependencies : [];
   const reasons = Array.isArray(row?.incomplete_reasons) ? row.incomplete_reasons : [];
+  const calibration = row?.calibration || "Research objective";
+  const reviewer =
+    row?.reviewer_result ||
+    (review?.decision ? [review.decision, review.classification].filter(Boolean).join(" / ") : null);
+  // A title never renders as a bare icon: without visible text the link is
+  // named for the calibration it was researched for.
+  const title = String(row?.title || "").trim() || (row?.source_url ? `${calibration} — source page` : "");
+  const failure = row?.failure_reason || null;
+  const extraReasons = reasons.filter((reason) => reason && reason !== failure).slice(0, 3);
   return (
     <div className="field-row research-objective" key={row.objective_id}>
-      <strong>{row.ro_number}</strong>
+      <strong>{calibration}</strong>
       <span className="field-topics">
-        {[row.vehicle, row.calibration].filter(Boolean).join(" · ")}
+        {[row.ro_number ? `RO ${row.ro_number}` : null, row.vehicle].filter(Boolean).join(" · ")}
       </span>
       <em className="field-meta">{row.outcome_label || row.outcome}</em>
-      {row.title ? (
+      {title ? (
         <p className="card-note">
           {row.source_url ? (
             <a className="field-link" href={row.source_url} target="_blank" rel="noreferrer noopener">
-              <ExternalLink size={12} /> {row.title}
+              <ExternalLink size={12} /> <span>{title}</span>
             </a>
           ) : (
-            row.title
+            title
           )}
-          {review?.decision ? ` · review ${review.decision}${review.classification ? ` (${review.classification.toLowerCase().replace(/_/g, " ")})` : ""}` : ""}
         </p>
       ) : null}
+      {reviewer ? <p className="card-note">Reviewer: {reviewer.toLowerCase().replace(/_/g, " ")}</p> : null}
       {attachments.map((item, index) => (
         <p className="card-note" key={`${row.objective_id}-att-${index}`}>
-          {item.attached ? "Attached in Calibration IQ" : `Attachment ${item.status || "not confirmed"}`}
+          {item.attached ? "Attached in Calibration IQ" : `Attachment ${String(item.status || "not confirmed").replace(/_/g, " ")}`}
           {item.document_status ? ` as ${item.document_status}` : ""}
           {item.title ? ` · ${item.title}` : ""}
+          {item.reason ? ` · ${item.reason}` : ""}
         </p>
       ))}
       {dependencies.map((item, index) => (
@@ -1458,10 +1475,11 @@ function ResearchObjectiveRow({ row }) {
           Also needs “{item.title}” · {item.status}
         </p>
       ))}
-      {reasons.map((reason, index) => (
+      {failure ? <em className="card-note">Why: {String(failure).slice(0, 240)}</em> : null}
+      {extraReasons.map((reason, index) => (
         <em className="card-note" key={`${row.objective_id}-why-${index}`}>{String(reason).slice(0, 200)}</em>
       ))}
-      {row.reason && !row.title ? <em className="card-note">{String(row.reason).slice(0, 200)}</em> : null}
+      {!failure && row.reason && !row.title ? <em className="card-note">{String(row.reason).slice(0, 200)}</em> : null}
     </div>
   );
 }
@@ -1489,7 +1507,9 @@ export function AdasSiResearchCard({ data }) {
       </p>
       {finished
         ? groups.map((group, index) => (
-            <details className="field-hit" key={group.outcome} open={index === 0 && group.outcome !== "attached"}>
+            // Attached procedures are the result the technician came for:
+            // that group, and the first group of any kind, start open.
+            <details className="field-hit" key={group.outcome} open={group.outcome === "attached" || index === 0}>
               <summary>
                 <strong>{group.label}</strong>
                 <span className="field-page">{group.count}</span>

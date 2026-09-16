@@ -87,11 +87,11 @@ TOOL_ROUND_CAP_FALLBACK = (
 NO_TOOL_SELF_CHECK_ACCEPT = "NO_TOOL_NEEDED"
 BACKGROUND_REVIEW_PREFIX = (
     "Internal evidence check; this is not a new user request. Core's own record of "
-    "background work, current as of this message: {record} First question: does the "
-    "withheld draft state an outcome, a completion, or attached/acquired results for "
-    "that background work that this record does not contain? If it does, the draft "
-    "is unsupported: do not output NO_TOOL_NEEDED; call query_ciq with "
-    "kind=adas_map_sweep now and answer from what it returns."
+    "background work, current as of this message: {record} Never say background work is "
+    "completed while the record says it is still running. If the withheld draft states an "
+    "outcome or results the record lacks, do not output NO_TOOL_NEEDED: call "
+    "query_ciq (kind=adas_si_research for SI research, kind=adas_map_sweep for an ADAS Map "
+    "sweep) and answer only from that read."
 )
 NO_TOOL_SELF_CHECK_MESSAGE = """Internal final-answer evidence check; this is not a new user request. Review the withheld draft against the original request, current structured context, advertised tool contracts, and returned evidence. If a safe answer requires current or live business state, execution proof, capability state, or vehicle-specific OEM technical evidence, do not answer in prose: call the best justified advertised tool or tools now. Nothing has executed in this turn, so a draft reporting work as done -- acquired, retrieved, saved, attached, reconciled, updated, or complete -- and any specific finding it credits to that work are unsupported no matter how confident they read: call the tool that would actually do it instead of accepting the draft. If the draft is a casual, conceptual, or general answer, or already states a truthful unresolved boundary and no tool is needed, output exactly NO_TOOL_NEEDED; an active conversation subject is memory and is never by itself a reason to call a tool. Never run a mutation to test or demonstrate capability. Reason from meaning and evidence contracts, not keyword rules."""
 ADAS_SI_POST_TOOL_SELF_CHECK_MESSAGE = """Internal ADAS SI evidence check; this is not a new user request. Review the withheld draft against the original request and the tool results returned in this turn. An ADAS SI search or open result proves only that a matching document exists and what it contains; it does not prove when documents arrived, which documents are new, or what was filed from the root folder. If the draft makes any new/recent/arrival or root-filing claim without an adas_si_inventory result containing recent_additions and storage_refresh, call adas_si_inventory with the requested time window now. Otherwise output exactly NO_TOOL_NEEDED. Do not repeat a search and do not infer arrival from conversation history, document counts, or an ADAS Map sweep."""

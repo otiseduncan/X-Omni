@@ -200,7 +200,7 @@ def test_the_navigator_wrappers_this_contract_replaces_are_gone():
         assert not (services / retired).exists(), retired
     init = (services / "__init__.py").read_text(encoding="utf-8")
     assert "_research_navigator_agent)" not in init, "no installer may rebind the Navigator module"
-    assert "_research_semantic_review" not in init.split("_conversation_contract_guard.install()")[1]
+    assert "_research_semantic_review." not in init
 
 
 def test_the_navigator_and_reviewer_modules_are_not_rebound_after_import():

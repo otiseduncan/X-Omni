@@ -22,16 +22,6 @@ _STATUS_RESULT: ContextVar[dict[str, Any] | None] = ContextVar(
     "xomni_si_background_status_result", default=None
 )
 
-_BACKGROUND_REVIEW = (
-    "Internal evidence check; this is not a new user request. Core's own record of "
-    "background work, current as of this message: {record} First, compare the withheld "
-    "draft with that record. Never say background work is completed while the record says "
-    "it is still running, and never invent a result for a pending objective. If the draft "
-    "needs fresher progress or a result not contained in the record, do not output "
-    "NO_TOOL_NEEDED: call query_ciq for the matching background service. Use "
-    "kind=adas_si_research for service-information research and kind=adas_map_sweep for "
-    "an ADAS Map sweep. Then answer only from what that read returns."
-)
 
 
 def _is_status_result(result: Any) -> bool:
@@ -185,5 +175,4 @@ def install(research_module: Any) -> None:
 
     loop_module.calibration_iq_mutation_truth_review_required = truth_review_required
     loop_module.Orchestrator._calibration_iq_truth_reviewed_text = truth_reviewed_text
-    loop_module.BACKGROUND_REVIEW_PREFIX = _BACKGROUND_REVIEW
     setattr(research_module, _INSTALLED_ATTR, True)

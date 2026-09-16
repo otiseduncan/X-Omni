@@ -257,4 +257,21 @@ test("background service-information research renders per-objective truth", asyn
   assert.match(cards, /Also needs/);
   assert.match(cards, /could not be read/);
   assert.doesNotMatch(cards, /intentionally dormant/);
+  // Attached procedures are visible without expanding anything.
+  assert.match(cards, /open=\{group\.outcome === "attached" \|\| index === 0\}/);
+  // Every row names its calibration, reviewer result and failure reason, and
+  // a source link always carries visible text next to its icon.
+  assert.match(cards, /<strong>\{calibration\}<\/strong>/);
+  assert.match(cards, /Reviewer: \{reviewer/);
+  assert.match(cards, /Why: \{String\(failure\)/);
+  assert.match(cards, /<ExternalLink size=\{12\} \/> <span>\{title\}<\/span>/);
+});
+
+test("a repair order card never calls a truncated or failed read 'not found'", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/FieldCards.jsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(cards, /data\?\.truncated\s*\?\s*`The repair order was read, but the result/);
+  assert.match(cards, /The repair order read did not complete/);
 });
