@@ -1021,6 +1021,23 @@ def _candidate_from_evidence(evidence: dict[str, Any], summary: Optional[dict[st
 def _next_instruction_for_review(review: dict[str, Any]) -> str:
     decision = review.get("decision")
     summary = str(review.get("evidence_summary") or "")[:400]
+    match = str(review.get("objective_match") or "")
+    # A real page for the wrong target says which way to move, not only that
+    # this page is wrong: the reviewer's own objective match separates "right
+    # component, wrong article" from "wrong component or sensor altogether".
+    if decision == "CONTINUE_SEARCH" and match in {"DIFFERENT_COMPONENT", "DIFFERENT_SENSOR_FAMILY"}:
+        return (
+            f"Independent review: this is a real page, but it performs a {match.replace('_', ' ').lower()}"
+            f" rather than the requested system. Reviewer: {summary} Do not extract this page "
+            "again and do not keep drilling in this branch. Back out using the live controls "
+            "until other systems or components are visible, then choose the requested one."
+        )
+    if decision == "CONTINUE_SEARCH" and match == "SAME_COMPONENT_WRONG_PROCEDURE":
+        return (
+            "Independent review: right component, but this article does not perform the "
+            f"requested operation. Reviewer: {summary} Stay with this component and look for a "
+            "different article under it that does. Do not extract this page again."
+        )
     if decision == "ACCEPT":
         return "Independent review ACCEPTED this page as the procedure. Stop browsing; the evidence has been reached."
     if decision == "ACCEPT_WITH_DEPENDENCIES":
@@ -1546,11 +1563,13 @@ async def _run_task(
                                 for key in (
                                     "classification",
                                     "procedure_type",
+                                    "objective_match",
                                     "decision",
                                     "confidence",
                                     "evidence",
                                     "dependencies",
                                     "evidence_summary",
+                                    "inconsistent",
                                     "malformed",
                                 )
                             }

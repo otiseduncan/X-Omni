@@ -2,18 +2,29 @@
 
 The Navigator loop finds pages; it does not get to grade its own work. When
 it marks a page as the procedure, this module puts the *evidence* -- the
-original research objective, the exact vehicle, the system, the page's own
-title, breadcrumb, URL, extracted text, referenced documents, and a current
+original research objective, the exact vehicle, the page's own title,
+breadcrumb, URL, extracted text, referenced documents, and a current
 screenshot -- in front of the model in a fresh context that has never seen
-the Navigator's reasoning, with an explicitly sceptical instruction, and
-asks for a structured verdict.
+the Navigator's reasoning, with an explicitly sceptical instruction, and asks
+for ONE structured verdict.
+
+That one verdict covers everything the review has to decide: what kind of
+document the page is, whether it is for this vehicle, whether it performs the
+requested system and operation, what else it requires, and the decision.
+These used to be separate layers -- a keyword radar/camera veto in Python, a
+second "objective match" model call, and a supporting-page boundary -- each
+bolted on after a live failure and each re-judging the verdict before it. They
+are one call now. The match is declared *before* the decision, because
+llama.cpp's grammar emits properties in declared order, so the model has to
+commit to what the page performs before it may decide anything.
 
 The model decides what the page is and whether it satisfies the objective.
-Python decides only whether the reply is well-formed and internally
-consistent: a verdict that accepts a page while its own evidence table says
-the execution steps are missing is not an acceptance, and a reply that
-cannot be parsed is never one. Nothing here inspects titles, counts
-characters, or matches procedure words.
+Python decides only whether the reply is well formed and internally
+consistent with itself and with the workflow role Core already knows: an
+acceptance that its own evidence table, vehicle match, or objective match
+contradicts is not an acceptance, and a reply that cannot be parsed is never
+one. Nothing here inspects titles, counts characters, or matches automotive
+words.
 """
 
 from __future__ import annotations
@@ -28,7 +39,7 @@ REVIEW_TOOL_NAME = "report_semantic_review"
 REVIEW_TEXT_CHARS = 24_000
 REVIEW_MAX_LINKS = 60
 REVIEW_MAX_DEPENDENCIES = 6
-REVIEW_MAX_TOKENS = 900
+REVIEW_MAX_TOKENS = 1_000
 
 CLASSIFICATIONS: tuple[str, ...] = (
     "ACTUAL_PROCEDURE",
@@ -55,6 +66,13 @@ PROCEDURE_TYPES: tuple[str, ...] = (
     "NOT_A_PROCEDURE",
 )
 VEHICLE_MATCH: tuple[str, ...] = ("MATCHES", "DIFFERENT_VEHICLE", "NOT_STATED")
+OBJECTIVE_MATCH: tuple[str, ...] = (
+    "EXACT_MATCH",
+    "SAME_COMPONENT_WRONG_PROCEDURE",
+    "DIFFERENT_COMPONENT",
+    "DIFFERENT_SENSOR_FAMILY",
+    "UNCERTAIN",
+)
 EVIDENCE_FIELDS: tuple[str, ...] = (
     "prerequisites",
     "tools_or_equipment",
@@ -79,20 +97,31 @@ DECISIONS: tuple[str, ...] = (
     "UNCERTAIN",
 )
 ACCEPTING_DECISIONS = frozenset({"ACCEPT", "ACCEPT_WITH_DEPENDENCIES"})
-ACCEPTABLE_CLASSIFICATIONS = frozenset({"ACTUAL_PROCEDURE", "REQUIRED_SUPPORTING_PROCEDURE"})
 DEPENDENCY_DECISIONS = frozenset({"ACCEPT_WITH_DEPENDENCIES", "FOLLOW_DEPENDENCY"})
+# What a document task may close, by the workflow role Core assigned it. A
+# primary objective needs the procedure itself; a dependency task exists to
+# retrieve one required supporting document, so that is what it may accept.
+ACCEPTABLE_CLASSIFICATIONS_BY_ROLE: dict[str, frozenset[str]] = {
+    "primary": frozenset({"ACTUAL_PROCEDURE"}),
+    "dependency": frozenset({"ACTUAL_PROCEDURE", "REQUIRED_SUPPORTING_PROCEDURE"}),
+}
+# Objective-match categories that say "real page, wrong target": the useful
+# response is to keep navigating, not to call the page ambiguous.
+WRONG_TARGET_MATCHES = frozenset(
+    {"SAME_COMPONENT_WRONG_PROCEDURE", "DIFFERENT_COMPONENT", "DIFFERENT_SENSOR_FAMILY"}
+)
 
 # Property order is part of the contract: llama.cpp's grammar emits object
-# properties in declared order and cannot revisit one, so the verdict is
-# declared after the evidence table it has to be consistent with.
+# properties in declared order and cannot revisit one, so every judgement the
+# decision must be consistent with is declared before the decision.
 REVIEW_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": REVIEW_TOOL_NAME,
         "description": (
             "Report the semantic review of one candidate service-information page "
-            "against the original research objective. Fill the evidence table from "
-            "the page text before deciding."
+            "against the original research objective. Fill the evidence table and the "
+            "objective match from the page itself before deciding."
         ),
         "parameters": {
             "type": "object",
@@ -108,6 +137,14 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
                     },
                     "required": list(EVIDENCE_FIELDS),
                     "additionalProperties": False,
+                },
+                "objective_match": {
+                    "type": "string",
+                    "enum": list(OBJECTIVE_MATCH),
+                    "description": (
+                        "What the page actually performs compared with the requested "
+                        "system and operation."
+                    ),
                 },
                 "dependencies": {
                     "type": "array",
@@ -137,6 +174,7 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
                 "procedure_type",
                 "vehicle_match",
                 "evidence",
+                "objective_match",
                 "dependencies",
                 "decision",
                 "confidence",
@@ -151,29 +189,52 @@ REVIEW_SYSTEM_PROMPT = (
     "You are an independent reviewer for a collision repair shop's ADAS service-"
     "information research. You have not seen how this page was found and you do not "
     "trust the person who found it. Do not assume this is the requested calibration "
-    "procedure. Determine from the evidence alone whether it is an actual calibration, "
-    "aiming, initialization, relearn, or required supporting procedure for the exact "
-    "vehicle and system in the objective. Removal/replacement, wiring, diagnostics, "
-    "component descriptions, and general system overviews must not be accepted merely "
-    "because they mention the component. A page that carries steps, setup, tools, "
-    "targets, distances, or scan-tool operations for performing the calibration is an "
-    "actual procedure even if it never uses the word 'calibration' -- OEMs say aiming, "
-    "adjustment, alignment, initialization, learn, or zero point. Fill the evidence "
-    "table honestly from the page text: PRESENT only when the page itself contains it; "
-    "REFERENCED_ELSEWHERE when the page points to another document for it; "
-    "NOT_APPLICABLE when that kind of content does not belong to this procedure; "
-    "otherwise MISSING_OR_UNCERTAIN. Name a dependency ONLY when this page's own text "
-    "says another document must be performed or consulted to complete the procedure "
+    "procedure. Decide from the evidence alone.\n\n"
+    "WHAT THE OBJECTIVE MEANS. The requirement name comes from the shop's own job "
+    "system, not from the vehicle manufacturer, and the manufacturer almost never uses "
+    "the same words. Work out which vehicle system the requirement refers to and what "
+    "a technician must do for it after a repair or replacement, then ask whether this "
+    "page performs that.\n\n"
+    "JUDGE THE PAGE BY WHAT IT DOES, NOT WHAT IT IS CALLED. A page that carries the "
+    "setup, tools, targets or reflectors, distances or angles, scan-tool operations, "
+    "execution steps, and completion criteria for that work is an actual procedure "
+    "whatever its title says. Title words such as Operation Check, Inspection, "
+    "Confirmation, Verification, Beam Axis Inspection, Adjustment, Initialization, or "
+    "Learn are not evidence in either direction: an 'Operation Check' that performs the "
+    "beam-axis confirmation or adjustment is the procedure, and one that only tells the "
+    "technician whether some other procedure is needed is supporting material. "
+    "Removal/replacement, wiring, diagnostics, component descriptions, and system "
+    "overviews are not the procedure merely because they mention the component.\n\n"
+    "EVIDENCE TABLE. Fill it honestly from the page text: PRESENT only when the page "
+    "itself contains it; REFERENCED_ELSEWHERE when the page points to another document "
+    "for it; NOT_APPLICABLE when that kind of content does not belong to this procedure; "
+    "otherwise MISSING_OR_UNCERTAIN.\n\n"
+    "OBJECTIVE MATCH. Compare what the page actually performs with the requested system "
+    "and operation, and set procedure_type to what the page itself calibrates, not to "
+    "what the objective asked for. EXACT_MATCH: it performs the requested work. "
+    "SAME_COMPONENT_WRONG_PROCEDURE: right component, different operation or article. "
+    "DIFFERENT_COMPONENT: another component in the same broad area. "
+    "DIFFERENT_SENSOR_FAMILY: a different kind of sensor -- a camera procedure never "
+    "satisfies a radar requirement and a radar procedure never satisfies a camera one. "
+    "UNCERTAIN: the evidence does not let you tell.\n\n"
+    "WORKFLOW ROLE. When the evidence packet has no dependency_context you are reviewing "
+    "the PRIMARY objective, which only the actual procedure can satisfy; a required "
+    "supporting procedure is useful but cannot close it, so decide CONTINUE_SEARCH for "
+    "one. When dependency_context is present, the task exists to retrieve that required "
+    "supporting document, and it may be accepted as REQUIRED_SUPPORTING_PROCEDURE.\n\n"
+    "DEPENDENCIES. Name one only when this page's own text unconditionally directs the "
+    "technician to another named document on the normal path to completing the work "
     "(for example 'perform the wheel alignment first', 'set up the target as described "
-    "in ...', 'then perform the initialization in ...'), and quote that exact sentence "
-    "from the page text in the dependency's quote; a dependency whose quote is not on "
-    "the page is discarded. A related-information link, a removal/replacement article, "
-    "a parts page, or a document that merely 'may' apply is not a dependency; leave "
-    "dependencies empty when the page says nothing of the kind. Decide: ACCEPT when this page alone "
-    "satisfies the objective; ACCEPT_WITH_DEPENDENCIES when it is the procedure but "
-    "needs the named documents too; FOLLOW_DEPENDENCY when this page is not the "
-    "procedure but names the document that is; CONTINUE_SEARCH when it is related but "
-    "not the procedure; REJECT when it is the wrong kind of document or the wrong "
+    "in ...'), and quote that exact sentence; a dependency whose quote is not on the page "
+    "is discarded. A related-information link, a parts page, a document that merely "
+    "'may' apply, or a conditional repair branch -- a DTC check, diagnosis, removal, "
+    "installation, or replacement that applies only if a fault is found -- is not a "
+    "dependency. Leave dependencies empty when the page says nothing of the kind.\n\n"
+    "DECISION. ACCEPT when this page alone satisfies the objective; "
+    "ACCEPT_WITH_DEPENDENCIES when it is the procedure but needs the named documents "
+    "too; FOLLOW_DEPENDENCY when this page is not the procedure but names the document "
+    "that is; CONTINUE_SEARCH when it is related but not the procedure, or the wrong "
+    "system or operation; REJECT when it is the wrong kind of document or the wrong "
     "vehicle; UNCERTAIN when the evidence does not let you tell. Report through the "
     "review tool only."
 )
@@ -185,6 +246,13 @@ class SemanticReviewError(ValueError):
 
 def _clean(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
+
+
+def review_role(objective: Any) -> str:
+    """Which workflow role a review answers for, from Core's own task record."""
+    if isinstance(objective, dict) and _clean(objective.get("dependency_context"), 400):
+        return "dependency"
+    return "primary"
 
 
 def build_review_messages(
@@ -217,6 +285,7 @@ def build_review_messages(
     ][:REVIEW_MAX_LINKS]
     packet: dict[str, Any] = {
         "research_objective": _clean(objective.get("objective"), 600),
+        "requirement_label": _clean(objective.get("requirement_label"), 200) or None,
         "system": _clean(objective.get("system"), 200) or None,
         "component": _clean(objective.get("component"), 200) or None,
         "dependency_context": _clean(objective.get("dependency_context"), 400) or None,
@@ -262,15 +331,23 @@ def _normalized_text(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
-def validate_review(payload: Any, *, page_text: Optional[str] = None) -> dict[str, Any]:
+def validate_review(
+    payload: Any,
+    *,
+    page_text: Optional[str] = None,
+    role: str = "primary",
+) -> dict[str, Any]:
     """Return a normalized verdict, or raise SemanticReviewError.
 
     Structural only. Enumerations, ranges, required fields, and the
-    consistency between the verdict and the reviewer's own evidence table
-    are checked; the meaning of the page is not re-judged here. A dependency
-    must cite the sentence on the page that requires it; when ``page_text``
-    is given, a citation that is not on the page discards that dependency --
-    a check that the reviewer's claim is grounded, not a judgement of it.
+    consistency between the decision and the reviewer's own judgements are
+    checked; the meaning of the page is not re-judged here. A dependency must
+    cite the sentence on the page that requires it; when ``page_text`` is
+    given, a citation that is not on the page discards that dependency -- a
+    check that the reviewer's claim is grounded, not a judgement of it.
+
+    ``role`` is the workflow role Core assigned the task ("primary" or
+    "dependency"). It decides only which classifications may close the task.
     """
     if not isinstance(payload, dict):
         raise SemanticReviewError("review is not an object")
@@ -292,6 +369,10 @@ def validate_review(payload: Any, *, page_text: Optional[str] = None) -> dict[st
         if status not in EVIDENCE_STATUSES:
             raise SemanticReviewError(f"evidence.{field} is missing or unknown")
         evidence[field] = status
+    raw_match = payload.get("objective_match")
+    objective_match = str(raw_match).strip() if raw_match not in (None, "") else ""
+    if objective_match and objective_match not in OBJECTIVE_MATCH:
+        raise SemanticReviewError("objective_match is unknown")
     decision = str(payload.get("decision") or "").strip()
     if decision not in DECISIONS:
         raise SemanticReviewError("decision is missing or unknown")
@@ -328,33 +409,21 @@ def validate_review(payload: Any, *, page_text: Optional[str] = None) -> dict[st
     if not summary:
         raise SemanticReviewError("evidence_summary is missing")
 
+    role = role if role in ACCEPTABLE_CLASSIFICATIONS_BY_ROLE else "primary"
     verdict: dict[str, Any] = {
         "classification": classification,
         "procedure_type": procedure_type,
         "vehicle_match": vehicle_match,
         "evidence": evidence,
+        "objective_match": objective_match or None,
         "dependencies": dependencies,
         "decision": decision,
         "confidence": round(confidence, 3),
         "evidence_summary": summary,
+        "review_role": role,
         "malformed": False,
     }
 
-    # Consistency between the verdict and its own evidence. An acceptance the
-    # table does not support is downgraded, never promoted; the reviewer's
-    # words are kept so the downgrade is inspectable.
-    inconsistencies: list[str] = []
-    if decision in ACCEPTING_DECISIONS:
-        if classification not in ACCEPTABLE_CLASSIFICATIONS:
-            inconsistencies.append(
-                f"decision {decision} with classification {classification}"
-            )
-        if vehicle_match == "DIFFERENT_VEHICLE":
-            inconsistencies.append("decision accepts a page the review says is for a different vehicle")
-        if evidence["execution_steps"] != "PRESENT":
-            inconsistencies.append(
-                f"decision accepts a page whose execution_steps are {evidence['execution_steps']}"
-            )
     if unsupported:
         verdict["unsupported_dependencies"] = unsupported
         if decision == "ACCEPT_WITH_DEPENDENCIES" and not dependencies:
@@ -363,12 +432,56 @@ def validate_review(payload: Any, *, page_text: Optional[str] = None) -> dict[st
             verdict["original_decision"] = decision
             verdict["decision"] = "ACCEPT"
             decision = "ACCEPT"
+
+    # Consistency between the decision and the reviewer's own judgements. A
+    # decision they contradict is downgraded, never promoted, and the
+    # reviewer's words are kept so the downgrade stays inspectable.
+    #
+    # Two kinds of contradiction lead to different next steps. "Real page,
+    # wrong target" -- a supporting page on a primary task, or a page the
+    # reviewer itself says performs a different system or operation -- means
+    # keep navigating (CONTINUE_SEARCH). A gap in the evidence itself -- no
+    # execution steps, a different vehicle, an unacceptable document kind, an
+    # objective match that is uncertain or missing -- means the page cannot
+    # be called either way (UNCERTAIN).
+    wrong_target: list[str] = []
+    ungrounded: list[str] = []
+    if decision in ACCEPTING_DECISIONS:
+        allowed = ACCEPTABLE_CLASSIFICATIONS_BY_ROLE[role]
+        if classification not in allowed:
+            if classification == "REQUIRED_SUPPORTING_PROCEDURE" and role == "primary":
+                wrong_target.append(
+                    "a REQUIRED_SUPPORTING_PROCEDURE cannot satisfy the primary objective"
+                )
+            else:
+                ungrounded.append(f"decision {decision} with classification {classification}")
+        if vehicle_match == "DIFFERENT_VEHICLE":
+            ungrounded.append("decision accepts a page the review says is for a different vehicle")
+        if evidence["execution_steps"] != "PRESENT":
+            ungrounded.append(
+                f"decision accepts a page whose execution_steps are {evidence['execution_steps']}"
+            )
+        # The objective match answers "does this perform the requested work".
+        # A dependency task was created to fetch a different, named document,
+        # so comparing it with the primary objective would be the wrong test.
+        if role == "primary":
+            if objective_match in WRONG_TARGET_MATCHES:
+                wrong_target.append(f"objective_match={objective_match}")
+            elif objective_match != "EXACT_MATCH":
+                ungrounded.append(
+                    f"decision accepts a page whose objective_match is {objective_match or 'not stated'}"
+                )
     if decision in DEPENDENCY_DECISIONS and not dependencies:
-        inconsistencies.append(f"decision {decision} names no dependency")
-    if inconsistencies:
+        ungrounded.append(f"decision {decision} names no dependency")
+
+    if wrong_target:
+        verdict["original_decision"] = verdict.get("original_decision", decision)
+        verdict["decision"] = "CONTINUE_SEARCH"
+        verdict["inconsistent"] = wrong_target + ungrounded
+    elif ungrounded:
         verdict["original_decision"] = verdict.get("original_decision", decision)
         verdict["decision"] = "UNCERTAIN"
-        verdict["inconsistent"] = inconsistencies
+        verdict["inconsistent"] = ungrounded
     return verdict
 
 
@@ -379,6 +492,7 @@ def malformed_review(error: str) -> dict[str, Any]:
         "procedure_type": "NOT_A_PROCEDURE",
         "vehicle_match": "NOT_STATED",
         "evidence": {field: "MISSING_OR_UNCERTAIN" for field in EVIDENCE_FIELDS},
+        "objective_match": None,
         "dependencies": [],
         "decision": "UNCERTAIN",
         "confidence": 0.0,
@@ -411,6 +525,7 @@ async def review_candidate(
     unreadable or inconsistent verdict -- ends as UNCERTAIN with the reason
     recorded. It never ends as an acceptance.
     """
+    role = review_role(objective)
     messages = build_review_messages(
         objective=objective,
         vehicle=vehicle,
@@ -453,7 +568,9 @@ async def review_candidate(
             verdict = malformed_review(parse_error)
         else:
             try:
-                verdict = validate_review(payload, page_text=str(candidate.get("text") or ""))
+                verdict = validate_review(
+                    payload, page_text=str(candidate.get("text") or ""), role=role
+                )
             except SemanticReviewError as exc:
                 verdict = malformed_review(str(exc))
     if isinstance(usage, dict):

@@ -16,6 +16,7 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "procedure_type": "STATIC_CAMERA",
         "vehicle_match": "MATCHES",
         "evidence": {field: "PRESENT" for field in review.EVIDENCE_FIELDS},
+        "objective_match": "EXACT_MATCH",
         "dependencies": [],
         "decision": "ACCEPT",
         "confidence": 0.88,
@@ -131,6 +132,114 @@ def test_an_accept_its_own_evidence_does_not_support_is_downgraded_never_promote
     assert rejected["decision"] == "REJECT" and review.accepted(rejected) is False
 
 
+# ------------------------------------------------ objective match and role
+#
+# These contracts used to live in three separate wrappers around the reviewer
+# (a keyword radar/camera veto, a second "objective match" model call, and a
+# primary/supporting boundary). They are one verdict now, checked in one place.
+
+
+def test_a_camera_procedure_cannot_close_a_radar_objective():
+    """The 2023 Accord front-radar run captured Multipurpose Camera Aiming.
+
+    The reviewer called it a real procedure and accepted it. It is caught now
+    because the reviewer must say what the page performs before it decides,
+    and a page it says belongs to a different sensor family cannot be accepted.
+    """
+    verdict = review.validate_review(
+        _payload(procedure_type="DYNAMIC_CAMERA", objective_match="DIFFERENT_SENSOR_FAMILY")
+    )
+    assert verdict["decision"] == "CONTINUE_SEARCH"
+    assert verdict["original_decision"] == "ACCEPT"
+    assert "objective_match=DIFFERENT_SENSOR_FAMILY" in verdict["inconsistent"]
+    assert review.accepted(verdict) is False
+
+
+@pytest.mark.parametrize("category", ["SAME_COMPONENT_WRONG_PROCEDURE", "DIFFERENT_COMPONENT"])
+def test_a_real_procedure_for_the_wrong_target_keeps_the_search_going(category):
+    verdict = review.validate_review(_payload(objective_match=category))
+    assert verdict["decision"] == "CONTINUE_SEARCH"
+    assert review.accepted(verdict) is False
+
+
+def test_an_acceptance_that_never_states_the_objective_match_is_not_an_acceptance():
+    # Fail closed: the grammar makes the field required, so a verdict without
+    # it did not come from the reviewer's own contract.
+    missing = _payload()
+    missing.pop("objective_match")
+    assert review.validate_review(missing)["decision"] == "UNCERTAIN"
+    assert review.validate_review(_payload(objective_match="UNCERTAIN"))["decision"] == "UNCERTAIN"
+
+
+def test_an_unknown_objective_match_is_malformed():
+    with pytest.raises(review.SemanticReviewError):
+        review.validate_review(_payload(objective_match="CLOSE_ENOUGH"))
+
+
+def test_a_supporting_page_cannot_close_a_primary_objective():
+    verdict = review.validate_review(_payload(classification="REQUIRED_SUPPORTING_PROCEDURE"))
+    assert verdict["decision"] == "CONTINUE_SEARCH"
+    assert review.accepted(verdict) is False
+
+
+def test_a_supporting_page_may_close_the_dependency_task_that_asked_for_it():
+    verdict = review.validate_review(
+        _payload(classification="REQUIRED_SUPPORTING_PROCEDURE"), role="dependency"
+    )
+    assert verdict["decision"] == "ACCEPT"
+    assert review.accepted(verdict) is True
+
+
+def test_a_dependency_task_is_not_regraded_against_the_primary_objective():
+    # A dependency task fetches a different, named document on purpose.
+    verdict = review.validate_review(
+        _payload(objective_match="DIFFERENT_COMPONENT"), role="dependency"
+    )
+    assert verdict["decision"] == "ACCEPT"
+
+
+def test_an_actual_procedure_that_matches_still_closes_the_primary_objective():
+    verdict = review.validate_review(_payload())
+    assert verdict["decision"] == "ACCEPT"
+    assert verdict["objective_match"] == "EXACT_MATCH"
+    assert verdict["review_role"] == "primary"
+
+
+def test_a_non_accepting_verdict_is_never_promoted_or_rewritten():
+    for decision in ("CONTINUE_SEARCH", "REJECT", "UNCERTAIN"):
+        verdict = review.validate_review(
+            _payload(decision=decision, objective_match="DIFFERENT_SENSOR_FAMILY")
+        )
+        assert verdict["decision"] == decision
+        assert "original_decision" not in verdict
+
+
+def test_the_review_role_comes_from_cores_own_task_record():
+    assert review.review_role({"objective": "x"}) == "primary"
+    assert review.review_role({"objective": "x", "dependency_context": "Required document"}) == "dependency"
+    assert review.review_role(None) == "primary"
+
+
+def test_the_match_is_declared_before_the_decision():
+    # llama.cpp emits properties in declared order, so the model must commit
+    # to what the page performs before it may decide.
+    order = list(review.REVIEW_TOOL_SCHEMA["function"]["parameters"]["properties"])
+    assert order.index("objective_match") < order.index("decision")
+    assert order.index("evidence") < order.index("decision")
+    assert "objective_match" in review.REVIEW_TOOL_SCHEMA["function"]["parameters"]["required"]
+
+
+def test_the_prompt_judges_a_page_by_its_steps_not_its_title():
+    prompt = review.REVIEW_SYSTEM_PROMPT
+    assert "not evidence in either direction" in prompt
+    assert "Operation Check" in prompt
+    # The shop's requirement label is not the manufacturer's term.
+    assert "not from the vehicle manufacturer" in prompt
+    # One prompt, written once -- not a base plus appended suffixes.
+    assert prompt.count("DEPENDENCIES.") == 1
+    assert prompt.count("WORKFLOW ROLE.") == 1
+
+
 class _Client:
     def __init__(self, events: list[dict[str, Any]]):
         self.events = events
@@ -158,6 +267,8 @@ async def test_review_candidate_reads_a_tool_call_verdict_and_records_usage():
     assert verdict["decision"] == "CONTINUE_SEARCH"
     assert verdict["review_prompt_tokens"] == 3210
     assert verdict["reviewed_title"] == "Blind Spot Monitor System"
+    # One model call reviews one candidate; there is no second critic turn.
+    assert len(client.requests) == 1
     request = client.requests[0]
     assert request["tools"][0]["function"]["name"] == review.REVIEW_TOOL_NAME
     assert request["tool_choice"] == "required"
@@ -180,3 +291,19 @@ async def test_prose_or_unparseable_or_failing_reviews_are_uncertain_not_accepte
 
     failed = await review.review_candidate(client=_Failing(), objective={"objective": "x"}, vehicle={}, candidate={"title": "t", "url": "u", "text": "body"}, provider="alldata")
     assert failed["decision"] == "UNCERTAIN" and "worker down" in failed["error"]
+
+
+@pytest.mark.asyncio
+async def test_review_candidate_applies_the_dependency_role_from_the_task_record():
+    supporting = _payload(classification="REQUIRED_SUPPORTING_PROCEDURE")
+    client = _Client([{"type": "tool_call", "id": "c", "name": review.REVIEW_TOOL_NAME, "arguments": json.dumps(supporting)}])
+    primary = await review.review_candidate(client=client, objective={"objective": "radar aiming"}, vehicle={}, candidate={"title": "t", "url": "u", "text": "body"}, provider="alldata")
+    assert primary["decision"] == "CONTINUE_SEARCH"
+
+    client = _Client([{"type": "tool_call", "id": "c", "name": review.REVIEW_TOOL_NAME, "arguments": json.dumps(supporting)}])
+    dependency = await review.review_candidate(
+        client=client,
+        objective={"objective": "radar aiming", "dependency_context": "Required document 'Wheel Alignment'"},
+        vehicle={}, candidate={"title": "t", "url": "u", "text": "body"}, provider="alldata",
+    )
+    assert dependency["decision"] == "ACCEPT"
