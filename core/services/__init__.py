@@ -70,7 +70,7 @@ _adas_calibration_depth.install(_adas_si)
 _adas_calibration_identity.install(_adas_si)
 _adas_si_research_identity.install(_adas_si_research)
 _adas_si_research_adas_map_vin_repair.install(_adas_si_research)
-_adas_si_research_scope_guard.install(_adas_si_research)
+_adas_si_research_scope_guard.install(_adas_si_research, _calibration_iq_work_prep)
 # SI research is intentionally VIN-bound. No year/make/model fallback is installed.
 # If an older RO has an attached ADAS Map but no stored CIQ VIN, the adapter
 # above may restore only the VIN already proven by that exact ScrapeX map result.
