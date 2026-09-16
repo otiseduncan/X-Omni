@@ -21,6 +21,7 @@ from . import adas_calibration_identity as _adas_calibration_identity
 from . import adas_si_research as _adas_si_research
 from . import adas_si_research_identity as _adas_si_research_identity
 from . import adas_si_research_adas_map_vin_repair as _adas_si_research_adas_map_vin_repair
+from . import adas_si_research_scope_guard as _adas_si_research_scope_guard
 from . import adas_si_research_source_cascade as _adas_si_research_source_cascade
 from . import adas_si_research_provenance_guard as _adas_si_research_provenance_guard
 from . import adas_si_background_truth_guard as _adas_si_background_truth_guard
@@ -38,6 +39,7 @@ from . import research_semantic_review as _research_semantic_review
 from . import research_semantic_system_guard as _research_semantic_system_guard
 from . import research_objective_match_guard as _research_objective_match_guard
 from . import research_dependency_semantic_guard as _research_dependency_semantic_guard
+from . import research_primary_procedure_guard as _research_primary_procedure_guard
 from . import research_navigator_vehicle_anchor as _research_navigator_vehicle_anchor
 from . import research_dependency_budget_extension as _research_dependency_budget_extension
 from . import research_operator as _research_operator
@@ -68,6 +70,7 @@ _adas_calibration_depth.install(_adas_si)
 _adas_calibration_identity.install(_adas_si)
 _adas_si_research_identity.install(_adas_si_research)
 _adas_si_research_adas_map_vin_repair.install(_adas_si_research)
+_adas_si_research_scope_guard.install(_adas_si_research)
 # SI research is intentionally VIN-bound. No year/make/model fallback is installed.
 # If an older RO has an attached ADAS Map but no stored CIQ VIN, the adapter
 # above may restore only the VIN already proven by that exact ScrapeX map result.
@@ -81,6 +84,7 @@ _research_navigator_tool_repair.install(_research_navigator_agent)
 _research_semantic_system_guard.install(_research_semantic_review, _research_navigator_agent)
 _research_objective_match_guard.install(_research_semantic_review, _research_navigator_agent)
 _research_dependency_semantic_guard.install(_research_semantic_review)
+_research_primary_procedure_guard.install(_research_semantic_review, _research_navigator_agent)
 _research_navigator_vehicle_anchor.install(_research_navigator_agent)
 _research_dependency_budget_extension.install(_research_navigator_agent)
 _adas_si_research_source_cascade.install(_adas_si_research)
