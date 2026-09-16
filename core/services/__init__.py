@@ -24,6 +24,7 @@ from . import adas_si_research_adas_map_vin_repair as _adas_si_research_adas_map
 from . import adas_si_research_scope_guard as _adas_si_research_scope_guard
 from . import adas_si_research_source_cascade as _adas_si_research_source_cascade
 from . import adas_si_research_provenance_guard as _adas_si_research_provenance_guard
+from . import adas_si_research_presentation_guard as _adas_si_research_presentation_guard
 from . import adas_si_background_truth_guard as _adas_si_background_truth_guard
 from . import calibration_iq as _calibration_iq
 from . import calibration_iq_endpoint_discovery as _calibration_iq_endpoint_discovery
@@ -91,6 +92,7 @@ _adas_si_research_source_cascade.install(_adas_si_research)
 _adas_si_research_provenance_guard.install(
     _adas_si_research_source_cascade, _adas_si_research
 )
+_adas_si_research_presentation_guard.install(_adas_si_research)
 _adas_si_background_truth_guard.install(_adas_si_research)
 _research_operator.install()
 _research_route_compat.install()
