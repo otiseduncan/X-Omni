@@ -220,3 +220,91 @@ async def test_local_procedure_with_unresolved_dependency_still_escalates(
 
     assert len(navigator.calls) == 1
     assert navigator.calls[0]["target"]["vin"] == OBJECTIVE["vin"]
+
+
+class FolderAdas:
+    """A vehicle folder whose other procedures outrank the one asked for."""
+
+    def __init__(self, root: Path, documents: list[tuple[str, str | None]]):
+        import json as _json
+
+        self.root = root
+        self.rows = []
+        for title, captured_for in documents:
+            relative = f"2023/Toyota/Tacoma 4WD/{title}.pdf"
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"%PDF-1.4")
+            path.with_suffix(".text.txt").write_text(f"{title} text", encoding="utf-8")
+            if captured_for:
+                path.with_suffix(".source.json").write_text(
+                    _json.dumps({"objective": {"calibration_item_id": captured_for}}), encoding="utf-8"
+                )
+            self.rows.append({"title": title, "relative_path": relative, "page": 1})
+
+    def model_search(self, _args):
+        return {"status": "success", "results": self.rows, "matched_documents": []}
+
+    def resolve_relative(self, relative: str) -> Path:
+        return self.root / relative
+
+    def render_page(self, *_args):
+        return b"png"
+
+
+@pytest.mark.asyncio
+async def test_hits_captured_for_other_calibrations_do_not_use_review_slots(tmp_path, monkeypatch):
+    others = [(f"Other procedure {index}", f"cal-other-{index}") for index in range(6)]
+    adas = FolderAdas(tmp_path, others + [("Blind Spot Monitor System - Operation Check", "cal-bsm")])
+    reviewed_titles = []
+
+    async def review(**kwargs):
+        reviewed_titles.append(kwargs["candidate"]["title"])
+        return {
+            "classification": "ACTUAL_PROCEDURE", "procedure_type": "BLIND_SPOT_RADAR",
+            "vehicle_match": "MATCHES", "objective_match": "EXACT_MATCH", "evidence": {},
+            "dependencies": [], "decision": "ACCEPT", "confidence": 0.9,
+            "evidence_summary": "Steps.", "malformed": False,
+        }
+
+    monkeypatch.setattr(research_semantic_review, "review_candidate", review)
+    navigator = FakeNavigator()
+    result = await service(tmp_path, adas, navigator)._research(dict(OBJECTIVE))
+
+    assert reviewed_titles == ["Blind Spot Monitor System - Operation Check"]
+    assert navigator.calls == []
+    assert result["source"] == "adas_si"
+    skipped = [entry for entry in result["library_reviews"] if entry.get("not_reviewed")]
+    assert len(skipped) == 6 and all("captured for calibration item" in entry["not_reviewed"] for entry in skipped)
+
+
+@pytest.mark.asyncio
+async def test_an_escalated_objective_reports_what_the_library_reviewer_said(tmp_path, monkeypatch):
+    adas = FolderAdas(tmp_path, [("Repair Instruction - Initialization", "cal-bsm")])
+
+    async def review(**_kwargs):
+        return {
+            "classification": "REQUIRED_SUPPORTING_PROCEDURE", "procedure_type": "OTHER",
+            "vehicle_match": "MATCHES", "objective_match": "DIFFERENT_COMPONENT", "evidence": {},
+            "dependencies": [], "decision": "CONTINUE_SEARCH", "confidence": 0.9,
+            "evidence_summary": "Generic initialization, not the BSM procedure.", "malformed": False,
+        }
+
+    monkeypatch.setattr(research_semantic_review, "review_candidate", review)
+    navigator = FakeNavigator()
+    result = await service(tmp_path, adas, navigator)._research(dict(OBJECTIVE))
+
+    assert len(navigator.calls) == 1
+    assert result["library_reviews"] == [
+        {
+            "relative_path": "2023/Toyota/Tacoma 4WD/Repair Instruction - Initialization.pdf",
+            "title": "Repair Instruction - Initialization",
+            "decision": "CONTINUE_SEARCH",
+            "classification": "REQUIRED_SUPPORTING_PROCEDURE",
+            "objective_match": "DIFFERENT_COMPONENT",
+            "vehicle_match": "MATCHES",
+            "reason": "Generic initialization, not the BSM procedure.",
+        }
+    ]
+    compact = research.AdasSiResearchService._compact_result(result)
+    assert compact["library_reviews"][0]["decision"] == "CONTINUE_SEARCH"

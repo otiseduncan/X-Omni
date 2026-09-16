@@ -37,7 +37,12 @@ from urllib.parse import quote
 log = logging.getLogger("xomni.adas_si_research_source_cascade")
 
 _LOCAL_TEXT_CHARS = 60_000
-_LOCAL_DOC_LIMIT = 5
+# Library hits considered per objective, and how many of them may be sent to
+# the reviewer. A vehicle's own folder often ranks its other procedures above
+# the one asked for, so hits captured for a different calibration item are
+# refused by provenance first and never use a review slot.
+_LOCAL_DOC_LIMIT = 12
+_LOCAL_REVIEW_LIMIT = 5
 _ACCEPTING = frozenset({"ACCEPT", "ACCEPT_WITH_DEPENDENCIES"})
 _ACTUAL = "ACTUAL_PROCEDURE"
 
@@ -289,10 +294,42 @@ async def _review_local(
     }
 
 
+def _provenance_refusal(service: Any, objective: dict[str, Any], row: dict[str, Any]) -> str:
+    """Why a library hit may not be reused for this objective, or ''."""
+    try:
+        path = service.adas.resolve_relative(row["relative_path"])
+        metadata = _source_metadata(path)
+    except Exception:  # noqa: BLE001 - the review step owns unreadable files
+        return ""
+    if provenance_allows_reuse(metadata, objective):
+        return ""
+    return f"captured for calibration item {captured_calibration_id(metadata)}, not this one"
+
+
+def _review_record(row: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "relative_path": row.get("relative_path"),
+        "title": row.get("title"),
+        "decision": review.get("decision"),
+        "classification": review.get("classification"),
+        "objective_match": review.get("objective_match"),
+        "vehicle_match": review.get("vehicle_match"),
+        "reason": _clean(review.get("evidence_summary"), 240) or None,
+    }
+
+
 async def local_procedure(
-    service: Any, objective: dict[str, Any]
+    service: Any,
+    objective: dict[str, Any],
+    reviews: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Return a production result only for a complete local actual procedure."""
+    """Return a production result only for a complete local actual procedure.
+
+    ``reviews``, when given, receives one entry per library hit considered:
+    the reviewer's verdict, or why the hit was not reviewed. A requirement
+    that escalates to ALLDATA then says exactly what the library held.
+    """
+    reviews = reviews if reviews is not None else []
     if service.adas is None:
         return None
     try:
@@ -313,11 +350,22 @@ async def local_procedure(
     ):
         return None
 
+    reviewed_count = 0
     for row in _candidate_rows(result):
+        refusal = await asyncio.to_thread(_provenance_refusal, service, objective, row)
+        if refusal:
+            reviews.append({"relative_path": row.get("relative_path"), "title": row.get("title"), "not_reviewed": refusal})
+            continue
+        if reviewed_count >= _LOCAL_REVIEW_LIMIT:
+            reviews.append({"relative_path": row.get("relative_path"), "title": row.get("title"), "not_reviewed": "review limit reached"})
+            continue
         reviewed = await _review_local(service, objective, row)
         if reviewed is None:
+            reviews.append({"relative_path": row.get("relative_path"), "title": row.get("title"), "not_reviewed": "could not be prepared for review"})
             continue
+        reviewed_count += 1
         review = reviewed["review"]
+        reviews.append(_review_record(row, review))
         if (
             review.get("decision") not in _ACCEPTING
             or review.get("classification") != _ACTUAL

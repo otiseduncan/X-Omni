@@ -1030,15 +1030,17 @@ class AdasSiResearchService:
 
         # The shared Year/Make/Model library first; a reviewed actual procedure
         # there, captured for this calibration or for none, closes the objective.
-        local = await cascade.local_procedure(self, objective)
+        library_reviews: list[dict[str, Any]] = []
+        local = await cascade.local_procedure(self, objective, library_reviews)
         if local is not None:
+            local["library_reviews"] = library_reviews
             return local
 
         search = self.navigator_search or nav_agent.run_navigator_search
         target = dict(objective["vehicle"])
         if objective.get("vin"):
             target["vin"] = objective["vin"]
-        return await search(
+        result = await search(
             client=self.client,
             settings=self.settings,
             provider="alldata",
@@ -1055,6 +1057,9 @@ class AdasSiResearchService:
                 "calibration_item_id": objective.get("calibration_id"),
             },
         )
+        if isinstance(result, dict):
+            result["library_reviews"] = library_reviews
+        return result
 
     @staticmethod
     def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -1081,6 +1086,7 @@ class AdasSiResearchService:
             "incomplete_reasons": list(result.get("incomplete_reasons") or [])[:6],
             "task_ids": list(result.get("task_ids") or []),
             "source": result.get("source") or "alldata",
+            "library_reviews": list(result.get("library_reviews") or [])[:12],
             "receipt": {
                 "task_ids": receipt.get("task_ids"),
                 "visited_urls": receipt.get("visited_urls"),
