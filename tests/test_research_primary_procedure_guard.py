@@ -49,3 +49,12 @@ def test_actual_procedure_still_closes_primary_objective():
     )
     assert verdict is original
     assert verdict["decision"] == "ACCEPT"
+
+
+def test_prompt_judges_operation_check_by_steps_not_title():
+    prompt = guard._PROMPT_SUFFIX  # noqa: SLF001
+    assert "Operation Check" in prompt
+    assert "Beam Axis Inspection" in prompt
+    assert "ACTUAL_PROCEDURE" in prompt
+    assert "functional role from its steps, not its title" in prompt
+    assert "only tells the technician whether another procedure is needed" in prompt
