@@ -81,6 +81,17 @@ def _malformed_navigator_event(events: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _supports_keyword(delegate: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(delegate.stream).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def _supports_tool_choice(delegate: Any) -> bool:
     """Whether delegate.stream accepts the optional tool_choice keyword.
 
@@ -105,6 +116,7 @@ class NavigatorToolRepairClient:
     def __init__(self, delegate: Any):
         self._delegate = delegate
         self._delegate_supports_tool_choice = _supports_tool_choice(delegate)
+        self._delegate_supports_temperature = _supports_keyword(delegate, "temperature")
         self.navigator_tool_json_repairs = 0
         setattr(self, _REPAIR_ATTR, True)
 
@@ -118,6 +130,7 @@ class NavigatorToolRepairClient:
         tools: Any,
         max_tokens: int | None,
         tool_choice: Any = None,
+        temperature: float | None = None,
     ):
         kwargs: dict[str, Any] = {
             "tools": tools,
@@ -128,6 +141,8 @@ class NavigatorToolRepairClient:
         # Navigator test suite before this repair layer existed.
         if tool_choice is not None and self._delegate_supports_tool_choice:
             kwargs["tool_choice"] = tool_choice
+        if temperature is not None and self._delegate_supports_temperature:
+            kwargs["temperature"] = temperature
         return self._delegate.stream(messages, **kwargs)
 
     async def _repair(
@@ -174,6 +189,7 @@ class NavigatorToolRepairClient:
         max_tokens: int | None = None,
         *,
         tool_choice: Any = None,
+        temperature: float | None = None,
     ):
         if not _is_navigator_toolset(tools):
             async for event in self._stream_delegate(
@@ -181,6 +197,7 @@ class NavigatorToolRepairClient:
                 tools=tools,
                 max_tokens=max_tokens,
                 tool_choice=tool_choice,
+                temperature=temperature,
             ):
                 yield event
             return

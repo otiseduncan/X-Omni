@@ -17,6 +17,10 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "vehicle_match": "MATCHES",
         "evidence": {field: "PRESENT" for field in review.EVIDENCE_FIELDS},
         "objective_match": "EXACT_MATCH",
+        "requirement_location": "WINDSHIELD",
+        "page_location": "WINDSHIELD",
+        "same_unit": "SAME",
+        "page_structure": "STEPS_FOR_ONE_SYSTEM",
         "dependencies": [],
         "decision": "ACCEPT",
         "confidence": 0.88,
@@ -327,3 +331,103 @@ def test_the_prompt_defines_the_actual_procedure_by_the_work_not_the_word():
     for operation in ("calibration", "aiming", "initialization", "zero-point"):
         assert operation in prompt
     assert "EXACT_MATCH with its execution steps present is the ACTUAL_PROCEDURE" in prompt
+
+
+def test_a_neighbouring_sensor_on_the_same_module_is_a_different_component():
+    prompt = review.REVIEW_SYSTEM_PROMPT
+    assert "different sensor that is calibrated through the same control module or scan-tool menu" in prompt
+    assert "not merely a neighbouring one" in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_review_is_requested_deterministically_when_the_client_allows_it():
+    seen = {}
+
+    class Client:
+        async def stream(self, messages, tools=None, max_tokens=None, tool_choice=None, temperature=None):
+            seen["temperature"] = temperature
+            yield {"type": "tool_call", "id": "r", "name": review.REVIEW_TOOL_NAME, "arguments": json.dumps(_payload())}
+
+    await review.review_candidate(
+        client=Client(),
+        objective={"objective": "front camera calibration"},
+        vehicle={"year": 2026, "make": "Hyundai", "model": "Tucson"},
+        candidate={"title": "Camera", "url": "u", "text": "Camera aiming with target board placement and scan tool steps."},
+        provider="alldata",
+    )
+    assert seen["temperature"] == review.REVIEW_TEMPERATURE == 0.0
+
+
+@pytest.mark.asyncio
+async def test_the_navigator_repair_wrapper_passes_the_review_temperature_through():
+    from core.services.research_navigator_tool_repair import NavigatorToolRepairClient
+
+    seen = {}
+
+    class Client:
+        async def stream(self, messages, tools=None, max_tokens=None, tool_choice=None, temperature=None):
+            seen["temperature"] = temperature
+            yield {"type": "tool_call", "id": "r", "name": review.REVIEW_TOOL_NAME, "arguments": json.dumps(_payload())}
+
+    await review.review_candidate(
+        client=NavigatorToolRepairClient(Client()),
+        objective={"objective": "front camera calibration"},
+        vehicle={"year": 2026, "make": "Hyundai", "model": "Tucson"},
+        candidate={"title": "Camera", "url": "u", "text": "Camera aiming with target board placement and scan tool steps."},
+        provider="alldata",
+    )
+    assert seen["temperature"] == 0.0
+
+
+def test_an_exact_match_on_a_unit_the_reviewer_called_different_keeps_searching():
+    verdict = review.validate_review(_payload(requirement_system="Steering Angle Sensor", page_system="Vehicle Dynamic Sensor", same_unit="DIFFERENT"))
+    assert verdict["decision"] == "CONTINUE_SEARCH"
+    assert verdict["original_decision"] == "ACCEPT"
+    assert "same_unit=DIFFERENT" in verdict["inconsistent"]
+
+
+def test_an_exact_match_at_a_different_place_on_the_vehicle_keeps_searching():
+    verdict = review.validate_review(_payload(requirement_location="REAR", page_location="FRONT"))
+    assert verdict["decision"] == "CONTINUE_SEARCH"
+    assert any("page_location=FRONT" in item for item in verdict["inconsistent"])
+
+
+def test_whole_vehicle_or_unstated_locations_do_not_contradict_a_match():
+    assert review.validate_review(_payload(requirement_location="FRONT", page_location="WHOLE_VEHICLE"))["decision"] == "ACCEPT"
+    assert review.validate_review(_payload(requirement_location="NOT_STATED", page_location="REAR"))["decision"] == "ACCEPT"
+
+
+def test_an_uncertain_unit_cannot_close_the_primary_objective():
+    verdict = review.validate_review(_payload(same_unit="UNCERTAIN"))
+    assert verdict["decision"] == "UNCERTAIN"
+
+
+def test_a_dependency_document_is_not_held_to_the_primary_unit():
+    verdict = review.validate_review(
+        _payload(classification="REQUIRED_SUPPORTING_PROCEDURE", same_unit="DIFFERENT", requirement_location="FRONT", page_location="WHOLE_VEHICLE"),
+        role="dependency",
+    )
+    assert verdict["decision"] == "ACCEPT"
+
+
+def test_units_and_locations_are_generated_before_the_match():
+    order = list(review.REVIEW_TOOL_SCHEMA["function"]["parameters"]["properties"])
+    assert order.index("requirement_system") < order.index("page_system") < order.index("same_unit") < order.index("objective_match")
+    assert order.index("requirement_location") < order.index("objective_match")
+    assert order.index("page_location") < order.index("objective_match")
+
+
+def test_an_index_of_required_procedures_is_not_the_procedure():
+    prompt = review.REVIEW_SYSTEM_PROMPT
+    assert "is an index: its execution_steps are REFERENCED_ELSEWHERE" in prompt
+
+
+def test_a_table_of_procedures_for_many_systems_cannot_close_the_primary_objective():
+    verdict = review.validate_review(_payload(page_structure="LIST_OR_TABLE_OF_MANY_SYSTEMS"))
+    assert verdict["decision"] == "CONTINUE_SEARCH"
+    assert "page_structure=LIST_OR_TABLE_OF_MANY_SYSTEMS" in verdict["inconsistent"]
+
+
+def test_page_structure_is_the_first_thing_generated():
+    order = list(review.REVIEW_TOOL_SCHEMA["function"]["parameters"]["properties"])
+    assert order[0] == "page_structure"

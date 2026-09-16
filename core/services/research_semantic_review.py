@@ -29,6 +29,7 @@ words.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from typing import Any, Optional
@@ -40,6 +41,7 @@ REVIEW_TEXT_CHARS = 24_000
 REVIEW_MAX_LINKS = 60
 REVIEW_MAX_DEPENDENCIES = 6
 REVIEW_MAX_TOKENS = 1_000
+REVIEW_TEMPERATURE = 0.0
 
 CLASSIFICATIONS: tuple[str, ...] = (
     "ACTUAL_PROCEDURE",
@@ -50,6 +52,26 @@ CLASSIFICATIONS: tuple[str, ...] = (
     "WIRING_OR_COMPONENT_INFORMATION",
     "UNRELATED",
     "UNCERTAIN",
+)
+# Where on the vehicle a sensor or system is. Chosen by the reviewer for the
+# requirement and, separately, for the page's own steps; only their agreement
+# is checked structurally.
+LOCATIONS: tuple[str, ...] = (
+    "FRONT",
+    "REAR",
+    "SIDE",
+    "WINDSHIELD",
+    "INTERIOR_OR_SEAT",
+    "STEERING_OR_CHASSIS",
+    "WHOLE_VEHICLE",
+    "NOT_STATED",
+)
+SAME_UNIT: tuple[str, ...] = ("SAME", "DIFFERENT", "UNCERTAIN")
+# How the page is built, judged before anything about what it is for.
+PAGE_STRUCTURES: tuple[str, ...] = (
+    "STEPS_FOR_ONE_SYSTEM",
+    "LIST_OR_TABLE_OF_MANY_SYSTEMS",
+    "DESCRIPTION_OR_NAVIGATION",
 )
 PROCEDURE_TYPES: tuple[str, ...] = (
     "STATIC_RADAR",
@@ -126,7 +148,56 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
         "parameters": {
             "type": "object",
             "properties": {
+                "page_structure": {
+                    "type": "string",
+                    "enum": list(PAGE_STRUCTURES),
+                    "description": (
+                        "How this page is built: numbered or ordered instructions for one "
+                        "system; a list or table covering many systems or parts that names "
+                        "a procedure for each; or a description, overview, or menu."
+                    ),
+                },
                 "vehicle_match": {"type": "string", "enum": list(VEHICLE_MATCH)},
+                "requirement_system": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 200,
+                    "description": (
+                        "The sensor or system the requirement refers to, in the vehicle "
+                        "manufacturer's terms, including where it is on the vehicle."
+                    ),
+                },
+                "requirement_location": {
+                    "type": "string",
+                    "enum": list(LOCATIONS),
+                    "description": "Where on the vehicle the requirement's sensor or system is.",
+                },
+                "page_system": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 200,
+                    "description": (
+                        "The sensor or system this page's own steps work on -- which unit is "
+                        "adjusted and where targets or the vehicle are positioned -- not the "
+                        "section or menu the page is filed under."
+                    ),
+                },
+                "page_location": {
+                    "type": "string",
+                    "enum": list(LOCATIONS),
+                    "description": (
+                        "Where on the vehicle the unit this page's steps adjust is -- read from "
+                        "the steps (where targets go, which unit is removed or aimed)."
+                    ),
+                },
+                "same_unit": {
+                    "type": "string",
+                    "enum": list(SAME_UNIT),
+                    "description": (
+                        "Is page_system the same physical sensor or system as "
+                        "requirement_system? Different names for different units are DIFFERENT."
+                    ),
+                },
                 "evidence": {
                     "type": "object",
                     "properties": {
@@ -177,7 +248,13 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
                 "evidence_summary": {"type": "string", "minLength": 1, "maxLength": 1200},
             },
             "required": [
+                "page_structure",
                 "vehicle_match",
+                "requirement_system",
+                "requirement_location",
+                "page_system",
+                "page_location",
+                "same_unit",
                 "evidence",
                 "objective_match",
                 "classification",
@@ -211,16 +288,31 @@ REVIEW_SYSTEM_PROMPT = (
     "beam-axis confirmation or adjustment is the procedure, and one that only tells the "
     "technician whether some other procedure is needed is supporting material. "
     "Removal/replacement, wiring, diagnostics, component descriptions, and system "
-    "overviews are not the procedure merely because they mention the component.\n\n"
+    "overviews are not the procedure merely because they mention the component. A "
+    "table or list of which procedures are needed after a repair, naming the document "
+    "for each, is an index: its execution_steps are REFERENCED_ELSEWHERE even when it "
+    "names the right system.\n\n"
     "EVIDENCE TABLE. Fill it honestly from the page text: PRESENT only when the page "
     "itself contains it; REFERENCED_ELSEWHERE when the page points to another document "
     "for it; NOT_APPLICABLE when that kind of content does not belong to this procedure; "
     "otherwise MISSING_OR_UNCERTAIN.\n\n"
-    "OBJECTIVE MATCH. Compare what the page actually performs with the requested system "
-    "and operation, and set procedure_type to what the page itself calibrates, not to "
-    "what the objective asked for. EXACT_MATCH: it performs the requested work. "
+    "PAGE STRUCTURE. Before anything else, say how the page is built. A page covering many "
+    "systems or parts in a list or table, even one that names the right procedure for the "
+    "right system, is LIST_OR_TABLE_OF_MANY_SYSTEMS, and only STEPS_FOR_ONE_SYSTEM can be "
+    "the procedure.\n\n"
+    "OBJECTIVE MATCH. First name the sensor or system the requirement refers to "
+    "(requirement_system) and, separately, the one this page works on (page_system), each "
+    "with its location on the vehicle, then say whether they are the same unit (same_unit); "
+    "different names for different sensors are DIFFERENT even when one module calibrates both. "
+    "Name the page's from what its steps do, not from the "
+    "section it is filed under, which often groups several sensors. EXACT_MATCH only when those are the same sensor or "
+    "system and the page performs the requested work on it; set procedure_type to what "
+    "the page itself calibrates, not to what the objective asked for. "
     "SAME_COMPONENT_WRONG_PROCEDURE: right component, different operation or article. "
-    "DIFFERENT_COMPONENT: another component in the same broad area. "
+    "DIFFERENT_COMPONENT: another component in the same broad area -- including a "
+    "different sensor that is calibrated through the same control module or scan-tool "
+    "menu, or a page filed under another component's section. The page must work on "
+    "the sensor or system the requirement names, not merely a neighbouring one. "
     "DIFFERENT_SENSOR_FAMILY: a different kind of sensor -- a camera procedure never "
     "satisfies a radar requirement and a radar procedure never satisfies a camera one. "
     "UNCERTAIN: the evidence does not let you tell.\n\n"
@@ -252,6 +344,17 @@ REVIEW_SYSTEM_PROMPT = (
     "vehicle; UNCERTAIN when the evidence does not let you tell. Report through the "
     "review tool only."
 )
+
+
+def _accepts_temperature(client: Any) -> bool:
+    try:
+        parameters = inspect.signature(client.stream).parameters.values()
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return any(
+        parameter.name == "temperature" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 class SemanticReviewError(ValueError):
@@ -383,6 +486,22 @@ def validate_review(
         if status not in EVIDENCE_STATUSES:
             raise SemanticReviewError(f"evidence.{field} is missing or unknown")
         evidence[field] = status
+    raw_structure = payload.get("page_structure")
+    page_structure = str(raw_structure).strip() if raw_structure not in (None, "") else ""
+    if page_structure and page_structure not in PAGE_STRUCTURES:
+        raise SemanticReviewError("page_structure is unknown")
+    locations = {}
+    for field in ("requirement_location", "page_location"):
+        value = str(payload.get(field) or "NOT_STATED").strip()
+        if value not in LOCATIONS:
+            raise SemanticReviewError(f"{field} is unknown")
+        locations[field] = value
+    raw_same_unit = payload.get("same_unit")
+    same_unit = str(raw_same_unit).strip() if raw_same_unit not in (None, "") else ""
+    if same_unit and same_unit not in SAME_UNIT:
+        raise SemanticReviewError("same_unit is unknown")
+    requirement_system = _clean(payload.get("requirement_system"), 200) or None
+    page_system = _clean(payload.get("page_system"), 200) or None
     raw_match = payload.get("objective_match")
     objective_match = str(raw_match).strip() if raw_match not in (None, "") else ""
     if objective_match and objective_match not in OBJECTIVE_MATCH:
@@ -430,6 +549,11 @@ def validate_review(
         "vehicle_match": vehicle_match,
         "evidence": evidence,
         "objective_match": objective_match or None,
+        "requirement_system": requirement_system,
+        "page_system": page_system,
+        **locations,
+        "same_unit": same_unit or None,
+        "page_structure": page_structure or None,
         "dependencies": dependencies,
         "decision": decision,
         "confidence": round(confidence, 3),
@@ -479,6 +603,20 @@ def validate_review(
         # A dependency task was created to fetch a different, named document,
         # so comparing it with the primary objective would be the wrong test.
         if role == "primary":
+            # The reviewer's own naming of the two units: a page it says works
+            # on a different unit, or in a different place on the vehicle,
+            # cannot be the exact match it also claims.
+            if page_structure and page_structure != "STEPS_FOR_ONE_SYSTEM":
+                wrong_target.append(f"page_structure={page_structure}")
+            if same_unit == "DIFFERENT":
+                wrong_target.append("same_unit=DIFFERENT")
+            elif same_unit == "UNCERTAIN":
+                ungrounded.append("same_unit=UNCERTAIN")
+            stated = {locations["requirement_location"], locations["page_location"]} - {"NOT_STATED"}
+            if len(stated) == 2 and "WHOLE_VEHICLE" not in stated:
+                wrong_target.append(
+                    f"requirement_location={locations['requirement_location']} but page_location={locations['page_location']}"
+                )
             if objective_match in WRONG_TARGET_MATCHES:
                 wrong_target.append(f"objective_match={objective_match}")
             elif objective_match != "EXACT_MATCH":
@@ -547,16 +685,16 @@ async def review_candidate(
         provider=provider,
         screenshot=screenshot,
     )
+    stream_options: dict[str, Any] = {
+        "tools": [REVIEW_TOOL_SCHEMA],
+        "max_tokens": REVIEW_MAX_TOKENS,
+        "tool_choice": "required",
+    }
+    if _accepts_temperature(client):
+        # The same page must get the same verdict on every run.
+        stream_options["temperature"] = REVIEW_TEMPERATURE
     try:
-        events = [
-            event
-            async for event in client.stream(
-                messages,
-                tools=[REVIEW_TOOL_SCHEMA],
-                max_tokens=REVIEW_MAX_TOKENS,
-                tool_choice="required",
-            )
-        ]
+        events = [event async for event in client.stream(messages, **stream_options)]
     except Exception as exc:  # noqa: BLE001 - a failed review is an UNCERTAIN verdict
         log.warning("semantic review model call failed", exc_info=True)
         return malformed_review(f"model call failed: {type(exc).__name__}: {exc}")

@@ -130,6 +130,7 @@ async def test_stream_forwards_required_tool_choice_without_changing_default(mon
         _max_tokens=None,
         *,
         tool_choice=None,
+        temperature=None,
     ):
         observed.append(tool_choice)
         yield {"type": "tool_call", "name": "read", "arguments": "{}"}

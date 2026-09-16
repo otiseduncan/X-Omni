@@ -68,8 +68,12 @@ class ModelClient:
         max_tokens: Optional[int] = None,
         *,
         tool_choice: Optional[str | dict[str, Any]] = None,
+        temperature: Optional[float] = None,
     ) -> AsyncIterator[dict]:
         """Stream a turn, recovering once if the worker has died.
+
+        ``temperature`` overrides the conversational default for one call; a
+        judgement that must not vary between runs passes 0.
 
         A bare httpx ConnectError surfaces to the user as "All connection
         attempts failed", which says nothing useful. If the worker port is
@@ -90,6 +94,7 @@ class ModelClient:
                     tools,
                     max_tokens,
                     tool_choice=tool_choice,
+                    temperature=temperature,
                 ):
                     emitted = True
                     yield event
@@ -105,6 +110,7 @@ class ModelClient:
                         tools,
                         max_tokens,
                         tool_choice=tool_choice,
+                        temperature=temperature,
                     ):
                         yield event
                 return
@@ -137,6 +143,7 @@ class ModelClient:
                     tools,
                     max_tokens,
                     tool_choice=tool_choice,
+                    temperature=temperature,
                 ):
                     yield event
         except (httpx.ConnectError, WorkerSwapError) as exc:
@@ -155,6 +162,7 @@ class ModelClient:
         max_tokens: Optional[int] = None,
         *,
         tool_choice: Optional[str | dict[str, Any]] = None,
+        temperature: Optional[float] = None,
     ) -> AsyncIterator[dict]:
         """Yields {"type": "content", "text": ...} as tokens arrive, then
         {"type": "tool_call", ...} for any accumulated calls once the
@@ -165,7 +173,7 @@ class ModelClient:
             "model": cfg.alias,
             "messages": messages,
             "stream": True,
-            "temperature": self.temperature,
+            "temperature": self.temperature if temperature is None else float(temperature),
             "max_tokens": max_tokens or self.max_tokens,
         }
         if tools:
