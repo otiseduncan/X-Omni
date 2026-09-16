@@ -2,7 +2,7 @@
 
 A failed Navigator objective may preserve a source URL even when the provider
 returns no usable page title. The card previously rendered that as an external-
-link icon with no text, leaving two failed objectives visually anonymous. This
+link icon with no text, leaving failed objectives visually anonymous. This
 adapter adds only presentation identity already present in the objective: the
 calibration name plus "last reviewed candidate". It does not change research
 outcomes, reviewer decisions, URLs, or attachment truth.
@@ -18,36 +18,42 @@ _FAILURE_OUTCOMES = frozenset({"not_found", "uncertain", "incomplete", "found_no
 
 
 def _clean(value: Any, limit: int = 240) -> str:
-    text = str(value or "").replace("\u200b", "").replace("\ufeff", "")
+    text = str(value or "")
+    # Provider/UI strings occasionally carry directional/zero-width format
+    # marks. They make a Python string truthy and a React link render, while
+    # leaving no human-visible title beside the external-link icon.
+    text = "".join(ch for ch in text if not (ch.isspace() or ch in {"\u200b", "\ufeff", "\u200e", "\u200f"})) if text and not any(ch.isalnum() for ch in text) else text
     return " ".join(text.split())[:limit]
+
+
+def _has_visible_title(value: Any) -> bool:
+    title = _clean(value)
+    return bool(title and any(ch.isalnum() for ch in title))
 
 
 def _repair_row(row: Any) -> None:
     if not isinstance(row, dict):
         return
-    title = _clean(row.get("title"))
-    if title:
-        row["title"] = title
+
+    outcome = str(row.get("outcome") or "")
+    reason = _clean(row.get("reason"), 300)
+    reasons = [
+        _clean(item, 300)
+        for item in (row.get("incomplete_reasons") or [])
+        if _clean(item, 300)
+    ]
+    if outcome in _FAILURE_OUTCOMES and reason and reason not in reasons:
+        reasons.append(reason)
+        row["incomplete_reasons"] = reasons
+
+    if _has_visible_title(row.get("title")):
+        row["title"] = _clean(row.get("title"))
         return
     if not _clean(row.get("source_url"), 1000):
         return
 
     calibration = _clean(row.get("calibration"), 180) or "Research objective"
     row["title"] = f"{calibration} — last reviewed candidate"
-
-    # ResearchObjectiveRow normally shows `reason` only when there is no title.
-    # Preserve the failure explanation after adding the fallback title by also
-    # carrying it in the always-rendered incomplete-reasons list.
-    if str(row.get("outcome") or "") in _FAILURE_OUTCOMES:
-        reason = _clean(row.get("reason"), 300)
-        reasons = [
-            _clean(item, 300)
-            for item in (row.get("incomplete_reasons") or [])
-            if _clean(item, 300)
-        ]
-        if reason and reason not in reasons:
-            reasons.append(reason)
-        row["incomplete_reasons"] = reasons
 
 
 def install(research_module: Any) -> None:
