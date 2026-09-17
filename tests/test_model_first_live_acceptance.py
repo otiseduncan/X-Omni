@@ -443,7 +443,8 @@ class FixtureBackends:
             rows = [
                 row
                 for row in SWEEP_MISSING
-                if not phases or row["phase"] in phases
+                if (not phases or row["phase"] in phases)
+                and row["ro_number"] not in self._sweep_attached()
             ]
             scope = f"phases {', '.join(phases)}" if phases else "the active board"
             return {
@@ -528,9 +529,13 @@ class FixtureBackends:
         scope = f"phases {', '.join(phases)}" if phases else "the active board"
         if self.store is not None:
             # Persist what the real service persists so the next turn's
-            # background-work context reflects a running sweep.
+            # background-work context reflects a running sweep. That context is
+            # scoped to the chat, so the record carries its conversation_id;
+            # without it the model and its review never saw the running sweep.
             from core.services import adas_map_sweep as sweep_svc
             from datetime import UTC, datetime
+
+            context = args.get(sweep_svc.INVOCATION_KEY) or {}
 
             self.store.put_record(
                 sweep_svc.NAMESPACE,
@@ -538,6 +543,7 @@ class FixtureBackends:
                 {
                     "sweep_id": "sweep-fixture-1",
                     "user_id": "local-dev",
+                    "conversation_id": context.get("conversation_id"),
                     "state": "running",
                     "scope_label": scope,
                     "started_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
@@ -610,6 +616,15 @@ class FixtureBackends:
             ),
         }
 
+    def _sweep_attached(self) -> set[str]:
+        """ROs a finished sweep attached a map to; CIQ no longer lists them missing."""
+
+        record = self._sweep_record()
+        if record is None or record.get("state") != "completed":
+            return set()
+        group = next(g for g in SWEEP_FINISHED["groups"] if g["outcome"] == "attached")
+        return {ro["ro_number"] for ro in group["ros"]}
+
     def _sweep_record(self) -> dict[str, Any] | None:
         if self.store is None:
             return None
@@ -636,6 +651,15 @@ class FixtureBackends:
             }
         )
         self.store.put_record(sweep_svc.NAMESPACE, "sweep-fixture-1", record, user_id="local-dev")
+        # The real job posts its result card into the chat that started it.
+        if record.get("conversation_id") is not None:
+            self.store.add_message(
+                int(record["conversation_id"]),
+                "assistant",
+                SWEEP_FINISHED["message"],
+                worker_used="core",
+                artifacts=[{"type": "adas_map_sweep", "data": deepcopy(SWEEP_FINISHED)}],
+            )
 
     async def get_calendar(self, args: dict[str, Any]) -> dict[str, Any]:
         self._record("get_calendar", args)
@@ -1822,6 +1846,42 @@ def test_live_qwen_model_first_conversational_acceptance() -> None:
     print(json.dumps(report, indent=2, ensure_ascii=False))
     failures = [row for row in report["results"] if row["status"] == "failed"]
     assert not failures, json.dumps(failures, indent=2, ensure_ascii=False)
+
+
+def test_fixture_sweep_matches_what_production_shows_the_next_turn(tmp_path) -> None:
+    """Runs without the model. The fixture once stored no conversation_id, so the
+    chat-scoped background context never saw its running sweep, and finishing it
+    posted nothing; the morning routine then failed for reasons production lacks."""
+
+    from core.services import adas_map_sweep as sweep_svc
+    from core.state.db import Store
+
+    store = Store(tmp_path / "fixture.sqlite")
+    conversation_id = store.create_conversation("fixture sweep")
+    backends = FixtureBackends()
+    backends.store = store
+    asyncio.run(
+        backends.adas_map_sweep(
+            {"phases": ["1"], sweep_svc.INVOCATION_KEY: {"conversation_id": conversation_id}}
+        )
+    )
+    line = sweep_svc.latest_context_line(
+        store, "local-dev", conversation_id=conversation_id, include_completed=False
+    )
+    assert line and "running" in line
+
+    backends.finish_sweep()
+    assert sweep_svc.latest_context_line(
+        store, "local-dev", conversation_id=conversation_id, include_completed=False
+    ) is None
+    posted = store.get_messages(conversation_id)[-1]
+    assert posted["role"] == "assistant"
+    assert posted["content"] == SWEEP_FINISHED["message"]
+    inventory = asyncio.run(
+        backends.calibration_iq_work_prep({"mode": "adas_map_inventory"})
+    )
+    assert inventory["adas_map_missing_count"] == 8
+    store.close()
 
 
 def _main(argv: list[str]) -> int:

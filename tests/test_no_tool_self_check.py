@@ -507,3 +507,97 @@ async def test_background_record_leads_the_review_and_idle_record_when_nothing_r
     assert seen[1].startswith("Internal evidence check;")
     assert "ADAS Map sweep: running." in seen[1]
     assert IDLE_BACKGROUND_REVIEW_PREFIX not in seen[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "expected"),
+    [
+        ({"valid": True}, "The sweep started; nothing is attached yet."),
+        ({"valid": False, "contradictions": ["called the sweep complete"]}, "START MESSAGE"),
+    ],
+)
+async def test_started_background_work_answer_is_truth_reviewed_against_the_record(
+    tmp_path, verdict: dict[str, Any], expected: str
+) -> None:
+    from core.orchestrator import truth_review
+    from core.services import adas_map_sweep as sweep_mod
+
+    store = Store(tmp_path / "started-sweep.sqlite")
+    conversation_id = store.create_conversation("sweep")
+    user_message_id = store.add_message(conversation_id, "user", "Get their ADAS maps.")
+    registry = Registry("config/tools.yaml", store=store, profile="adas_operator")
+
+    async def adas_map_sweep(args: dict[str, Any]) -> dict[str, Any]:
+        store.put_record(
+            sweep_mod.NAMESPACE,
+            "s1",
+            {
+                "sweep_id": "s1",
+                "user_id": "local-dev",
+                "conversation_id": conversation_id,
+                "state": "running",
+                "scope_label": "phases 5, 6",
+                "started_at": "2026-09-16T09:20:00+00:00",
+                "targets": [{"finished": False}],
+            },
+            user_id="local-dev",
+        )
+        return {"status": "running", "executed": True, "message": "START MESSAGE"}
+
+    registry.register("adas_map_sweep", adas_map_sweep)
+
+    reviews: list[str] = []
+
+    class Client:
+        supports_no_tool_self_check = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, messages, tools=None, *, tool_choice=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "type": "tool_call",
+                    "id": "sweep-1",
+                    "name": "stage_action",
+                    "arguments": json.dumps({"operation": "sweep_adas_maps"}),
+                }
+                return
+            last = str(messages[-1].get("content") or "")
+            if last.endswith(truth_review.TRUTH_REVIEW_INSTRUCTION):
+                reviews.append(last)
+                yield {"type": "content", "text": json.dumps(verdict)}
+                return
+            if last.startswith("Internal correction"):
+                yield {"type": "content", "text": "The sweep is complete."}
+                return
+            yield {
+                "type": "content",
+                "text": (
+                    "The sweep started; nothing is attached yet."
+                    if verdict["valid"]
+                    else "The sweep is complete."
+                ),
+            }
+
+    events = [event async for event in _orchestrator(Client(), registry, store).run_turn(
+        conversation_id,
+        "Get their ADAS maps.",
+        approval_context={
+            "session_id": "local:local-dev",
+            "user_id": "local-dev",
+            "role": "owner",
+            "message_id": user_message_id,
+        },
+    )]
+
+    final_text = "".join(event["text"] for event in events if event.get("type") == "token")
+    assert final_text == expected
+    assert reviews and all(
+        review.startswith("Core's own record of background work")
+        and "ADAS Map sweep for phases 5, 6 is still running" in review
+        for review in reviews
+    )
+    store.close()

@@ -1969,6 +1969,52 @@ class Orchestrator:
                 return regenerated
         return truth_review_mod.fail_closed_text(state)
 
+    async def _background_start_truth_reviewed_text(
+        self,
+        messages: list[dict[str, Any]],
+        candidate: str,
+        started: list[dict[str, Any]],
+        record: Optional[str],
+    ) -> str:
+        """Validate the answer for a turn that started background work.
+
+        Live acceptance on 2026-09-16: after starting a sweep and reading its
+        status as running, X answered "the sweep ... is complete" 3 of 6 times.
+        Same bounded review as a mutation turn; when no wording survives, the
+        fail-closed answer is the job's own start message from Core.
+        """
+        fit_messages_to_window(
+            messages,
+            [],
+            context_tokens=int(getattr(self.settings, "context_tokens", 32_768)),
+            reserve_tokens=int(getattr(self.settings, "max_response_tokens", 1_536)) + 1_500,
+        )
+        fallback = " ".join(
+            str(item.get("message") or "").strip() for item in started
+        ).strip() or "The background work started; its results post to this chat when it finishes."
+        candidate = (candidate or "").strip()
+        if not candidate:
+            return fallback
+        review = await truth_review_mod.review_candidate(
+            self.client, messages, candidate, record=record
+        )
+        if review is None:
+            return fallback
+        if review.valid:
+            return candidate
+        regenerated = (
+            await truth_review_mod.regenerate_candidate(
+                self.client, messages, candidate, review
+            )
+        ).strip()
+        if regenerated:
+            second = await truth_review_mod.review_candidate(
+                self.client, messages, regenerated, record=record
+            )
+            if second is not None and second.valid:
+                return regenerated
+        return fallback
+
     async def run_turn(
         self,
         conversation_id: int,
@@ -2101,6 +2147,8 @@ class Orchestrator:
         last_calibration_iq_operator_result: Optional[dict[str, Any]] = None
         calibration_iq_operator_results: list[dict[str, Any]] = []
         calibration_iq_work_prep_results: list[dict[str, Any]] = []
+        # Background jobs (ADAS Map sweep, SI research) this turn started.
+        background_started_results: list[dict[str, Any]] = []
         calibration_iq_truth_emitted = False
         # Tracks the most recent web_research_current result across rounds
         # regardless of whether the call was model-chosen or (formerly)
@@ -2509,6 +2557,11 @@ class Orchestrator:
             guarded_calibration_iq_response = bool(
                 calibration_iq_mutation_turn and not tool_calls
             )
+            guarded_background_response = bool(
+                background_started_results
+                and not tool_calls
+                and not calibration_iq_mutation_turn
+            )
             guarded_web_response = bool(
                 last_web_research_result is not None
                 and not tool_calls
@@ -2537,6 +2590,7 @@ class Orchestrator:
                 not tool_calls
                 and not calibration_iq_mutation_turn
                 and not guarded_web_response
+                and not guarded_background_response
             ):
                 if synthesis_boundary_failed:
                     yield {"type": "token", "text": TOOL_ROUND_CAP_FALLBACK}
@@ -2558,6 +2612,26 @@ class Orchestrator:
                 yield {"type": "token", "text": reviewed_text}
                 full_text += reviewed_text
                 calibration_iq_truth_emitted = True
+            elif guarded_background_response:
+                record = " ".join(
+                    line
+                    for line in (
+                        svc.latest_context_line(
+                            self.store,
+                            effective_context.get("user_id"),
+                            for_model=False,
+                            conversation_id=conversation_id,
+                            include_completed=False,
+                        )
+                        for svc in (adas_map_sweep_svc, adas_si_research_svc)
+                    )
+                    if line
+                ) or None
+                reviewed_text = await self._background_start_truth_reviewed_text(
+                    messages, round_text, background_started_results, record
+                )
+                yield {"type": "token", "text": reviewed_text}
+                full_text += reviewed_text
             elif guarded_web_response:
                 guarded_text = web_research_fallback_summary(last_web_research_result)
                 yield {"type": "token", "text": guarded_text}
@@ -2794,6 +2868,10 @@ class Orchestrator:
                                 calibration_iq_operator_results.append(
                                     last_calibration_iq_operator_result
                                 )
+                            if hook_result.get("stage") == "started" and isinstance(
+                                hook_result.get("execution"), dict
+                            ):
+                                background_started_results.append(hook_result["execution"])
                         elif call.get("name") == "capability_search":
                             unlocked = hook_result.get("unlocked_tools")
                             if isinstance(unlocked, list):

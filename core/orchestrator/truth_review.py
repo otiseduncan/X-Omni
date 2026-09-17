@@ -132,14 +132,33 @@ async def _no_tool_completion(client: Any, messages: list[dict[str, Any]]) -> st
     return text
 
 
+RECORD_REVIEW_PREFIX = (
+    "Core's own record of background work, current as of this message: {record} A "
+    "message that calls this work complete, done, or finished, or says anything from it "
+    "was attached or acquired, contradicts that record. "
+)
+
+
 async def review_candidate(
-    client: Any, base_messages: list[dict[str, Any]], candidate: str
+    client: Any,
+    base_messages: list[dict[str, Any]],
+    candidate: str,
+    *,
+    record: Optional[str] = None,
 ) -> Optional[TruthReview]:
-    """Run the truth review once. None means the reviewer was unavailable."""
+    """Run the truth review once. None means the reviewer was unavailable.
+
+    ``record`` is Core's structured truth about running background work; it
+    leads the instruction, since the reviewer weighed a record appended after
+    the generic checklist too lightly.
+    """
+    instruction = TRUTH_REVIEW_INSTRUCTION
+    if record:
+        instruction = RECORD_REVIEW_PREFIX.format(record=record) + instruction
     review_messages = [
         *base_messages,
         {"role": "assistant", "content": candidate},
-        {"role": "user", "content": TRUTH_REVIEW_INSTRUCTION},
+        {"role": "user", "content": instruction},
     ]
     try:
         raw = await _no_tool_completion(client, review_messages)
