@@ -22,7 +22,9 @@ verified external evidence into ADAS SI through the existing capture paths.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+import re
 from typing import Any, Callable, Optional
 
 log = logging.getLogger("xomni.research_delegate")
@@ -36,6 +38,23 @@ DEFAULT_SOURCE_ORDER: tuple[str, ...] = (
 MAX_FINDINGS = 8
 EXCERPT_CHARS = 1_500
 ALLDATA_EXTRACT_CHARS = 4_000
+# ADAS SI pages keep their line structure and get room for a whole table page;
+# every excerpt together stays well inside the model's tool-result budget so no
+# finding is dropped to make room for another's text.
+ADAS_EXCERPT_CHARS = 3_200
+TOTAL_EXCERPT_CHARS = 7_000
+MIN_EXCERPT_CHARS = 400
+# Returned with every result. The findings are evidence for X to interpret, not
+# text to relay: live, X pasted a flattened OCR table into its answer and then
+# answered from general knowledge instead of from what the table said.
+READING_GUIDE = (
+    "Findings are source evidence for you to interpret, listed in source-authority "
+    "order. Excerpts keep the source's line structure; in OCR'd tables ' | ' separates "
+    "columns and each row lines up with the header row above it. Work out what the "
+    "evidence means for Otis's question and answer in your own words; quote or show "
+    "raw excerpts only when he asks to see the source."
+)
+_COLUMN_GAP_RE = re.compile(r"[ \t]{3,}")
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -46,6 +65,31 @@ async def _maybe_await(value: Any) -> Any:
 
 def _clean(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
+
+
+def _clean_lines(value: Any, limit: int) -> str:
+    """Normalize spacing but keep rows: collapsing a table to one line destroys it."""
+    lines = []
+    for raw_line in str(value or "").splitlines():
+        cells = [" ".join(cell.split()) for cell in _COLUMN_GAP_RE.split(raw_line.strip())]
+        line = " | ".join(cell for cell in cells if cell)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)[:limit]
+
+
+def _bound_excerpts(findings: list[dict[str, Any]]) -> None:
+    """Share one excerpt budget across findings, in authority order."""
+    remaining = TOTAL_EXCERPT_CHARS
+    for finding in findings:
+        excerpt = finding.get("excerpt")
+        if not isinstance(excerpt, str):
+            continue
+        allowed = max(MIN_EXCERPT_CHARS, remaining)
+        if len(excerpt) > allowed:
+            finding["excerpt"] = excerpt[:allowed].rstrip()
+            finding["excerpt_truncated"] = True
+        remaining = max(0, remaining - len(finding["excerpt"]))
 
 
 def _vehicle(args: dict[str, Any]) -> dict[str, Any]:
@@ -91,12 +135,21 @@ def _adas_findings(result: dict[str, Any]) -> list[dict[str, Any]]:
     for item in (result.get("results") or [])[:MAX_FINDINGS]:
         if not isinstance(item, dict):
             continue
+        extraction = item.get("text_extraction") if isinstance(item.get("text_extraction"), dict) else {}
         finding = {
             "source": "adas_si",
             "title": _clean(item.get("title") or item.get("source"), 200),
             "relative_path": item.get("relative_path"),
             "page": item.get("page"),
-            "excerpt": _clean(item.get("excerpt"), EXCERPT_CHARS),
+            "excerpt": _clean_lines(item.get("excerpt"), ADAS_EXCERPT_CHARS),
+            "excerpt_truncated": True if item.get("excerpt_truncated") else None,
+            "text_method": extraction.get("method"),
+            "ocr_confidence": (
+                round(float(extraction["confidence"]), 2)
+                if extraction.get("method") == "ocr"
+                and isinstance(extraction.get("confidence"), (int, float))
+                else None
+            ),
             "url": item.get("url"),
         }
         if item.get("evidence_id"):
@@ -153,6 +206,81 @@ def _web_findings(result: dict[str, Any]) -> list[dict[str, Any]]:
         }
         findings.append({key: value for key, value in finding.items() if value not in (None, "")})
     return findings
+
+
+# Result fields the model reads above the findings. The request echo (objective,
+# vehicle, depth, source order) is left out: live, X searched with an invented
+# vehicle and then read the chart against that echo instead of the question.
+_MODEL_HEADER_KEYS = (
+    "status",
+    "verified",
+    "sources_checked",
+    "source_ledger",
+    "finding_count",
+    "evidence_ids",
+    "authentication_required",
+    "requires_human",
+    "message",
+    "reading_guide",
+)
+_FINDING_DETAIL_KEYS = (
+    "relative_path",
+    "record_id",
+    "lifecycle",
+    "provenance",
+    "semantic_review",
+    "documents",
+    "dependencies",
+    "complete",
+    "captured",
+    "task_id",
+)
+
+
+def result_text_for_model(result: Any, *, max_chars: int) -> str:
+    """Render a research result for the model: a small JSON header, then text.
+
+    Inside JSON an OCR table is one long string of escaped newlines, and the
+    live 30B worker read the Hyundai/Kia/Genesis bumper chart that way as
+    having no bumper information at all. Each finding's excerpt is therefore
+    given as its own block with real line breaks; the full structured result
+    still reaches the card, the store, and the evidence record unchanged.
+    """
+
+    if not isinstance(result, dict):
+        return json.dumps(result, default=str)[:max_chars]
+    header = {key: result[key] for key in _MODEL_HEADER_KEYS if key in result}
+    parts = [json.dumps(header, ensure_ascii=False, default=str)]
+    used = len(parts[0])
+    findings = result.get("findings") if isinstance(result.get("findings"), list) else []
+    for index, finding in enumerate(findings, start=1):
+        if not isinstance(finding, dict):
+            continue
+        label = [str(finding.get("source") or "source")]
+        if finding.get("page"):
+            label.append(f"page {finding['page']}")
+        if finding.get("text_method") == "ocr":
+            confidence = finding.get("ocr_confidence")
+            label.append("OCR" if confidence is None else f"OCR confidence {confidence}")
+        if finding.get("excerpt_truncated"):
+            label.append("excerpt shortened")
+        title = finding.get("title") or finding.get("url") or "Untitled"
+        block = [f"--- Finding {index}: {title} ({', '.join(label)}) ---"]
+        details = {
+            key: finding[key]
+            for key in _FINDING_DETAIL_KEYS
+            if finding.get(key) not in (None, "", [], {})
+        }
+        if details:
+            block.append(json.dumps(details, ensure_ascii=False, default=str))
+        block.append(str(finding.get("excerpt") or "(no text extracted)"))
+        text = "\n".join(block)
+        if used + len(text) + 2 > max_chars:
+            parts.append(f"--- {len(findings) - index + 1} more finding(s) omitted for length ---")
+            break
+        parts.append(text)
+        used += len(text) + 2
+    return "\n\n".join(parts)[:max_chars]
 
 
 def make_delegate_research(
@@ -379,6 +507,7 @@ def make_delegate_research(
             if entry.get("verified") and not exhaustive:
                 break
 
+        _bound_excerpts(findings)
         verified = any(item.get("verified") for item in ledger)
         checked = [item["source"] for item in ledger if item.get("attempted")]
         if verified:
@@ -400,6 +529,7 @@ def make_delegate_research(
             "source_ledger": ledger,
             "findings": findings,
             "finding_count": len(findings),
+            "reading_guide": READING_GUIDE,
             "evidence_ids": sorted(set(evidence_ids)),
             "authentication_required": authentication_required,
             "requires_human": requires_human,

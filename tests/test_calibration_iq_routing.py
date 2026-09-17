@@ -199,7 +199,11 @@ async def test_model_selected_truncated_list_preserves_truth_and_single_card_ord
         "done",
     ]
     assert events[1]["result"] == result
-    expected_artifact = {"type": "calibration_iq_ros", "data": result}
+    expected_artifact = {
+        "type": "calibration_iq_ros",
+        "data": result,
+        "presentation": "evidence",
+    }
     assert events[2]["artifact"] == expected_artifact
     assert events[3]["text"] == (
         "Showing 20 of 59 active repair orders in Macon phase 5."

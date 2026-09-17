@@ -111,6 +111,7 @@ class LiveModelClient:
     """The production client's event protocol over non-streaming completions."""
 
     supports_no_tool_self_check = True
+    supports_evidence_review = True
 
     def __init__(self, target: WorkerTarget, *, timeout: float = 300.0) -> None:
         self.target = target

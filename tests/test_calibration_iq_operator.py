@@ -3113,6 +3113,7 @@ async def test_natural_language_multi_action_request_executes_one_operator_batch
     ] == [{
         "type": "calibration_iq_receipt",
         "data": operator_result,
+        "presentation": "evidence",
     }]
     assert any(artifact["type"] == "calibration_iq_ro" for artifact in artifacts)
     row = store.conn.execute(

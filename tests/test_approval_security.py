@@ -358,7 +358,9 @@ def test_approval_request_and_terminal_receipt_are_persisted_as_message_artifact
         "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
     }
     staged_message = store.get_messages(conversation_id)[-1]
-    assert staged_message["artifacts"] == [{"type": "approval_request", "data": request}]
+    assert staged_message["artifacts"] == [
+        {"type": "approval_request", "data": request, "presentation": "primary"}
+    ]
     assert secret not in json.dumps(staged_message["artifacts"])
 
     raw_record = store.get_approval(request["id"])

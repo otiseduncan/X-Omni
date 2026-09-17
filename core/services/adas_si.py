@@ -79,6 +79,13 @@ MAX_RESULTS = 8
 MAX_MATCHED_DOCS = 5
 EXCERPT_LEAD = 350
 EXCERPT_LEN = 1800
+# A page this short is returned whole. A table page (a bumper chart, a
+# year-by-model matrix) only means something with its header row, and a
+# fixed window starting at the first matched word cut the live Kia rows off.
+FULL_PAGE_EXCERPT_CHARS = 4_000
+EXCERPT_HEAD_LINES = 6
+EXCERPT_CONTEXT_LINES = 2
+STRUCTURED_EXCERPT_CHARS = 3_200
 CACHE_SCHEMA_VERSION = "3"
 
 IGNORE_TOKENS = {
@@ -288,6 +295,52 @@ REFERENCE_MAKE_ALIASES: dict[str, tuple[str, ...]] = {
     "stellantis": ("chrysler", "dodge", "jeep", "ram"),
     "fca": ("chrysler", "dodge", "jeep", "ram"),
 }
+
+
+def page_excerpt(text: str, tokens: list[str]) -> tuple[str, bool]:
+    """Return a line-preserving excerpt of one page and whether it was cut.
+
+    Short pages come back whole. Longer pages keep their opening lines (the
+    title and any column header) plus the lines around every matched token, in
+    document order, with an explicit gap marker. Line breaks are never
+    collapsed: rows and columns are the meaning of a table page.
+    """
+    body = str(text or "").strip()
+    if len(body) <= FULL_PAGE_EXCERPT_CHARS:
+        return body, False
+    lines = body.splitlines()
+    keep: set[int] = set(range(min(EXCERPT_HEAD_LINES, len(lines))))
+    hits = [
+        index
+        for index, line in enumerate(lines)
+        if any(token in line.casefold() for token in tokens)
+    ]
+    if not hits:
+        start = max(0, body.find(tokens[0]) if tokens else 0)
+        return body[max(0, start - EXCERPT_LEAD):max(0, start - EXCERPT_LEAD) + EXCERPT_LEN].strip(), True
+    for index in hits:
+        keep.update(
+            range(
+                max(0, index - EXCERPT_CONTEXT_LINES),
+                min(len(lines), index + EXCERPT_CONTEXT_LINES + 1),
+            )
+        )
+    pieces: list[str] = []
+    used = 0
+    previous = -1
+    for index in sorted(keep):
+        line = lines[index]
+        prefix = "..." if previous >= 0 and index != previous + 1 else None
+        cost = len(line) + 1 + (4 if prefix else 0)
+        if used + cost > STRUCTURED_EXCERPT_CHARS:
+            pieces.append("...")
+            break
+        if prefix:
+            pieces.append(prefix)
+        pieces.append(line)
+        used += cost
+        previous = index
+    return "\n".join(pieces).strip(), True
 
 
 def reference_group_of(doc: dict) -> str:
@@ -1136,8 +1189,7 @@ class AdasSI:
                 if score < threshold:
                     continue
 
-                positions = [folded.find(t) for t in content_tokens if folded.find(t) >= 0]
-                start = max(0, (min(positions) if positions else 0) - EXCERPT_LEAD)
+                excerpt, excerpt_truncated = page_excerpt(text, content_tokens)
                 relative = self.relative_of(path)
                 results.append({
                     "source": path.name,
@@ -1145,7 +1197,8 @@ class AdasSI:
                     "page": page_number,
                     "relative_path": relative,
                     "url": f"/api/adas-si/document?path={quote(relative)}",
-                    "excerpt": text[start:start + EXCERPT_LEN].strip(),
+                    "excerpt": excerpt,
+                    "excerpt_truncated": excerpt_truncated,
                     "match_score": score,
                     "source_match_score": filename_score,
                     "vehicle": {

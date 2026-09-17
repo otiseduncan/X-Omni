@@ -351,9 +351,10 @@ def test_normal_prompt_is_concise_and_free_of_capability_micro_routing() -> None
     prompt = system_prompt(_omni_router())
     folded = prompt.casefold()
 
-    # Raised 2026-09-12 with the setup-measurement rule; see the budget note in
+    # Raised 2026-09-12 with the setup-measurement rule and 2026-09-17 with the
+    # evidence-and-conversation section; see the budget note in
     # test_prompt_tool_budget.py.
-    assert len(prompt) < 5_600
+    assert len(prompt) < 6_800
     assert "## right now" not in folded
     for tool in PERMANENT_TOOLS:
         assert f"`{tool}`" in prompt
@@ -519,10 +520,11 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     )
 
     # Measured 2026-09-11 with the voice-dictation sentence: 4,831 chars, ~1,381 estimator tokens.
-    # Raised 2026-09-12 with the setup-measurement rule; see the budget note in
+    # Raised 2026-09-12 with the setup-measurement rule and 2026-09-17 with the
+    # evidence-and-conversation section; see the budget note in
     # test_prompt_tool_budget.py.
-    assert metrics["base_system"]["chars"] < 5_600
-    assert metrics["base_system"]["tokens"] < 1_620
+    assert metrics["base_system"]["chars"] < 6_800
+    assert metrics["base_system"]["tokens"] < 1_950
     assert metrics["active_working_context"]["chars"] > 0
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
@@ -536,7 +538,8 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # catalog; measured 9,706 chars / 2,774 estimator tokens after trimming.
     assert metrics["advertised_tools"]["catalog_chars"] < 9_900
     assert metrics["advertised_tools"]["catalog_tokens"] < 2_830
-    assert metrics["total_input_used_tokens"] < 4_900
+    # 2026-09-17: the evidence-and-conversation section measured 5,142.
+    assert metrics["total_input_used_tokens"] < 5_180
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
     # The no-tool review now reserves room for the background-work line.
     # 24,500 -> 24,400 on 2026-09-12. The setup-measurement rule costs ~190
@@ -546,11 +549,13 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # further to recover three tokens would be the wrong trade.
     # 2026-09-13 after the research_si contract: 24,4xx measured.
     # 2026-09-16 after the get-missing-map-reports sweep wording: 24,248.
-    assert metrics["remaining_normal_turn_tokens"] > 24_200
+    # 2026-09-17 after the evidence-and-conversation section (~330 tokens).
+    assert metrics["remaining_normal_turn_tokens"] > 23_880
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",
         "truth_and_authorization",
+        "evidence_and_conversation",
         "working_context",
         "operator_truth",
         "active_worker",

@@ -48,6 +48,10 @@ Never claim a search, read, mutation, acquisition, test, or background-job state
 Setup measurements -- target distance and height, reference marks, arcs, angles, clearances -- come from this vehicle's procedure this turn, quoted with document and page, or say you lack them; never from memory or a near model. A clear-zone diagram gives the area to keep clear, not the target position; its height limit bounds obstructions, not the target. Front radar, forward camera (LKAS), blind spot and surround view are separate procedures: answer the one asked. Send stated arc/angle dimensions to adas_target_placement.
 """
 
+EVIDENCE_AND_CONVERSATION = """## Evidence and conversation
+Tool results are evidence to interpret, not text to relay. Answer Otis's actual question first, technician to technician, from what the evidence means; name the source briefly when useful. Authority, highest first: this vehicle's OEM service information, vehicle-specific ADAS SI documents, OEM/reference requirement charts, ADAS SI library data, Calibration IQ job context, web results, then your general knowledge, which may explain evidence but never overrides it unless you can say why the source doesn't apply or can't be read. Procedures run in stages (prerequisite, inspection, setup, calibration, verification) and a condition can change between them, like a part off for inspection and back on for calibration: tie each requirement to its stage instead of flattening them into one rule, and never invent a stage the evidence lacks. Say when applicability or legibility is uncertain instead of filling the gap from memory. Sources and tool work show separately in the app: never paste raw OCR, tables, JSON, receipts, hashes, URLs, or tool status into the answer unless Otis asks to see them, and never narrate tool use.
+"""
+
 WORKING_CONTEXT = """## Working context
 The active subject and stored cards are memory from earlier authoritative results: use them to resolve follow-ups ("that RO", "it", "the Camry"), never as proof that mutable state is still current. Any RO number Otis names in his current message -- full, or the shop-relative short form such as "11774 in Warner Robins" -- is a fresh identification: call `query_ciq` with exactly what he said, not with the prior subject. A current-state question about the subject RO (phase, status, saved calibrations, blockers, documents) needs a fresh `query_ciq` read. A clearly selected new RO or vehicle replaces the prior subject. Speak RO numbers back the way Otis named them.
 """
@@ -90,6 +94,7 @@ def system_prompt_sections(router) -> dict[str, str]:
         "identity": IDENTITY.strip(),
         "model_first_contract": MODEL_FIRST_CONTRACT.strip(),
         "truth_and_authorization": TRUTH_AND_AUTHORIZATION.strip(),
+        "evidence_and_conversation": EVIDENCE_AND_CONVERSATION.strip(),
         "working_context": WORKING_CONTEXT.strip(),
         "operator_truth": OPERATOR_TRUTH.strip(),
         "active_worker": worker_block(router).strip(),

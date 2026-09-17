@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Cpu,
   History,
@@ -23,6 +23,7 @@ import ApprovalCard from "./components/ApprovalCard.jsx";
 import HistoryPanel from "./components/HistoryPanel.jsx";
 import DashboardRail from "./components/DashboardRail.jsx";
 import VoicePanel from "./components/VoicePanel.jsx";
+import EvidenceDisclosure from "./components/EvidenceDisclosure.jsx";
 import ToolRail from "./components/ToolRail.jsx";
 import Artifact from "./components/cards/Cards.jsx";
 import { useChatSocket } from "./hooks/useChatSocket.js";
@@ -48,6 +49,7 @@ import {
   tooLarge,
   uploadAttachment,
 } from "./lib/attachments.js";
+import { presentTimeline, spokenReply } from "./lib/responsePresentation.js";
 import { settledWorkerHealth } from "./lib/workerState.js";
 import "./styles/theme.css";
 import "./styles/app.css";
@@ -167,6 +169,8 @@ export default function App() {
     createConversation,
     openConversation,
   } = continuity;
+  // Evidence cards attach, collapsed, to the reply they support.
+  const presentedItems = useMemo(() => presentTimeline(items), [items]);
   const [streaming, setStreaming] = useState("");
   const [thinking, setThinking] = useState(false);
   const [activeTool, setActiveTool] = useState(null);
@@ -432,7 +436,8 @@ export default function App() {
               text,
               worker: event.worker,
             });
-            if (ttsOnRef.current) voice.speak(text);
+            // Voice reads Core's spoken form of the answer, never its evidence.
+            if (ttsOnRef.current) voice.speak(spokenReply(event, text));
           }
           window.setTimeout(() => reconcile(), 0);
           break;
@@ -1061,7 +1066,7 @@ export default function App() {
           </div>
         )}
 
-        {items.map((item) => {
+        {presentedItems.map((item) => {
           if (item.kind === "user") {
             const { text: typed, blocks } = splitAttachmentBlocks(item.text);
             return (
@@ -1082,9 +1087,26 @@ export default function App() {
           }
           if (item.kind === "assistant")
             return (
-              <div className="msg assistant" key={item.key}>
-                {item.text}
-                {item.worker && <div className="msg-meta">via {item.worker}</div>}
+              <div className="reply" key={item.key}>
+                {item.text?.trim() ? (
+                  <div className="msg assistant">
+                    {item.text}
+                    {item.worker && <div className="msg-meta">via {item.worker}</div>}
+                  </div>
+                ) : null}
+                <EvidenceDisclosure
+                  evidence={item.evidence}
+                  onCameraCapture={captureAndAnalyzeCamera}
+                />
+              </div>
+            );
+          if (item.kind === "evidence")
+            return (
+              <div className="reply" key={item.key}>
+                <EvidenceDisclosure
+                  evidence={item.evidence}
+                  onCameraCapture={captureAndAnalyzeCamera}
+                />
               </div>
             );
           if (item.kind === "system")

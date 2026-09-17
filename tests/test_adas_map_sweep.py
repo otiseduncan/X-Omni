@@ -19,6 +19,7 @@ import pytest
 
 from core.config import ROOT, Settings
 from core.main import build_app, configured_profile_catalog
+from core.orchestrator import loop as loop_mod
 from core.orchestrator.loop import artifacts_for_result, fit_messages_to_window
 from core.services import adas_map_sweep as sweep_mod
 from core.services.adas_map_sweep import (
@@ -911,7 +912,7 @@ async def test_rejected_draft_during_a_sweep_never_replaces_the_request_with_swe
         )
     ]
     text = "".join(event["text"] for event in events if event.get("type") == "token")
-    assert text == "I can’t verify the withheld draft from the available evidence, so I’m not presenting it as established."
+    assert text == loop_mod.NO_TOOL_SELF_CHECK_FALLBACK
     assert "ADAS Map sweep" not in text
     assert "all maps are attached" not in text
     store.close()

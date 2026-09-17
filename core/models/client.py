@@ -48,6 +48,9 @@ class ModelClient:
     # Core accepts an initial prose-only draft. Lightweight test clients opt in
     # explicitly so their scripted call counts remain deterministic.
     supports_no_tool_self_check = True
+    # Evidence-backed answers get one model-owned review before release; see
+    # core.orchestrator.evidence_review.
+    supports_evidence_review = True
 
     def __init__(self, router: ModelRouter, temperature: float = 0.4,
                  max_tokens: int = 1536):

@@ -92,6 +92,7 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
         "identity",
         "model_first_contract",
         "truth_and_authorization",
+        "evidence_and_conversation",
         "working_context",
         "operator_truth",
         "active_worker",
@@ -119,8 +120,14 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # static prompt, because its job is to stop an answer that never reaches a
     # tool. ~190 estimator tokens against a 32k window, and the turn headroom
     # asserted below still holds.
-    assert metrics["base_system"]["chars"] < 5_600
-    assert metrics["base_system"]["tokens"] < 1_620
+    # 2026-09-17: the evidence-and-conversation section added 1,158 chars
+    # (~330 estimator tokens). Live, X retrieved the Hyundai/Kia/Genesis front
+    # radar bumper chart, answered from general knowledge that the bumper stays
+    # installed, and pasted the flattened OCR into its reply. Source precedence,
+    # stage-aware reading, and "evidence is interpreted, not relayed" govern
+    # every evidence-backed answer, so they belong in the static prompt.
+    assert metrics["base_system"]["chars"] < 6_800
+    assert metrics["base_system"]["tokens"] < 1_950
     # Measured 2026-09-11 with the sweep contract and phase enums: 4,003
     # estimator tokens total (exact: 992 system + ~2,481 permanent tools).
     # 2026-09-12: the setup-measurement rule above carries this to ~4,225. The
@@ -130,8 +137,9 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # 2026-09-16: saying that getting missing maps (or "map reports") is the
     # sweep, even right after an inventory answer, cost 54 tokens: 4,458. Live
     # X answered that request with the read-only inventory 3 of 3 times.
-    assert metrics["total_input_used_tokens"] < 4_500
-    assert metrics["remaining_normal_turn_tokens"] > 26_750
+    # 2026-09-17: the evidence-and-conversation section: 4,789.
+    assert metrics["total_input_used_tokens"] < 4_830
+    assert metrics["remaining_normal_turn_tokens"] > 26_400
 
 
 def test_budget_reserve_covers_permanent_plus_largest_unlockable_set() -> None:
@@ -369,4 +377,5 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     # Measured 2026-09-11 after the ADAS Map sweep contract: 24,985.
     # 2026-09-13 after the research_si contract: 24,649.
     # 2026-09-16 after the get-missing-map-reports sweep wording: 24,546.
-    assert metrics["remaining_normal_turn_tokens"] >= 24_500
+    # 2026-09-17 after the evidence-and-conversation section: 24,215.
+    assert metrics["remaining_normal_turn_tokens"] >= 24_170

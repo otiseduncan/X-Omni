@@ -305,6 +305,80 @@
   border-bottom-left-radius: 5px;
 }
 
+/* One assistant reply: X's answer, then its collapsed evidence. */
+.reply {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 0;
+}
+
+.evidence-disclosure {
+  align-self: flex-start;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.evidence-disclosure[open] {
+  align-self: stretch;
+}
+
+.evidence-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 6px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  list-style: none;
+  border-radius: 8px;
+  user-select: none;
+}
+
+.evidence-summary::-webkit-details-marker {
+  display: none;
+}
+
+.evidence-summary small {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  opacity: 0.8;
+}
+
+.evidence-summary:hover {
+  color: var(--blue-bright);
+}
+
+.evidence-summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.evidence-disclosure.needs-attention .evidence-attention {
+  color: var(--warning);
+  opacity: 1;
+}
+
+.evidence-disclosure[open] .disclosure-chevron {
+  transform: rotate(180deg);
+}
+
+.evidence-body {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 2px 0 4px;
+}
+
+.evidence-body > * {
+  max-width: 100%;
+  min-width: 0;
+}
+
 .msg.system {
   align-self: center;
   max-width: 100%;

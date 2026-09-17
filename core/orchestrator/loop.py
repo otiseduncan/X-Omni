@@ -7,12 +7,16 @@ One user message in, a stream of events out:
     {"type": "tool_result","name": ...,"result": ...}
     {"type": "artifact",  "artifact": {...}}       inline chat card
     {"type": "approval",  "approval": {...}}       pauses, waits for operator
-    {"type": "done",      "message_id": ...,"worker": ...}
+    {"type": "done",      "message_id": ...,"worker": ...,"response": {...}}
     {"type": "error",     "message": ...}
 
 Tool results become artifacts where a card exists for them, which is what
 makes the UI chat-native: weather and calendar render inside the message
-that produced them rather than in a separate panel.
+that produced them rather than in a separate panel. Each card is stamped with
+its presentation level (see response_contract): deliverables stay in the
+stream, while evidence -- sources, extractions, reads, receipts -- attaches to
+the reply collapsed. ``done.response`` separates X's answer and its spoken
+form from that evidence.
 """
 
 from __future__ import annotations
@@ -36,7 +40,9 @@ from ..tools.registry import (
     scrapex_apply_new_quarantine,
     scrapex_evidence_from_result,
 )
+from . import evidence_review as evidence_review_mod
 from . import prompt as prompt_mod
+from . import response_contract
 from . import truth_review as truth_review_mod
 
 log = logging.getLogger("xomni.loop")
@@ -79,9 +85,12 @@ REPEAT_ONLY_SYNTHESIS_MESSAGE = (
     "are available: do not request another tool or imply that an unexecuted action "
     "ran. Preserve source, approval, receipt, and indeterminate-result boundaries."
 )
+# Fixed fail-closed lines Otis reads. They keep the truth boundary but speak
+# plainly: an earlier "withheld draft" / "six-round tool limit" wording put
+# orchestration internals into the conversation.
 TOOL_ROUND_CAP_FALLBACK = (
-    "The six-round tool limit was reached. No additional tool was run, and I’m "
-    "not making a claim beyond the tool results already returned."
+    "I ran out of lookup steps before I could finish that, so I'm not going to claim "
+    "anything past what I'd already found. Ask me again and I'll pick it back up."
 )
 
 NO_TOOL_SELF_CHECK_ACCEPT = "NO_TOOL_NEEDED"
@@ -107,8 +116,8 @@ IDLE_BACKGROUND_REVIEW_PREFIX = (
 NO_TOOL_SELF_CHECK_MESSAGE = """Internal final-answer evidence check; this is not a new user request. Review the withheld draft against the original request, current structured context, advertised tool contracts, and returned evidence. If a safe answer requires current or live business state, execution proof, capability state, or vehicle-specific OEM technical evidence, do not answer in prose: call the best justified advertised tool or tools now. Nothing has executed in this turn, so a draft reporting work as done -- acquired, retrieved, saved, attached, reconciled, updated, or complete -- and any specific finding it credits to that work are unsupported no matter how confident they read: call the tool that would actually do it instead of accepting the draft. If the draft is a casual, conceptual, or general answer, or already states a truthful unresolved boundary and no tool is needed, output exactly NO_TOOL_NEEDED; an active conversation subject is memory and is never by itself a reason to call a tool. Never run a mutation to test or demonstrate capability. Reason from meaning and evidence contracts, not keyword rules."""
 ADAS_SI_POST_TOOL_SELF_CHECK_MESSAGE = """Internal ADAS SI evidence check; this is not a new user request. Review the withheld draft against the original request and the tool results returned in this turn. An ADAS SI search or open result proves only that a matching document exists and what it contains; it does not prove when documents arrived, which documents are new, or what was filed from the root folder. If the draft makes any new/recent/arrival or root-filing claim without an adas_si_inventory result containing recent_additions and storage_refresh, call adas_si_inventory with the requested time window now. Otherwise output exactly NO_TOOL_NEEDED. Do not repeat a search and do not infer arrival from conversation history, document counts, or an ADAS Map sweep."""
 NO_TOOL_SELF_CHECK_FALLBACK = (
-    "I can’t verify the withheld draft from the available evidence, so I’m not "
-    "presenting it as established."
+    "I couldn't back that up with anything I could check just now, so I'm not going "
+    "to state it as fact."
 )
 
 
@@ -1423,8 +1432,17 @@ def _bounded_tool_result_json(
 
 
 def tool_result_json_for_model(name: str, result: Any) -> str:
-    """Serialize exactly the projected result delivered to the model."""
+    """Serialize exactly the projected result delivered to the model.
 
+    Research findings are the exception: their excerpts are source text --
+    often OCR'd tables -- and reach the model as readable text blocks under a
+    JSON header rather than as escaped JSON strings.
+    """
+
+    if name == "delegate_research" and isinstance(result, dict) and "findings" in result:
+        from ..services.research_delegate import result_text_for_model
+
+        return result_text_for_model(result, max_chars=TOOL_RESULT_MODEL_CHAR_BUDGET)
     return _bounded_tool_result_json(tool_result_for_model(name, result))
 
 
@@ -1860,7 +1878,9 @@ class Orchestrator:
                 ),
             }
             final_summary = website_result_summary(final_result, update=True)
-            replacement = {"type": "website_preview", "data": final_result}
+            replacement = response_contract.present_artifact(
+                {"type": "website_preview", "data": final_result}
+            )
             final_artifacts = list(artifacts)
             for index in range(len(final_artifacts) - 1, -1, -1):
                 if final_artifacts[index].get("type") == "website_preview":
@@ -1899,9 +1919,29 @@ class Orchestrator:
                 current.get("type") == "artifact"
                 and (current.get("artifact") or {}).get("type") == "website_preview"
             ):
-                current["artifact"] = {"type": "website_preview", "data": result}
+                current["artifact"] = response_contract.present_artifact(
+                    {"type": "website_preview", "data": result}
+                )
             rewritten.append(current)
         return rewritten
+
+    async def _evidence_reviewed_text(
+        self, messages: list[dict[str, Any]], draft: str
+    ) -> tuple[str, dict[str, Any]]:
+        """Release an evidence-backed draft only after the model reviews it.
+
+        Every call here is either a forced review function or a tool-less
+        rewrite, so review can never select or repeat an action.
+        """
+        # The revision step reuses the turn context plus a reading of the
+        # evidence, so it gets the same headroom as a truth-review rewrite.
+        fit_messages_to_window(
+            messages,
+            [],
+            context_tokens=int(getattr(self.settings, "context_tokens", 32_768)),
+            reserve_tokens=int(getattr(self.settings, "max_response_tokens", 1_536)) + 1_500,
+        )
+        return await evidence_review_mod.reviewed_answer(self.client, messages, draft)
 
     async def _calibration_iq_truth_reviewed_text(
         self,
@@ -2097,6 +2137,13 @@ class Orchestrator:
             not approved_tool
             and getattr(self.client, "supports_no_tool_self_check", False)
         )
+        # Answers built on retrieved technical evidence get one model-owned
+        # evidence review before release (see evidence_review). Lightweight
+        # scripted clients opt in explicitly, like the no-tool self-check.
+        evidence_review_enabled = bool(
+            not approved_tool and getattr(self.client, "supports_evidence_review", False)
+        )
+        evidence_review_record: Optional[dict[str, Any]] = None
         no_tool_self_check_reserve = (
             no_tool_self_check_reserve_tokens(self.settings.max_response_tokens)
             if no_tool_self_check_enabled
@@ -2248,7 +2295,9 @@ class Orchestrator:
                     "receipt": receipt,
                 }
             ]
-            receipt_artifact = {"type": "execution_receipt", "data": receipt}
+            receipt_artifact = response_contract.present_artifact(
+                {"type": "execution_receipt", "data": receipt}
+            )
             artifacts.append(receipt_artifact)
             approved_events.append({"type": "artifact", "artifact": receipt_artifact})
             card_type = artifact_type_for_tool(name, result)
@@ -2267,7 +2316,9 @@ class Orchestrator:
             if name == "image_generate" and not verified_image:
                 card_type = "image_generation_status"
             if card_type and isinstance(result, dict):
-                artifact = {"type": card_type, "data": result}
+                artifact = response_contract.present_artifact(
+                    {"type": card_type, "data": result}
+                )
                 artifacts.append(artifact)
                 approved_events.append({"type": "artifact", "artifact": artifact})
 
@@ -2299,6 +2350,7 @@ class Orchestrator:
                     "message_id": message_id,
                     "worker": self.router.active_name,
                     "artifacts": artifacts,
+                    "response": response_contract.build_response(summary, artifacts),
                 }
                 return
 
@@ -2342,6 +2394,7 @@ class Orchestrator:
                     "message_id": message_id,
                     "worker": self.router.active_name,
                     "artifacts": artifacts,
+                    "response": response_contract.build_response(summary, artifacts),
                 }
                 return
 
@@ -2380,6 +2433,7 @@ class Orchestrator:
                     "message_id": message_id,
                     "worker": self.router.active_name,
                     "artifacts": artifacts,
+                    "response": response_contract.build_response(summary, artifacts),
                 }
                 return
 
@@ -2530,8 +2584,16 @@ class Orchestrator:
                     round_text = ""
                     sealed_round_tokens = []
                 elif self_check.accept_draft:
-                    for token_event in sealed_round_tokens:
-                        yield token_event
+                    if evidence_review_enabled and evidence_review_mod.turn_used_evidence(
+                        executed_tool_names
+                    ):
+                        round_text, evidence_review_record = await self._evidence_reviewed_text(
+                            messages, round_text
+                        )
+                        yield {"type": "token", "text": round_text}
+                    else:
+                        for token_event in sealed_round_tokens:
+                            yield token_event
                     full_text += round_text
                     break
                 else:
@@ -2594,6 +2656,15 @@ class Orchestrator:
             ):
                 if synthesis_boundary_failed:
                     yield {"type": "token", "text": TOOL_ROUND_CAP_FALLBACK}
+                elif (
+                    evidence_review_enabled
+                    and round_text.strip()
+                    and evidence_review_mod.turn_used_evidence(executed_tool_names)
+                ):
+                    round_text, evidence_review_record = await self._evidence_reviewed_text(
+                        messages, round_text
+                    )
+                    yield {"type": "token", "text": round_text}
                 else:
                     for token_event in sealed_round_tokens:
                         yield token_event
@@ -2926,6 +2997,7 @@ class Orchestrator:
                         "message_id": message_id,
                         "worker": self.router.active_name,
                         "artifacts": artifacts,
+                        "response": response_contract.build_response(summary, artifacts),
                     }
                     return
 
@@ -3005,6 +3077,7 @@ class Orchestrator:
                 reserve_tools
             ),
             unlocked_tools=sorted(unlocked_tool_names),
+            evidence_review=evidence_review_record,
             active_subject=(
                 subject_payload.get("resource_id")
                 if isinstance(subject_payload, dict)
@@ -3019,6 +3092,9 @@ class Orchestrator:
             "worker": self.router.active_name,
             "artifacts": artifacts,
             "metrics": turn_metrics,
+            "response": response_contract.build_response(
+                full_text, artifacts, metrics=turn_metrics
+            ),
         }
 
     async def _execute(
@@ -3191,7 +3267,9 @@ class Orchestrator:
                     "receipt": receipt,
                 }
                 if receipt:
-                    artifact = {"type": "execution_receipt", "data": receipt}
+                    artifact = response_contract.present_artifact(
+                        {"type": "execution_receipt", "data": receipt}
+                    )
                     artifacts.append(artifact)
                     yield {"type": "artifact", "artifact": artifact}
                 return
@@ -3222,7 +3300,9 @@ class Orchestrator:
                 "action_digest": record.get("action_digest"),
                 "idempotency_key": record.get("idempotency_key"),
             }
-            artifact = {"type": "approval_request", "data": approval}
+            artifact = response_contract.present_artifact(
+                {"type": "approval_request", "data": approval}
+            )
             artifacts.append(artifact)
             yield {
                 "type": "approval",
@@ -3270,7 +3350,9 @@ class Orchestrator:
             call_cache[dedupe_key] = result
 
         for card_type, card_data in artifacts_for_result(name, result):
-            artifact = {"type": card_type, "data": card_data}
+            artifact = response_contract.present_artifact(
+                {"type": card_type, "data": card_data}
+            )
             artifacts.append(artifact)
             yield {"type": "artifact", "artifact": artifact}
 

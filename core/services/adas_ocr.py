@@ -30,7 +30,21 @@ from PIL import Image, ImageOps
 log = logging.getLogger("xomni.adas_ocr")
 
 OCR_PIPELINE_VERSION = "1"
+# A page read through its content region (below) records this version on its
+# row. The global cache wipe still keys on OCR_PIPELINE_VERSION, so adding the
+# region pass never discards the thousands of full-page reads already cached.
+OCR_REGION_PIPELINE_VERSION = "1+region"
 OCR_RENDER_WIDTH = 2000
+# Reference charts are often a spreadsheet screenshot pasted into the top of a
+# letter page. At 2000px the whole page is OCR'd but the table text is a few
+# pixels tall: live, the Hyundai/Kia/Genesis front radar chart lost every
+# colored OFF/ON cell and all of its Kia rows, so X never received the rows it
+# was asked about. When content fills little of the page, OCR that region again
+# at a resolution where its text is legible.
+SPARSE_CONTENT_FRACTION = 0.45
+REGION_TARGET_WIDTH = 5600
+REGION_MAX_PIXELS = 40_000_000
+REGION_MARGIN = 0.01
 MIN_NATIVE_ALNUM = 24
 MIN_NATIVE_WORDS = 4
 MIN_OCR_ALNUM = 12
@@ -258,6 +272,99 @@ def _ocr_png(png_bytes: bytes) -> dict[str, Any]:
     }
 
 
+def sparse_content_region(png_bytes: bytes) -> Optional[tuple[float, float, float, float]]:
+    """Normalized (left, top, right, bottom) of a page's content when it is small.
+
+    Returns None when the image cannot be decoded, is blank, or its non-white
+    content already fills most of the page -- those pages keep the ordinary
+    full-page read.
+    """
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as opened:
+            gray = ImageOps.grayscale(opened.convert("RGB"))
+    except Exception:  # noqa: BLE001 - an undecodable render keeps the full-page path
+        return None
+    width, height = gray.size
+    if width < 1 or height < 1:
+        return None
+    # Anything noticeably darker than paper white is content.
+    bbox = gray.point(lambda value: 255 if value < 245 else 0).getbbox()
+    if bbox is None:
+        return None
+    left, top, right, bottom = bbox
+    if (right - left) * (bottom - top) >= SPARSE_CONTENT_FRACTION * width * height:
+        return None
+    return (
+        max(0.0, left / width - REGION_MARGIN),
+        max(0.0, top / height - REGION_MARGIN),
+        min(1.0, right / width + REGION_MARGIN),
+        min(1.0, bottom / height + REGION_MARGIN),
+    )
+
+
+def _render_region_png(
+    path: Path, page: int, region: tuple[float, float, float, float]
+) -> Optional[bytes]:
+    """Render only ``region`` of a PDF page at legible resolution, grayscale."""
+    try:
+        import pypdfium2 as pdfium
+
+        from .pdfium_lock import PDFIUM_LOCK
+    except ImportError:
+        return None
+    left, top, right, bottom = region
+    try:
+        with PDFIUM_LOCK:
+            document = pdfium.PdfDocument(str(path))
+            try:
+                pdf_page = document[int(page) - 1]
+                page_width, page_height = pdf_page.get_size()
+                region_width = max(1.0, (right - left) * page_width)
+                region_height = max(1.0, (bottom - top) * page_height)
+                scale = REGION_TARGET_WIDTH / region_width
+                pixels = (region_width * scale) * (region_height * scale)
+                if pixels > REGION_MAX_PIXELS:
+                    scale *= math.sqrt(REGION_MAX_PIXELS / pixels)
+                # PDFium crops by the amount cut from each border, ordered
+                # (left, bottom, right, top).
+                crop = (
+                    left * page_width,
+                    (1.0 - bottom) * page_height,
+                    (1.0 - right) * page_width,
+                    top * page_height,
+                )
+                image = pdf_page.render(scale=scale, crop=crop).to_pil()
+            finally:
+                document.close()
+    except Exception as exc:  # noqa: BLE001 - the full-page read remains available
+        log.warning("ADAS OCR region render failed for %s page %s: %s", Path(path).name, page, exc)
+        return None
+    image = ImageOps.autocontrast(ImageOps.grayscale(image.convert("RGB")))
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _ocr_rendered_page(path: Path, page: int, png_bytes: bytes) -> dict[str, Any]:
+    """OCR one page, reading a small content region at legible resolution first."""
+    region = sparse_content_region(png_bytes)
+    if region is not None:
+        region_png = _render_region_png(path, page, region)
+        if region_png is not None:
+            try:
+                result = _ocr_png(region_png)
+            except Exception as exc:  # noqa: BLE001 - fall back to the full-page read
+                log.warning("ADAS OCR region pass failed for %s page %s: %s", Path(path).name, page, exc)
+            else:
+                if _usable_ocr_text(result.get("text") or "", result.get("confidence")):
+                    return {
+                        **result,
+                        "pipeline_version": OCR_REGION_PIPELINE_VERSION,
+                        "region": [round(value, 4) for value in region],
+                    }
+    return _ocr_png(png_bytes)
+
+
 def ocr_png_bytes(png_bytes: bytes) -> dict[str, Any]:
     """OCR one rendered page image. Public entry point for callers outside
     the ADAS SI cache path (operator file attachments), which render their own
@@ -288,6 +395,13 @@ def _ensure_cache(adas: Any) -> None:
             "rotation INTEGER NOT NULL DEFAULT 0, engine TEXT NOT NULL, "
             "engine_version TEXT NOT NULL, pipeline_version TEXT NOT NULL, "
             "updated_at TEXT NOT NULL, PRIMARY KEY(path, page))"
+        )
+        # Pages whose rendered layout was already checked for a small content
+        # region, so a cached full-page read is re-examined at most once.
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS ocr_layout("
+            "path TEXT NOT NULL, page INTEGER NOT NULL, source_mtime_ns INTEGER NOT NULL, "
+            "PRIMARY KEY(path, page))"
         )
         current = db.execute(
             "SELECT value FROM meta WHERE key='ocr_pipeline_version'"
@@ -351,9 +465,28 @@ def _store_page(
                 int(result.get("rotation") or 0),
                 str(result.get("engine") or "rapidocr-onnxruntime"),
                 str(result.get("engine_version") or "unknown"),
-                OCR_PIPELINE_VERSION,
+                str(result.get("pipeline_version") or OCR_PIPELINE_VERSION),
                 datetime.now(timezone.utc).isoformat(),
             ),
+        )
+
+
+def _layout_checked(adas: Any, path: Path, page: int, mtime: int) -> bool:
+    _ensure_cache(adas)
+    with sqlite3.connect(adas.cache_path) as db:
+        row = db.execute(
+            "SELECT 1 FROM ocr_layout WHERE path=? AND page=? AND source_mtime_ns=?",
+            (str(path), int(page), int(mtime)),
+        ).fetchone()
+    return row is not None
+
+
+def _mark_layout_checked(adas: Any, path: Path, page: int, mtime: int) -> None:
+    _ensure_cache(adas)
+    with sqlite3.connect(adas.cache_path) as db:
+        db.execute(
+            "INSERT OR REPLACE INTO ocr_layout(path, page, source_mtime_ns) VALUES(?,?,?)",
+            (str(path), int(page), int(mtime)),
         )
 
 
@@ -384,6 +517,26 @@ def _page_metadata(adas: Any, path: Path, page: int) -> dict[str, Any]:
     }
 
 
+def _upgrade_to_region_read(
+    adas: Any, path: Path, page: int, mtime: int, cached: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-read a cached full-page OCR through its content region, once."""
+    try:
+        png = adas.render_page(path, page, width=OCR_RENDER_WIDTH)
+        region = sparse_content_region(png)
+        if region is not None:
+            result = _ocr_rendered_page(path, page, png)
+            if result.get("pipeline_version") == OCR_REGION_PIPELINE_VERSION:
+                _store_page(adas, path, page, mtime, result, "success")
+                _mark_layout_checked(adas, path, page, mtime)
+                return _cached_page(adas, path, page, mtime) or cached
+    except Exception as exc:  # noqa: BLE001 - the cached read stays authoritative
+        log.warning("ADAS OCR region upgrade failed for %s page %s: %s", path.name, page, exc)
+        return cached
+    _mark_layout_checked(adas, path, page, mtime)
+    return cached
+
+
 def install_class(adas_cls: type) -> None:
     """Add page-level OCR to an AdasSI class exactly once."""
     if adas_cls in _PATCHED_CLASSES:
@@ -410,6 +563,12 @@ def install_class(adas_cls: type) -> None:
                 continue
 
             cached = _cached_page(self, Path(path), int(page_number), int(mtime))
+            if (
+                cached is not None
+                and cached.get("pipeline_version") == OCR_PIPELINE_VERSION
+                and not _layout_checked(self, Path(path), int(page_number), int(mtime))
+            ):
+                cached = _upgrade_to_region_read(self, Path(path), int(page_number), int(mtime), cached)
             if cached is not None:
                 cached_text = str(cached.get("text") or "")
                 output.append(
@@ -422,7 +581,7 @@ def install_class(adas_cls: type) -> None:
 
             try:
                 png = self.render_page(Path(path), int(page_number), width=OCR_RENDER_WIDTH)
-                result = _ocr_png(png)
+                result = _ocr_rendered_page(Path(path), int(page_number), png)
             except Exception as exc:  # noqa: BLE001 - search must keep the original honest result
                 log.warning(
                     "ADAS OCR failed for %s page %s: %s",
@@ -443,6 +602,7 @@ def install_class(adas_cls: type) -> None:
                 result,
                 "success" if good else "low_quality",
             )
+            _mark_layout_checked(self, Path(path), int(page_number), int(mtime))
             output.append((int(page_number), ocr_text if good else native_text))
         return output
 
