@@ -60,14 +60,17 @@ try:
 except ImportError:  # pragma: no cover - page images degrade to the PDF link
     pdfium = None
 
+from .pdfium_lock import PDFIUM_LOCK
+
 # PDFium's C library is not safe for concurrent use across threads. A search
 # runs several adas.search() calls in parallel (one per calibration
 # requirement, via asyncio.to_thread), and the chat UI opens several page
 # images at once -- both paths land here from different threads at the same
 # time. Without this lock, concurrent PdfDocument access crashes the native
 # library instead of raising a catchable Python exception, which is why a
-# page could fail to render with no error ever reaching the log.
-_PDFIUM_LOCK = threading.Lock()
+# page could fail to render with no error ever reaching the log. The lock is
+# shared with every other PDFium caller in Core (see pdfium_lock).
+_PDFIUM_LOCK = PDFIUM_LOCK
 
 MANAGED_DIRNAME = "_xomni_managed"
 BACKUP_DIRNAME = "_xomni_backups"

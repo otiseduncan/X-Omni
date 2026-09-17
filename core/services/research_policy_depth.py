@@ -177,30 +177,36 @@ def _ocr_pdf_page(raw: bytes, page_index: int) -> str:
         import pypdfium2 as pdfium
     except ImportError:
         return ""
+    from .pdfium_lock import PDFIUM_LOCK
+
     document = None
     page = None
+    buffer = io.BytesIO()
+    with PDFIUM_LOCK:
+        try:
+            document = pdfium.PdfDocument(raw)
+            page = document[int(page_index)]
+            width = page.get_size()[0] or 612
+            image = page.render(scale=adas_ocr.OCR_RENDER_WIDTH / width).to_pil()
+            image.save(buffer, format="PNG")
+        except Exception:
+            return ""
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if document is not None:
+                try:
+                    document.close()
+                except Exception:
+                    pass
     try:
-        document = pdfium.PdfDocument(raw)
-        page = document[int(page_index)]
-        width = page.get_size()[0] or 612
-        image = page.render(scale=adas_ocr.OCR_RENDER_WIDTH / width).to_pil()
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
         result = adas_ocr._ocr_png(buffer.getvalue())  # noqa: SLF001 - shared local OCR engine
         return str(result.get("text") or "")
     except Exception:
         return ""
-    finally:
-        if page is not None:
-            try:
-                page.close()
-            except Exception:
-                pass
-        if document is not None:
-            try:
-                document.close()
-            except Exception:
-                pass
 
 
 def _same_host_deep_links(document: str, base_url: str) -> list[tuple[str, str]]:

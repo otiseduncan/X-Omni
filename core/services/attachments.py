@@ -36,6 +36,8 @@ from typing import Optional
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from .pdfium_lock import PDFIUM_LOCK
+
 log = logging.getLogger("xomni.attachments")
 
 KIND_IMAGE = "image"
@@ -407,30 +409,31 @@ def _read_pdf_pages(raw: bytes, filename: str) -> tuple[list[str], str]:
     if (pages is None or not any(page.strip() for page in pages)) and pdfium is not None:
         native = pages
         document = None
-        try:
-            document = pdfium.PdfDocument(io.BytesIO(raw))
-            extracted: list[str] = []
-            for index in range(min(len(document), MAX_PDF_PAGES)):
-                page = document[index]
-                try:
-                    text_page = page.get_textpage()
+        with PDFIUM_LOCK:
+            try:
+                document = pdfium.PdfDocument(io.BytesIO(raw))
+                extracted: list[str] = []
+                for index in range(min(len(document), MAX_PDF_PAGES)):
+                    page = document[index]
                     try:
-                        extracted.append(text_page.get_text_range() or "")
+                        text_page = page.get_textpage()
+                        try:
+                            extracted.append(text_page.get_text_range() or "")
+                        finally:
+                            text_page.close()
                     finally:
-                        text_page.close()
-                finally:
-                    page.close()
-            pages = extracted
-            method = "pdfium"
-        except Exception:  # noqa: BLE001 - keep an honest pypdf result
-            if native is None:
-                raise AttachmentError(
-                    f"'{filename}' could not be read as a PDF."
-                ) from None
-            pages = native
-        finally:
-            if document is not None:
-                document.close()
+                        page.close()
+                pages = extracted
+                method = "pdfium"
+            except Exception:  # noqa: BLE001 - keep an honest pypdf result
+                if native is None:
+                    raise AttachmentError(
+                        f"'{filename}' could not be read as a PDF."
+                    ) from None
+                pages = native
+            finally:
+                if document is not None:
+                    document.close()
 
     if pages is None:
         raise AttachmentError(
@@ -463,40 +466,51 @@ def _ocr_pdf_pages(raw: bytes, pages: list[str]) -> tuple[list[str], int]:
 
     output = list(pages)
     recovered = 0
+    # Render the weak pages under the shared PDFium lock, then OCR the images
+    # after releasing it, so slow OCR never holds other PDF readers up.
+    rendered: list[tuple[int, bytes]] = []
     document = None
-    try:
-        document = pdfium.PdfDocument(io.BytesIO(raw))
-        for index in weak:
-            if index >= len(document):
-                continue
-            try:
-                page = document[index]
+    with PDFIUM_LOCK:
+        try:
+            document = pdfium.PdfDocument(io.BytesIO(raw))
+            for index in weak:
+                if index >= len(document):
+                    continue
                 try:
-                    scale = adas_ocr.OCR_RENDER_WIDTH / max(1.0, page.get_width())
-                    bitmap = page.render(scale=max(1.0, min(scale, 4.0)))
-                    image = bitmap.to_pil()
+                    page = document[index]
                     try:
-                        buffer = io.BytesIO()
-                        image.save(buffer, format="PNG")
+                        scale = adas_ocr.OCR_RENDER_WIDTH / max(1.0, page.get_width())
+                        bitmap = page.render(scale=max(1.0, min(scale, 4.0)))
+                        image = bitmap.to_pil()
+                        try:
+                            buffer = io.BytesIO()
+                            image.save(buffer, format="PNG")
+                        finally:
+                            image.close()
                     finally:
-                        image.close()
-                finally:
-                    page.close()
-                result = adas_ocr.ocr_png_bytes(buffer.getvalue())
-            except Exception as exc:  # noqa: BLE001 - keep the honest native text
-                log.warning(
-                    "attachment OCR failed on page %s: %s", index + 1, type(exc).__name__
-                )
-                continue
-            text = str(result.get("text") or "")
-            if adas_ocr.usable_ocr_text(text, result.get("confidence")):
-                output[index] = text
-                recovered += 1
-    except Exception as exc:  # noqa: BLE001 - OCR is best-effort enrichment
-        log.warning("attachment OCR pass failed: %s", type(exc).__name__)
-    finally:
-        if document is not None:
-            document.close()
+                        page.close()
+                    rendered.append((index, buffer.getvalue()))
+                except Exception as exc:  # noqa: BLE001 - keep the honest native text
+                    log.warning(
+                        "attachment OCR failed on page %s: %s", index + 1, type(exc).__name__
+                    )
+        except Exception as exc:  # noqa: BLE001 - OCR is best-effort enrichment
+            log.warning("attachment OCR pass failed: %s", type(exc).__name__)
+        finally:
+            if document is not None:
+                document.close()
+    for index, png in rendered:
+        try:
+            result = adas_ocr.ocr_png_bytes(png)
+        except Exception as exc:  # noqa: BLE001 - keep the honest native text
+            log.warning(
+                "attachment OCR failed on page %s: %s", index + 1, type(exc).__name__
+            )
+            continue
+        text = str(result.get("text") or "")
+        if adas_ocr.usable_ocr_text(text, result.get("confidence")):
+            output[index] = text
+            recovered += 1
     return output, recovered
 
 

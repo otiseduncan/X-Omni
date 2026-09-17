@@ -39,6 +39,8 @@ try:
 except ImportError:  # pragma: no cover - normalized as an unreadable artifact
     pdfium = None
 
+from .pdfium_lock import PDFIUM_LOCK
+
 
 CATALOG_SCHEMA_VERSION = "7"  # ScrapeX ADAS Map contract v3 -- forces a full re-scan
 SCRAPEX_ADAS_MAP_CONTRACT_VERSION = 3
@@ -734,28 +736,29 @@ class AdasArtifactCatalog:
         if needs_pdfium and pdfium is not None:
             pypdf_pages = pages
             document = None
-            try:
-                document = pdfium.PdfDocument(str(path))
-                extracted: list[tuple[int, str]] = []
-                for index in range(len(document)):
-                    page = document[index]
-                    try:
-                        text_page = page.get_textpage()
+            with PDFIUM_LOCK:
+                try:
+                    document = pdfium.PdfDocument(str(path))
+                    extracted: list[tuple[int, str]] = []
+                    for index in range(len(document)):
+                        page = document[index]
                         try:
-                            text = text_page.get_text_range() or ""
+                            text_page = page.get_textpage()
+                            try:
+                                text = text_page.get_text_range() or ""
+                            finally:
+                                text_page.close()
                         finally:
-                            text_page.close()
-                    finally:
-                        page.close()
-                    extracted.append((index + 1, text[:250_000]))
-                pages = extracted
-            except Exception:  # noqa: BLE001 - preserve an honest pypdf scan result
-                if pypdf_pages is None:
-                    raise
-                pages = pypdf_pages
-            finally:
-                if document is not None:
-                    document.close()
+                            page.close()
+                        extracted.append((index + 1, text[:250_000]))
+                    pages = extracted
+                except Exception:  # noqa: BLE001 - preserve an honest pypdf scan result
+                    if pypdf_pages is None:
+                        raise
+                    pages = pypdf_pages
+                finally:
+                    if document is not None:
+                        document.close()
         if pages is None:
             raise RuntimeError(
                 "Neither pypdf nor pypdfium2 is installed; cannot read ADAS SI PDFs."
