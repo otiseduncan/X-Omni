@@ -467,10 +467,28 @@ function AccessCard({ data }) {
   );
 }
 
+// ALLDATA is sunset in X (core/services/alldata_sunset.py): Core no longer
+// serves the setup, credential, or inline-browser routes. AccessCard is kept
+// for reference, but a historical access card renders this notice instead of
+// a form that could only fail.
+function RetiredAccessCard() {
+  return (
+    <Card title="ALLDATA research access" tone="warn">
+      <p className="card-note">
+        ALLDATA is retired in X. Nothing is opened, signed in to, or searched there any more;
+        service information comes from the ADAS SI library and durable knowledge.
+      </p>
+    </Card>
+  );
+}
+
 export function ResearchProviderCard({ data }) {
   if (data?.action === "full_research") return <FullResearchResult data={data} />;
   if (data?.action === "public_search" || data?.action === "public_read") return <ExternalResults data={data} />;
   if (data?.action === "capture_to_adas" || data?.action === "public_capture") return <CaptureResult data={data} />;
   if (["extract", "snapshot", "alldata_vehicle_research"].includes(data?.action)) return <ExtractResult data={data} />;
-  return <AccessCard data={data} />;
+  return <RetiredAccessCard />;
 }
+
+// Preserved, not rendered: see RetiredAccessCard.
+void AccessCard;

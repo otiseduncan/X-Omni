@@ -36,6 +36,7 @@ from typing import Any, Optional
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from . import adas_storage
+from . import alldata_sunset
 from . import calibration_iq
 from . import research_alldata_navigation as nav
 from . import research_operator as ro
@@ -929,6 +930,7 @@ async def collect_general_reference(settings: Any, adas: Any, args: dict[str, An
     ALLDATA signal before anything is captured; this only removes the CIQ
     match requirement, not the vehicle-selection proof requirement.
     """
+    alldata_sunset.refuse("research_alldata_quick_reference.collect_general_reference")
     browser = ro.get_browser(Path(settings.root), adas=adas)
     state = await browser.start(auto_login=False)
     if not state.get("authenticated"):
@@ -1028,6 +1030,7 @@ async def collect_general_reference(settings: Any, adas: Any, args: dict[str, An
 
 
 async def collect_for_calibration_iq_ro(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, Any]:
+    alldata_sunset.refuse("research_alldata_quick_reference.collect_for_calibration_iq_ro")
     ro_identifier = str(args.get("repair_order_id") or "").strip()
     if not ro_identifier:
         return {

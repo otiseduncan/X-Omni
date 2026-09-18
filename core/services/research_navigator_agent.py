@@ -45,6 +45,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import alldata_sunset
 from . import research_navigator_contract as contract
 from . import scrapex as scrapex_svc
 from .research_navigator_tool_repair import NavigatorToolRepairClient
@@ -2276,6 +2277,7 @@ async def run_navigator_search(
     ScrapeX task inside the same turn budget, and running out of budget is
     reported as incompleteness rather than hidden.
     """
+    alldata_sunset.refuse("research_navigator_agent.run_navigator_search")
     if NAVIGATOR_LOCK.locked():
         return {
             "status": "navigator_busy",

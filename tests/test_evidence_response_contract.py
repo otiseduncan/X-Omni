@@ -167,10 +167,17 @@ def _run_turn(tmp_path: Path, client: _ScriptedModel, registry: _Registry, quest
 
 
 def _kia_research_result(*hits: dict[str, Any]) -> dict[str, Any]:
+    async def accepts_the_chart(**_kwargs: Any) -> dict[str, Any]:
+        # The shared evaluator's verdict on the chart, scripted: these tests are
+        # about presentation, not about judging the evidence.
+        return {"outcome": "SATISFIED", "deliverable": "answer", "stage": "not_stated", "reasons": []}
+
     handler = research_delegate.make_delegate_research(
         None,
         adas_search=lambda _query: {"status": "success", "results": list(hits)},
         knowledge_search=lambda _query: {"status": "no_result", "records": []},
+        evaluator=accepts_the_chart,
+        client_provider=object,
     )
     return asyncio.run(
         handler({"objective": "Kia front bumper during front radar calibration", "vehicle": {"make": "Kia"}})

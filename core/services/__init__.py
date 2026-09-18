@@ -8,7 +8,8 @@ arguments from prose.
 
 ADAS SI keeps one shared OCR/search implementation.  Calibration IQ keeps its
 authorization, idempotency, optimistic-concurrency, receipt, and reread gates.
-ALLDATA remains a licensed, vehicle-first operator with interactive human access.
+ALLDATA is sunset (``alldata_sunset``): its installers still load so the code
+stays importable and tested, but every runtime entry point refuses to run.
 ScrapeX remains a loopback-only ADAS Map acquisition service.  Durable subject
 state is injected as trusted context and the model resolves follow-up language.
 """

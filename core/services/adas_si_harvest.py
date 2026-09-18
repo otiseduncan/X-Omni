@@ -11,8 +11,8 @@ title as the task topic. Field results were many saved documents, most of
 them removal/replacement and parts information, and few actual calibration
 procedures. Those semantic decisions belong to X, not to this file.
 
-It is no longer registered by default. Set ``XOMNI_LEGACY_SI_HARVEST=1`` to
-register its tools for a side-by-side comparison run. Do not extend its
+ALLDATA is sunset (``alldata_sunset``, 2026-09-17), so this module is never
+registered and its tools are blocked by the gateway. Do not extend its
 semantic rules; the mechanical pieces worth keeping (label parsing, the VIN
 keystroke fast path) have moved to ScrapeX's provider and to the research
 job's target resolution.

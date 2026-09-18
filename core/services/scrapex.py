@@ -23,6 +23,8 @@ from urllib.parse import quote, urlsplit
 import httpx
 import psutil
 
+from . import alldata_sunset
+
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8125"
 BASE_URL_ENV = "XOMNI_SCRAPEX_BASE_URL"
@@ -2859,6 +2861,8 @@ async def navigator_current_page_signals(settings: Any, provider: str) -> dict[s
     selected in an already-authenticated Navigator session.
     """
     action = "current_page_signals"
+    # Every Navigator provider is ALLDATA, which is sunset.
+    alldata_sunset.refuse("scrapex.navigator_current_page_signals")
     try:
         provider_value = _text(provider, "provider", maximum=40)
         assert provider_value is not None
@@ -2915,6 +2919,7 @@ async def navigator_current_target_signal(
     to state that fact before a research run spends a turn on it.
     """
     action = "current_target_signal"
+    alldata_sunset.refuse("scrapex.navigator_current_target_signal")
     try:
         provider_value = _text(provider, "provider", maximum=40)
         assert provider_value is not None
@@ -2961,6 +2966,7 @@ async def navigator_screenshot(
     one and echoes the bound id, which is what lets a later coordinate
     action name the frame it was chosen on.
     """
+    alldata_sunset.refuse("scrapex.navigator_screenshot")
     task_value = _text(task_id, "task_id", maximum=MAX_TASK_ID_CHARS)
     assert task_value is not None
     if not _RESOURCE_ID_RE.fullmatch(task_value):
@@ -3078,6 +3084,7 @@ async def navigator_capture(
     review travels into the provenance sidecar as data.
     """
     action = "capture"
+    alldata_sunset.refuse("scrapex.navigator_capture")
     try:
         task_value = _text(task_id, "task_id", maximum=MAX_TASK_ID_CHARS)
         assert task_value is not None
@@ -3150,6 +3157,7 @@ async def navigator(settings: Any, args: dict[str, Any]) -> dict[str, Any]:
     legitimately obtained.
     """
     action = "navigator"
+    alldata_sunset.refuse("scrapex.navigator")
     try:
         clean = _clean_args(args)
         action_value = _text(clean.get("action"), "action", maximum=40)

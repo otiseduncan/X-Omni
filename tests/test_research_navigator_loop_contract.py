@@ -28,6 +28,14 @@ from tests.test_research_navigator_binding_and_review import (
     _target_signal,
 )
 
+
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
 LANDING = "https://my.alldata.com/repair/#/vehicle/9001/component/77/filter/noFilter"
 ARTICLE = "https://my.alldata.com/repair/#/article/9001/component/77/itype/376/nonstandard/1"
 PICKER = "https://my.alldata.com/repair/#/select-vehicle"
@@ -156,6 +164,7 @@ def _continue(**extra: Any) -> dict[str, Any]:
 # ------------------------------------------------------------ completion
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_done_on_a_component_landing_page_is_refused_without_reaching_scrapex(monkeypatch):
     site = _wire(monkeypatch, _Site(start="landing"))
@@ -171,6 +180,7 @@ async def test_done_on_a_component_landing_page_is_refused_without_reaching_scra
     assert _refusals(result) == ["premature_done_on_routing_page"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_done_on_an_untested_article_route_is_refused(monkeypatch):
     site = _wire(monkeypatch, _Site(start="article"))
@@ -180,6 +190,7 @@ async def test_done_on_an_untested_article_route_is_refused(monkeypatch):
     assert "premature_done_on_untested_article" in _refusals(result)
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_done_on_the_vehicle_picker_is_an_explicit_failure_not_refused(monkeypatch):
     site = _wire(monkeypatch, _Site(start="picker"))
@@ -192,6 +203,7 @@ async def test_done_on_the_vehicle_picker_is_an_explicit_failure_not_refused(mon
 # ------------------------------------------------------------ end of page
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_downward_scroll_at_the_bottom_is_refused_and_an_upward_one_runs(monkeypatch):
     site = _wire(monkeypatch, _Site(start="a", at_bottom=True))
@@ -205,6 +217,7 @@ async def test_a_downward_scroll_at_the_bottom_is_refused_and_an_upward_one_runs
 # ------------------------------------------------------------ prose replies
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_prose_reply_is_reminded_once_and_the_task_continues(monkeypatch):
     site = _wire(monkeypatch, _Site(start="a", route=_click_to_b))
@@ -219,6 +232,7 @@ async def test_a_prose_reply_is_reminded_once_and_the_task_continues(monkeypatch
 # ------------------------------------------------------------ cycles
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_return_to_an_earlier_page_state_is_a_cycle_not_progress(monkeypatch):
     def toggle(action, args, current):
@@ -238,6 +252,7 @@ async def test_a_return_to_an_earlier_page_state_is_a_cycle_not_progress(monkeyp
 # ------------------------------------------------------------ candidates
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_the_same_rejected_page_is_not_reviewed_twice(monkeypatch):
     _wire(monkeypatch, _Site(start="a"))
@@ -249,6 +264,7 @@ async def test_the_same_rejected_page_is_not_reviewed_twice(monkeypatch):
     assert repeated
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_rejected_candidate_keeps_the_search_going_to_an_accepted_one(monkeypatch):
     site = _wire(monkeypatch, _Site(start="a", route=_click_to_b))
@@ -267,6 +283,7 @@ async def test_a_rejected_candidate_keeps_the_search_going_to_an_accepted_one(mo
 # ------------------------------------------------------------ attempts
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_stalled_primary_continues_in_a_fresh_task_that_remembers_rejections(monkeypatch):
     site = _wire(monkeypatch, _Site(start="a", route=_click_to_b))
@@ -289,6 +306,7 @@ async def test_a_stalled_primary_continues_in_a_fresh_task_that_remembers_reject
     assert events and events[0]["kind"] == "primary_attempt_restarted"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_attempts_stop_at_the_limit_and_the_failure_says_how_each_ended(monkeypatch):
     _wire(monkeypatch, _Site(start="a"))
@@ -304,6 +322,7 @@ async def test_attempts_stop_at_the_limit_and_the_failure_says_how_each_ended(mo
 # ------------------------------------------------------------ vehicle
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_every_managed_primary_attempt_reselects_the_exact_vin_and_dependencies_do_not(monkeypatch):
     site = _wire(monkeypatch, _Site(start="a"))
@@ -325,6 +344,7 @@ async def test_every_managed_primary_attempt_reselects_the_exact_vin_and_depende
 # ------------------------------------------------------------ dependency capacity
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_required_dependencies_add_turns_and_a_plain_accept_does_not(monkeypatch):
     _wire(monkeypatch, _Site(start="a"))

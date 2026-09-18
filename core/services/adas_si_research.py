@@ -9,21 +9,19 @@ What changed is who decides. This job knows only what a scheduler may know:
 
 * the exact vehicle and VIN, read fresh from Calibration IQ;
 * the RO and the calibration requirements Calibration IQ lists for it;
-* the provider (ALLDATA through ScrapeX's Navigator) and the destination
-  (ADAS SI, then the RO's research case);
+* the source (the shared Year/Make/Model ADAS SI library) and the
+  destination (the RO's research case);
 * budgets, status, receipts.
 
-It turns each requirement into one structured research objective and hands it
-to the model-driven Navigator (``research_navigator_agent.run_navigator_search``).
-X chooses where to go inside ALLDATA, what to click, what is a procedure, and
-what else is required; an independent semantic review judges every candidate;
-ScrapeX proves the mechanics, captures, and hashes. Nothing in this module
-inspects a page, a title, or a link name.
+It turns each requirement into one structured research objective and checks
+the library for it (``adas_si_research_source_cascade``). Every candidate is
+judged by the shared semantic evidence evaluator
+(``research_evidence_contract``) -- the same one ordinary chat research uses --
+and the objective ends SATISFIED, PARTIAL, or UNSATISFIED. Nothing in this
+module inspects a page, a title, or a link name.
 
-Each objective checks the shared Year/Make/Model ADAS SI library first
-(``adas_si_research_source_cascade``); only a requirement without a reviewed,
-provenance-compatible actual procedure there escalates to ALLDATA with the
-exact VIN.
+ALLDATA is sunset (``alldata_sunset``): a requirement the library cannot
+satisfy is reported as not found there. There is no licensed-browser fallback.
 
 Attachment goes through the existing Calibration IQ operator path
 (``ensure_case_workspace`` + ``import_document``, or ``link_document`` when the
@@ -236,7 +234,7 @@ def research_goal(requirement: str) -> str:
 
     The requirement is the shop's label. It deliberately carries no procedure
     vocabulary ("calibration / aiming / initialization"): the manufacturer's
-    and ALLDATA's names for the system and its procedure are X's to work out.
+    names for the system and its procedure are X's to work out.
     """
     return (
         f"the vehicle manufacturer's service procedure a technician performs for the "
@@ -313,8 +311,8 @@ def objectives_for(target: dict[str, Any], *, systems: Optional[list[str]] = Non
     """One research objective per calibration requirement (or per named system).
 
     The objective text is the requirement as Calibration IQ names it, plus
-    the research goal. It is the *question*; the model decides how ALLDATA
-    answers it. When the caller names systems explicitly, those are the
+    the research goal. It is the *question*; the evaluator decides whether a
+    library document answers it. When the caller names systems explicitly, those are the
     objectives instead. A requirement with no written procedure (see
     ``requires_written_si``) is never an objective, even when named.
     """
@@ -591,7 +589,7 @@ def default_attach(settings: Any, adas: Any) -> Callable[..., Awaitable[dict[str
                 else "candidate"
             )
             reused = bool(artifact.get("already_present"))
-            provider = _clean(document.get("provider"), 80) or ("ADAS SI" if reused else "ALLDATA")
+            provider = _clean(document.get("provider"), 80) or "ADAS SI"
             source_url = _clean(document.get("url"), 1000) or source_uri
             arguments: dict[str, Any] = {
                 "source_path": str(source_path),
@@ -734,7 +732,7 @@ class AdasSiResearchService:
         client: Any = None,
         router: Any = None,
         adas: Any = None,
-        navigator_search: Optional[Callable[..., Awaitable[dict[str, Any]]]] = None,
+        library_search: Optional[Callable[..., Awaitable[Optional[dict[str, Any]]]]] = None,
         ro_reader: Optional[Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = None,
         board_reader: Optional[Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = None,
         attach: Optional[Callable[..., Awaitable[dict[str, Any]]]] = None,
@@ -749,7 +747,8 @@ class AdasSiResearchService:
         self.client = client
         self.router = router
         self.adas = adas
-        self.navigator_search = navigator_search
+        # Defaults to the shared library cascade; tests supply a fake library.
+        self.library_search = library_search
         self.ro_reader = ro_reader or default_ro_reader(settings)
         self.board_reader = board_reader or default_board_reader(settings)
         self.attach = attach or (default_attach(settings, adas) if adas is not None else None)
@@ -874,7 +873,7 @@ class AdasSiResearchService:
             _clean(item, 160) for item in (payload.get("systems") or []) if _clean(item, 160)
         ][:12] if isinstance(payload.get("systems"), list) else []
         user_id = str(context.get("user_id") or "local-dev")
-        if self.client is None and self.navigator_search is None:
+        if self.client is None and self.library_search is None:
             return self._not_started("model_unavailable", "No model client is wired for background research; nothing was started.")
 
         async with self._start_lock:
@@ -940,11 +939,10 @@ class AdasSiResearchService:
         view["message"] = (
             f"Started service-information research for {label}: {len(objectives)} procedure "
             f"objective(s) across {len(targets)} repair order(s). X checks the shared Year/Make/Model "
-            "ADAS SI library first for each requirement; only requirements without a confirmed actual "
-            "procedure there go to ALLDATA, with the exact RO VIN selected before navigation. An "
-            "independent review judges every candidate; accepted procedures are filed in ADAS SI and "
-            "attached to the exact calibration item on the RO. Results post to this chat when it "
-            "finishes; started is not complete."
+            "ADAS SI library for each requirement; an independent review judges every candidate, and "
+            "accepted procedures are attached to the exact calibration item on the RO. A requirement "
+            "the library cannot satisfy is reported as not found there. Results post to this chat "
+            "when it finishes; started is not complete."
         )
         return view
 
@@ -1006,7 +1004,7 @@ class AdasSiResearchService:
         )
 
     def _model_ready(self) -> bool:
-        if self.navigator_search is not None and self.client is None:
+        if self.library_search is not None and self.client is None:
             return True
         if self.router is None:
             return self.client is not None
@@ -1026,40 +1024,35 @@ class AdasSiResearchService:
 
     async def _research(self, objective: dict[str, Any]) -> dict[str, Any]:
         from . import adas_si_research_source_cascade as cascade
-        from . import research_navigator_agent as nav_agent
+        from . import research_evidence_contract as contract
 
-        # The shared Year/Make/Model library first; a reviewed actual procedure
-        # there, captured for this calibration or for none, closes the objective.
+        # The shared Year/Make/Model library, judged by the shared evaluator. A
+        # SATISFIED or PARTIAL procedure there, captured for this calibration
+        # or for none, is the result; ALLDATA is sunset, so there is no fallback.
         library_reviews: list[dict[str, Any]] = []
-        local = await cascade.local_procedure(self, objective, library_reviews)
+        search = self.library_search or cascade.local_procedure
+        local = await search(self, objective, library_reviews)
         if local is not None:
             local["library_reviews"] = library_reviews
             return local
-
-        search = self.navigator_search or nav_agent.run_navigator_search
-        target = dict(objective["vehicle"])
-        if objective.get("vin"):
-            target["vin"] = objective["vin"]
-        result = await search(
-            client=self.client,
-            settings=self.settings,
-            provider="alldata",
-            target=target,
-            topic=objective["topic"],
-            max_turns=self.objective_turns,
-            capture=True,
-            objective={
-                "objective": objective["topic"],
-                "requirement_label": objective.get("requirement_label") or objective.get("calibration_title"),
-                "system": objective.get("system"),
-                "component": objective.get("calibration_title"),
-                "repair_order": objective.get("ro_number"),
-                "calibration_item_id": objective.get("calibration_id"),
-            },
-        )
-        if isinstance(result, dict):
-            result["library_reviews"] = library_reviews
-        return result
+        return {
+            "status": "not_found",
+            "outcome": contract.UNSATISFIED,
+            "verified": False,
+            "complete": False,
+            "captured": False,
+            "requires_human": False,
+            "reason": (
+                "The ADAS SI library has no reviewed procedure for this requirement. "
+                "ALLDATA is retired, so nothing else was searched."
+            ),
+            "documents": [],
+            "dependencies": [],
+            "incomplete_reasons": [],
+            "task_ids": [],
+            "source": "adas_si",
+            "library_reviews": library_reviews,
+        }
 
     @staticmethod
     def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -1085,7 +1078,8 @@ class AdasSiResearchService:
             ][:8],
             "incomplete_reasons": list(result.get("incomplete_reasons") or [])[:6],
             "task_ids": list(result.get("task_ids") or []),
-            "source": result.get("source") or "alldata",
+            "outcome": result.get("outcome"),
+            "source": result.get("source") or "adas_si",
             "library_reviews": list(result.get("library_reviews") or [])[:12],
             "receipt": {
                 "task_ids": receipt.get("task_ids"),

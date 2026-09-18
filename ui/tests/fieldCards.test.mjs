@@ -207,15 +207,20 @@ test("delegated research findings render a provenance-first card", async () => {
 
   assert.match(cards, /research_findings:\s*ResearchFindingsCard/);
   assert.match(cards, /export function ResearchFindingsCard/);
-  // A licensed finding carries the independent reviewer's verdict and the
-  // documents it required, and says when one is still missing.
-  assert.match(cards, /Independent review: \{finding\.semantic_review\.decision\}/);
-  assert.match(cards, /still has a required document missing/);
-  // Every source the worker touched is listed with its verification state,
-  // and an ALLDATA sign-in boundary is stated instead of claimed as a result.
+  // Retrieval is not an answer: every finding carries the shared evaluator's
+  // outcome and says whether it was accepted, with the exact source anchor.
+  assert.match(cards, /Independent review: \{RESEARCH_OUTCOME_LABELS\[evaluation\.outcome\]/);
+  assert.match(cards, /finding\?\.accepted \? "accepted" : "not accepted"/);
+  assert.match(cards, /evaluation\.anchor_quote/);
+  // Every source the worker touched is listed with its outcome, and what is
+  // still open is stated rather than hidden.
   assert.match(cards, /research-source-ledger/);
-  assert.match(cards, /no verified finding/);
-  assert.match(cards, /needs an interactive sign-in/);
+  assert.match(cards, /SATISFIED: "answered"/);
+  assert.match(cards, /PARTIAL: "partly answered"/);
+  assert.match(cards, /UNSATISFIED: "not answered"/);
+  assert.match(cards, /Still open:/);
+  // ALLDATA is sunset: no card offers a sign-in for it.
+  assert.doesNotMatch(cards, /needs an interactive sign-in/);
   assert.match(cards, /RESEARCH_SOURCE_LABELS\[finding\?\.source\]/);
   assert.match(cards, /finding\?\.page \? ` · p\.\$\{finding\.page\}` : ""/);
   assert.match(cards, /rel="noreferrer noopener"/);

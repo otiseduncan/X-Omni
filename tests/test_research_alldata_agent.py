@@ -15,6 +15,14 @@ import pytest
 from core.services import research_alldata_agent
 
 
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
+
 class _EmptyLoc:
     def __init__(self):
         self.first = self
@@ -133,6 +141,7 @@ VEHICLE = {"year": "2018", "make": "Ford", "model_trim": "F-350", "label": "2018
 TOPIC = "forward facing camera calibration"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_stuck_on_select_vehicle_is_never_reported_verified():
     browser = _StuckBrowser()
@@ -154,6 +163,7 @@ async def test_stuck_on_select_vehicle_is_never_reported_verified():
     assert browser.actions  # the agent did call tools -- it just never got anywhere
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_successful_vehicle_first_navigation_is_verified():
     browser = _ProgressingBrowser()
@@ -175,6 +185,7 @@ async def test_successful_vehicle_first_navigation_is_verified():
     assert "calibration" in result["matched_terms"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_the_model_claiming_success_in_prose_alone_is_not_enough():
     """The epilogue re-reads the live page; it never trusts assistant text."""
@@ -191,6 +202,7 @@ async def test_the_model_claiming_success_in_prose_alone_is_not_enough():
     assert result["verified"] is False
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_unauthenticated_session_never_calls_the_model():
     class _UnauthenticatedBrowser:
@@ -222,6 +234,7 @@ def test_validate_args_accepts_a_well_formed_fill_call():
     ) is None
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_repeated_malformed_fill_call_is_caught_and_stops_early():
     """Second live reproduction (after the key -> keyboard_key rename): the
@@ -244,6 +257,7 @@ async def test_repeated_malformed_fill_call_is_caught_and_stops_early():
     assert len(result["agent_trace"]) < 7  # stopped well short of the full turn budget
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_self_correction_after_one_validation_error_still_succeeds():
     """The circuit breaker must not punish a model that actually corrects
@@ -265,6 +279,7 @@ async def test_self_correction_after_one_validation_error_still_succeeds():
     assert result["verified"] is True
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_press_keyboard_key_is_translated_to_key_for_the_operator():
     """research_operator.py's operator_action still expects "key" for press --

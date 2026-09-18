@@ -88,7 +88,8 @@ list, decided a page was a document from its character count, and verified
 each capture against the candidate page's own title. The field result was a
 library full of removal/replacement and parts pages and few procedures. That
 module is now **legacy, experimental, non-default and not authoritative**
-(registered only with `XOMNI_LEGACY_SI_HARVEST=1`, for comparison runs).
+(never registered since the 2026-09-17 ALLDATA sunset; see
+docs/RESEARCH_EVIDENCE_CONTRACT.md).
 
 The production path is `stage_action` operation `research_si` starting
 `core/services/adas_si_research.py`:

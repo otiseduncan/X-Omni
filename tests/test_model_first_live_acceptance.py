@@ -702,23 +702,6 @@ class FixtureBackends:
         self.research_calls.append(("automotive_knowledge", deepcopy(args)))
         return {"status": "no_result", "records": []}
 
-    async def navigator_search(self, **kwargs: Any) -> dict[str, Any]:
-        self.research_calls.append(("alldata", deepcopy({k: v for k, v in kwargs.items() if k in {"target", "topic", "capture"}})))
-        target = kwargs.get("target") or {}
-        if str(target.get("make") or "").casefold() == "nissan":
-            return {
-                "attempted": True,
-                "searched": True,
-                "verified": True,
-                "captured": False,
-                "task_id": "nav-task-rogue-1",
-                "source_url": "https://alldata.test/nissan/rogue/2021/radar-aiming",
-                "extracted_text": "Radar sensor aiming: target at 2.5 m, vehicle level, use CONSULT-III plus.",
-                "provenance": {"provider": "alldata", "licensed_session": True, "workflow": "model_navigator_agent"},
-                "verification": {"verified": True, "matched_terms": ["radar", "aiming"]},
-            }
-        return {"attempted": True, "searched": True, "verified": False, "reason": "No matching procedure."}
-
     async def public_search(self, query: str, make: str | None, *, source_depth: str = "standard") -> dict[str, Any]:
         self.research_calls.append(("web", {"query": query, "make": make, "source_depth": source_depth}))
         return {"searched": True, "verified": False, "sources": [], "read_results": [], "result_count": 0}
@@ -1060,14 +1043,14 @@ SCENARIOS: tuple[Scenario, ...] = (
         "technical_evidence",
         (
             Turn(
-                "Look up the radar sensor aiming spec for a 2021 Nissan Rogue, but don't use ALLDATA.",
-                calls=(Call("delegate_research", _all(_vehicle(2021, "Nissan", "Rogue"), _excludes("alldata"))),),
+                "Look up the radar sensor aiming spec for a 2021 Nissan Rogue, but don't search the web.",
+                calls=(Call("delegate_research", _all(_vehicle(2021, "Nissan", "Rogue"), _excludes("web"))),),
                 forbidden=frozenset({"calibration_iq_ro", "stage_action"}),
                 contracts=frozenset({"no_invented_data"}),
                 answer_contracts={
-                    "reports_miss_without_alldata": (
-                        "The response says no verified finding came from the sources checked, "
-                        "acknowledges ALLDATA was excluded, and invents no specification."
+                    "reports_miss_without_web": (
+                        "The response says nothing in the sources checked answered it, "
+                        "acknowledges the web was left out, and invents no specification."
                     ),
                 },
             ),
@@ -1409,7 +1392,6 @@ def build_harness_registry(store: Any, backends: FixtureBackends):
             settings,
             adas_search=backends.adas_search,
             knowledge_search=backends.knowledge_search,
-            navigator_search=backends.navigator_search,
             public_search=backends.public_search,
         ),
     )

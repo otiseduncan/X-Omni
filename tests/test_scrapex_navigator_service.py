@@ -11,6 +11,14 @@ from jsonschema import Draft202012Validator
 from core.services import scrapex
 
 
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
+
 @dataclass
 class FakeSettings:
     scrapex_base_url: str = "http://127.0.0.1:8125"
@@ -82,6 +90,7 @@ def test_navigator_tool_is_registered_in_the_static_schema_map() -> None:
     assert scrapex.SCRAPEX_TOOL_SCHEMAS["scrapex_navigator"] is scrapex.SCRAPEX_NAVIGATOR_SCHEMA
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_create_task_echoes_provider_target_and_topic(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -123,6 +132,7 @@ async def test_create_task_echoes_provider_target_and_topic(monkeypatch):
     assert result["data"]["id"] == "task-1"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_create_task_rejects_mismatched_provider_echo(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -147,6 +157,7 @@ async def test_create_task_rejects_mismatched_provider_echo(monkeypatch):
     assert result["error"]["contract_code"] == "navigator_provider_mismatch"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_observe_requires_well_formed_elements(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -165,6 +176,7 @@ async def test_observe_requires_well_formed_elements(monkeypatch):
     assert result["error"]["contract_code"] == "navigator_observation_malformed"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_click_sends_the_exact_ref_and_task_id(monkeypatch):
     requests: list[tuple[str, str, Any]] = []
@@ -195,6 +207,7 @@ async def test_click_sends_the_exact_ref_and_task_id(monkeypatch):
     assert result["work_complete"] is False
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_scroll_and_wait_send_bounded_action_payloads(monkeypatch):
     requests: list[dict[str, Any]] = []
@@ -222,6 +235,7 @@ async def test_scroll_and_wait_send_bounded_action_payloads(monkeypatch):
     ]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_done_marks_work_complete(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -236,6 +250,7 @@ async def test_done_marks_work_complete(monkeypatch):
     assert result["work_complete"] is True
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_verify_reports_unverified_without_failing_the_call(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -264,6 +279,7 @@ async def test_verify_reports_unverified_without_failing_the_call(monkeypatch):
     assert result["data"]["vehicle_verified"] is True
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_verify_reports_verified_when_all_gates_pass(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -293,6 +309,7 @@ async def test_verify_reports_verified_when_all_gates_pass(monkeypatch):
     assert result["work_complete"] is True
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_get_evidence_rejects_a_task_id_mismatch(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -310,6 +327,7 @@ async def test_get_evidence_rejects_a_task_id_mismatch(monkeypatch):
     assert result["error"]["contract_code"] == "navigator_task_mismatch"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_unsupported_provider_is_rejected_before_any_request(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -325,6 +343,7 @@ async def test_unsupported_provider_is_rejected_before_any_request(monkeypatch):
     assert result["success"] is False
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_current_page_signals_returns_the_bounded_signal_list(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -347,6 +366,7 @@ async def test_current_page_signals_returns_the_bounded_signal_list(monkeypatch)
     assert result["data"]["signals"] == ["2023 Toyota Camry - ALLDATA"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_current_page_signals_rejects_a_provider_echo_mismatch(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -361,6 +381,7 @@ async def test_current_page_signals_rejects_a_provider_echo_mismatch(monkeypatch
     assert result["error"]["contract_code"] == "navigator_provider_mismatch"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_current_page_signals_rejects_unsupported_provider(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -373,6 +394,7 @@ async def test_current_page_signals_rejects_unsupported_provider(monkeypatch):
     assert result["success"] is False
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_malformed_task_id_is_rejected_before_any_request(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -387,6 +409,7 @@ async def test_malformed_task_id_is_rejected_before_any_request(monkeypatch):
     assert result["success"] is False
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_navigator_screenshot_is_task_bound_jpeg(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -407,6 +430,7 @@ async def test_navigator_screenshot_is_task_bound_jpeg(monkeypatch):
     assert mime == "image/jpeg"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_navigator_screenshot_rejects_wrong_task_echo(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -425,6 +449,7 @@ async def test_navigator_screenshot_rejects_wrong_task_echo(monkeypatch):
     assert exc.value.code == "navigator_task_mismatch"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_alldata_authentication_required_is_not_mislabeled_as_adas_map(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -454,6 +479,7 @@ async def test_alldata_authentication_required_is_not_mislabeled_as_adas_map(mon
 # --------------------------------------------------------------------------
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_bound_ref_actions_carry_the_observation_and_marks_are_opt_in(monkeypatch):
     requests: list[tuple[str, dict[str, Any]]] = []
@@ -500,6 +526,7 @@ async def test_bound_ref_actions_carry_the_observation_and_marks_are_opt_in(monk
     assert typed["success"] is True and clicked["success"] is True
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_mark_visual_and_vin_actions_send_their_exact_contracts(monkeypatch):
     requests: list[dict[str, Any]] = []
@@ -537,6 +564,7 @@ async def test_mark_visual_and_vin_actions_send_their_exact_contracts(monkeypatc
     ]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_mark_and_visual_actions_require_their_observation_before_any_request(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
@@ -559,6 +587,7 @@ async def test_mark_and_visual_actions_require_their_observation_before_any_requ
         assert result["executed"] is False
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_stale_target_refusal_reaches_the_caller_as_a_definitive_409(monkeypatch):
     """The refusal X's loop branches on: it must be definitive, carry ScrapeX's
@@ -597,6 +626,7 @@ async def test_a_stale_target_refusal_reaches_the_caller_as_a_definitive_409(mon
     assert "moved from where it was observed" in message
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_the_screenshot_is_bound_to_the_observation_it_belongs_to(monkeypatch):
     seen: list[str] = []
@@ -618,6 +648,7 @@ async def test_the_screenshot_is_bound_to_the_observation_it_belongs_to(monkeypa
     assert raw.startswith(b"\xff\xd8\xff") and mime == "image/jpeg"
     assert "observation_id=obs_abc123" in seen[0]
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_screenshot_of_a_newer_observation_is_refused(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -637,6 +668,7 @@ async def test_a_screenshot_of_a_newer_observation_is_refused(monkeypatch):
     assert exc.value.code == "navigator_observation_mismatch"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_capture_carries_the_review_and_reads_back_the_text_sidecar(monkeypatch):
     bodies: list[dict[str, Any]] = []
@@ -673,6 +705,7 @@ async def test_capture_carries_the_review_and_reads_back_the_text_sidecar(monkey
     assert result["data"]["capture_method"] == "rendered_page_images"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_malformed_observation_id_or_mark_never_reaches_scrapex(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
@@ -691,6 +724,7 @@ async def test_a_malformed_observation_id_or_mark_never_reaches_scrapex(monkeypa
     assert bad_mark["status"] == "invalid_request"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_the_target_signal_asks_the_provider_about_the_exact_vehicle(monkeypatch):
     seen: list[str] = []
@@ -721,6 +755,7 @@ async def test_the_target_signal_asks_the_provider_about_the_exact_vehicle(monke
     assert result["data"]["reason"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_target_signal_without_a_selected_flag_is_a_contract_failure(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -734,6 +769,7 @@ async def test_a_target_signal_without_a_selected_flag_is_a_contract_failure(mon
     assert result["error"]["contract_code"] == "navigator_signals_malformed"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_target_signal_for_another_provider_is_refused(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:

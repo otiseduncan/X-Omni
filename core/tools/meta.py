@@ -91,6 +91,8 @@ QUERY_CIQ_KINDS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], dict[str
     "status": ("calibration_iq_status", (), (), {}),
     "adas_map_sweep": ("adas_map_sweep_status", (), (), {}),
     "adas_si_research": ("adas_si_research_status", (), (), {}),
+    # The authoritative ADAS SI library inventory, read-only (no root filing).
+    "adas_si_library": ("adas_si_inventory", (), (), {"organize_root": False}),
 }
 
 QUERY_CIQ_SCHEMA: dict[str, Any] = {
@@ -110,6 +112,8 @@ QUERY_CIQ_SCHEMA: dict[str, Any] = {
         "which continues on its own. It is a past snapshot rather "
         "than current state; adas_si_research reads the latest background "
         "service-information research job the same way. "
+        "adas_si_library: the ADAS SI library inventory; vehicle or document counts "
+        "come from it, never from search results. "
         "status: service reachability. CIQ state is not OEM proof."
     ),
     "parameters": {
@@ -224,25 +228,23 @@ def expand_query_ciq(args: Any) -> tuple[str, dict[str, Any]]:
     return tool, concrete
 
 
+# ALLDATA is sunset (core.services.alldata_sunset) and is not a source.
 RESEARCH_SOURCES: tuple[str, ...] = (
-    "adas_si",
     "automotive_knowledge",
-    "alldata",
+    "adas_si",
     "web",
 )
 
 DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
     "description": (
-        "Delegate one research objective to a bounded worker. Sources in order: "
-        "local ADAS SI library, durable automotive knowledge, licensed ALLDATA "
-        "(ScrapeX Navigator), public OEM web; stops at the first verified finding "
-        "unless exhaustive. Returns provenance (document/page, record, URL, or "
-        "ALLDATA task) with excerpts. Any vehicle, with or without an RO; give "
-        "year/make/model when known. sources sets preference order; exclude_sources "
-        "honors Otis's exclusions. Never changes Calibration IQ; preserve=true only "
-        "captures verified external evidence into ADAS SI. It never satisfies or "
-        "attaches SI to a CIQ RO; use stage_action research_si. A miss is only a miss in the "
-        "sources checked."
+        "Delegate one technical research objective to a bounded worker over durable "
+        "knowledge, the local ADAS SI library, then public OEM web. Each retrieved "
+        "source is judged for this exact vehicle and system: outcome SATISFIED, "
+        "PARTIAL, or UNSATISFIED; only accepted findings establish facts. Any vehicle, "
+        "with or without an RO; give year/make/model when known. exclude_sources "
+        "honors Otis's exclusions. Never changes Calibration IQ; it never satisfies or "
+        "attaches SI to a CIQ RO (stage_action research_si). A miss is only a miss in "
+        "the sources checked."
     ),
     "parameters": {
         "type": "object",
@@ -253,6 +255,11 @@ DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
                 "minLength": 3,
                 "maxLength": 600,
                 "description": "The technical fact, procedure, or requirement to find.",
+            },
+            "deliverable": {
+                "type": "string",
+                "enum": ["answer", "procedure"],
+                "description": "procedure: Otis wants its steps; answer: a requirement or fact.",
             },
             "vehicle": {
                 "type": "object",
@@ -289,7 +296,6 @@ DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
                 "description": "calibration_requirements scans whole documents for buried triggers/prerequisites.",
             },
             "exhaustive": {"type": "boolean"},
-            "preserve": {"type": "boolean"},
         },
         "required": ["objective"],
     },

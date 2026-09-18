@@ -3413,6 +3413,14 @@ class Registry:
         return name in self._handlers or name in self.COMPOSITE_TOOLS
 
     def tier(self, name: str) -> str:
+        # ALLDATA is sunset: its capabilities are blocked whatever the policy
+        # file or a service installer says, so none is advertised, discoverable
+        # through capability_search, or invocable. (Imported here: the services
+        # package imports the orchestrator, which imports this module.)
+        from ..services.alldata_sunset import is_sunset_tool
+
+        if is_sunset_tool(name):
+            return "blocked"
         entry = self.policy.get(name)
         tier = str((entry or {}).get("tier", "blocked"))
         return tier if tier in VALID_POLICY_TIERS else "blocked"

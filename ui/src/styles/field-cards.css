@@ -360,6 +360,12 @@
   background: rgba(5, 15, 31, 0.5);
 }
 .research-source-row.is-verified { border-color: rgba(53, 232, 138, 0.34); }
+.research-anchor {
+  margin: 6px 0;
+  padding-left: 9px;
+  border-left: 2px solid var(--border-soft);
+  font-style: italic;
+}
 .research-source-row.is-warning { border-color: rgba(255, 184, 77, 0.38); }
 .research-source-line,
 .research-evidence-title {

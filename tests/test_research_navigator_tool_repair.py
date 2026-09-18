@@ -8,6 +8,14 @@ import pytest
 from core.services import research_navigator_tool_repair as repair
 
 
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
+
 NAV_TOOL = [{"type": "function", "function": {"name": "navigator_browse", "parameters": {}}}]
 
 
@@ -143,6 +151,7 @@ async def test_does_not_retry_non_navigator_or_non_parse_failure():
     assert client.navigator_tool_json_repairs == 0
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_navigator_search_builds_the_repair_client_itself(monkeypatch):
     """The repair client is part of the entry point, not a wrapper installed on it."""

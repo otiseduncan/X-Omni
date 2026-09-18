@@ -7,6 +7,14 @@ import pytest
 from core.services import scrapex_navigator_runtime
 
 
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
+
 def _managed_settings():
     return SimpleNamespace(scrapex_project_path=r"X:\ScrapeX")
 
@@ -21,6 +29,7 @@ def _valid_create():
     }
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_create_task_starts_scrapex_before_posting_task():
     calls: list[str] = []
@@ -47,6 +56,7 @@ async def test_create_task_starts_scrapex_before_posting_task():
     assert calls == ["start", "navigator:create_task"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_create_task_returns_startup_failure_without_mutation():
     calls: list[str] = []
@@ -75,6 +85,7 @@ async def test_create_task_returns_startup_failure_without_mutation():
     assert calls == ["start"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_non_create_navigator_action_does_not_restart_scrapex():
     calls: list[str] = []
@@ -98,6 +109,7 @@ async def test_non_create_navigator_action_does_not_restart_scrapex():
     assert calls == ["navigator:observe"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_unmanaged_adapter_create_keeps_original_transport_behavior():
     calls: list[str] = []
@@ -123,6 +135,7 @@ async def test_unmanaged_adapter_create_keeps_original_transport_behavior():
     assert calls == ["navigator"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_invalid_provider_never_starts_managed_runtime():
     calls: list[str] = []

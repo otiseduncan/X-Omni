@@ -20,6 +20,14 @@ from core.services import research_semantic_review as review_mod
 from tests.test_research_navigator_agent import _navigator_result
 
 
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
+
 def _accept(**overrides: Any) -> dict[str, Any]:
     verdict = {
         "classification": "ACTUAL_PROCEDURE",
@@ -201,6 +209,7 @@ async def _run(client, reviewer=None, **kwargs):
 # ------------------------------------------------------------ binding
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_ref_actions_carry_the_observation_they_were_chosen_from(wired):
     client = _Client([[("click", {"ref": "e1"})], [("type", {"ref": "e2", "text": "KNAF24A28S5000001"})], None])
@@ -217,6 +226,7 @@ async def test_ref_actions_carry_the_observation_they_were_chosen_from(wired):
     assert _screenshot.calls[0] == ("task-1", "obs_2")
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_missing_ref_can_fall_back_to_marks_then_a_visual_point(wired):
     client = _Client([
@@ -251,6 +261,7 @@ async def test_visual_actions_require_an_observation_identity():
     assert agent._validate_args("click_visual", {"x_norm": 0.5, "y_norm": 0.5}) is None
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_stale_target_refusal_returns_a_fresh_observation_never_a_substitute_click(monkeypatch):
     navigator = _Navigator(stale_once="click")
@@ -271,6 +282,7 @@ async def test_stale_target_refusal_returns_a_fresh_observation_never_a_substitu
     assert result["research_receipt"]["stale_action_rejections"] == 1
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_the_first_message_preselects_the_vin_before_the_model_sees_the_page(wired):
     """Every 2026-09-13 baseline task spent its whole budget inside whichever
@@ -296,6 +308,7 @@ async def test_the_first_message_preselects_the_vin_before_the_model_sees_the_pa
     }
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_session_already_on_the_right_vehicle_is_said_so(wired):
     _target_signal.selected = True
@@ -307,6 +320,7 @@ async def test_a_session_already_on_the_right_vehicle_is_said_so(wired):
     assert not any(call["action"] == "select_vehicle" for call in wired.calls)
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_an_unavailable_selection_check_says_nothing_rather_than_guessing(monkeypatch):
     navigator = _Navigator()
@@ -322,6 +336,7 @@ async def test_an_unavailable_selection_check_says_nothing_rather_than_guessing(
     assert result["attempted"] is True
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_select_vehicle_fast_path_is_dispatched_with_the_vin(wired):
     client = _Client([[("select_vehicle", {"vin": "KNAF24A28S5000001"})], None])
@@ -336,6 +351,7 @@ async def test_select_vehicle_fast_path_is_dispatched_with_the_vin(wired):
 # ------------------------------------------------------------- critic
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_reviewer_gets_the_objective_and_evidence_but_never_the_navigator_transcript(wired):
     reviewer = _Reviewer([_accept()])
@@ -366,6 +382,7 @@ async def test_reviewer_gets_the_objective_and_evidence_but_never_the_navigator_
     assert result["documents"][0]["artifact"]["sha256"] == "f" * 64
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_review_reject_and_continue_keep_the_loop_going_and_never_accept(wired):
     reviewer = _Reviewer([
@@ -386,6 +403,7 @@ async def test_review_reject_and_continue_keep_the_loop_going_and_never_accept(w
     assert "semantic review did not accept" in " ".join(result["incomplete_reasons"]).casefold()
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_uncertain_or_malformed_review_never_becomes_an_acceptance(wired):
     reviewer = _Reviewer([review_mod.malformed_review("prose instead of a verdict")])
@@ -397,6 +415,7 @@ async def test_uncertain_or_malformed_review_never_becomes_an_acceptance(wired):
     assert result["research_receipt"]["critic_decisions"][0]["malformed"] is True
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_accepted_with_dependencies_pursues_each_as_its_own_task(wired):
     reviewer = _Reviewer([
@@ -420,6 +439,7 @@ async def test_accepted_with_dependencies_pursues_each_as_its_own_task(wired):
     assert result["task_ids"] == ["task-1", "task-2"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_unresolved_dependency_is_reported_as_incompleteness(wired):
     reviewer = _Reviewer([
@@ -433,6 +453,7 @@ async def test_unresolved_dependency_is_reported_as_incompleteness(wired):
     assert any("Target Setup" in reason for reason in result["incomplete_reasons"])
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_dependency_the_reviewer_rejects_on_sight_is_dismissed_not_missing(wired):
     reviewer = _Reviewer([
@@ -449,6 +470,7 @@ async def test_a_dependency_the_reviewer_rejects_on_sight_is_dismissed_not_missi
     assert [call["task_id"] for call in _capture.calls] == ["task-1"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_documents_listed_under_a_plain_accept_are_noted_not_pursued(wired):
     reviewer = _Reviewer([_accept(dependencies=[{"title": "Wheel Alignment", "reason": "related information", "quote": "Related information: Wheel Alignment"}])])
@@ -459,6 +481,7 @@ async def test_documents_listed_under_a_plain_accept_are_noted_not_pursued(wired
     assert [call["topic"] for call in wired.calls if call["action"] == "create_task"] == ["front radar sensor calibration"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_dependency_limit_is_a_resource_bound_not_a_depth_rule(wired):
     dependencies = [{"title": f"Doc {index}", "reason": "needed"} for index in range(5)]
@@ -471,6 +494,7 @@ async def test_dependency_limit_is_a_resource_bound_not_a_depth_rule(wired):
     assert any("dependency limit" in reason for reason in result["incomplete_reasons"])
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_follow_dependency_ends_the_primary_task_and_pursues_the_named_document(wired):
     reviewer = _Reviewer([
@@ -486,6 +510,7 @@ async def test_follow_dependency_ends_the_primary_task_and_pursues_the_named_doc
     assert result["verified"] is True
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_review_can_be_switched_off_for_mechanical_comparison(wired):
     reviewer = _Reviewer([])
@@ -517,6 +542,7 @@ class _StuckNavigator(_Navigator):
         }
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_the_same_action_that_changes_nothing_is_not_sent_forever(monkeypatch):
     """The 2026-09-13 baseline's dominant waste: one ref clicked 39 times, no
@@ -543,6 +569,7 @@ async def test_the_same_action_that_changes_nothing_is_not_sent_forever(monkeypa
     assert "same scroll position" in notice
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_working_scroll_down_a_long_page_is_never_called_no_effect(monkeypatch):
     """The Palisade procedure needs about ten scrolls to reach its bottom, and
@@ -577,6 +604,7 @@ async def test_a_working_scroll_down_a_long_page_is_never_called_no_effect(monke
     assert len([call for call in navigator.calls if call["action"] == "scroll"]) == 8
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_varied_actions_that_get_nowhere_still_run_out_of_progress(monkeypatch):
     navigator = _StuckNavigator()
@@ -591,6 +619,7 @@ async def test_varied_actions_that_get_nowhere_still_run_out_of_progress(monkeyp
     assert "stalled" in " ".join(result["incomplete_reasons"])
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_receipt_records_actions_observations_urls_decisions_and_artifacts(wired):
     reviewer = _Reviewer([_accept()])
@@ -621,6 +650,7 @@ async def test_receipt_records_actions_observations_urls_decisions_and_artifacts
     assert "messages" not in json.dumps(receipt)
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_second_run_while_one_holds_the_browser_is_refused_not_queued(wired):
     async with agent.NAVIGATOR_LOCK:

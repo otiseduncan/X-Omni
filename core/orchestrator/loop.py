@@ -3201,9 +3201,10 @@ class Orchestrator:
                 return
 
         try:
-            from ..services import research_navigator_agent
+            from ..services import research_evidence_contract
 
-            navigator_model_token = research_navigator_agent.bind_model_client(
+            # Research tools judge what they retrieve with this turn's model.
+            evaluator_model_token = research_evidence_contract.bind_model_client(
                 self.client
             )
             try:
@@ -3219,7 +3220,7 @@ class Orchestrator:
                     scrapex_evidence=scrapex_evidence,
                 )
             finally:
-                research_navigator_agent.reset_model_client(navigator_model_token)
+                research_evidence_contract.reset_model_client(evaluator_model_token)
         except NeedsApproval as pending:
             context = approval_context or {}
             if not all(

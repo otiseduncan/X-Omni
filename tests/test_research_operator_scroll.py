@@ -16,6 +16,14 @@ import pytest
 from core.services import research_operator
 
 
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
+
 class _FakeLocator:
     def __init__(self):
         self.first = self
@@ -58,6 +66,7 @@ def _browser(tmp_path: Path, page: _FakePage) -> research_operator.LicensedBrows
     return browser
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_scroll_with_coordinates_moves_the_cursor_there_first(tmp_path: Path):
     page = _FakePage()
@@ -68,6 +77,7 @@ async def test_scroll_with_coordinates_moves_the_cursor_there_first(tmp_path: Pa
     assert page.mouse.calls == [("move", 300.0, 500.0), ("wheel", 0, 700.0)]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_scroll_without_coordinates_still_scrolls_in_place(tmp_path: Path):
     # Backward compatible: an older client that never sends x/y must keep
@@ -80,6 +90,7 @@ async def test_scroll_without_coordinates_still_scrolls_in_place(tmp_path: Path)
     assert page.mouse.calls == [("wheel", 0, -700.0)]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_scroll_coordinates_are_bounded_to_the_screenshot_viewport(tmp_path: Path):
     page = _FakePage()

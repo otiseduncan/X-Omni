@@ -32,7 +32,6 @@ from .config import Settings
 from .models.client import ModelClient
 from .models.router import ModelRouter, WorkerSwapError
 from .services import adas_map_sweep as adas_map_sweep_svc
-from .services import adas_si_harvest as adas_si_harvest_svc
 from .services import adas_si_research as adas_si_research_svc
 from .services import attachments as attachments_svc
 from .services import adas_si as adas_si_svc
@@ -48,6 +47,7 @@ from .services import image_generation as image_svc
 from .services import live_events as live_events_svc
 from .services import research as research_svc
 from .services import research_delegate as research_delegate_svc
+from .services import research_knowledge_promotion as research_knowledge_promotion_svc
 from .services import scrapex as scrapex_svc
 from .services import video_generation as video_svc
 from .services import website as website_svc
@@ -354,13 +354,8 @@ def build_app(
     registry.register("adas_si_research", adas_si_research.start)
     registry.register("adas_si_research_status", adas_si_research.status)
 
-    # The scripted harvester is legacy and non-authoritative; it is registered
-    # only for an explicit side-by-side comparison run.
-    adas_si_harvest = None
-    if os.getenv("XOMNI_LEGACY_SI_HARVEST", "").strip() == "1":
-        adas_si_harvest = adas_si_harvest_svc.AdasSiHarvestService(settings, store)
-        registry.register("adas_si_harvest", adas_si_harvest.start)
-        registry.register("adas_si_harvest_status", adas_si_harvest.status)
+    # The scripted ALLDATA harvester (adas_si_harvest) is sunset with ALLDATA:
+    # kept in source, never registered (core.services.alldata_sunset).
 
     registry.register("automotive_knowledge_search", automotive_knowledge.search)
     registry.register("automotive_knowledge_read", automotive_knowledge.read)
@@ -381,6 +376,8 @@ def build_app(
             settings,
             adas_search=lambda a: adas.model_search(a),
             knowledge_search=automotive_knowledge.search,
+            adas=adas,
+            learn=research_knowledge_promotion_svc.make_learner(knowledge_repository, adas),
         ),
     )
 
@@ -529,8 +526,6 @@ def build_app(
             try:
                 await adas_map_sweep.shutdown()
                 await adas_si_research.shutdown()
-                if adas_si_harvest is not None:
-                    await adas_si_harvest.shutdown()
                 adas_refresh_task.cancel()
                 await asyncio.gather(adas_refresh_task, return_exceptions=True)
             finally:

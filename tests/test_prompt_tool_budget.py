@@ -110,8 +110,11 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # 2026-09-13: stage_action research_si (background service-information
     # research) and query_ciq adas_si_research added ~500 chars to the permanent
     # catalog; measured 9,706 chars / 2,774 estimator tokens after trimming.
-    assert metrics["advertised_tools"]["catalog_tokens"] < 2_830
-    assert metrics["advertised_tools"]["catalog_chars"] < 9_900
+    # 2026-09-17: the research outcome contract (SATISFIED / PARTIAL / UNSATISFIED,
+    # deliverable, query_ciq adas_si_library) and the ALLDATA sunset measured
+    # 2,855 estimator tokens, +28 over the prior catalog.
+    assert metrics["advertised_tools"]["catalog_tokens"] < 2_860
+    assert metrics["advertised_tools"]["catalog_chars"] < 9_990
     # Static system prompt, measured with the voice-dictation sentence: 4,831
     # chars, ~1,381 estimator tokens. Raised 2026-09-12 by 637 chars for the
     # setup-measurement rule: X had answered a target placement question from
@@ -126,8 +129,12 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # installed, and pasted the flattened OCR into its reply. Source precedence,
     # stage-aware reading, and "evidence is interpreted, not relayed" govern
     # every evidence-backed answer, so they belong in the static prompt.
-    assert metrics["base_system"]["chars"] < 6_800
-    assert metrics["base_system"]["tokens"] < 1_950
+    # 2026-09-17 (later): accepted-evidence grounding and technical-research
+    # follow-ups added 401 chars (7,150 measured with the Omni worker block):
+    # only accepted findings
+    # establish vehicle facts, and follow-ups keep the research subject.
+    assert metrics["base_system"]["chars"] < 7_200
+    assert metrics["base_system"]["tokens"] < 2_060
     # Measured 2026-09-11 with the sweep contract and phase enums: 4,003
     # estimator tokens total (exact: 992 system + ~2,481 permanent tools).
     # 2026-09-12: the setup-measurement rule above carries this to ~4,225. The
@@ -138,8 +145,10 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # sweep, even right after an inventory answer, cost 54 tokens: 4,458. Live
     # X answered that request with the read-only inventory 3 of 3 times.
     # 2026-09-17: the evidence-and-conversation section: 4,789.
-    assert metrics["total_input_used_tokens"] < 4_830
-    assert metrics["remaining_normal_turn_tokens"] > 26_400
+    # 2026-09-17 (later): research outcome contract, accepted-evidence
+    # grounding, technical-research follow-ups, ALLDATA sunset: 4,932.
+    assert metrics["total_input_used_tokens"] < 4_970
+    assert metrics["remaining_normal_turn_tokens"] > 26_260
 
 
 def test_budget_reserve_covers_permanent_plus_largest_unlockable_set() -> None:
@@ -378,4 +387,6 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     # 2026-09-13 after the research_si contract: 24,649.
     # 2026-09-16 after the get-missing-map-reports sweep wording: 24,546.
     # 2026-09-17 after the evidence-and-conversation section: 24,215.
-    assert metrics["remaining_normal_turn_tokens"] >= 24_170
+    # 2026-09-17 after the research outcome contract, ALLDATA sunset, and the
+    # separate technical-research section: 24,073.
+    assert metrics["remaining_normal_turn_tokens"] >= 24_030

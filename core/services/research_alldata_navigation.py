@@ -17,6 +17,7 @@ import re
 import threading
 from typing import Any, Optional
 
+from . import alldata_sunset
 from . import research_operator as ro
 from . import research_verification
 from . import research_workflow
@@ -516,6 +517,7 @@ async def search_alldata_vehicle_first(
     calls supply the already-interpreted vehicle and topic fields, so this
     executor does not manufacture business arguments from user prose.
     """
+    alldata_sunset.refuse("research_alldata_navigation.search_alldata_vehicle_first")
     state = await browser.start(auto_login=True)
     page = browser._page  # noqa: SLF001 - provider automation owned by this service
     if page is None:

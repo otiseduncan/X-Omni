@@ -28,6 +28,7 @@ from typing import Any, Optional
 
 from . import adas_artifact_catalog
 from . import adas_si_research
+from . import alldata_sunset
 from . import calibration_iq
 from . import calibration_iq_weekly_queue as weekly_queue
 from . import research_alldata_navigation as nav
@@ -344,6 +345,16 @@ async def _acquire_si_gaps(
     ]
     if not missing:
         return []
+    if alldata_sunset.ALLDATA_SUNSET:
+        # The gaps stay reported as gaps; nothing is acquired from ALLDATA.
+        return [
+            alldata_sunset.sunset_result(
+                "calibration_iq_work_prep.acquire_si_gaps",
+                captured=False,
+                topic=str(item.get("calibration") or ""),
+            )
+            for item in missing
+        ]
 
     target = _navigator_target(snapshot)
     if target is None:
@@ -3217,6 +3228,10 @@ async def handle(settings: Any, adas: Any, args: dict[str, Any]) -> dict[str, An
         return await _ro_requirements(settings, adas, args)
     if mode == "adas_map_inventory":
         return await _adas_map_inventory(settings, args)
+    if mode in {"ro_si_acquire", "queue_next"} and alldata_sunset.ALLDATA_SUNSET:
+        # Both modes existed only to acquire from ALLDATA. RO service
+        # information is stage_action research_si against the ADAS SI library.
+        return alldata_sunset.sunset_result(f"calibration_iq_work_prep.{mode}", mode=mode)
     if mode == "ro_si_acquire":
         return await _ro_si_acquire(settings, adas, args)
     if mode == "week_readiness":

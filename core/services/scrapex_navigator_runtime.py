@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import alldata_sunset
+
 _INSTALLED_ATTR = "__xomni_navigator_runtime_preflight_installed__"
 
 
@@ -93,6 +95,8 @@ def install(module: Any) -> None:
     original_navigator = module.navigator
 
     async def navigator_with_runtime_preflight(settings: Any, args: dict[str, Any]):
+        # Refused before ScrapeX is started for it: every Navigator provider is ALLDATA.
+        alldata_sunset.refuse("scrapex_navigator_runtime.navigator")
         if _managed_project(settings) and _valid_create_task(module, args):
             startup = await module.start_native(settings)
             if not isinstance(startup, dict) or startup.get("success") is not True:

@@ -27,7 +27,7 @@ def test_research_routes_skip_minimal_settings_without_application_root():
     assert not any("/research/providers/alldata" in path for path in paths)
 
 
-def test_research_routes_attach_when_real_application_root_exists(tmp_path):
+def test_no_alldata_routes_attach_even_with_a_real_application_root(tmp_path):
     router = APIRouter(prefix="/api")
 
     async def require_session():
@@ -40,7 +40,6 @@ def test_research_routes_attach_when_real_application_root_exists(tmp_path):
     )
     research_operator.install_http_routes(router, settings, require_session)
 
+    # ALLDATA is sunset: no setup page, credential form, or inline browser.
     paths = {route.path for route in router.routes}
-    assert "/api/research/providers/alldata/status" in paths
-    assert "/api/research/providers/alldata/credentials" in paths
-    assert "/api/research/providers/alldata/sessions" in paths
+    assert not any("/research/providers/alldata" in path for path in paths)

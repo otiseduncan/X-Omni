@@ -56,15 +56,15 @@ async def test_background_research_never_opens_navigator_without_ciq_vin(tmp_pat
     async def ro_reader(_args: dict[str, Any]) -> dict[str, Any]:
         return _verified_ro(vin="")
 
-    async def navigator_search(**kwargs: Any) -> dict[str, Any]:
-        navigator_calls.append(kwargs)
-        raise AssertionError("Navigator must not run without an exact VIN")
+    async def library_search(_service: Any, objective: dict[str, Any], _reviews: Any) -> dict[str, Any]:
+        navigator_calls.append(objective)
+        raise AssertionError("Research must not run without an exact VIN")
 
     service = research.AdasSiResearchService(
         SimpleNamespace(),
         store,
         client=object(),
-        navigator_search=navigator_search,
+        library_search=library_search,
         ro_reader=ro_reader,
     )
     context = {

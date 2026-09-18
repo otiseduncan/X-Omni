@@ -34,12 +34,15 @@ def test_alldata_setup_is_exposed_as_a_model_selectable_secure_capability():
     assert "never enters model context" in description
 
 
-def test_research_tools_are_registered_with_separate_policy_tiers(tmp_path: Path):
+def test_research_tools_are_registered_but_blocked_by_the_alldata_sunset(tmp_path: Path):
     policy = tmp_path / "tools.yaml"
+    # Even a policy file that still grants the old tiers cannot make them run.
     policy.write_text(_policy_text(), encoding="utf-8")
     registry = Registry(policy)
-    assert registry.tier("research_provider_setup") == "read_only"
-    assert registry.tier("collision_research") == "operator_authorized"
+    assert registry.tier("research_provider_setup") == "blocked"
+    assert registry.tier("collision_research") == "blocked"
+    names = {item["function"]["name"] for item in registry.model_tools("owner")}
+    assert "research_provider_setup" not in names and "collision_research" not in names
     assert "research_provider_setup" in registry._handlers  # noqa: SLF001
     assert "collision_research" in registry._handlers  # noqa: SLF001
     assert "research_provider_setup" in TOOL_SCHEMAS

@@ -25,6 +25,7 @@ import json
 import logging
 from typing import Any, Optional
 
+from . import alldata_sunset
 from . import research_alldata_navigation as nav
 from . import research_operator as ro
 from . import research_verification
@@ -152,6 +153,7 @@ async def run_agent_search(
     topic: str,
     max_turns: int = MAX_AGENT_TURNS,
 ) -> dict[str, Any]:
+    alldata_sunset.refuse("research_alldata_agent.run_agent_search")
     state = await browser.start(auto_login=True)
     if not state.get("authenticated"):
         return {

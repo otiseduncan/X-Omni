@@ -104,11 +104,12 @@ tools:
   delegate_research:
     tier: operator_authorized
     description: >-
-      Bounded multi-source research worker: local ADAS SI, durable knowledge,
-      licensed ALLDATA Navigator, public OEM web. Never writes to Calibration IQ;
-      preserve=true captures verified evidence into ADAS SI. It never satisfies
-      or attaches SI to a Calibration IQ RO; stage_action research_si is the
-      canonical production route for that work.
+      Bounded research worker over durable automotive knowledge, the local ADAS SI
+      library, and public OEM web. Every retrieved source is judged by the shared
+      semantic evidence evaluator; the result is SATISFIED, PARTIAL, or
+      UNSATISFIED, never mere retrieval. Never writes to Calibration IQ. It never
+      satisfies or attaches SI to a Calibration IQ RO; stage_action research_si
+      is the canonical production route for that work.
 
   stage_action:
     tier: operator_authorized
@@ -230,7 +231,7 @@ tools:
   # ---- ADAS SI: the source library is read-only; annotations are gated ----
   adas_si_search:
     tier: read_only
-    description: "Search the local authoritative ADAS SI library only. A miss is not acquisition; for an RO SI request use alldata_service_information so the licensed ALLDATA Navigator can continue the job."
+    description: "Search the local authoritative ADAS SI library only. A hit is retrieval, not an answer, and a miss is not acquisition; RO SI work is stage_action research_si."
 
   adas_si_inventory:
     tier: read_only
@@ -300,35 +301,29 @@ tools:
       versioning. Requires Owner approval and still fails closed unless the
       repository already contains deterministically validated evidence.
 
-  # ---- Post-collision research: setup is passive, operator use is authorized ----
+  # ---- ALLDATA: sunset 2026-09-17 ----
+  # Preserved in source control, not executable. core.services.alldata_sunset
+  # blocks these whatever this file says; the entries stay so a direct call is
+  # refused by policy too. Re-enabling is a code change plus a redeploy.
   research_provider_setup:
-    tier: read_only
-    description: >-
-      ALLDATA account setup/authentication only. Use only for an explicit request
-      to configure credentials, sign in, log in, or open the authentication card.
-      Never use for SI research or "check ALLDATA"; alldata_service_information
-      owns that work. Credentials go directly to Core/Windows Credential Manager
-      and never become model arguments or conversation content.
+    tier: blocked
+    description: "ALLDATA account setup. Sunset: not available."
 
   collision_research:
-    tier: operator_authorized
-    description: >-
-      Backward-compatible targeted post-collision research using licensed ALLDATA
-      and public OEM sources. Retained for full-profile maintenance.
+    tier: blocked
+    description: "Legacy licensed ALLDATA / public OEM research. Sunset: not available."
 
   service_information_research:
-    tier: operator_authorized
-    description: >-
-      Backward-compatible general service-information research. Retained for the
-      full maintenance profile; not advertised in the normal ADAS operator surface.
+    tier: blocked
+    description: "Legacy ALLDATA service-information research. Sunset: not available."
 
   alldata_service_information:
-    tier: operator_authorized
-    description: >-
-      Primary one-RO OEM service-information acquisition. Checks local ADAS SI
-      first, then uses ScrapeX's licensed ALLDATA Navigator on a miss or unverified
-      result, captures verified procedure evidence, refreshes ADAS SI, and links it
-      to Calibration IQ. This capability never acquires or authenticates ADAS Map.
+    tier: blocked
+    description: "Legacy one-RO ALLDATA acquisition. Sunset: not available."
+
+  scrapex_navigator:
+    tier: blocked
+    description: "ScrapeX Navigator browser turns (ALLDATA only). Sunset: not available."
 
   # ---- ScrapeX: loopback-only ADAS Map acquisition and CIQ reconciliation ----
   scrapex_status:
@@ -369,11 +364,11 @@ tools:
     tier: operator_authorized
     description: >-
       Background ADAS service-information research: exact vehicle/VIN and
-      calibration requirements from Calibration IQ, one model-driven ALLDATA
-      Navigator objective per requirement, an independent semantic review of
-      every candidate, capture into ADAS SI with provenance, and attachment to
-      the RO through the operator path. Reached through stage_action
-      research_si; not advertised directly in the daily profile.
+      calibration requirements from Calibration IQ, the shared ADAS SI library
+      searched per requirement, the shared semantic evidence evaluator on every
+      candidate (SATISFIED / PARTIAL / UNSATISFIED), and attachment of accepted
+      procedures to the RO through the operator path. No ALLDATA fallback.
+      Reached through stage_action research_si; not advertised directly.
 
   adas_si_research_status:
     tier: read_only

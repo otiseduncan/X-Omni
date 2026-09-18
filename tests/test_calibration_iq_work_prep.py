@@ -2307,32 +2307,28 @@ async def test_ro_si_acquire_does_not_open_alldata_when_si_is_already_covered(
 
 
 @pytest.mark.asyncio
-async def test_handle_routes_ro_si_acquire_mode(monkeypatch):
+async def test_handle_refuses_ro_si_acquire_under_the_alldata_sunset(monkeypatch):
     observed: dict = {}
 
     async def acquire(_settings, _adas, args):
         observed.update(args)
-        return {
-            "status": "captured",
-            "mode": "ro_si_acquire",
-            "success": True,
-            "verified": True,
-        }
+        raise AssertionError("ALLDATA acquisition must not run")
 
     monkeypatch.setattr(prep, "_ro_si_acquire", acquire)
-    result = await prep.handle(
-        SimpleNamespace(),
-        SimpleNamespace(),
-        {
-            "mode": "ro_si_acquire",
-            "repair_order_id": "2400612495",
-            "topic": "front long-range radar SI",
-        },
-    )
-
-    assert observed["repair_order_id"] == "2400612495"
-    assert observed["topic"] == "front long-range radar SI"
-    assert result["verified"] is True
+    for mode in ("ro_si_acquire", "queue_next"):
+        result = await prep.handle(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            {
+                "mode": mode,
+                "repair_order_id": "2400612495",
+                "topic": "front long-range radar SI",
+            },
+        )
+        assert result["sunset"] is True
+        assert result["executed"] is False and result["verified"] is False
+        assert result["provider"] == "alldata"
+    assert observed == {}
 
 
 @pytest.mark.asyncio

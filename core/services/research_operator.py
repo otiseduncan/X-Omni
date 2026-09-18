@@ -39,6 +39,8 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, SecretStr
 
+from . import alldata_sunset
+
 log = logging.getLogger("xomni.research_operator")
 
 PROVIDER = "alldata"
@@ -137,6 +139,7 @@ class WindowsCredentialVault:
         return username, password
 
     def write(self, username: str, password: str) -> dict[str, Any]:
+        alldata_sunset.refuse("research_operator.credential_write")
         self._require_windows()
         username, password = self._validate(username, password)
         secret = password.encode("utf-8")
@@ -158,6 +161,7 @@ class WindowsCredentialVault:
         return self.status()
 
     def read(self) -> tuple[str, str] | None:
+        alldata_sunset.refuse("research_operator.credential_read")
         self._require_windows()
         pointer = _PCREDENTIALW()
         if not self._advapi.CredReadW(self.target, CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)):
@@ -248,6 +252,7 @@ class LicensedBrowser:
         self._lock = asyncio.Lock()
 
     async def _ensure(self) -> None:
+        alldata_sunset.refuse("research_operator.licensed_browser")
         if self._context is not None and self._page is not None:
             self._last_used = time.monotonic()
             return
@@ -304,6 +309,7 @@ class LicensedBrowser:
                     pass
 
     async def start(self, *, auto_login: bool = True) -> dict[str, Any]:
+        alldata_sunset.refuse("research_operator.licensed_browser_start")
         async with self._lock:
             await self._ensure()
             assert self._page is not None
@@ -861,6 +867,9 @@ document.querySelector('#send').onclick=()=>{const el=document.querySelector('#t
 
 
 def install_http_routes(router: Any, settings: Any, require_session: Any, *, adas: Any | None = None) -> None:
+    if alldata_sunset.ALLDATA_SUNSET:
+        # No setup page, credential form, or inline browser: ALLDATA is sunset.
+        return
     browser = get_browser(Path(settings.root), adas=adas)
 
     @router.get(f"/research/providers/{PROVIDER}/setup", response_class=HTMLResponse)

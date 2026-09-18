@@ -39,14 +39,16 @@ def _source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_the_scripted_harvester_is_legacy_and_not_registered_by_default(monkeypatch):
+def test_the_scripted_harvester_is_legacy_and_never_registered(monkeypatch):
     assert adas_si_harvest.LEGACY is True
     assert adas_si_harvest.AUTHORITATIVE is False
     header = _source(SERVICES / "adas_si_harvest.py")[:1200]
     for word in ("LEGACY", "EXPERIMENTAL", "NON-DEFAULT", "NOT AUTHORITATIVE"):
         assert word in header
     main_source = _source(ROOT / "core" / "main.py")
-    assert 'os.getenv("XOMNI_LEGACY_SI_HARVEST", "").strip() == "1"' in main_source
+    # ALLDATA is sunset: no environment switch registers the harvester any more.
+    assert "XOMNI_LEGACY_SI_HARVEST" not in main_source
+    assert "adas_si_harvest.start" not in main_source
     assert 'registry.register("adas_si_research", adas_si_research.start)' in main_source
 
 

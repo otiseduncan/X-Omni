@@ -59,13 +59,25 @@ NO_RAW_EXTRACTION = (
 
 
 class EvidenceBackends(FixtureBackends):
-    """Fixture sources whose ADAS SI results are chosen per scenario."""
+    """Fixture sources whose ADAS SI and durable-knowledge results are chosen per scenario."""
 
     def __init__(self) -> None:
         super().__init__()
         self.adas_hits: Callable[[dict[str, Any]], list[dict[str, Any]]] = lambda _args: []
         self.adas_failure: str | None = None
-        self.navigator_failure: dict[str, Any] | None = None
+        self.knowledge_records: Callable[[dict[str, Any]], list[dict[str, Any]]] = lambda _args: []
+        self.inventory_summary: dict[str, Any] | None = None
+
+    def knowledge_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        self.research_calls.append(("automotive_knowledge", deepcopy(args)))
+        records = self.knowledge_records(args)
+        return {"status": "success" if records else "no_result", "records": deepcopy(records)}
+
+    def adas_si_inventory(self, args: dict[str, Any]) -> dict[str, Any]:
+        self.research_calls.append(("adas_si_inventory", deepcopy(args)))
+        if self.inventory_summary is None:
+            return {"status": "unavailable"}
+        return {"status": "success", "summary": deepcopy(self.inventory_summary), "applications": []}
 
     def adas_search(self, args: dict[str, Any]) -> dict[str, Any]:
         self.research_calls.append(("adas_si", deepcopy(args)))
@@ -76,11 +88,6 @@ class EvidenceBackends(FixtureBackends):
             return {"status": "no_result", "results": [], "structured_query": deepcopy(args)}
         return {"status": "success", "results": deepcopy(hits), "structured_query": deepcopy(args)}
 
-    async def navigator_search(self, **kwargs: Any) -> dict[str, Any]:
-        if self.navigator_failure is not None:
-            self.research_calls.append(("alldata", {"target": kwargs.get("target")}))
-            return deepcopy(self.navigator_failure)
-        return await super().navigator_search(**kwargs)
 
 
 def _kia_tokens(args: dict[str, Any]) -> list[str]:
@@ -98,6 +105,8 @@ class EvidenceTurn:
     expect_evidence: bool = True
     # A turn that never retrieved the evidence tests nothing about reading it.
     required_call: str | None = None
+    # Structural check of the fixture calls this turn made (source, arguments).
+    check: Callable[[list[tuple[str, dict[str, Any]]], "EvidenceTurnResult"], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -131,14 +140,85 @@ def _dynamic_setup(backends: EvidenceBackends) -> None:
 
 def _failure_setup(backends: EvidenceBackends) -> None:
     backends.adas_failure = "sqlite3.OperationalError: unable to open database file"
-    backends.navigator_failure = {
-        "attempted": True,
-        "searched": False,
-        "verified": False,
-        "status": "authentication_required",
-        "requires_human": True,
-        "reason": "ALLDATA sign-in is required in the managed browser.",
+
+
+def _k4_library(*hits: Callable[[], dict[str, Any]]) -> Callable[[EvidenceBackends], None]:
+    def setup(backends: EvidenceBackends) -> None:
+        backends.adas_hits = lambda args: (
+            [hit() for hit in hits] if "k4" in json.dumps(args).casefold() else []
+        )
+
+    return setup
+
+
+def _k4_reuse_setup(backends: EvidenceBackends) -> None:
+    backends.adas_hits = lambda args: (
+        [fx.k4_front_radar_hit()] if "k4" in json.dumps(args).casefold() else []
+    )
+    backends.knowledge_records = lambda args: (
+        [fx.k4_front_radar_knowledge_record()]
+        if str(args.get("model") or "").casefold() == "k4" and args.get("year") == 2025
+        else []
+    )
+
+
+def _inventory_setup(backends: EvidenceBackends) -> None:
+    backends.inventory_summary = {
+        "document_count": 412,
+        "vehicle_application_count": 137,
+        "parsed_document_count": 398,
     }
+    # A vehicle search would return a handful of hits: never the inventory.
+    backends.adas_hits = lambda _args: [fx.k4_bsm_hit(), fx.k4_bumper_hit(), fx.k4_front_radar_hit()]
+
+
+def _research_args(calls: list[tuple[str, dict[str, Any]]], source: str) -> list[dict[str, Any]]:
+    return [args for name, args in calls if name == source]
+
+
+def _k4_research(calls: list[tuple[str, dict[str, Any]]], _result: Any) -> None:
+    searched = _research_args(calls, "adas_si") + _research_args(calls, "automotive_knowledge")
+    if not searched:
+        raise ModelProtocolError(f"no research ran: {calls}")
+    for args in searched:
+        text = json.dumps(args).casefold()
+        if "k4" not in text:
+            raise ModelProtocolError(f"research lost the K4: {args}")
+
+
+def _k4_bsm_research(calls: list[tuple[str, dict[str, Any]]], result: Any) -> None:
+    _k4_research(calls, result)
+    library = _research_args(calls, "adas_si")
+    if not any(
+        any(word in json.dumps(args).casefold() for word in ("blind", "bsm", "bcw", "corner", "side"))
+        for args in library
+    ):
+        raise ModelProtocolError(f"the correction did not switch the system to BSM: {library}")
+
+
+def _reused_without_library(calls: list[tuple[str, dict[str, Any]]], _result: Any) -> None:
+    if not _research_args(calls, "automotive_knowledge"):
+        raise ModelProtocolError(f"durable knowledge was not consulted: {calls}")
+    if _research_args(calls, "adas_si"):
+        raise ModelProtocolError("the library was re-researched although durable knowledge answered")
+
+
+def _inventory_read(calls: list[tuple[str, dict[str, Any]]], _result: Any) -> None:
+    reads = _research_args(calls, "adas_si_inventory")
+    if not reads:
+        raise ModelProtocolError(f"the ADAS SI inventory was not read: {calls}")
+    if any(args.get("organize_root") is not False for args in reads):
+        raise ModelProtocolError(f"the inventory read could file documents: {reads}")
+
+
+def _no_alldata(calls: list[tuple[str, dict[str, Any]]], result: Any) -> None:
+    from core.services import alldata_sunset
+
+    if any(name == "alldata" for name, _args in calls):
+        raise ModelProtocolError("an ALLDATA source was reached")
+    touched = set(result.calls) & alldata_sunset.SUNSET_TOOLS
+    if touched:
+        raise ModelProtocolError(f"a sunset ALLDATA capability was called: {touched}")
 
 
 STAGED_CONTRACTS = {
@@ -249,8 +329,8 @@ SCENARIOS: tuple[EvidenceScenario, ...] = (
                 contracts={
                     "explains_failure": (
                         "The response says plainly that it could not retrieve the procedure "
-                        "(for example the library was unavailable and ALLDATA needs sign-in) "
-                        "and does not present any procedure steps as retrieved."
+                        "(for example the library was unavailable) and does not present any "
+                        "procedure steps as retrieved."
                     ),
                     "no_orchestration_dump": (
                         "The response does not include JSON, exception text, database errors, "
@@ -258,6 +338,173 @@ SCENARIOS: tuple[EvidenceScenario, ...] = (
                         "authentication_required."
                     ),
                 },
+            ),
+        ),
+    ),
+    # --- 2026-09-17 research contract field regressions ------------------
+    EvidenceScenario(
+        name="retrieval_is_not_satisfaction",
+        setup=_k4_library(fx.k4_bumper_hit),
+        turns=(
+            EvidenceTurn(
+                user="Give me the BSM calibration procedure for a 2025 Kia K4.",
+                required_call="delegate_research",
+                check=_k4_research,
+                contracts={
+                    "no_procedure_from_a_related_page": (
+                        "The response does not present rear bumper removal and installation "
+                        "steps as the blind spot (BSM/BCW) calibration procedure."
+                    ),
+                    "says_procedure_not_found": (
+                        "The response makes clear the BSM calibration procedure itself was not "
+                        "found or not confirmed in the sources checked."
+                    ),
+                    "no_invented_steps": (
+                        "The response does not give calibration steps, target distances, or "
+                        "reflector positions as if they came from a source."
+                    ),
+                },
+            ),
+        ),
+    ),
+    EvidenceScenario(
+        name="kia_application_grounding",
+        setup=_k4_library(fx.k4_front_radar_hit),
+        turns=(
+            EvidenceTurn(
+                user="On a 2021 Kia K4, does the front bumper stay on for the front radar calibration?",
+                required_call="delegate_research",
+                contracts={
+                    "no_later_model_year_as_fact": (
+                        "The response does not state as an established fact for a 2021 K4 what "
+                        "a 2025 K4 source says; it says the source it found covers the 2025 K4 "
+                        "or that it could not confirm the answer for a 2021."
+                    ),
+                },
+            ),
+        ),
+    ),
+    EvidenceScenario(
+        name="bsm_correction_keeps_the_vehicle",
+        setup=_k4_library(fx.k4_front_radar_hit, fx.k4_bsm_hit),
+        turns=(
+            EvidenceTurn(
+                user="What does the front radar calibration need on a 2025 Kia K4?",
+                required_call="delegate_research",
+                check=_k4_research,
+                contracts={"stays_on_topic": "The response is about the front radar on the 2025 Kia K4."},
+            ),
+            EvidenceTurn(
+                user="No, I meant BSM.",
+                required_call="delegate_research",
+                check=_k4_bsm_research,
+                contracts={
+                    "switched_system_kept_vehicle": (
+                        "The response is about the blind spot (BSM / BCW / rear corner radar) "
+                        "system on the 2025 Kia K4, not the front radar and not another vehicle."
+                    ),
+                    "no_raw_extraction": NO_RAW_EXTRACTION,
+                },
+                raw_sources=(fx.K4_BSM_TEXT,),
+            ),
+        ),
+    ),
+    EvidenceScenario(
+        name="technical_follow_ups_keep_the_subject",
+        setup=_k4_library(fx.k4_bsm_hit, fx.k4_bumper_hit),
+        turns=(
+            EvidenceTurn(
+                user="Check BSM on this 2025 Kia K4.",
+                required_call="delegate_research",
+                check=_k4_research,
+                contracts={"about_k4_bsm": "The response is about the blind spot system on the 2025 Kia K4."},
+            ),
+            EvidenceTurn(
+                user="Does the bumper stay on?",
+                contracts={
+                    "answers_from_the_source": (
+                        "The response says the rear bumper cover must be installed before the "
+                        "BSM calibration, for the 2025 Kia K4."
+                    ),
+                },
+                expect_evidence=False,
+            ),
+            EvidenceTurn(
+                user="Where does it say that?",
+                contracts={
+                    "names_the_source": (
+                        "The response points to the K4 blind spot / rear corner radar "
+                        "calibration document (or quotes its bumper sentence), not a different "
+                        "vehicle or system."
+                    ),
+                },
+                raw_allowed=True,
+                expect_evidence=False,
+            ),
+            EvidenceTurn(
+                user="Show me the procedure.",
+                contracts={
+                    "gives_the_k4_bsm_procedure": (
+                        "The response gives the 2025 Kia K4 blind spot (rear corner radar) "
+                        "calibration procedure from the source: KDS calibration menu, corner "
+                        "reflector 1.0 m behind the rear bumper at 45 degrees, and completion "
+                        "confirmation -- not a front radar or other vehicle's procedure."
+                    ),
+                },
+                raw_allowed=True,
+                expect_evidence=False,
+            ),
+        ),
+    ),
+    EvidenceScenario(
+        name="inventory_uses_the_authoritative_count",
+        setup=_inventory_setup,
+        turns=(
+            EvidenceTurn(
+                user="How many vehicles are represented in ADAS SI?",
+                required_call="query_ciq",
+                check=_inventory_read,
+                contracts={
+                    "uses_the_inventory_count": (
+                        "The response says 137 vehicles are represented in ADAS SI."
+                    ),
+                },
+                expect_evidence=False,
+            ),
+        ),
+    ),
+    EvidenceScenario(
+        name="durable_knowledge_is_reused",
+        setup=_k4_reuse_setup,
+        turns=(
+            EvidenceTurn(
+                user="Does the front bumper stay on for the front radar calibration on a 2025 Kia K4?",
+                required_call="delegate_research",
+                check=_reused_without_library,
+                contracts={
+                    "answers_from_durable_knowledge": (
+                        "The response says the front bumper cover must be installed during front "
+                        "radar calibration on the 2025 Kia K4."
+                    ),
+                    "no_raw_extraction": NO_RAW_EXTRACTION,
+                },
+            ),
+        ),
+    ),
+    EvidenceScenario(
+        name="alldata_is_never_used",
+        setup=_k4_library(fx.k4_bsm_hit),
+        turns=(
+            EvidenceTurn(
+                user="Check ALLDATA for the 2025 Kia K4 blind spot calibration procedure.",
+                check=_no_alldata,
+                contracts={
+                    "no_alldata_claim": (
+                        "The response does not claim ALLDATA was searched, opened, or signed in "
+                        "to, and does not present anything as coming from ALLDATA."
+                    ),
+                },
+                expect_evidence=False,
             ),
         ),
     ),
@@ -298,6 +545,7 @@ class EvidenceHarness(LiveHarness):
         from test_model_first_live_acceptance import build_harness_registry
 
         self.registry = build_harness_registry(self.store, self.backends)
+        self.registry.register("adas_si_inventory", self.backends.adas_si_inventory)
         self.orchestrator = Orchestrator(
             self.orchestrator.router,
             self.client,
@@ -492,7 +740,9 @@ def run_suite(
             error = None
             try:
                 for turn in scenario.turns:
+                    before = len(harness.backends.research_calls)
                     result = harness.drive(conversation_id, turn.user)
+                    turn_calls = list(harness.backends.research_calls[before:])
                     turns.append(
                         {
                             "user": turn.user,
@@ -503,10 +753,13 @@ def run_suite(
                                 for item in result.response.get("evidence") or []
                             ],
                             "evidence_review": result.metrics.get("evidence_review"),
+                            "research": [name for name, _args in turn_calls],
                             "elapsed_seconds": round(result.elapsed_seconds, 1),
                         }
                     )
                     harness.check_structure(turn, result)
+                    if turn.check is not None:
+                        turn.check(turn_calls, result)
                     harness.audit(turn, result)
             except Exception as exc:  # noqa: BLE001 - the report keeps every failure
                 status = "failed"

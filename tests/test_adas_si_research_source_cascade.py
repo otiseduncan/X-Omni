@@ -97,13 +97,13 @@ class FakeNavigator:
 
 
 def service(tmp_path: Path, adas: FakeAdas, navigator: FakeNavigator):
+    # ``navigator`` records any ALLDATA attempt; the sunset means none is made.
     return research.AdasSiResearchService(
         SimpleNamespace(),
         object(),
         client=object(),
         router=None,
         adas=adas,
-        navigator_search=navigator,
         attach=lambda *_args, **_kwargs: None,
     )
 
@@ -150,7 +150,7 @@ async def test_actual_local_procedure_satisfies_objective_without_opening_alldat
 
 
 @pytest.mark.asyncio
-async def test_related_bumper_requirement_does_not_suppress_vin_bound_bsm_lookup(
+async def test_related_bumper_requirement_never_satisfies_the_bsm_procedure(
     tmp_path, monkeypatch
 ):
     adas = FakeAdas(
@@ -176,17 +176,19 @@ async def test_related_bumper_requirement_does_not_suppress_vin_bound_bsm_lookup
     monkeypatch.setattr(research_semantic_review, "review_candidate", related_only)
     result = await service(tmp_path, adas, navigator)._research(dict(OBJECTIVE))
 
-    assert result["verified"] is True
-    assert len(navigator.calls) == 1
-    assert navigator.calls[0]["provider"] == "alldata"
-    assert navigator.calls[0]["target"]["vin"] == OBJECTIVE["vin"]
-    assert navigator.calls[0]["target"]["year"] == 2025
-    assert navigator.calls[0]["target"]["make"] == "Kia"
-    assert navigator.calls[0]["target"]["model"] == "K4"
+    # Retrieval is not satisfaction: a related bumper page is UNSATISFIED, and
+    # ALLDATA is sunset, so nothing else is searched -- the injected Navigator
+    # is never called.
+    assert result["outcome"] == "UNSATISFIED"
+    assert result["verified"] is False and result["complete"] is False
+    assert result["status"] == "not_found"
+    assert navigator.calls == []
+    assert result["library_reviews"][0]["outcome"] == "UNSATISFIED"
+    assert research.classify_objective({"status": "finished", "result": result}) == "not_found"
 
 
 @pytest.mark.asyncio
-async def test_local_procedure_with_unresolved_dependency_still_escalates(
+async def test_local_procedure_with_unresolved_dependency_is_partial(
     tmp_path, monkeypatch
 ):
     adas = FakeAdas(
@@ -216,10 +218,17 @@ async def test_local_procedure_with_unresolved_dependency_still_escalates(
         }
 
     monkeypatch.setattr(research_semantic_review, "review_candidate", incomplete)
-    await service(tmp_path, adas, navigator)._research(dict(OBJECTIVE))
+    result = await service(tmp_path, adas, navigator)._research(dict(OBJECTIVE))
 
-    assert len(navigator.calls) == 1
-    assert navigator.calls[0]["target"]["vin"] == OBJECTIVE["vin"]
+    # ACCEPT_WITH_DEPENDENCIES is PARTIAL: the page is the procedure, but the
+    # initialization it requires is unresolved, so the objective is not complete.
+    assert result["outcome"] == "PARTIAL"
+    assert result["verified"] is True and result["complete"] is False
+    assert result["dependencies"] == [
+        {"title": "Blind Spot Initialization", "reason": "Required after aiming", "status": "unresolved"}
+    ]
+    assert "Blind Spot Initialization" in result["incomplete_reasons"][0]
+    assert navigator.calls == []
 
 
 class FolderAdas:
@@ -279,7 +288,7 @@ async def test_hits_captured_for_other_calibrations_do_not_use_review_slots(tmp_
 
 
 @pytest.mark.asyncio
-async def test_an_escalated_objective_reports_what_the_library_reviewer_said(tmp_path, monkeypatch):
+async def test_an_unsatisfied_objective_reports_what_the_library_reviewer_said(tmp_path, monkeypatch):
     adas = FolderAdas(tmp_path, [("Repair Instruction - Initialization", "cal-bsm")])
 
     async def review(**_kwargs):
@@ -294,11 +303,13 @@ async def test_an_escalated_objective_reports_what_the_library_reviewer_said(tmp
     navigator = FakeNavigator()
     result = await service(tmp_path, adas, navigator)._research(dict(OBJECTIVE))
 
-    assert len(navigator.calls) == 1
+    assert navigator.calls == []
+    assert result["outcome"] == "UNSATISFIED"
     assert result["library_reviews"] == [
         {
             "relative_path": "2023/Toyota/Tacoma 4WD/Repair Instruction - Initialization.pdf",
             "title": "Repair Instruction - Initialization",
+            "outcome": "UNSATISFIED",
             "decision": "CONTINUE_SEARCH",
             "classification": "REQUIRED_SUPPORTING_PROCEDURE",
             "objective_match": "DIFFERENT_COMPONENT",

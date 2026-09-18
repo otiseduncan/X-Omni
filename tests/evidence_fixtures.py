@@ -118,3 +118,95 @@ def raw_row_lines(text: str, *, minimum_cells: int = 4) -> list[str]:
         if len(cells) >= minimum_cells:
             rows.append(" ".join(cells[-minimum_cells:]))
     return rows
+
+
+# --- 2025 Kia K4 field regressions (written fixtures, never stored) --------
+
+K4_2025 = {"year": 2025, "make": "Kia", "model": "K4"}
+
+K4_BSM_TITLE = "2025 Kia K4 (BL3) Blind Spot Collision Warning Radar Calibration (fixture)"
+K4_BSM_TEXT = "\n".join(
+    [
+        "REAR CORNER RADAR (BCW) - CALIBRATION",
+        "Applies to: 2025 Kia K4",
+        "Perform this calibration after a rear corner radar is removed or replaced, or after",
+        "the rear bumper cover is removed and reinstalled.",
+        "Before calibration: the rear bumper cover must be installed with all fasteners tightened.",
+        "1. Connect KDS and select S/W Management > Rear Corner Radar > Calibration.",
+        "2. Place the corner reflector 1.0 m behind the rear bumper at a 45 degree angle from the radar.",
+        "3. Start the calibration with IG ON and the engine off.",
+        "4. Confirm KDS reports the calibration complete and no BCW DTC returns.",
+    ]
+)
+
+K4_BUMPER_TITLE = "2025 Kia K4 (BL3) Rear Bumper Cover Removal and Installation (fixture)"
+K4_BUMPER_TEXT = "\n".join(
+    [
+        "REAR BUMPER COVER - REMOVAL AND INSTALLATION",
+        "Applies to: 2025 Kia K4",
+        "1. Remove the rear combination lamps.",
+        "2. Remove the screws and clips and pull the rear bumper cover rearward.",
+        "3. Disconnect the rear corner radar and parking sensor connectors.",
+        "4. Installation is the reverse of removal.",
+    ]
+)
+
+K4_FRONT_RADAR_TITLE = "2025 Kia K4 (BL3) Front Radar Bumper Requirement (fixture)"
+K4_FRONT_RADAR_TEXT = "\n".join(
+    [
+        "FRONT RADAR (ADAS) - CALIBRATION CONDITIONS",
+        "Applies to: 2025 Kia K4",
+        "The front bumper cover must be installed during front radar calibration.",
+    ]
+)
+
+
+def _k4_hit(title: str, text: str, relative: str, page: int = 1) -> dict[str, Any]:
+    return {
+        "source": f"{relative.rsplit('/', 1)[-1]}",
+        "title": title,
+        "page": page,
+        "relative_path": relative,
+        "url": f"/api/adas-si/document?path={relative.replace(' ', '%20')}",
+        "excerpt": text,
+        "text_extraction": {"method": "native", "status": "success", "source_is_original_pdf": True},
+        "vehicle": dict(K4_2025),
+    }
+
+
+def k4_bsm_hit() -> dict[str, Any]:
+    return _k4_hit(K4_BSM_TITLE, K4_BSM_TEXT, "2025/Kia/K4/2025 Kia K4 Rear Corner Radar Calibration.pdf", 4)
+
+
+def k4_bumper_hit() -> dict[str, Any]:
+    return _k4_hit(K4_BUMPER_TITLE, K4_BUMPER_TEXT, "2025/Kia/K4/2025 Kia K4 Rear Bumper Cover RI.pdf", 2)
+
+
+def k4_front_radar_hit() -> dict[str, Any]:
+    return _k4_hit(K4_FRONT_RADAR_TITLE, K4_FRONT_RADAR_TEXT, "2025/Kia/K4/2025 Kia K4 Front Radar Conditions.pdf")
+
+
+def k4_front_radar_knowledge_record() -> dict[str, Any]:
+    """A verified durable claim, as the knowledge store returns it after promotion."""
+
+    return {
+        "id": "akr_k4_front_radar_bumper",
+        "lifecycle": "verified",
+        "stored_lifecycle": "verified",
+        "application": {"manufacturer": "Kia", "model": "K4", "year_start": 2025, "year_end": 2025},
+        "system": {"name": "front radar"},
+        "requirement": {
+            "requirement_type": "calibration",
+            "text": "The front bumper cover must be installed during front radar calibration.",
+            "applicability_notes": "2025 Kia K4",
+        },
+        "source_integrity": {"status": "current", "verified_read_allowed": True},
+        "evidence": [
+            {
+                "page_start": 1,
+                "excerpt": "The front bumper cover must be installed during front radar calibration.",
+                "verification_effective": True,
+                "source": {"source_name": K4_FRONT_RADAR_TITLE},
+            }
+        ],
+    }

@@ -9,7 +9,7 @@ import pytest
 from core.orchestrator.loop import Orchestrator
 from core.services import calibration_iq_work_prep as prep
 from core.state.db import Store
-from core.tools.registry import Registry
+from core.tools.registry import Registry, ToolBlocked
 
 
 class _Store:
@@ -602,62 +602,30 @@ async def test_alldata_service_information_false_miss_is_repaired_by_review():
 
 
 @pytest.mark.asyncio
-async def test_real_registry_binds_alldata_service_information_context(tmp_path):
+async def test_real_registry_blocks_alldata_service_information_under_the_sunset(tmp_path):
     store = Store(tmp_path / "si-research-context.sqlite")
     registry = Registry("config/tools.yaml", store=store)
     captured: dict[str, Any] = {}
 
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
         captured.update(args)
-        return {
-            "status": "acquisition_failed",
-            "mode": "ro_si_acquire",
-            "executed": True,
-            "success": False,
-            "verified": False,
-            "work_complete": False,
-            "message": "ALLDATA acquisition did not verify a capture.",
-        }
+        raise AssertionError("an ALLDATA capability must never run")
 
+    # Even with a handler registered, the gateway refuses the sunset tool.
     registry.register(prep.ALLDATA_SI_TOOL_NAME, handler)
+    assert registry.tier(prep.ALLDATA_SI_TOOL_NAME) == "blocked"
     conversation_id = store.create_conversation("SI research context")
-    message_id = store.add_message(
-        conversation_id,
-        "user",
-        "get front radar SI for 2400612495",
-    )
-    spoof = {
-        "conversation_id": 999,
-        "message_id": 998,
-        "tool_call_id": "spoofed-si-call",
-        "user_id": "attacker",
-        "role": "owner",
-    }
+    message_id = store.add_message(conversation_id, "user", "get front radar SI for 2400612495")
 
-    await registry.invoke(
-        prep.ALLDATA_SI_TOOL_NAME,
-        {
-            "repair_order_id": "2400612495",
-            "topic": "front radar SI",
-            prep._CONTEXT_KEY: spoof,  # noqa: SLF001
-        },
-        message_id=message_id,
-        conversation_id=conversation_id,
-        tool_call_id="real-si-call",
-        user_id="local-dev",
-        role="owner",
-    )
-
-    context = captured[prep._CONTEXT_KEY]  # noqa: SLF001
-    assert context["conversation_id"] == conversation_id
-    assert context["message_id"] == message_id
-    assert context["tool_call_id"] == "real-si-call"
-    assert context["user_id"] == "local-dev"
-    row = store.conn.execute(
-        "SELECT status, approved_by, args_json FROM tool_calls WHERE tool_call_id = ?",
-        ("real-si-call",),
-    ).fetchone()
-    assert row["status"] == "failed"
-    assert row["approved_by"] == "operator_authorized"
-    assert prep._CONTEXT_KEY not in json.loads(row["args_json"])  # noqa: SLF001
+    with pytest.raises(ToolBlocked):
+        await registry.invoke(
+            prep.ALLDATA_SI_TOOL_NAME,
+            {"repair_order_id": "2400612495", "topic": "front radar SI"},
+            message_id=message_id,
+            conversation_id=conversation_id,
+            tool_call_id="real-si-call",
+            user_id="local-dev",
+            role="owner",
+        )
+    assert captured == {}
     store.close()

@@ -37,6 +37,10 @@ CIQ_TOOLS = frozenset(
         "calibration_iq_update",
     }
 )
+RESEARCH_TOOL = "delegate_research"
+TECHNICAL_RESEARCH_TYPE = "technical_research"
+# Global sections that survive a change of RO subject.
+CARRIED_SECTIONS = ("weekly", "work_list", TECHNICAL_RESEARCH_TYPE)
 
 
 def _dig(value: Any, *paths: str) -> Any:
@@ -794,9 +798,124 @@ def _work_prep_subject(result: dict[str, Any]) -> Optional[dict[str, Any]]:
     )
 
 
+def technical_research_section(result: Any) -> Optional[dict[str, Any]]:
+    """The first-class technical subject a ``delegate_research`` result establishes.
+
+    Structured fields only: the objective, vehicle, system, and deliverable
+    the model sent; the outcome the shared evaluator reached; and, per
+    finding, whether it was accepted and what the source said. Follow-ups
+    ("show me the procedure", "what about 2024", "no, I meant BSM", "where
+    does it say that") are the model's to resolve against it.
+    """
+    if not isinstance(result, dict) or result.get("outcome") not in {
+        "SATISFIED",
+        "PARTIAL",
+        "UNSATISFIED",
+    }:
+        return None
+    objective = _scalar(result.get("objective"), 300)
+    if not objective:
+        return None
+    raw_vehicle = result.get("vehicle") if isinstance(result.get("vehicle"), dict) else {}
+    vehicle = {
+        key: item
+        for key in ("year", "make", "model", "trim", "vin", "label")
+        if (item := _scalar(raw_vehicle.get(key), 120)) is not None
+    }
+    established: list[dict[str, Any]] = []
+    not_accepted: list[dict[str, Any]] = []
+    for finding in result.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        evaluation = finding.get("evaluation") if isinstance(finding.get("evaluation"), dict) else {}
+        where = {
+            key: item
+            for key, item in {
+                "source": _scalar(finding.get("source"), 40),
+                "title": _scalar(finding.get("title"), 160),
+                "page": _scalar(finding.get("page"), 20),
+                "relative_path": _scalar(finding.get("relative_path"), 240),
+                "record_id": _scalar(finding.get("record_id"), 120),
+                "url": _safe_url(finding.get("url")),
+            }.items()
+            if item is not None
+        }
+        if finding.get("accepted") is True:
+            established.append(
+                {
+                    **where,
+                    **{
+                        key: item
+                        for key, item in {
+                            "outcome": _scalar(evaluation.get("outcome"), 20),
+                            "says": _scalar(evaluation.get("source_answer"), 240),
+                            "stage": _scalar(evaluation.get("stage"), 40),
+                            "anchor": _scalar(evaluation.get("anchor_quote"), 200),
+                        }.items()
+                        if item is not None
+                    },
+                }
+            )
+        elif evaluation.get("outcome") is not None:
+            reasons = evaluation.get("reasons") if isinstance(evaluation.get("reasons"), list) else []
+            not_accepted.append(
+                {
+                    **{key: where[key] for key in ("source", "title", "page") if key in where},
+                    **(
+                        {"why": _scalar(reasons[0], 160)}
+                        if reasons and _scalar(reasons[0], 160)
+                        else {}
+                    ),
+                }
+            )
+    section = {
+        "objective": objective,
+        "deliverable": _scalar(result.get("deliverable"), 20),
+        "vehicle": vehicle or None,
+        "system": _scalar(result.get("system"), 160),
+        "component": _scalar(result.get("component"), 160),
+        "outcome": result["outcome"],
+        "established": established[:3] or None,
+        "retrieved_not_accepted": not_accepted[:3] or None,
+        "unresolved": [
+            text
+            for item in (result.get("unresolved") or [])[:4]
+            if (text := _scalar(item, 200)) is not None
+        ]
+        or None,
+        "sources_checked": [
+            text
+            for item in (result.get("sources_checked") or [])[:4]
+            if (text := _scalar(item, 40)) is not None
+        ]
+        or None,
+    }
+    return {key: item for key, item in section.items() if item is not None}
+
+
+def _technical_research_subject(result: dict[str, Any]) -> Optional[dict[str, Any]]:
+    section = technical_research_section(result)
+    if section is None:
+        return None
+    subject: dict[str, Any] = {
+        "type": TECHNICAL_RESEARCH_TYPE,
+        "resource_id": TECHNICAL_RESEARCH_TYPE,
+        "identity_source_owner": "research_evidence_contract",
+        "working_context": {
+            "schema_version": SCHEMA_VERSION,
+            "sections": {TECHNICAL_RESEARCH_TYPE: section},
+        },
+    }
+    if isinstance(section.get("vehicle"), dict) and section["vehicle"].get("label"):
+        subject["vehicle"] = {"label": section["vehicle"]["label"]}
+    return finalize(subject)
+
+
 def non_ciq_subject(tool_name: str, result: Any) -> Optional[dict[str, Any]]:
     if not isinstance(result, dict):
         return None
+    if tool_name == RESEARCH_TOOL:
+        return _technical_research_subject(result)
     if tool_name == WORK_PREP_TOOL:
         return _work_prep_subject(result)
     if tool_name in WORK_LIST_TOOLS:
@@ -1040,6 +1159,16 @@ def _knowledge_patch(
 def _enrichment(
     tool_name: str, result: dict[str, Any], current: Optional[dict[str, Any]]
 ) -> Optional[dict[str, Any]]:
+    if tool_name == RESEARCH_TOOL and isinstance(current, dict):
+        # Research joins whatever subject is active (an RO, a work list)
+        # without replacing it; the section carries its own vehicle.
+        section = technical_research_section(result)
+        if section is None:
+            return None
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "sections": {TECHNICAL_RESEARCH_TYPE: section},
+        }
     if (
         not isinstance(current, dict)
         or current.get("type") != "calibration_iq.repair_order"
@@ -1177,7 +1306,7 @@ def _merge_subject(
     current_sections = _dig(current, "working_context.sections")
     carried = {
         key: deepcopy(current_sections[key])
-        for key in ("weekly", "work_list")
+        for key in CARRIED_SECTIONS
         if isinstance(current_sections, dict)
         and isinstance(current_sections.get(key), dict)
     }
@@ -1210,6 +1339,9 @@ def persist_update(
         )
         subject = incoming or non_ciq_subject(tool_name, result)
         patch = _enrichment(tool_name, result, current)
+        if tool_name == RESEARCH_TOOL and current is not None:
+            # Merge into the active subject; never replace it.
+            subject = None
         if subject is None and patch is None:
             return None
         if subject is not None:

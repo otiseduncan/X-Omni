@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from core.services import alldata_sunset
 from core.config import ROOT, Settings
 from core.main import configured_profile_catalog
 from core.orchestrator.prompt import prompt_budget_metrics, system_prompt
@@ -87,11 +88,8 @@ NON_ADAS_NORMAL_TOOLS = {
     "adas_si_record_modify",
     "automotive_knowledge_lifecycle",
     "calibration_iq_update",
-    "collision_research",
-    "service_information_research",
-    "alldata_service_information",
-    "research_provider_setup",
 }
+# The ALLDATA capabilities are sunset: in no profile at all (alldata_sunset).
 
 
 def _settings() -> SimpleNamespace:
@@ -131,6 +129,7 @@ def test_adas_operator_is_the_configured_default_profile() -> None:
     assert entry["permanent"] == list(PERMANENT_TOOLS)
     assert configured == EXPECTED_ADAS_TOOLS
     assert configured.isdisjoint(NON_ADAS_NORMAL_TOOLS)
+    assert configured.isdisjoint(alldata_sunset.SUNSET_TOOLS)
     assert configured.isdisjoint(META_WRAPPED_CIQ_TOOLS)
 
 
@@ -147,7 +146,12 @@ def test_production_profile_catalog_is_read_only_and_handler_independent() -> No
     # 60 since 2026-09-12: adas_target_placement. 62 since 2026-09-13:
     # adas_si_research and adas_si_research_status (background research
     # reached through stage_action research_si / query_ciq adas_si_research).
-    assert len(full_catalog) == len(full_names) == 62
+    # 58 since 2026-09-17: ALLDATA is sunset, so its four capabilities
+    # (collision_research, service_information_research,
+    # alldata_service_information, research_provider_setup) are blocked and
+    # absent from every profile, the full maintenance profile included.
+    assert len(full_catalog) == len(full_names) == 58
+    assert full_names.isdisjoint(alldata_sunset.SUNSET_TOOLS)
     assert NON_ADAS_NORMAL_TOOLS <= full_names
     assert META_WRAPPED_CIQ_TOOLS <= full_names
     assert PERMANENT <= full_names
@@ -354,7 +358,7 @@ def test_normal_prompt_is_concise_and_free_of_capability_micro_routing() -> None
     # Raised 2026-09-12 with the setup-measurement rule and 2026-09-17 with the
     # evidence-and-conversation section; see the budget note in
     # test_prompt_tool_budget.py.
-    assert len(prompt) < 6_800
+    assert len(prompt) < 7_200
     assert "## right now" not in folded
     for tool in PERMANENT_TOOLS:
         assert f"`{tool}`" in prompt
@@ -523,8 +527,8 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # Raised 2026-09-12 with the setup-measurement rule and 2026-09-17 with the
     # evidence-and-conversation section; see the budget note in
     # test_prompt_tool_budget.py.
-    assert metrics["base_system"]["chars"] < 6_800
-    assert metrics["base_system"]["tokens"] < 1_950
+    assert metrics["base_system"]["chars"] < 7_200
+    assert metrics["base_system"]["tokens"] < 2_060
     assert metrics["active_working_context"]["chars"] > 0
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
@@ -536,10 +540,15 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # 2026-09-13: stage_action research_si (background service-information
     # research) and query_ciq adas_si_research added ~500 chars to the permanent
     # catalog; measured 9,706 chars / 2,774 estimator tokens after trimming.
-    assert metrics["advertised_tools"]["catalog_chars"] < 9_900
-    assert metrics["advertised_tools"]["catalog_tokens"] < 2_830
+    # 2026-09-17: the research outcome contract (SATISFIED / PARTIAL / UNSATISFIED,
+    # deliverable, query_ciq adas_si_library) and the ALLDATA sunset measured
+    # 2,855 estimator tokens, +28 over the prior catalog.
+    assert metrics["advertised_tools"]["catalog_chars"] < 9_990
+    assert metrics["advertised_tools"]["catalog_tokens"] < 2_860
     # 2026-09-17: the evidence-and-conversation section measured 5,142.
-    assert metrics["total_input_used_tokens"] < 5_180
+    # 2026-09-17 (later): research outcome contract, accepted-evidence grounding,
+    # and ALLDATA sunset measured 5,285.
+    assert metrics["total_input_used_tokens"] < 5_320
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
     # The no-tool review now reserves room for the background-work line.
     # 24,500 -> 24,400 on 2026-09-12. The setup-measurement rule costs ~190
@@ -550,7 +559,8 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # 2026-09-13 after the research_si contract: 24,4xx measured.
     # 2026-09-16 after the get-missing-map-reports sweep wording: 24,248.
     # 2026-09-17 after the evidence-and-conversation section (~330 tokens).
-    assert metrics["remaining_normal_turn_tokens"] > 23_880
+    # 2026-09-17 after the research outcome contract and ALLDATA sunset: 23,775.
+    assert metrics["remaining_normal_turn_tokens"] > 23_740
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

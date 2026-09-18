@@ -125,9 +125,10 @@ class Settings:
     scrapex_project_path: Path = Path(r"X:\ScrapeX")
     automotive_knowledge_db: Path | None = None
     tool_profile: str = "adas_operator"
-    # ScrapeX Navigator is the production ALLDATA path. The provider browser
-    # remains isolated from the ADAS Map work-profile session.
-    alldata_navigator_enabled: bool = True
+    # ALLDATA is sunset (core.services.alldata_sunset). This stays False and is
+    # not read from the environment: re-enabling ALLDATA is a code change and a
+    # redeploy, never a setting.
+    alldata_navigator_enabled: bool = False
 
     # Web Push
     vapid_public_key: str = ""
@@ -220,9 +221,6 @@ class Settings:
             scrapex_project_path=Path(
                 os.getenv("XOMNI_SCRAPEX_PROJECT_PATH", r"X:\ScrapeX")
             ),
-            alldata_navigator_enabled=os.getenv(
-                "XOMNI_ALLDATA_NAVIGATOR_ENABLED", "1"
-            ).strip().casefold() in {"1", "true", "yes", "on"},
             automotive_knowledge_db=Path(
                 os.getenv(
                     "XOMNI_AUTOMOTIVE_KNOWLEDGE_DB",

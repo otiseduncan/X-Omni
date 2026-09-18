@@ -147,6 +147,12 @@ async def _search_alldata_best_available(
     or persistence.
     """
     del browser
+    from . import alldata_sunset
+
+    if alldata_sunset.ALLDATA_SUNSET:
+        return alldata_sunset.sunset_result(
+            "research_workflow.search_alldata", searched=False, attempted=False, query=query
+        )
     from ..config import Settings
     from . import research_alldata_navigation as nav
 

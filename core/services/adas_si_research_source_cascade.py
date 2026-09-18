@@ -1,11 +1,18 @@
-"""Local-library-first source cascade for CIQ-bound service-information research.
+"""The ADAS SI library as the source for CIQ-bound service-information research.
 
 Every Calibration IQ calibration requirement is checked against the shared
-Year/Make/Model ADAS SI library before licensed browsing begins. A local hit
-only satisfies the objective when X's independent semantic review says it is
-the ACTUAL_PROCEDURE for that exact vehicle/system. Related requirements,
-R&I pages, descriptions, diagnostics, and supporting information never suppress
-the ALLDATA fallback for a missing calibration procedure.
+Year/Make/Model ADAS SI library. A library hit is retrieval, not an answer:
+each candidate is judged by the shared semantic evidence evaluator
+(``research_evidence_contract.evaluate`` with ``deliverable="procedure"``),
+the same evaluator ordinary chat research uses. The objective ends
+
+* SATISFIED -- the reviewer accepted the page as the actual procedure for this
+  vehicle and system;
+* PARTIAL -- it is the actual procedure but names a required supporting
+  document that is not resolved;
+* UNSATISFIED -- nothing in the library is the procedure. Related
+  requirements, R&I pages, descriptions, diagnostics, and supporting
+  information never close a procedure objective.
 
 A library shared by Year/Make/Model does not make every procedure in it
 evidence for every calibration on the vehicle. ScrapeX capture sidecars record
@@ -13,15 +20,12 @@ the research objective that produced an artifact, including its
 ``calibration_item_id``. That stored id is provenance, not semantics: an
 artifact captured for one CIQ calibration item is never reused for a different
 one. Legacy or manual library files without captured objective provenance stay
-eligible for X's independent review.
+eligible for review.
 
-The ALLDATA Navigator is the fallback. It receives the exact CIQ VIN and
-reselects that vehicle before X navigates. Accepted ALLDATA captures are stored
-by ScrapeX in the same library, then attached from that library artifact to the
-exact RO calibration item (``adas_si_research.default_attach``).
-
-``AdasSiResearchService._research`` calls ``local_procedure`` directly; nothing
-here is installed or rebinds another module.
+ALLDATA is sunset; there is no licensed-browser fallback after a library miss.
+``AdasSiResearchService._research`` calls ``local_procedure`` directly, and
+``prepare_library_candidate`` is shared with ``delegate_research`` so both
+paths review exactly the same evidence.
 """
 
 from __future__ import annotations
@@ -43,8 +47,6 @@ _LOCAL_TEXT_CHARS = 60_000
 # refused by provenance first and never use a review slot.
 _LOCAL_DOC_LIMIT = 12
 _LOCAL_REVIEW_LIMIT = 5
-_ACCEPTING = frozenset({"ACCEPT", "ACCEPT_WITH_DEPENDENCIES"})
-_ACTUAL = "ACTUAL_PROCEDURE"
 
 
 def _clean(value: Any, limit: int = 300) -> str:
@@ -204,6 +206,41 @@ async def _screenshot(
     return (data, "image/png") if data else None
 
 
+async def prepare_library_candidate(
+    adas: Any, relative_path: str, *, page: int = 1, title: str = "", url: Any = None
+) -> dict[str, Any] | None:
+    """Build the reviewer's candidate for one library document, or None.
+
+    The text is ScrapeX's exact extracted text when a capture sidecar exists,
+    otherwise the shared cached PDF/OCR pages ADAS SI search uses; a rendered
+    page image rides along for visual review of scans and charts.
+    """
+    try:
+        path = adas.resolve_relative(relative_path)
+        metadata = await asyncio.to_thread(_source_metadata, path)
+        text = await _library_text(adas, path)
+        shot = await _screenshot(adas, path, int(page or 1))
+    except Exception:  # noqa: BLE001 - one bad library file must not stop the rest
+        log.warning("Could not prepare ADAS SI candidate %s", relative_path, exc_info=True)
+        return None
+    return {
+        "path": path,
+        "metadata": metadata,
+        "screenshot": shot,
+        "candidate": {
+            # The capture sidecar keeps the provider's own page title; the file
+            # name is only a storage identity with a timestamp on it.
+            "title": _clean(metadata.get("title"), 300) or title or path.stem,
+            "breadcrumb": list(Path(relative_path).parts[:-1]),
+            "url": url or f"adas-si:///{quote(relative_path)}",
+            "text": text,
+            "text_truncated": len(text) >= _LOCAL_TEXT_CHARS,
+            "referenced_links": [],
+            "page": int(page or 1),
+        },
+    }
+
+
 async def _review_local(
     service: Any,
     objective: dict[str, Any],
@@ -211,23 +248,20 @@ async def _review_local(
 ) -> dict[str, Any] | None:
     if service.adas is None or service.client is None:
         return None
-
-    try:
-        path = service.adas.resolve_relative(row["relative_path"])
-        metadata = await asyncio.to_thread(_source_metadata, path)
-        if not provenance_allows_reuse(metadata, objective):
-            return None
-        text = await _library_text(service.adas, path)
-        shot = await _screenshot(service.adas, path, int(row.get("page") or 1))
-    except Exception:  # noqa: BLE001 - one bad library file must not stop fallback
-        log.warning(
-            "Could not prepare ADAS SI candidate %s",
-            row.get("relative_path"),
-            exc_info=True,
-        )
+    prepared = await prepare_library_candidate(
+        service.adas,
+        row["relative_path"],
+        page=int(row.get("page") or 1),
+        title=str(row.get("title") or ""),
+        url=row.get("url"),
+    )
+    if prepared is None:
+        return None
+    path, metadata, candidate = prepared["path"], prepared["metadata"], prepared["candidate"]
+    if not provenance_allows_reuse(metadata, objective):
         return None
 
-    from . import research_semantic_review
+    from . import research_evidence_contract as contract
 
     review_objective = {
         "objective": objective.get("topic"),
@@ -237,24 +271,16 @@ async def _review_local(
         "repair_order": objective.get("ro_number"),
         "calibration_item_id": objective.get("calibration_id"),
     }
-    candidate = {
-        # The capture sidecar keeps the provider's own page title; the file
-        # name is only a storage identity with a timestamp on it.
-        "title": _clean(metadata.get("title"), 300) or row.get("title") or path.stem,
-        "breadcrumb": list(Path(row["relative_path"]).parts[:-1]),
-        "url": row.get("url") or f"adas-si:///{quote(row['relative_path'])}",
-        "text": text,
-        "text_truncated": len(text) >= _LOCAL_TEXT_CHARS,
-        "referenced_links": [],
-    }
-    review = await research_semantic_review.review_candidate(
+    evaluation = await contract.evaluate(
         client=service.client,
         objective=review_objective,
         vehicle={**_vehicle(objective), "vin": objective.get("vin") or None},
         candidate=candidate,
         provider="ADAS SI",
-        screenshot=shot,
+        deliverable="procedure",
+        screenshot=prepared["screenshot"],
     )
+    review = evaluation.get("review")
     if not isinstance(review, dict):
         return None
 
@@ -263,22 +289,18 @@ async def _review_local(
     )
     source_url = _clean(metadata.get("source_url"), 1000) or candidate["url"]
     provider = _clean(metadata.get("provider"), 80) or "ADAS SI"
-    accepted_actual = (
-        review.get("decision") in _ACCEPTING
-        and review.get("classification") == _ACTUAL
-        and review.get("vehicle_match") != "DIFFERENT_VEHICLE"
-    )
     document = {
         "role": "primary",
         "title": candidate["title"],
         "url": source_url,
         "provider": provider,
-        "accepted": accepted_actual,
+        "accepted": evaluation["outcome"] in {contract.SATISFIED, contract.PARTIAL},
         # "captured" means a usable library artifact exists. For a local hit
         # it is already present rather than newly captured this turn.
         "captured": True,
         "classification": review.get("classification"),
         "decision": review.get("decision"),
+        "outcome": evaluation["outcome"],
         "review": review,
         "artifact": {
             "relative_path": row["relative_path"],
@@ -290,6 +312,7 @@ async def _review_local(
     }
     return {
         "review": review,
+        "evaluation": evaluation,
         "document": document,
         "source_url": source_url,
         "provider": provider,
@@ -308,10 +331,13 @@ def _provenance_refusal(service: Any, objective: dict[str, Any], row: dict[str, 
     return f"captured for calibration item {captured_calibration_id(metadata)}, not this one"
 
 
-def _review_record(row: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
+def _review_record(
+    row: dict[str, Any], review: dict[str, Any], outcome: Any = None
+) -> dict[str, Any]:
     return {
         "relative_path": row.get("relative_path"),
         "title": row.get("title"),
+        "outcome": outcome,
         "decision": review.get("decision"),
         "classification": review.get("classification"),
         "objective_match": review.get("objective_match"),
@@ -325,12 +351,15 @@ async def local_procedure(
     objective: dict[str, Any],
     reviews: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Return a production result only for a complete local actual procedure.
+    """Return the research result for a SATISFIED or PARTIAL library procedure.
 
-    ``reviews``, when given, receives one entry per library hit considered:
-    the reviewer's verdict, or why the hit was not reviewed. A requirement
-    that escalates to ALLDATA then says exactly what the library held.
+    None means UNSATISFIED: no library document is the procedure. ``reviews``,
+    when given, receives one entry per library hit considered -- the
+    evaluator's outcome and verdict, or why the hit was not reviewed -- so a
+    requirement that stays unsatisfied says exactly what the library held.
     """
+    from . import research_evidence_contract as contract
+
     reviews = reviews if reviews is not None else []
     if service.adas is None:
         return None
@@ -338,9 +367,9 @@ async def local_procedure(
         result = await asyncio.to_thread(
             service.adas.model_search, _search_args(objective)
         )
-    except Exception:  # noqa: BLE001 - library trouble falls through to ALLDATA
+    except Exception:  # noqa: BLE001 - library trouble is an unsatisfied objective
         log.warning(
-            "ADAS SI preflight failed for %s",
+            "ADAS SI library search failed for %s",
             objective.get("objective_id"),
             exc_info=True,
         )
@@ -352,6 +381,7 @@ async def local_procedure(
     ):
         return None
 
+    partial: dict[str, Any] | None = None
     reviewed_count = 0
     for row in _candidate_rows(result):
         refusal = await asyncio.to_thread(_provenance_refusal, service, objective, row)
@@ -367,17 +397,13 @@ async def local_procedure(
             continue
         reviewed_count += 1
         review = reviewed["review"]
-        reviews.append(_review_record(row, review))
-        if (
-            review.get("decision") not in _ACCEPTING
-            or review.get("classification") != _ACTUAL
-            or review.get("vehicle_match") == "DIFFERENT_VEHICLE"
-        ):
+        outcome = reviewed["evaluation"]["outcome"]
+        reviews.append(_review_record(row, review, outcome))
+        if outcome == contract.UNSATISFIED:
             # A bumper R&I/requirement page can be useful and still be the wrong
-            # answer to "give me the BSM calibration procedure." Do not let a
-            # related local hit close the procedure objective.
+            # answer to "give me the BSM calibration procedure." A related
+            # library hit never closes the procedure objective.
             continue
-
         dependencies = [
             {
                 "title": _clean(item.get("title"), 160),
@@ -387,55 +413,75 @@ async def local_procedure(
             for item in review.get("dependencies") or []
             if isinstance(item, dict) and _clean(item.get("title"), 160)
         ]
-        if dependencies:
-            # The local page is real but incomplete. The Navigator owns
-            # dependency pursuit, so fall through rather than marking complete.
-            return None
+        built = _library_result(reviewed, outcome, dependencies)
+        if outcome == contract.SATISFIED:
+            return built
+        if partial is None:
+            # Keep looking for a complete procedure; report this one if none is.
+            partial = built
+    return partial
 
-        document = reviewed["document"]
-        return {
-            "status": "verified",
-            "verified": True,
-            "complete": True,
-            "captured": True,
-            "requires_human": False,
-            "reason": (
-                "The exact procedure is already present in the shared "
-                "Year/Make/Model ADAS SI library."
-            ),
-            "evidence_title": document["title"],
-            "source_url": reviewed["source_url"],
-            "semantic_review": review,
-            "documents": [document],
-            "dependencies": [],
-            "incomplete_reasons": [],
+
+def _library_result(
+    reviewed: dict[str, Any], outcome: str, dependencies: list[dict[str, Any]]
+) -> dict[str, Any]:
+    from . import research_evidence_contract as contract
+
+    review = reviewed["review"]
+    document = reviewed["document"]
+    complete = outcome == contract.SATISFIED
+    incomplete = [
+        f"requires {item['title']}, which the ADAS SI library review did not resolve"
+        for item in dependencies
+    ]
+    return {
+        "status": "verified" if complete else "partial",
+        "outcome": outcome,
+        # The document is the reviewed actual procedure either way; "complete"
+        # says whether the objective is SATISFIED.
+        "verified": True,
+        "complete": complete,
+        "captured": True,
+        "requires_human": False,
+        "reason": (
+            "The exact procedure is present in the shared Year/Make/Model ADAS SI library."
+            if complete
+            else "The procedure is in the shared ADAS SI library, but it requires a "
+            "supporting document that is not resolved."
+        ),
+        "evidence_title": document["title"],
+        "source_url": reviewed["source_url"],
+        "semantic_review": review,
+        "documents": [document],
+        "dependencies": dependencies,
+        "incomplete_reasons": incomplete,
+        "task_ids": [],
+        "research_receipt": {
             "task_ids": [],
-            "research_receipt": {
-                "task_ids": [],
-                "visited_urls": [reviewed["source_url"]],
-                "candidates": [
-                    {"source": "adas_si", "title": document["title"]}
-                ],
-                "critic_decisions": [
-                    {
-                        "source": "adas_si",
-                        "classification": review.get("classification"),
-                        "decision": review.get("decision"),
-                        "confidence": review.get("confidence"),
-                    }
-                ],
-                "dependencies": [],
-                "stale_action_rejections": 0,
-                "artifacts": [document["artifact"]],
-                "final_status": "verified",
-                "incomplete_reasons": [],
-                "metrics": {
-                    "local_library_hit": True,
-                    "navigator_started": False,
-                },
-                "actions": [],
-                "observation_ids": [],
+            "visited_urls": [reviewed["source_url"]],
+            "candidates": [
+                {"source": "adas_si", "title": document["title"]}
+            ],
+            "critic_decisions": [
+                {
+                    "source": "adas_si",
+                    "classification": review.get("classification"),
+                    "decision": review.get("decision"),
+                    "confidence": review.get("confidence"),
+                    "outcome": outcome,
+                }
+            ],
+            "dependencies": dependencies,
+            "stale_action_rejections": 0,
+            "artifacts": [document["artifact"]],
+            "final_status": "verified" if complete else "partial",
+            "incomplete_reasons": incomplete,
+            "metrics": {
+                "local_library_hit": True,
+                "navigator_started": False,
             },
-            "source": "adas_si",
-        }
-    return None
+            "actions": [],
+            "observation_ids": [],
+        },
+        "source": "adas_si",
+    }

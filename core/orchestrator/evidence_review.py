@@ -17,6 +17,13 @@ research -- its draft answer is withheld until the same model has checked it:
 3. **Revision, only if needed.** The model writes the answer once more from its
    own reading, with no tools available and without the rejected draft in view.
 
+Technical grounding: research results carry the shared evaluator's outcome
+(SATISFIED / PARTIAL / UNSATISFIED) and mark each finding accepted or not. The
+reading records only what accepted findings establish, and the check flags a
+draft that states vehicle-specific facts no accepted evidence establishes --
+so a related document, or evidence for another model year, never reaches Otis
+as an established fact about his vehicle.
+
 Core validates only the *shape* of each structured result and releases the
 draft unchanged when the model finds it sound or when a review step is
 unavailable. Every semantic judgment is the model's; there is no phrase
@@ -206,6 +213,7 @@ CHECK_TOOL = {
                 "draft_credits_the_source_with_claims_it_does_not_make": {"type": "boolean"},
                 "draft_flattens_stage_dependent_requirements": {"type": "boolean"},
                 "draft_pastes_raw_extraction_or_tool_status": {"type": "boolean"},
+                "draft_states_vehicle_facts_no_accepted_evidence_establishes": {"type": "boolean"},
             },
             "required": [
                 "draft_claims",
@@ -216,6 +224,7 @@ CHECK_TOOL = {
                 "draft_credits_the_source_with_claims_it_does_not_make",
                 "draft_flattens_stage_dependent_requirements",
                 "draft_pastes_raw_extraction_or_tool_status",
+                "draft_states_vehicle_facts_no_accepted_evidence_establishes",
             ],
         },
     },
@@ -230,8 +239,11 @@ READING_SYSTEM = (
     "row and the document's title, and note rows that are unreadable. Tag each finding with "
     "the procedure stage the evidence itself ties it to (not_stated when it names none; "
     "never invent a stage). Answer for Otis's question as he asked it; the search request "
-    "that produced the results is not evidence. If a source failed or found nothing, "
-    "record that. Call evidence_reading exactly once."
+    "that produced the results is not evidence. A research result says which findings "
+    "were accepted for this vehicle and system; a finding marked not accepted establishes "
+    "nothing about Otis's vehicle, so record only that it was retrieved and why it was not "
+    "accepted. If the outcome is PARTIAL or UNSATISFIED, or a source failed or found "
+    "nothing, record what is still open. Call evidence_reading exactly once."
 )
 
 CHECK_SYSTEM = (
@@ -241,8 +253,11 @@ CHECK_SYSTEM = (
     "or do not mention it, and list every problem. Finally say whether the draft "
     "states general knowledge where the evidence says otherwise or is silent, presents "
     "requirements as coming from the source that the reading does not contain, collapses "
-    "requirements that differ between procedure stages into one rule, or pastes raw OCR, "
-    "table rows, JSON, receipts, or tool status. Judge meaning, not wording; a short draft "
+    "requirements that differ between procedure stages into one rule, pastes raw OCR, "
+    "table rows, JSON, receipts, or tool status, or states as fact for Otis's vehicle "
+    "something the reading does not establish for that vehicle (evidence for another "
+    "model year, model, or system, or a document that was not accepted). Judge meaning, "
+    "not wording; a short draft "
     "or one that adds explanation consistent with the evidence is fine. Call "
     "draft_evidence_check exactly once."
 )
@@ -254,7 +269,8 @@ REVISION_INSTRUCTION = (
     "Problems with the draft:\n{problems}\n"
     "Answer Otis now from what the evidence means: answer his question first, as one "
     "technician to another; tie each requirement to the stage the evidence gives it; say "
-    "plainly where the evidence is unclear, incomplete, or covers other vehicles; {raw_rule} "
+    "plainly where the evidence is unclear, incomplete, or covers other vehicles, and never "
+    "state as fact for his vehicle what the evidence does not establish for it; {raw_rule} "
     "No tools are available, and do not mention this review."
 )
 RAW_RULE_HIDDEN = "do not paste raw extraction, table rows, JSON, or tool status."
@@ -284,6 +300,7 @@ class DraftCheck:
     flattens_stages: bool
     raw_extraction: bool
     problems: tuple[str, ...]
+    ungrounded_vehicle_fact: bool = False
 
 
 def needs_revision(reading: EvidenceReadingResult, check: DraftCheck) -> bool:
@@ -293,6 +310,7 @@ def needs_revision(reading: EvidenceReadingResult, check: DraftCheck) -> bool:
         or check.general_knowledge_override
         or check.unsupported_attribution
         or check.flattens_stages
+        or check.ungrounded_vehicle_fact
         or (check.raw_extraction and not reading.asked_for_source)
     )
 
@@ -381,6 +399,9 @@ def parse_check(arguments: Any, finding_count: int) -> Optional[DraftCheck]:
         problems=tuple(_text(item) for item in (data.get("problems") or []) if _text(item))[
             :MAX_PROBLEMS
         ],
+        ungrounded_vehicle_fact=(
+            data.get("draft_states_vehicle_facts_no_accepted_evidence_establishes") is True
+        ),
     )
 
 

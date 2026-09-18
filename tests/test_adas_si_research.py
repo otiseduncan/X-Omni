@@ -1,10 +1,11 @@
 """Background service-information research: scheduling without deciding.
 
-The job reads exact identities from Calibration IQ, hands each requirement
-to the model-driven Navigator, attaches what the independent review accepted
-through the operator path, and reports per objective from Calibration IQ's
-own reread. Fakes stand in for Calibration IQ, the Navigator, and the
-attachment path; nothing here touches a browser.
+The job reads exact identities from Calibration IQ, checks the ADAS SI
+library for each requirement through the shared evaluator, attaches what the
+independent review accepted through the operator path, and reports per
+objective from Calibration IQ's own reread. Fakes stand in for Calibration IQ,
+the library, and the attachment path; nothing here touches a browser, and
+ALLDATA is sunset.
 """
 
 from __future__ import annotations
@@ -52,26 +53,38 @@ async def _no_sleep(_seconds: float) -> None:
     return None
 
 
-class _FakeNavigator:
-    def __init__(self, outcomes: dict[str, dict[str, Any]] | None = None):
+def _library_result(title: str, relative_path: str, sha: str, *, outcome: str = "SATISFIED", dependencies=None) -> dict[str, Any]:
+    complete = outcome == "SATISFIED"
+    dependencies = dependencies or []
+    return {
+        "status": "verified" if complete else "partial", "outcome": outcome,
+        "verified": True, "complete": complete, "captured": True,
+        "evidence_title": title, "source_url": f"adas-si:///{relative_path}",
+        "semantic_review": {"classification": "ACTUAL_PROCEDURE", "decision": "ACCEPT" if complete else "ACCEPT_WITH_DEPENDENCIES", "confidence": 0.9, "evidence_summary": "aiming steps"},
+        "documents": [{"role": "primary", "title": title, "url": f"adas-si:///{relative_path}", "provider": "ADAS SI", "accepted": True, "captured": True, "outcome": outcome, "artifact": {"relative_path": relative_path, "sha256": sha, "title": title, "already_present": True}}],
+        "dependencies": dependencies,
+        "incomplete_reasons": [f"requires {item['title']}, which the ADAS SI library review did not resolve" for item in dependencies],
+        "task_ids": [],
+        "research_receipt": {"task_ids": [], "visited_urls": [f"adas-si:///{relative_path}"], "candidates": [], "critic_decisions": [{"decision": "ACCEPT", "outcome": outcome}], "dependencies": dependencies, "stale_action_rejections": 0, "artifacts": [{"sha256": sha}], "final_status": "verified" if complete else "partial", "incomplete_reasons": [], "metrics": {"local_library_hit": True, "navigator_started": False}, "actions": [], "observation_ids": []},
+        "source": "adas_si",
+    }
+
+
+class _FakeLibrary:
+    """Stands in for the ADAS SI library cascade: a result, or None when unsatisfied."""
+
+    def __init__(self, outcomes: dict[str, Any] | None = None):
         self.calls: list[dict[str, Any]] = []
         self.outcomes = outcomes or {}
 
-    async def __call__(self, **kwargs: Any) -> dict[str, Any]:
-        self.calls.append(kwargs)
-        topic = kwargs["topic"]
-        default = {
-            "status": "verified", "verified": True, "complete": True, "captured": True,
-            "evidence_title": "Front Radar (ADAS) - Adjustment", "source_url": "https://my.alldata.com/a",
-            "semantic_review": {"classification": "ACTUAL_PROCEDURE", "decision": "ACCEPT", "confidence": 0.9, "evidence_summary": "aiming steps"},
-            "documents": [{"role": "primary", "title": "Front Radar (ADAS) - Adjustment", "url": "https://my.alldata.com/a", "accepted": True, "captured": True, "artifact": {"relative_path": "2025/Kia/K4/Front Radar (ADAS) - Adjustment ALLDATA 20260913-1.pdf", "sha256": "f" * 64, "title": "Front Radar (ADAS) - Adjustment"}, "task_id": "t1"}],
-            "dependencies": [], "incomplete_reasons": [], "task_ids": ["t1"],
-            "research_receipt": {"task_ids": ["t1"], "visited_urls": ["https://my.alldata.com/a"], "candidates": [], "critic_decisions": [{"decision": "ACCEPT"}], "dependencies": [], "stale_action_rejections": 0, "artifacts": [{"sha256": "f" * 64}], "final_status": "verified", "incomplete_reasons": [], "metrics": {"model_calls": 5}, "actions": [1, 2, 3], "observation_ids": ["obs_1"]},
-        }
+    async def __call__(self, _service, objective: dict[str, Any], reviews: list[dict[str, Any]]) -> dict[str, Any] | None:
+        self.calls.append(objective)
         for key, outcome in self.outcomes.items():
-            if key in topic:
+            if key in objective["topic"]:
+                if outcome is None:
+                    reviews.append({"relative_path": "2025/Kia/K4/Bumper R&I.pdf", "title": "Bumper R&I", "outcome": "UNSATISFIED", "decision": "CONTINUE_SEARCH"})
                 return outcome
-        return default
+        return _library_result("Front Radar (ADAS) - Adjustment", "2025/Kia/K4/Front Radar (ADAS) - Adjustment.pdf", "f" * 64)
 
 
 class _FakeAttach:
@@ -84,7 +97,7 @@ class _FakeAttach:
         return {"attached": self.attached, "status": "attached" if self.attached else "not_confirmed", "document_id": "doc-1", "document_status": "validated"}
 
 
-def _service(tmp_path: Path, *, navigator=None, attach=None, reads=None, board=None):
+def _service(tmp_path: Path, *, library=None, attach=None, reads=None, board=None):
     store = Store(tmp_path / "state.sqlite")
     conversation_id = store.create_conversation("research")
     message_id = store.add_message(conversation_id, "user", "research the k4")
@@ -108,7 +121,7 @@ def _service(tmp_path: Path, *, navigator=None, attach=None, reads=None, board=N
         store,
         client=object(),
         router=SimpleNamespace(supports_vision=lambda: True),
-        navigator_search=navigator or _FakeNavigator(),
+        library_search=library or _FakeLibrary(),
         ro_reader=ro_reader,
         board_reader=board_reader,
         attach=attach or _FakeAttach(),
@@ -178,9 +191,9 @@ def test_objectives_are_one_per_requirement_and_carry_no_navigation_decisions():
 
 @pytest.mark.asyncio
 async def test_job_researches_each_requirement_attaches_accepted_documents_and_reports(tmp_path):
-    navigator = _FakeNavigator()
+    library = _FakeLibrary()
     attach = _FakeAttach()
-    service, store, context, posted, published = _service(tmp_path, navigator=navigator, attach=attach)
+    service, store, context, posted, published = _service(tmp_path, library=library, attach=attach)
 
     started = await service.start({"repair_order_id": "2400711902", research_mod.INVOCATION_KEY: context})
     assert started["status"] == "running" and started["executed"] is True
@@ -196,18 +209,12 @@ async def test_job_researches_each_requirement_attaches_accepted_documents_and_r
     assert row["review"]["decision"] == "ACCEPT"
     assert row["attachments"][0]["attached"] is True
 
-    # The Navigator was given the exact identity and the requirement, nothing more.
-    call = navigator.calls[0]
-    assert call["target"] == {
-        "year": 2025,
-        "make": "Kia",
-        "model": "K4 LX FWD",
-        "vin": "KNAF24A28S5000001",
-    }
-    assert call["capture"] is True
-    assert call["objective"]["repair_order"] == "2400711902"
-    assert call["objective"]["calibration_item_id"] == "cal-radar"
-    assert call["provider"] == "alldata"
+    # The library was asked for the exact identity and the requirement, nothing more.
+    call = library.calls[0]
+    assert call["vehicle"] == {"year": 2025, "make": "Kia", "model": "K4 LX FWD"}
+    assert call["vin"] == "KNAF24A28S5000001"
+    assert call["ro_number"] == "2400711902"
+    assert call["calibration_id"] == "cal-radar"
 
     # Attachment bound the document to the calibration item under the job's identity.
     objective, document, attach_context = attach.calls[0]
@@ -224,7 +231,8 @@ async def test_job_researches_each_requirement_attaches_accepted_documents_and_r
     # The receipt is kept with the job for diagnosis without logs.
     record = store.get_record(research_mod.NAMESPACE, started["job_id"], user_id="local-dev")
     assert record["objectives"][0]["result"]["receipt"]["final_status"] == "verified"
-    assert record["objectives"][0]["result"]["receipt"]["action_count"] == 3
+    assert record["objectives"][0]["result"]["outcome"] == "SATISFIED"
+    assert record["objectives"][0]["result"]["source"] == "adas_si"
     store.close()
 
 
@@ -238,12 +246,14 @@ async def test_unaccepted_incomplete_and_unattached_outcomes_are_reported_truthf
             {"id": "c4", "title": "Occupant Classification", "determination": "REQUIRED"},
         ]),
     }
-    navigator = _FakeNavigator({
-        "Blind Spot": {"status": "unverified", "verified": False, "captured": False, "reason": "Semantic review did not accept a candidate: removal only.", "documents": [], "dependencies": [], "incomplete_reasons": ["semantic review did not accept"], "task_ids": ["t2"]},
-        "Steering": {"status": "incomplete", "verified": True, "complete": False, "captured": True, "evidence_title": "SAS Calibration", "source_url": "https://my.alldata.com/s", "semantic_review": {"decision": "ACCEPT_WITH_DEPENDENCIES", "classification": "ACTUAL_PROCEDURE", "confidence": 0.8}, "documents": [{"role": "primary", "title": "SAS Calibration", "url": "https://my.alldata.com/s", "accepted": True, "captured": True, "artifact": {"relative_path": "2025/Kia/K4/SAS.pdf", "sha256": "e" * 64}, "task_id": "t3"}], "dependencies": [{"title": "Wheel Alignment", "reason": "needed first", "status": "unresolved"}], "incomplete_reasons": ["dependency 'Wheel Alignment' unresolved: not found"], "task_ids": ["t3", "t4"]},
-        "Occupant": {"status": "authentication_required", "verified": False, "requires_human": True, "reason": "sign in", "documents": [], "dependencies": [], "incomplete_reasons": [], "task_ids": []},
+    library = _FakeLibrary({
+        # A related bumper page is UNSATISFIED: nothing is attached.
+        "Blind Spot": None,
+        # ACCEPT_WITH_DEPENDENCIES is PARTIAL: attached, but incomplete.
+        "Steering": _library_result("SAS Calibration", "2025/Kia/K4/SAS.pdf", "e" * 64, outcome="PARTIAL", dependencies=[{"title": "Wheel Alignment", "reason": "needed first", "status": "unresolved"}]),
+        "Occupant": None,
     })
-    service, store, context, _posted, _published = _service(tmp_path, navigator=navigator, reads=reads)
+    service, store, context, _posted, _published = _service(tmp_path, library=library, reads=reads)
     started = await service.start({"repair_order_id": "2400711902", research_mod.INVOCATION_KEY: context})
     assert started["objective_count"] == 4
     await _finish(service)
@@ -253,12 +263,12 @@ async def test_unaccepted_incomplete_and_unattached_outcomes_are_reported_truthf
         "Front Radar": "attached",
         "Blind Spot Monitor": "not_found",
         "Steering Angle Sensor": "incomplete",
-        "Occupant Classification": "blocked",
+        "Occupant Classification": "not_found",
     }
     steering = next(row for row in status["objectives"] if row["calibration"] == "Steering Angle Sensor")
     assert steering["dependencies"][0]["status"] == "unresolved"
     assert "Wheel Alignment" in " ".join(steering["incomplete_reasons"])
-    assert status["counts"] == {"attached": 1, "not_found": 1, "incomplete": 1, "blocked": 1}
+    assert status["counts"] == {"attached": 1, "not_found": 2, "incomplete": 1}
     assert "1 of 4 procedure(s) filed and attached" in status["message"]
     store.close()
 
@@ -292,13 +302,13 @@ async def test_start_needs_a_conversation_targets_and_requirements(tmp_path):
 async def test_phase_scope_takes_targets_from_the_board_and_a_second_start_reports_the_running_job(tmp_path):
     board = {"status": "verified", "rows": [{"id": "id-2400711902", "RO": "2400711902"}, {"id": "id-2400711902", "RO": "2400711902"}]}
 
-    class _SlowNavigator(_FakeNavigator):
-        async def __call__(self, **kwargs):
+    class _SlowLibrary(_FakeLibrary):
+        async def __call__(self, service, objective, reviews):
             await asyncio.sleep(0.05)
-            return await super().__call__(**kwargs)
+            return await super().__call__(service, objective, reviews)
 
     reads = {"id-2400711902": _ro_read("2400711902")}
-    service, store, context, _posted, _published = _service(tmp_path, navigator=_SlowNavigator(), reads=reads, board=board)
+    service, store, context, _posted, _published = _service(tmp_path, library=_SlowLibrary(), reads=reads, board=board)
     started = await service.start({"phases": ["1"], "shop": "Warner Robins", research_mod.INVOCATION_KEY: context})
     assert started["status"] == "running"
     assert started["scope"] == "phase 1 in Warner Robins"

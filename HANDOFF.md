@@ -272,8 +272,9 @@ This section records what moved to which side and what was measured.
   not authoritative**. It chose ALLDATA links from `PROCEDURE_WORDS`, called a
   page a document at `DOCUMENT_CHARS` / `DOCUMENT_WITH_LINKS_CHARS`, walked to
   `MAX_DEPTH`, and verified each capture against the candidate page's own
-  title. Its tools register only with `XOMNI_LEGACY_SI_HARVEST=1`; no heuristic
-  is added to it. `tests/test_si_research_architecture.py` keeps those knobs
+  title. Since the 2026-09-17 ALLDATA sunset it is never registered and its
+  tools are blocked (docs/RESEARCH_EVIDENCE_CONTRACT.md); no heuristic is
+  added to it. `tests/test_si_research_architecture.py` keeps those knobs
   out of the production modules.
 - No new keyword router, phrase table, title matcher, page-length rule,
   navigation-depth rule, or deterministic procedure classifier was added.

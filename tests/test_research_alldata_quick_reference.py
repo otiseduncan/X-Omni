@@ -11,6 +11,14 @@ from core.services import research_alldata_quick_reference as quick
 from core.tools import registry as registry_mod
 
 
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
+
 def _pdf_bytes(seed: bytes = b"A") -> bytes:
     return b"%PDF-1.4\n" + seed * 2200
 
@@ -247,6 +255,7 @@ async def test_new_procedure_is_captured_ocr_readable_and_search_retrievable(tmp
     assert Path(root / result["source_sidecar"]).is_file()
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_collector_stops_before_quick_reference_when_selected_vehicle_mismatches(
     tmp_path: Path, monkeypatch
@@ -391,6 +400,7 @@ async def test_read_selected_alldata_vehicle_ignores_non_vehicle_heading(monkeyp
     assert await quick.read_selected_alldata_vehicle(page) == {}
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_collect_general_reference_requires_a_proven_vehicle(monkeypatch, tmp_path: Path):
     async def empty_vehicle(_page):
@@ -415,6 +425,7 @@ async def test_collect_general_reference_requires_a_proven_vehicle(monkeypatch, 
     assert result["action"] == "collect_alldata_general_reference"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_collect_general_reference_captures_and_stores_with_no_repair_order(
     tmp_path: Path, monkeypatch

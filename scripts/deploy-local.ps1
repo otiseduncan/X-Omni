@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$XOmniRoot = 'X:\X Omni',
-    [string]$CalibrationIQRoot = 'X:\Calibration IQ',
+    # The folder on Omega is 'X:\calibration iq' (Windows paths ignore case).
+    [string]$CalibrationIQRoot = 'X:\calibration iq',
     [string]$ScrapeXRoot = 'X:\ScrapeX',
     [switch]$Open
 )
@@ -44,6 +45,18 @@ function Get-Revision {
 function Pull-Main {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
     Write-Step "Updating $Name"
+
+    # Deploy only from main, and never merge over uncommitted work: a checkout
+    # left on a feature branch would otherwise get origin/main merged into it.
+    $branch = ([string](& git -C $Path branch --show-current 2>$null)).Trim()
+    if ($branch -ne 'main') {
+        throw "$Name is on branch '$branch', not main, at $Path. Switch it to main before deploying."
+    }
+    $dirty = @(& git -C $Path status --porcelain --untracked-files=no 2>$null)
+    if ($dirty.Count -gt 0) {
+        $preview = @($dirty | Select-Object -First 12)
+        throw "$Name has uncommitted tracked changes at $Path; commit or set them aside before deploying.`n$($preview -join [Environment]::NewLine)"
+    }
 
     & git -C $Path fetch origin main | Out-Host
     if ($LASTEXITCODE -ne 0) {
@@ -108,6 +121,18 @@ Assert-Command -Name 'powershell.exe'
 Assert-Repository -Path $XOmniRoot -Name 'X Omni'
 Assert-Repository -Path $CalibrationIQRoot -Name 'Calibration IQ'
 Assert-Repository -Path $ScrapeXRoot -Name 'ScrapeX'
+foreach ($script in @(
+        (Join-Path $ScrapeXRoot 'scripts\install.ps1'),
+        (Join-Path $CalibrationIQRoot 'native\scripts\Start-Native.ps1'),
+        (Join-Path $XOmniRoot 'scripts\setup.ps1'),
+        (Join-Path $XOmniRoot 'scripts\launch-x-omni.ps1'))) {
+    if (-not (Test-Path -LiteralPath $script)) {
+        throw "Deployment script is missing: $script"
+    }
+}
+Write-Host "X Omni        : $((Resolve-Path -LiteralPath $XOmniRoot).Path)"
+Write-Host "ScrapeX       : $((Resolve-Path -LiteralPath $ScrapeXRoot).Path)"
+Write-Host "Calibration IQ: $((Resolve-Path -LiteralPath $CalibrationIQRoot).Path)"
 
 # Pull all three first so every service is deployed from one coherent checkout set.
 $ciqRevision = Pull-Main -Path $CalibrationIQRoot -Name 'Calibration IQ'

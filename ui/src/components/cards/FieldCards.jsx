@@ -1243,94 +1243,111 @@ export function AutomotiveKnowledgeCard({ data }) {
 const RESEARCH_SOURCE_LABELS = {
   adas_si: "ADAS SI",
   automotive_knowledge: "Durable knowledge",
-  alldata: "ALLDATA",
+  alldata: "ALLDATA (retired)",
   web: "Public OEM web",
 };
+
+// One operational research outcome (research_evidence_contract): retrieval is
+// not an answer, so a source row and a finding say what the evidence
+// established, not merely what was found.
+const RESEARCH_OUTCOME_LABELS = {
+  SATISFIED: "answered",
+  PARTIAL: "partly answered",
+  UNSATISFIED: "not answered",
+};
+
+function researchOutcomeLabel(row) {
+  if (row?.attempted === false) return "not attempted";
+  if (row?.retrieval_status === "error" || row?.status === "error") return "error";
+  if (row?.outcome && RESEARCH_OUTCOME_LABELS[row.outcome]) {
+    const retrieved = Number(row?.retrieved || 0);
+    return row.outcome === "UNSATISFIED" && retrieved > 0
+      ? `${retrieved} found · not answered`
+      : RESEARCH_OUTCOME_LABELS[row.outcome];
+  }
+  return row?.verified ? "verified" : "no verified finding";
+}
 
 export function ResearchFindingsCard({ data }) {
   const findings = Array.isArray(data?.findings) ? data.findings : [];
   const ledger = Array.isArray(data?.source_ledger) ? data.source_ledger : [];
   const objective = data?.objective || "Research";
   const vehicle = data?.vehicle?.label;
-  const tone = data?.verified ? undefined : data?.authentication_required ? "warn" : "warn";
-  const meta = `${findings.length} finding${findings.length === 1 ? "" : "s"} · ${ledger.filter((row) => row?.attempted).length} source${ledger.filter((row) => row?.attempted).length === 1 ? "" : "s"} checked`;
+  const outcome = data?.outcome;
+  const tone = outcome === "SATISFIED" || (!outcome && data?.verified) ? undefined : "warn";
+  const checked = ledger.filter((row) => row?.attempted).length;
+  const outcomeText = outcome ? RESEARCH_OUTCOME_LABELS[outcome] || outcome : null;
+  const meta = `${outcomeText ? `${outcomeText} · ` : ""}${findings.length} finding${findings.length === 1 ? "" : "s"} · ${checked} source${checked === 1 ? "" : "s"} checked`;
+  const unresolved = Array.isArray(data?.unresolved) ? data.unresolved : [];
   return (
     <Card icon={BookOpen} title="Research" meta={meta} tone={tone}>
       <p className="card-note">
         <strong>{objective}</strong>
         {vehicle ? ` · ${vehicle}` : ""}
       </p>
-      <div className="research-source-ledger" aria-label="Research source verification">
+      <div className="research-source-ledger" aria-label="Research source outcomes">
         {ledger.map((row, index) => (
           <div className="research-source-row" key={`${row?.source || "source"}-${index}`}>
             <span>{RESEARCH_SOURCE_LABELS[row?.source] || row?.source}</span>
-            <strong>
-              {row?.verified
-                ? "verified"
-                : row?.attempted === false
-                  ? "not attempted"
-                  : row?.status === "error"
-                    ? "error"
-                    : "no verified finding"}
-            </strong>
+            <strong>{researchOutcomeLabel(row)}</strong>
             {row?.reason ? <em className="card-note">{String(row.reason).slice(0, 200)}</em> : null}
           </div>
         ))}
       </div>
-      {data?.authentication_required ? (
-        <p className="card-note">
-          ALLDATA needs an interactive sign-in before it can be searched; nothing was claimed from it.
-        </p>
+      {unresolved.length ? (
+        <p className="card-note">Still open: {unresolved.slice(0, 4).join("; ")}</p>
       ) : null}
       {findings.length === 0 ? (
-        <p className="card-note">{data?.message || "No verified finding in the sources checked."}</p>
+        <p className="card-note">{data?.message || "Nothing answered the question in the sources checked."}</p>
       ) : null}
-      {findings.map((finding, index) => (
-        <details className="field-hit" key={`${finding?.source}-${index}`} open={index === 0}>
-          <summary>
-            <strong>{finding?.title || RESEARCH_SOURCE_LABELS[finding?.source] || "Finding"}</strong>
-            <span className="field-page">
-              {RESEARCH_SOURCE_LABELS[finding?.source] || finding?.source}
-              {finding?.page ? ` · p.${finding.page}` : ""}
-            </span>
-          </summary>
-          {finding?.semantic_review?.decision ? (
-            <p className="card-note research-review">
-              Independent review: {finding.semantic_review.decision}
-              {finding.semantic_review.classification
-                ? ` · ${String(finding.semantic_review.classification).toLowerCase().replace(/_/g, " ")}`
-                : ""}
-              {typeof finding.semantic_review.confidence === "number"
-                ? ` · ${Math.round(finding.semantic_review.confidence * 100)}%`
-                : ""}
-              {finding.semantic_review.evidence_summary ? ` — ${finding.semantic_review.evidence_summary}` : ""}
-            </p>
-          ) : null}
-          {Array.isArray(finding?.documents) && finding.documents.length > 1 ? (
-            <div className="research-documents">
-              {finding.documents.map((doc, docIndex) => (
-                <p className="card-note" key={`${finding?.source}-${index}-doc-${docIndex}`}>
-                  {doc.role === "dependency" ? "Also needs: " : ""}
-                  {doc.title || doc.url}
-                  {doc.accepted ? " · accepted" : " · not accepted"}
-                  {doc.captured ? " · filed" : ""}
-                </p>
-              ))}
-            </div>
-          ) : null}
-          {finding?.complete === false ? (
-            <em className="card-note">This procedure still has a required document missing.</em>
-          ) : null}
-          {finding?.excerpt ? <pre className="pre field-excerpt">{finding.excerpt}</pre> : null}
-          {finding?.url ? (
-            <a className="field-link" href={finding.url} target="_blank" rel="noreferrer noopener">
-              <ExternalLink size={12} /> Source
-            </a>
-          ) : null}
-          {finding?.relative_path ? <p className="card-note">{finding.relative_path}</p> : null}
-          {finding?.record_id ? <p className="card-note">record {finding.record_id}</p> : null}
-        </details>
-      ))}
+      {findings.map((finding, index) => {
+        const evaluation = finding?.evaluation || {};
+        const review = finding?.semantic_review || {};
+        return (
+          <details className="field-hit" key={`${finding?.source}-${index}`} open={index === 0}>
+            <summary>
+              <strong>{finding?.title || RESEARCH_SOURCE_LABELS[finding?.source] || "Finding"}</strong>
+              <span className="field-page">
+                {RESEARCH_SOURCE_LABELS[finding?.source] || finding?.source}
+                {finding?.page ? ` · p.${finding.page}` : ""}
+                {evaluation.outcome
+                  ? ` · ${finding?.accepted ? "accepted" : "not accepted"}`
+                  : ""}
+              </span>
+            </summary>
+            {evaluation.outcome ? (
+              <p className="card-note research-review">
+                Independent review: {RESEARCH_OUTCOME_LABELS[evaluation.outcome] || evaluation.outcome}
+                {evaluation.stage && evaluation.stage !== "not_stated" ? ` · ${String(evaluation.stage).replace(/_/g, " ")}` : ""}
+                {evaluation.source_answer ? ` — ${evaluation.source_answer}` : ""}
+                {!finding?.accepted && Array.isArray(evaluation.reasons) && evaluation.reasons.length
+                  ? ` — ${evaluation.reasons[0]}`
+                  : ""}
+              </p>
+            ) : review.decision ? (
+              <p className="card-note research-review">
+                Independent review: {review.decision}
+                {review.classification
+                  ? ` · ${String(review.classification).toLowerCase().replace(/_/g, " ")}`
+                  : ""}
+                {typeof review.confidence === "number" ? ` · ${Math.round(review.confidence * 100)}%` : ""}
+                {review.evidence_summary ? ` — ${review.evidence_summary}` : ""}
+              </p>
+            ) : null}
+            {evaluation.anchor_quote ? (
+              <blockquote className="card-note research-anchor">{evaluation.anchor_quote}</blockquote>
+            ) : null}
+            {finding?.excerpt ? <pre className="pre field-excerpt">{finding.excerpt}</pre> : null}
+            {finding?.url ? (
+              <a className="field-link" href={finding.url} target="_blank" rel="noreferrer noopener">
+                <ExternalLink size={12} /> Source
+              </a>
+            ) : null}
+            {finding?.relative_path ? <p className="card-note">{finding.relative_path}</p> : null}
+            {finding?.record_id ? <p className="card-note">record {finding.record_id}</p> : null}
+          </details>
+        );
+      })}
     </Card>
   );
 }

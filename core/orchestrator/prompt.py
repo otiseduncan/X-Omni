@@ -35,8 +35,8 @@ MODEL_FIRST_CONTRACT = """## How you work
 You interpret ordinary language: intent, references, pronouns, source choice, arguments, and wording; no magic phrasing is required, and never demand a restatement when context and tools suffice. Otis dictates; read through speech-to-text errors ("a dash map" or "the adopt" for ADAS Map, "plays" for phase). Use shop terms, never internal tool names. Answer general technical, conceptual, or conversational questions directly; OEM-specific ADAS requirements or procedures need returned technical evidence. Core validates, authorizes, executes, and verifies structured decisions; it does not decide what Otis meant.
 
 Four permanent tools cover daily work:
-- `query_ciq`: every Calibration IQ read (one RO, board counts or lists, a named phase, the ADAS Map inventory, sweep progress, service status). Never changes anything.
-- `delegate_research`: a bounded worker over the ADAS SI library, durable knowledge, licensed ALLDATA, and public OEM web; use it for general OEM/ADAS SI questions even when a CIQ RO is active. It never attaches SI to a CIQ RO.
+- `query_ciq`: every Calibration IQ read (one RO, board counts or lists, a named phase, the ADAS Map inventory, sweep progress, service status) and the ADAS SI library inventory. Never changes anything.
+- `delegate_research`: a bounded worker over durable knowledge, the ADAS SI library, and public OEM web that judges what it finds (SATISFIED, PARTIAL, UNSATISFIED); use it for OEM/ADAS questions even when a CIQ RO is active. It never attaches SI to a CIQ RO.
 - `stage_action`: the only path that changes Calibration IQ or acquires an RO's ADAS Map or SI; fresh exact-RO read, then a staged contract or an executed receipt; destructive operations pause for approval. One named RO's ADAS Map is `acquire_adas_map`; missing maps across phases, a shop, or the board are one `sweep_adas_maps` call. Only CIQ-attached RO procedure work is `research_si` here—not `delegate_research`; it runs in the background, attaches accepted evidence to CIQ, and posts results. Whether an already-started `research_si` job finished is a status read, not a new `delegate_research` request.
 - `capability_search`: unlock uncommon capabilities (calendar, tasks, files, cameras and footage, ADAS SI documents, ScrapeX reads, service starts) for this turn.
 Independent calls may run in parallel; dependent ones continue in bounded rounds. A miss, outage, or sign-in boundary applies only to that source; never repeat an unchanged failed call.
@@ -49,11 +49,11 @@ Setup measurements -- target distance and height, reference marks, arcs, angles,
 """
 
 EVIDENCE_AND_CONVERSATION = """## Evidence and conversation
-Tool results are evidence to interpret, not text to relay. Answer Otis's actual question first, technician to technician, from what the evidence means; name the source briefly when useful. Authority, highest first: this vehicle's OEM service information, vehicle-specific ADAS SI documents, OEM/reference requirement charts, ADAS SI library data, Calibration IQ job context, web results, then your general knowledge, which may explain evidence but never overrides it unless you can say why the source doesn't apply or can't be read. Procedures run in stages (prerequisite, inspection, setup, calibration, verification) and a condition can change between them, like a part off for inspection and back on for calibration: tie each requirement to its stage instead of flattening them into one rule, and never invent a stage the evidence lacks. Say when applicability or legibility is uncertain instead of filling the gap from memory. Sources and tool work show separately in the app: never paste raw OCR, tables, JSON, receipts, hashes, URLs, or tool status into the answer unless Otis asks to see them, and never narrate tool use.
+Tool results are evidence to interpret, not text to relay. Answer Otis's actual question first, technician to technician, from what the evidence means; name the source briefly when useful. Authority, highest first: this vehicle's OEM service information, vehicle-specific ADAS SI documents, OEM/reference requirement charts, ADAS SI library data, Calibration IQ job context, web results, then your general knowledge, which may explain evidence but never overrides it unless you can say why the source doesn't apply or can't be read. Procedures run in stages (prerequisite, inspection, setup, calibration, verification) and a condition can change between them, like a part off for inspection and back on for calibration: tie each requirement to its stage instead of flattening them into one rule, and never invent a stage the evidence lacks. Say when applicability or legibility is uncertain instead of filling the gap from memory. Only accepted research findings establish facts about this vehicle; say what is still open on PARTIAL and that it was not found on UNSATISFIED. Sources and tool work show separately in the app: never paste raw OCR, tables, JSON, receipts, hashes, URLs, or tool status into the answer unless Otis asks to see them, and never narrate tool use.
 """
 
 WORKING_CONTEXT = """## Working context
-The active subject and stored cards are memory from earlier authoritative results: use them to resolve follow-ups ("that RO", "it", "the Camry"), never as proof that mutable state is still current. Any RO number Otis names in his current message -- full, or the shop-relative short form such as "11774 in Warner Robins" -- is a fresh identification: call `query_ciq` with exactly what he said, not with the prior subject. A current-state question about the subject RO (phase, status, saved calibrations, blockers, documents) needs a fresh `query_ciq` read. A clearly selected new RO or vehicle replaces the prior subject. Speak RO numbers back the way Otis named them.
+The active subject and stored cards are memory from earlier authoritative results: use them to resolve follow-ups ("that RO", "it", "the Camry"), never as proof that mutable state is still current. Any RO number Otis names in his current message -- full, or the shop-relative short form such as "11774 in Warner Robins" -- is a fresh identification: call `query_ciq` with exactly what he said, not with the prior subject. A current-state question about the subject RO (phase, status, saved calibrations, blockers, documents) needs a fresh `query_ciq` read. A clearly selected new RO or vehicle replaces the prior subject. Active technical research carries technical follow-ups (the procedure, another year or system, where it says so): keep what Otis did not change and research again when new evidence is needed. Speak RO numbers back the way Otis named them.
 """
 
 OPERATOR_TRUTH = """## Operator truth
@@ -136,6 +136,10 @@ ARTIFACT_MAX_DEPTH = 6
 # original tool card falls outside the history window. It remains structured
 # data; the model, not a deterministic text-rewriter, resolves follow-ups.
 ACTIVE_SUBJECT_CONTEXT_MAX_CHARS = 2_400
+# The active technical research subject rides in its own section so a large RO
+# working context can never crowd it out of the prompt.
+TECHNICAL_RESEARCH_CONTEXT_MAX_CHARS = 1_600
+TECHNICAL_RESEARCH_SECTION = "technical_research"
 
 # calibration_iq_work_prep already does its own careful byte-budgeted
 # compaction server-side (progressively degrading detail, then a
@@ -418,19 +422,76 @@ def _stored_artifact_context(history: list[dict], max_chars: int) -> str:
     return f"{prefix}{payload}{suffix}"
 
 
+def _subject_payload(active_subject: Optional[dict]) -> Optional[dict]:
+    if not isinstance(active_subject, dict):
+        return None
+    payload = active_subject.get("payload")
+    return payload if isinstance(payload, dict) else active_subject
+
+
+def _technical_research(payload: Optional[dict]) -> Optional[dict]:
+    context = payload.get("working_context") if isinstance(payload, dict) else None
+    sections = context.get("sections") if isinstance(context, dict) else None
+    section = sections.get(TECHNICAL_RESEARCH_SECTION) if isinstance(sections, dict) else None
+    return section if isinstance(section, dict) else None
+
+
+def _without_technical_research(payload: dict) -> dict:
+    if _technical_research(payload) is None:
+        return payload
+    trimmed = dict(payload)
+    context = dict(trimmed["working_context"])
+    sections = dict(context["sections"])
+    sections.pop(TECHNICAL_RESEARCH_SECTION, None)
+    context["sections"] = sections
+    trimmed["working_context"] = context
+    return trimmed
+
+
+def _technical_research_context(active_subject: Optional[dict], max_chars: int) -> str:
+    """Render the active technical research subject, bounded, as its own section."""
+    section = _technical_research(_subject_payload(active_subject))
+    if section is None or max_chars <= 0:
+        return ""
+    prefix = (
+        "## Active technical research\n"
+        "The technical subject of this conversation from the last research result: "
+        "vehicle, system, objective, the outcome, what accepted evidence established, "
+        "and what is still open. Use it to resolve technical follow-ups. It is memory, "
+        "not new evidence.\n"
+        "<technical_research_json>"
+    )
+    suffix = "</technical_research_json>"
+    budget = max_chars - len(prefix) - len(suffix)
+    if budget <= 0:
+        return ""
+    compact = dict(Registry.redact_sensitive(section))
+    compact.pop("observation", None)
+    encoded = _encode_artifact_json(compact)
+    for key in ("retrieved_not_accepted", "sources_checked", "unresolved", "established"):
+        if len(encoded) <= budget:
+            break
+        if key in compact:
+            compact.pop(key)
+            compact["detail_omitted"] = True
+            encoded = _encode_artifact_json(compact)
+    if len(encoded) > budget:
+        return ""
+    return f"{prefix}{encoded}{suffix}"
+
+
 def _active_subject_context(active_subject: Optional[dict], max_chars: int) -> str:
     """Render a prompt-safe, bounded subject envelope from durable state."""
     if not isinstance(active_subject, dict) or max_chars <= 0:
         return ""
-    payload = active_subject.get("payload")
-    if not isinstance(payload, dict):
-        payload = active_subject
+    payload = _subject_payload(active_subject)
     subject_type = str(payload.get("type") or "").strip()[:120]
     resource_id = str(payload.get("resource_id") or "").strip()[:300]
-    if not subject_type or not resource_id:
+    if not subject_type or not resource_id or subject_type == TECHNICAL_RESEARCH_SECTION:
+        # A research-only subject is rendered whole by _technical_research_context.
         return ""
 
-    redacted = Registry.redact_sensitive(payload)
+    redacted = Registry.redact_sensitive(_without_technical_research(payload))
     compact = _compact_artifact_value(
         redacted,
         artifact_type="active_subject",
@@ -528,6 +589,11 @@ def turn_context_sections(
     subject = _active_subject_context(active_subject, subject_max_chars)
     if subject:
         sections["active_subject"] = subject
+    research = _technical_research_context(
+        active_subject, TECHNICAL_RESEARCH_CONTEXT_MAX_CHARS
+    )
+    if research:
+        sections["technical_research"] = research
     artifacts = _stored_artifact_context(history, artifact_max_chars)
     if artifacts:
         sections["stored_artifacts"] = artifacts
@@ -761,6 +827,18 @@ def build_messages(
         if subject_cost <= supplemental_budget:
             context_parts.append(subject_context)
             supplemental_budget -= subject_cost
+    research_context = _technical_research_context(
+        active_subject,
+        min(
+            TECHNICAL_RESEARCH_CONTEXT_MAX_CHARS,
+            max(0, int(max(0, supplemental_budget - 1) * CHARS_PER_TOKEN)),
+        ),
+    )
+    if research_context:
+        research_cost = estimate_tokens("\n\n" + research_context)
+        if research_cost <= supplemental_budget:
+            context_parts.append(research_context)
+            supplemental_budget -= research_cost
 
     artifact_char_budget = min(
         ARTIFACT_CONTEXT_MAX_CHARS,

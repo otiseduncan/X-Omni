@@ -69,3 +69,14 @@ test("research card exposes public OEM evidence and permanent ADAS capture resul
   assert.match(cards, /relative_path/);
   assert.match(cards, /"alldata_vehicle_research"/);
 });
+
+test("ALLDATA is sunset: a historical access card renders a retired notice, not the form", async () => {
+  const cards = await readFile(
+    new URL("../src/components/cards/ResearchCards.jsx", import.meta.url),
+    "utf8"
+  );
+  const provider = cards.slice(cards.indexOf("export function ResearchProviderCard"));
+  assert.match(provider, /return <RetiredAccessCard \/>;/);
+  assert.doesNotMatch(provider, /return <AccessCard/);
+  assert.match(cards, /ALLDATA is retired in X/);
+});

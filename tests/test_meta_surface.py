@@ -18,7 +18,6 @@ import pytest
 
 from core.main import configured_profile_catalog
 from core.orchestrator.loop import Orchestrator, TurnMetrics, artifacts_for_result
-from core.services import research_delegate
 from core.state.db import Store
 from core.tools import meta
 from core.tools.registry import NeedsApproval, Registry, ToolError
@@ -562,7 +561,8 @@ async def test_orchestrator_expands_query_ciq_renders_ro_card_and_reports_metric
     assert metrics["tool_rounds"] == 2
     assert metrics["advertised_tools"] == list(meta.PERMANENT_TOOLS)
     # 2026-09-13: research_si / adas_si_research contracts; measured 2,774.
-    assert metrics["tool_schema_tokens_estimate"] < 2_830
+    # 2026-09-17: research outcome contract and ALLDATA sunset measured 2,855.
+    assert metrics["tool_schema_tokens_estimate"] < 2_860
     assert metrics["reserved_tool_schema_tokens_estimate"] > metrics["tool_schema_tokens_estimate"]
     subject = store.get_conversation_subject(conversation_id)
     assert subject["payload"]["ro_number"] == "2400911779"
@@ -651,153 +651,16 @@ def test_turn_metrics_absorb_and_summarize_llama_timings() -> None:
 # ---------------------------------------------------------- delegate_research
 
 
-def _adas_hit(**overrides: Any) -> dict[str, Any]:
-    return {
-        "status": "success",
-        "evidence_id": "adas-hit-1",
-        "results": [
-            {
-                "title": "Blind Spot Monitor Calibration",
-                "relative_path": "Toyota/Camry/2023/bsm.pdf",
-                "page": 4,
-                "excerpt": "Place the reflector target 1.5 m behind the bumper.",
-                "url": "/api/adas-si/document?path=x",
-            }
-        ],
-        **overrides,
-    }
+# The delegate_research outcome contract (SATISFIED / PARTIAL / UNSATISFIED,
+# retrieval is not verification, no ALLDATA source) is covered in
+# tests/test_research_delegate_contract.py.
 
 
-def _run(handler, args):
-    import asyncio
-
-    return asyncio.run(handler(args))
-
-
-def test_delegate_research_stops_at_first_verified_source_in_default_order() -> None:
-    calls: list[str] = []
-
-    def adas(args):
-        calls.append("adas_si")
-        assert args["question"].startswith("blind-spot")
-        assert args["vehicle"] == {"year": 2023, "make": "Toyota", "model": "Camry"}
-        return _adas_hit()
-
-    def knowledge(args):
-        calls.append("automotive_knowledge")
-        return {"status": "no_result", "records": []}
-
-    handler = research_delegate.make_delegate_research(
-        SimpleNamespace(), adas_search=adas, knowledge_search=knowledge,
-        navigator_search=lambda **_k: calls.append("alldata") or {"verified": False},
-        public_search=lambda *_a, **_k: calls.append("web") or {"verified": False},
-    )
-    result = _run(handler, {
-        "objective": "blind-spot calibration procedure",
-        "vehicle": {"year": 2023, "make": "Toyota", "model": "Camry"},
-    })
-    assert calls == ["adas_si"]
-    assert result["status"] == "success" and result["verified"] is True
-    assert result["sources_checked"] == ["adas_si"]
-    assert result["findings"][0]["source"] == "adas_si"
-    assert result["findings"][0]["page"] == 4
-    assert result["evidence_ids"] == ["adas-hit-1"]
-    assert result["mutated_calibration_iq"] is False
-
-
-def test_delegate_research_honors_exclusions_preferences_and_exhaustive() -> None:
-    calls: list[str] = []
-    handler = research_delegate.make_delegate_research(
-        SimpleNamespace(),
-        adas_search=lambda a: calls.append("adas_si") or {"status": "no_result", "results": []},
-        knowledge_search=lambda a: calls.append("automotive_knowledge") or {
-            "status": "success", "records": [{"id": "rec-1", "title": "Reflector", "summary": "Uses a reflector."}],
-        },
-        navigator_search=lambda **_k: calls.append("alldata") or {"verified": True, "task_id": "t-1", "source_url": "https://alldata.test/p", "extracted_text": "Procedure text", "provenance": {"provider": "alldata"}},
-        public_search=lambda *_a, **_k: calls.append("web") or {"verified": True, "result_count": 1, "sources": [{"url": "https://oem.test/a", "title": "OEM", "snippet": "s"}], "read_results": []},
-    )
-    excluded = _run(handler, {
-        "objective": "does the camry blind spot use a reflector",
-        "vehicle": {"year": 2023, "make": "Toyota", "model": "Camry"},
-        "exclude_sources": ["alldata"],
-        "exhaustive": True,
-    })
-    assert calls == ["adas_si", "automotive_knowledge", "web"]
-    assert excluded["source_order"] == ["adas_si", "automotive_knowledge", "web"]
-    assert {finding["source"] for finding in excluded["findings"]} == {"automotive_knowledge", "web"}
-    assert excluded["status"] == "partial_success"
-    assert "rec-1" in excluded["evidence_ids"]
-
-    calls.clear()
-    preferred = _run(handler, {
-        "objective": "does the camry blind spot use a reflector",
-        "vehicle": {"year": 2023, "make": "Toyota", "model": "Camry"},
-        "sources": ["web", "alldata"],
-    })
-    assert calls == ["web"]
-    assert preferred["findings"][0]["source"] == "web"
-
-
-def test_delegate_research_passes_the_exact_vehicle_and_its_vin_to_alldata() -> None:
-    seen: list[dict[str, Any]] = []
-
-    def navigator(**kwargs):
-        seen.append(kwargs)
-        return {
-            "verified": True, "complete": True, "task_id": "t-1", "task_ids": ["t-1"],
-            "source_url": "https://alldata.test/p", "evidence_title": "Front Radar (ADAS) - Adjustment",
-            "extracted_text": "Procedure text", "provenance": {"provider": "alldata"},
-            "semantic_review": {"classification": "ACTUAL_PROCEDURE", "decision": "ACCEPT", "confidence": 0.9},
-            "documents": [{"role": "primary", "title": "Front Radar (ADAS) - Adjustment", "accepted": True, "captured": False}],
-            "dependencies": [],
-        }
-
-    handler = research_delegate.make_delegate_research(
-        SimpleNamespace(),
-        adas_search=lambda a: {"status": "no_result", "results": []},
-        knowledge_search=lambda a: {"status": "no_result", "records": []},
-        navigator_search=navigator,
-        public_search=lambda *_a, **_k: {"verified": False, "sources": [], "read_results": [], "result_count": 0},
-    )
-    result = _run(handler, {
-        "objective": "front radar calibration",
-        "system": "Front Radar Sensor - SCC / AEB / FCW",
-        "vehicle": {"year": 2025, "make": "Kia", "model": "K4", "vin": " knaf24a28s5000001 "},
-    })
-    assert seen[0]["target"]["vin"] == "KNAF24A28S5000001"
-    assert seen[0]["objective"]["system"] == "Front Radar Sensor - SCC / AEB / FCW"
-    # The VIN identifies the vehicle; it never becomes part of the search text.
-    assert "KNAF" not in seen[0]["topic"]
-    finding = result["findings"][0]
-    assert finding["semantic_review"]["decision"] == "ACCEPT"
-    assert finding["documents"][0]["accepted"] is True
-    vehicle_schema = meta.DELEGATE_RESEARCH_SCHEMA["parameters"]["properties"]["vehicle"]["properties"]
-    assert "vin" in vehicle_schema
-
-
-def test_delegate_research_reports_alldata_auth_boundary_and_skips_without_vehicle() -> None:
-    handler = research_delegate.make_delegate_research(
-        SimpleNamespace(),
-        adas_search=lambda a: {"status": "no_result", "results": []},
-        knowledge_search=lambda a: {"status": "no_result", "records": []},
-        navigator_search=lambda **_k: {"status": "authentication_required", "requires_human": True, "verified": False, "task_id": "t-9", "reason": "Sign in required."},
-        public_search=lambda *_a, **_k: {"verified": False, "sources": [], "read_results": [], "result_count": 0},
-    )
-    blocked = _run(handler, {
-        "objective": "radar aiming spec",
-        "vehicle": {"year": 2021, "make": "Nissan", "model": "Rogue"},
-        "exclude_sources": ["web"],
-    })
-    assert blocked["status"] == "blocked"
-    assert blocked["authentication_required"] is True and blocked["requires_human"] is True
-    assert blocked["findings"] == []
-    assert "navigator-task:t-9" in blocked["evidence_ids"]
-
-    no_vehicle = _run(handler, {"objective": "radar aiming spec"})
-    ledger = {row["source"]: row for row in no_vehicle["source_ledger"]}
-    assert ledger["alldata"]["attempted"] is False
-    assert no_vehicle["status"] == "no_result"
-    assert no_vehicle["sources_checked"] == ["adas_si", "automotive_knowledge", "web"]
-
-    with pytest.raises(ValueError, match="objective is required"):
-        _run(handler, {"objective": ""})
+def test_delegate_research_schema_has_no_alldata_source_and_carries_the_vin() -> None:
+    properties = meta.DELEGATE_RESEARCH_SCHEMA["parameters"]["properties"]
+    assert "alldata" not in properties["sources"]["items"]["enum"]
+    assert "alldata" not in properties["exclude_sources"]["items"]["enum"]
+    assert properties["deliverable"]["enum"] == ["answer", "procedure"]
+    assert "preserve" not in properties
+    assert "vin" in properties["vehicle"]["properties"]
+    assert "alldata" not in meta.DELEGATE_RESEARCH_SCHEMA["description"].casefold()

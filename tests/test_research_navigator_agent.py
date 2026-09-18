@@ -18,6 +18,14 @@ import pytest
 from core.services import research_navigator_agent
 
 
+# ALLDATA is sunset (core.services.alldata_sunset): the runtime these tests
+# exercise now refuses to run, which tests/test_alldata_sunset.py proves. They are
+# kept, skipped, as the record of how the retired Navigator behaved.
+_ALLDATA_SUNSET = pytest.mark.skip(
+    reason="ALLDATA is sunset: this exercises the retired ALLDATA runtime, which now refuses to run."
+)
+
+
 def _navigator_result(action: str, *, data: dict[str, Any], **overrides: Any) -> dict[str, Any]:
     result = {
         "service": "ScrapeX",
@@ -272,6 +280,7 @@ def test_system_prompt_prefers_alldata_ymme_search_without_make_aliases() -> Non
     assert "do not invent or hardcode make aliases" in prompt
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_initial_observation_waits_for_rendered_page_before_model_call(
     monkeypatch,
@@ -328,6 +337,7 @@ async def test_initial_observation_waits_for_rendered_page_before_model_call(
     assert "e1" in first_model_input
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_empty_initial_page_exits_without_inventing_browser_action(monkeypatch) -> None:
     class _NeverReadyNavigator(_FakeNavigator):
@@ -370,6 +380,7 @@ async def test_empty_initial_page_exits_without_inventing_browser_action(monkeyp
     assert [call["action"] for call in navigator.calls].count("observe") == 5
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_definitive_stale_ref_failure_supplies_fresh_observation(monkeypatch) -> None:
     class _StaleRefNavigator(_FakeNavigator):
@@ -449,6 +460,7 @@ async def test_definitive_stale_ref_failure_supplies_fresh_observation(monkeypat
     assert actions[:4] == ["create_task", "observe", "fill", "observe"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_happy_path_reaches_verified_via_scrapex_verify_not_model_narration(monkeypatch):
     navigator = _FakeNavigator()
@@ -491,6 +503,7 @@ async def test_happy_path_reaches_verified_via_scrapex_verify_not_model_narratio
     assert "done" not in actions_called
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_verified_navigation_captures_only_when_explicitly_requested(monkeypatch):
     navigator = _FakeNavigator()
@@ -538,6 +551,7 @@ async def test_verified_navigation_captures_only_when_explicitly_requested(monke
     assert capture.kwargs[0]["objective"]["objective"] == "blind spot monitor calibration"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_model_never_calling_extract_never_verifies_even_if_it_claims_success(monkeypatch):
     navigator = _FakeNavigator()
@@ -561,6 +575,7 @@ async def test_model_never_calling_extract_never_verifies_even_if_it_claims_succ
     assert result["agent_stopped_reason"] == "model_finished"
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_rejected_extract_is_fed_back_and_model_can_backtrack_to_a_verified_leaf(monkeypatch):
     navigator = _FakeNavigator()
@@ -614,6 +629,7 @@ async def test_observation_summary_includes_page_text_and_breadcrumb():
     assert summary["breadcrumb"] == ["ADAS", "Lane Change Assist"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_create_task_failure_short_circuits_before_any_model_turn(monkeypatch):
     navigator = _FakeNavigator(create_ok=False)
@@ -637,6 +653,7 @@ async def test_create_task_failure_short_circuits_before_any_model_turn(monkeypa
     ]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_turn_budget_exhausted_still_runs_the_verify_epilogue(monkeypatch):
     navigator = _FakeNavigator()
@@ -659,6 +676,7 @@ async def test_turn_budget_exhausted_still_runs_the_verify_epilogue(monkeypatch)
     assert "verify" in [call["action"] for call in navigator.calls]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_repeated_identical_invalid_call_stops_the_loop_early(monkeypatch):
     navigator = _FakeNavigator()
@@ -681,6 +699,7 @@ async def test_repeated_identical_invalid_call_stops_the_loop_early(monkeypatch)
     assert click_calls == []  # the malformed call never actually reached ScrapeX
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_unknown_action_is_reported_back_to_the_model_without_calling_scrapex(monkeypatch):
     navigator = _FakeNavigator()
@@ -704,6 +723,7 @@ async def test_unknown_action_is_reported_back_to_the_model_without_calling_scra
     assert teleport_calls == []
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_visual_observation_is_passed_to_multimodal_model_when_available(monkeypatch):
     navigator = _FakeNavigator()
@@ -736,6 +756,7 @@ async def test_visual_observation_is_passed_to_multimodal_model_when_available(m
     )
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_multiple_model_actions_do_not_run_blind_against_one_observation(monkeypatch):
     navigator = _FakeNavigator()
@@ -764,6 +785,7 @@ async def test_multiple_model_actions_do_not_run_blind_against_one_observation(m
     assert acted == ["fill"]
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_initial_alldata_authentication_boundary_short_circuits_before_model_turn(monkeypatch):
     class AuthBoundaryNavigator(_FakeNavigator):
@@ -826,6 +848,7 @@ def _prompt_chars(messages: list[dict[str, Any]]) -> int:
     return len(json.dumps(messages, default=str))
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_transcript_stays_bounded_instead_of_growing_with_every_action(monkeypatch):
     """The regression that stopped every live ALLDATA task at 2-5 actions.
@@ -872,6 +895,7 @@ async def test_transcript_stays_bounded_instead_of_growing_with_every_action(mon
     assert len(full_maps) == 1
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_superseded_observations_collapse_to_a_digest_of_what_was_tried(monkeypatch):
     navigator = _FakeNavigator(bulky=True)
@@ -915,6 +939,7 @@ async def test_superseded_observations_collapse_to_a_digest_of_what_was_tried(mo
     )
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_tool_receipt_does_not_repeat_the_observation(monkeypatch):
     navigator = _FakeNavigator(bulky=True)
@@ -945,6 +970,7 @@ async def test_tool_receipt_does_not_repeat_the_observation(monkeypatch):
         assert "page_text" not in payload
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_model_is_told_plainly_when_an_action_changed_nothing(monkeypatch):
     """Three identical scrolls on the live vehicle picker is what this stops.
@@ -979,6 +1005,7 @@ async def test_model_is_told_plainly_when_an_action_changed_nothing(monkeypatch)
     assert "left the page exactly as it was" in second_action_context
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_one_oversized_page_is_degraded_rather_than_refused(monkeypatch):
     navigator = _FakeNavigator(bulky=True)
@@ -1099,6 +1126,7 @@ def test_an_observation_with_no_scroll_signal_is_not_assumed_to_continue():
     assert "page_continues" not in summary
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_reaching_the_bottom_says_to_extract(monkeypatch):
     """The bottom is the destination, and arriving there is the cue to take it.
@@ -1130,6 +1158,7 @@ async def test_reaching_the_bottom_says_to_extract(monkeypatch):
     assert "page_bottom_reached" in last
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_reading_between_scrolls_resets_the_count(monkeypatch):
     navigator = _FakeNavigator(bulky=True)
@@ -1160,6 +1189,7 @@ async def test_reading_between_scrolls_resets_the_count(monkeypatch):
     assert "times in a row" not in last
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_the_same_rejected_extract_is_not_submitted_forever(monkeypatch):
     """40 identical extracts, 40 identical refusals, one exhausted budget.
@@ -1199,6 +1229,7 @@ async def test_the_same_rejected_extract_is_not_submitted_forever(monkeypatch):
     assert "REPEATED MISTAKE" in context
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_the_receipt_names_the_action_it_closes(monkeypatch):
     """Half of every live budget went to re-issuing clicks that had worked.
@@ -1289,6 +1320,7 @@ class _LaggingNavigator(_FakeNavigator):
         return await super().__call__(settings, args)
 
 
+@_ALLDATA_SUNSET
 @pytest.mark.asyncio
 async def test_a_click_that_answers_before_the_page_lands_is_waited_out(monkeypatch):
     """The alternation that cost half of every live turn budget.
