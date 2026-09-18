@@ -411,10 +411,16 @@ SCENARIOS: tuple[EvidenceScenario, ...] = (
     ),
     EvidenceScenario(
         name="technical_follow_ups_keep_the_subject",
-        setup=_k4_library(fx.k4_bsm_hit, fx.k4_bumper_hit),
+        setup=_k4_library(fx.k4_front_radar_hit, fx.k4_bsm_hit, fx.k4_bumper_hit),
         turns=(
             EvidenceTurn(
-                user="Check BSM on this 2025 Kia K4.",
+                user="I've got a 2025 Kia K4 in with rear bumper damage. Does the front radar need anything?",
+                required_call="delegate_research",
+                check=_k4_research,
+                contracts={"about_the_k4": "The response is about the 2025 Kia K4."},
+            ),
+            EvidenceTurn(
+                user="Check BSM on this K4.",
                 required_call="delegate_research",
                 check=_k4_research,
                 contracts={"about_k4_bsm": "The response is about the blind spot system on the 2025 Kia K4."},
@@ -462,7 +468,8 @@ SCENARIOS: tuple[EvidenceScenario, ...] = (
         turns=(
             EvidenceTurn(
                 user="How many vehicles are represented in ADAS SI?",
-                required_call="query_ciq",
+                # query_ciq kind=adas_si_library reports its concrete read.
+                required_call="adas_si_inventory",
                 check=_inventory_read,
                 contracts={
                     "uses_the_inventory_count": (

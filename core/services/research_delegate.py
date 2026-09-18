@@ -69,7 +69,8 @@ READING_GUIDE = (
     "the source's line structure; in OCR'd tables ' | ' separates columns and each "
     "row lines up with the header row above it. Answer Otis in your own words from "
     "the accepted evidence; quote or show raw excerpts only when he asks to see the "
-    "source. Result counts are not library inventory."
+    "source. Result counts are not library inventory. sources_checked lists every "
+    "source searched; never say any other source was searched or found nothing."
 )
 _COLUMN_GAP_RE = re.compile(r"[ \t]{3,}")
 
@@ -141,6 +142,12 @@ def source_order(args: dict[str, Any]) -> list[str]:
     ]
     if not order:
         order = list(DEFAULT_SOURCE_ORDER)
+    # Settled, verified knowledge is always consulted first unless Otis
+    # excluded it: live, the model's own source list skipped it and the
+    # library was researched again for an answer already on record.
+    if "automotive_knowledge" in order:
+        order.remove("automotive_knowledge")
+    order.insert(0, "automotive_knowledge")
     excluded = args.get("exclude_sources")
     excluded = set(excluded) if isinstance(excluded, list) else set()
     return [source for source in order if source not in excluded]

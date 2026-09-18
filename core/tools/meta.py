@@ -97,10 +97,11 @@ QUERY_CIQ_KINDS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], dict[str
 
 QUERY_CIQ_SCHEMA: dict[str, Any] = {
     "description": (
-        "Read current Calibration IQ state; reads never change anything. kind=ro: "
-        "exact read of one identified RO (workflow, phase, status, version, blockers, "
-        "saved calibrations, research, documents); use it whenever one RO is known, "
-        "including a current-state follow-up on the active subject. board_count / "
+        "Read current Calibration IQ state; reads never change anything. kind=ro: exact "
+        "read of an RO Otis identified or the selected repair-order subject (workflow, "
+        "phase, status, version, blockers, calibrations, research, documents). A "
+        "vehicle, model, or technical-research subject is not an RO; technical "
+        "questions use delegate_research. board_count / "
         "board_list: verified count or bounded rows for a shop/phase/status scope, "
         "finished work excluded unless include_completed. phase_list: one named "
         "phase. ro_requirements: one RO's governing ADAS Map requirements. "
@@ -112,8 +113,8 @@ QUERY_CIQ_SCHEMA: dict[str, Any] = {
         "which continues on its own. It is a past snapshot rather "
         "than current state; adas_si_research reads the latest background "
         "service-information research job the same way. "
-        "adas_si_library: the ADAS SI library inventory; vehicle or document counts "
-        "come from it, never from search results. "
+        "adas_si_library: only how many vehicles or documents ADAS SI holds, never "
+        "what a document says; counts come from it, not from search results. "
         "status: service reachability. CIQ state is not OEM proof."
     ),
     "parameters": {
@@ -132,8 +133,9 @@ QUERY_CIQ_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "minLength": 1,
                 "description": (
-                    "RO as Otis named it this turn: full number, id, or 5-digit short "
-                    "form (then also pass shop). Never the prior subject's."
+                    "RO Otis supplied: full number, id, or 5-digit short form (also "
+                    "pass shop). Never use a prior subject, invented value, or "
+                    "year/make/model."
                 ),
             },
             "phase": {
@@ -276,6 +278,7 @@ DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
                         "description": "The RO's VIN when a read returned one; it selects the exact vehicle.",
                     },
                 },
+                "description": "Only values Otis or a result gave; never guess a year, model, or trim.",
             },
             "system": {"type": "string", "maxLength": 200},
             "component": {"type": "string", "maxLength": 200},

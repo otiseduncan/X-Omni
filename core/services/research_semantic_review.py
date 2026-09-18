@@ -170,7 +170,12 @@ REVIEW_TOOL_SCHEMA: dict[str, Any] = {
                 "requirement_location": {
                     "type": "string",
                     "enum": list(LOCATIONS),
-                    "description": "Where on the vehicle the requirement's sensor or system is.",
+                    "description": (
+                        "Where on the vehicle the requirement's sensor or system is. Blind "
+                        "spot, lane change, and rear cross-traffic systems usually sense "
+                        "through rear corner radars: REAR. SIDE is for units in the doors "
+                        "or mirrors."
+                    ),
                 },
                 "page_system": {
                     "type": "string",
@@ -303,7 +308,10 @@ REVIEW_SYSTEM_PROMPT = (
     "OBJECTIVE MATCH. First name the sensor or system the requirement refers to "
     "(requirement_system) and, separately, the one this page works on (page_system), each "
     "with its location on the vehicle, then say whether they are the same unit (same_unit); "
-    "different names for different sensors are DIFFERENT even when one module calibrates both. "
+    "different names for different sensors are DIFFERENT even when one module calibrates both, "
+    "and different names for the same sensor are SAME: blind spot monitoring (BSM), blind spot "
+    "collision warning (BCW), blind spot detection, and rear corner or side radar all name the "
+    "rear corner radars. "
     "Name the page's from what its steps do, not from the "
     "section it is filed under, which often groups several sensors. EXACT_MATCH only when those are the same sensor or "
     "system and the page performs the requested work on it; set procedure_type to what "

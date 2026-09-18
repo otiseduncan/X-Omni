@@ -358,7 +358,7 @@ def test_normal_prompt_is_concise_and_free_of_capability_micro_routing() -> None
     # Raised 2026-09-12 with the setup-measurement rule and 2026-09-17 with the
     # evidence-and-conversation section; see the budget note in
     # test_prompt_tool_budget.py.
-    assert len(prompt) < 7_200
+    assert len(prompt) < 7_400
     assert "## right now" not in folded
     for tool in PERMANENT_TOOLS:
         assert f"`{tool}`" in prompt
@@ -527,8 +527,8 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # Raised 2026-09-12 with the setup-measurement rule and 2026-09-17 with the
     # evidence-and-conversation section; see the budget note in
     # test_prompt_tool_budget.py.
-    assert metrics["base_system"]["chars"] < 7_200
-    assert metrics["base_system"]["tokens"] < 2_060
+    assert metrics["base_system"]["chars"] < 7_400
+    assert metrics["base_system"]["tokens"] < 2_110
     assert metrics["active_working_context"]["chars"] > 0
     assert metrics["active_working_context"]["chars"] <= 2_400
     assert metrics["stored_artifact_context"]["chars"] > 0
@@ -543,12 +543,13 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # 2026-09-17: the research outcome contract (SATISFIED / PARTIAL / UNSATISFIED,
     # deliverable, query_ciq adas_si_library) and the ALLDATA sunset measured
     # 2,855 estimator tokens, +28 over the prior catalog.
-    assert metrics["advertised_tools"]["catalog_chars"] < 9_990
-    assert metrics["advertised_tools"]["catalog_tokens"] < 2_860
+    # 2026-09-18: RO-vs-technical-subject boundary in query_ciq measured 10,076 chars.
+    assert metrics["advertised_tools"]["catalog_chars"] < 10_250
+    assert metrics["advertised_tools"]["catalog_tokens"] < 2_935
     # 2026-09-17: the evidence-and-conversation section measured 5,142.
     # 2026-09-17 (later): research outcome contract, accepted-evidence grounding,
     # and ALLDATA sunset measured 5,285.
-    assert metrics["total_input_used_tokens"] < 5_320
+    assert metrics["total_input_used_tokens"] < 5_410
     assert metrics["extra_input_reserve_tokens"] == self_check_reserve
     # The no-tool review now reserves room for the background-work line.
     # 24,500 -> 24,400 on 2026-09-12. The setup-measurement rule costs ~190
@@ -560,7 +561,7 @@ def test_prompt_and_profile_budget_remain_visible_and_bounded() -> None:
     # 2026-09-16 after the get-missing-map-reports sweep wording: 24,248.
     # 2026-09-17 after the evidence-and-conversation section (~330 tokens).
     # 2026-09-17 after the research outcome contract and ALLDATA sunset: 23,775.
-    assert metrics["remaining_normal_turn_tokens"] > 23_740
+    assert metrics["remaining_normal_turn_tokens"] > 23_640
     assert set(metrics["system_sections"]) == {
         "identity",
         "model_first_contract",

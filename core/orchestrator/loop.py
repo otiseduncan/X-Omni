@@ -1431,6 +1431,37 @@ def _bounded_tool_result_json(
     return encoded[:max_chars]
 
 
+def _ro_token(value: Any) -> str:
+    return "".join(character for character in str(value or "").casefold() if character.isalnum())
+
+
+def unsupplied_repair_order(args: Any, messages: list[dict[str, Any]]) -> Optional[str]:
+    """The RO identifier of an exact read that appears nowhere in the conversation.
+
+    An exact RO read is only for an RO Otis supplied or an earlier result
+    returned. Live, the 30B worker turned "I've got a 2025 Kia K4 in" into
+    reads of invented identifiers ("11774", "25K4-001"). Provenance, not
+    meaning: the identifier must occur -- ignoring spacing and punctuation --
+    in some message after the static system prompt (Otis's messages, tool
+    results, the turn context carrying the active subject).
+    """
+
+    if not isinstance(args, dict):
+        return None
+    wanted = _ro_token(args.get("repair_order_id"))
+    if len(wanted) < 3:
+        return None
+    for message in messages[1:]:
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                str(part.get("text") or "") for part in content if isinstance(part, dict)
+            )
+        if wanted in _ro_token(content):
+            return None
+    return str(args.get("repair_order_id"))
+
+
 def tool_result_json_for_model(name: str, result: Any) -> str:
     """Serialize exactly the projected result delivered to the model.
 
@@ -2773,6 +2804,33 @@ class Orchestrator:
                         "name": requested_name,
                         "result": error_payload,
                     }
+                    continue
+                unsupplied = (
+                    unsupplied_repair_order(args, messages)
+                    if requested_name == "query_ciq" and expanded_name == "calibration_iq_ro"
+                    else None
+                )
+                if unsupplied is not None:
+                    refusal = {
+                        "status": "not_executed",
+                        "executed": False,
+                        "message": (
+                            f"RO {unsupplied} does not appear anywhere in this conversation, so "
+                            "nothing was read. An RO is read only when Otis gives its number or "
+                            "an earlier result returned it; a vehicle or repair described without "
+                            "an RO number is a technical question for delegate_research."
+                        ),
+                    }
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "name": requested_name,
+                            "content": _bounded_tool_result_json(refusal),
+                        }
+                    )
+                    yield {"type": "tool_start", "name": requested_name, "args": args}
+                    yield {"type": "tool_result", "name": requested_name, "result": refusal}
                     continue
                 call = {**call, "name": expanded_name}
                 executed_tool_names.add(expanded_name)

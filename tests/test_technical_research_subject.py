@@ -18,6 +18,7 @@ from core.orchestrator import prompt
 from core.services import conversation_working_context as working_context
 from core.services.conversation_subjects import track_active_subject_from_tool_result
 from core.state.db import Store
+from core.tools import meta
 
 K4 = {"year": 2025, "make": "Kia", "model": "K4", "label": "2025 Kia K4"}
 
@@ -179,3 +180,27 @@ def test_the_prompt_tells_x_to_carry_technical_follow_ups() -> None:
     text = prompt.WORKING_CONTEXT
     assert "Active technical research carries technical follow-ups" in text
     assert "keep what Otis did not change" in text
+    assert "call `delegate_research`" in text
+    assert "vehicle or repair description by itself is a technical subject" in text
+    assert "11774" not in text
+    assert "Do not query CIQ for a technical follow-up" in text
+
+    ciq_description = meta.QUERY_CIQ_SCHEMA["description"]
+    ro_description = meta.QUERY_CIQ_SCHEMA["parameters"]["properties"]["repair_order_id"]["description"]
+    assert "technical-research subject is not an RO" in ciq_description
+    assert "year/make/model" in ro_description
+
+
+def test_an_ro_read_needs_an_ro_the_conversation_actually_supplied() -> None:
+    from core.orchestrator.loop import unsupplied_repair_order
+
+    static = {"role": "system", "content": "prompt example such as 11774 in Warner Robins"}
+    vehicle_only = [static, {"role": "user", "content": "I've got a 2025 Kia K4 in with rear bumper damage."}]
+    # An invented identifier -- even one the static prompt happens to contain -- is refused.
+    assert unsupplied_repair_order({"repair_order_id": "11774"}, vehicle_only) == "11774"
+    assert unsupplied_repair_order({"repair_order_id": "25K4-001"}, vehicle_only) == "25K4-001"
+    # Otis's own short form, spoken with spacing, and ids a prior result returned pass.
+    named = [static, {"role": "user", "content": "check 11 774 in Warner Robins"}]
+    assert unsupplied_repair_order({"repair_order_id": "11774", "shop": "Warner Robins"}, named) is None
+    from_result = [static, {"role": "tool", "content": '{"repair_order": {"id": "ro-uuid-9"}}'}]
+    assert unsupplied_repair_order({"repair_order_id": "ro-uuid-9"}, from_result) is None

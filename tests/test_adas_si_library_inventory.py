@@ -24,7 +24,7 @@ def test_query_ciq_reaches_the_library_inventory_without_filing_anything() -> No
     assert tool == "adas_si_inventory"
     assert args == {"organize_root": False}
     description = meta.QUERY_CIQ_SCHEMA["description"]
-    assert "adas_si_library" in description and "never from search results" in description
+    assert "adas_si_library" in description and "not from search results" in description
     assert "adas_si_library" in meta.QUERY_CIQ_SCHEMA["parameters"]["properties"]["kind"]["enum"]
 
 

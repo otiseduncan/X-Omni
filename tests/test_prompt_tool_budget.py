@@ -113,8 +113,8 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # 2026-09-17: the research outcome contract (SATISFIED / PARTIAL / UNSATISFIED,
     # deliverable, query_ciq adas_si_library) and the ALLDATA sunset measured
     # 2,855 estimator tokens, +28 over the prior catalog.
-    assert metrics["advertised_tools"]["catalog_tokens"] < 2_860
-    assert metrics["advertised_tools"]["catalog_chars"] < 9_990
+    assert metrics["advertised_tools"]["catalog_tokens"] < 2_935
+    assert metrics["advertised_tools"]["catalog_chars"] < 10_250
     # Static system prompt, measured with the voice-dictation sentence: 4,831
     # chars, ~1,381 estimator tokens. Raised 2026-09-12 by 637 chars for the
     # setup-measurement rule: X had answered a target placement question from
@@ -133,8 +133,11 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # follow-ups added 401 chars (7,150 measured with the Omni worker block):
     # only accepted findings
     # establish vehicle facts, and follow-ups keep the research subject.
-    assert metrics["base_system"]["chars"] < 7_200
-    assert metrics["base_system"]["tokens"] < 2_060
+    # 2026-09-18: RO-vs-technical-subject boundary and "a source was searched only if a
+    # result lists it" measured 7,316 chars: live, X invented RO reads for a described
+    # vehicle and claimed a source it never searched.
+    assert metrics["base_system"]["chars"] < 7_400
+    assert metrics["base_system"]["tokens"] < 2_110
     # Measured 2026-09-11 with the sweep contract and phase enums: 4,003
     # estimator tokens total (exact: 992 system + ~2,481 permanent tools).
     # 2026-09-12: the setup-measurement rule above carries this to ~4,225. The
@@ -147,8 +150,8 @@ def test_permanent_catalog_and_static_prompt_budgets_are_bounded() -> None:
     # 2026-09-17: the evidence-and-conversation section: 4,789.
     # 2026-09-17 (later): research outcome contract, accepted-evidence
     # grounding, technical-research follow-ups, ALLDATA sunset: 4,932.
-    assert metrics["total_input_used_tokens"] < 4_970
-    assert metrics["remaining_normal_turn_tokens"] > 26_260
+    assert metrics["total_input_used_tokens"] < 5_060
+    assert metrics["remaining_normal_turn_tokens"] > 26_160
 
 
 def test_budget_reserve_covers_permanent_plus_largest_unlockable_set() -> None:
@@ -389,4 +392,4 @@ def test_working_context_and_stored_artifacts_have_visible_section_budgets() -> 
     # 2026-09-17 after the evidence-and-conversation section: 24,215.
     # 2026-09-17 after the research outcome contract, ALLDATA sunset, and the
     # separate technical-research section: 24,073.
-    assert metrics["remaining_normal_turn_tokens"] >= 24_030
+    assert metrics["remaining_normal_turn_tokens"] >= 23_930

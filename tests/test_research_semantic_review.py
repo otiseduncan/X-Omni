@@ -431,3 +431,14 @@ def test_a_table_of_procedures_for_many_systems_cannot_close_the_primary_objecti
 def test_page_structure_is_the_first_thing_generated():
     order = list(review.REVIEW_TOOL_SCHEMA["function"]["parameters"]["properties"])
     assert order[0] == "page_structure"
+
+
+def test_the_reviewer_knows_blind_spot_names_are_the_rear_corner_radars() -> None:
+    """Live 2026-09-18: a Kia K4 BCW rear corner radar calibration page was judged a
+    DIFFERENT unit from a BSM requirement, so the right procedure was never accepted."""
+    from core.services import research_semantic_review as review
+
+    prompt = review.REVIEW_SYSTEM_PROMPT
+    assert "different names for the same sensor are SAME" in prompt
+    assert "blind spot collision warning (BCW)" in prompt
+    assert "rear corner radars" in prompt

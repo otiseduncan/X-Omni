@@ -95,7 +95,8 @@ def _run(handler, args):
 def test_the_default_source_order_has_no_alldata_and_consults_durable_knowledge_first() -> None:
     assert research_delegate.DEFAULT_SOURCE_ORDER == ("automotive_knowledge", "adas_si", "web")
     assert research_delegate.source_order({"sources": ["alldata"]}) == list(research_delegate.DEFAULT_SOURCE_ORDER)
-    assert "alldata" not in research_delegate.source_order({"sources": ["alldata", "web"]})
+    assert research_delegate.source_order({"sources": ["alldata", "web"]}) == ["automotive_knowledge", "web"]
+    assert research_delegate.source_order({"sources": ["adas_si"]}) == ["automotive_knowledge", "adas_si"]
 
 
 def test_retrieval_is_not_satisfaction_a_related_bumper_document_answers_nothing() -> None:
@@ -148,6 +149,10 @@ def test_exclusions_preferences_and_exhaustive_are_honored() -> None:
 
     calls.clear()
     _run(handler, {"objective": "radar aiming spec", "vehicle": K4, "sources": ["web"]})
+    # Durable knowledge is always consulted first unless Otis excludes it.
+    assert calls == ["automotive_knowledge", "web"]
+    calls.clear()
+    _run(handler, {"objective": "radar aiming spec", "vehicle": K4, "sources": ["web"], "exclude_sources": ["automotive_knowledge"]})
     assert calls == ["web"]
 
 

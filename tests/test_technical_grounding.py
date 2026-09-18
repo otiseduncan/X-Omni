@@ -65,3 +65,24 @@ def test_the_reader_and_reviser_are_told_unaccepted_evidence_establishes_nothing
     assert "never state as fact for his vehicle" in evidence_review.REVISION_INSTRUCTION
     # delegate_research results remain evidence the review always reads.
     assert "delegate_research" in evidence_review.EVIDENCE_TOOLS
+
+
+def test_a_draft_that_names_an_unsearched_source_is_revised() -> None:
+    import json as _json
+
+    check = evidence_review.parse_check(
+        _check(draft_says_a_source_was_searched_that_is_not_in_sources_searched=True), 1
+    )
+    assert check is not None and check.unsearched_source_claimed is True
+    assert evidence_review.needs_revision(READING, check) is True
+    messages = [
+        {"role": "user", "content": "Check the other service site for the K4 BSM procedure."},
+        {"role": "tool", "name": "delegate_research", "content": _json.dumps({"sources_checked": ["automotive_knowledge", "web"]}) + "\n--- Finding 1 ---"},
+        {"role": "tool", "name": "adas_si_search", "content": "{}"},
+    ]
+    assert evidence_review.sources_searched(messages) == [
+        "durable automotive knowledge",
+        "public web",
+        "ADAS SI library",
+    ]
+    assert "not in sources_searched" in evidence_review.CHECK_SYSTEM

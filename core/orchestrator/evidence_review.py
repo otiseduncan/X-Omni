@@ -214,6 +214,7 @@ CHECK_TOOL = {
                 "draft_flattens_stage_dependent_requirements": {"type": "boolean"},
                 "draft_pastes_raw_extraction_or_tool_status": {"type": "boolean"},
                 "draft_states_vehicle_facts_no_accepted_evidence_establishes": {"type": "boolean"},
+                "draft_says_a_source_was_searched_that_is_not_in_sources_searched": {"type": "boolean"},
             },
             "required": [
                 "draft_claims",
@@ -225,6 +226,7 @@ CHECK_TOOL = {
                 "draft_flattens_stage_dependent_requirements",
                 "draft_pastes_raw_extraction_or_tool_status",
                 "draft_states_vehicle_facts_no_accepted_evidence_establishes",
+                "draft_says_a_source_was_searched_that_is_not_in_sources_searched",
             ],
         },
     },
@@ -256,7 +258,9 @@ CHECK_SYSTEM = (
     "requirements that differ between procedure stages into one rule, pastes raw OCR, "
     "table rows, JSON, receipts, or tool status, or states as fact for Otis's vehicle "
     "something the reading does not establish for that vehicle (evidence for another "
-    "model year, model, or system, or a document that was not accepted). Judge meaning, "
+    "model year, model, or system, or a document that was not accepted), or says a source "
+    "was searched, checked, or came up empty that is not in sources_searched -- even one "
+    "Otis asked for. Judge meaning, "
     "not wording; a short draft "
     "or one that adds explanation consistent with the evidence is fine. Call "
     "draft_evidence_check exactly once."
@@ -270,7 +274,9 @@ REVISION_INSTRUCTION = (
     "Answer Otis now from what the evidence means: answer his question first, as one "
     "technician to another; tie each requirement to the stage the evidence gives it; say "
     "plainly where the evidence is unclear, incomplete, or covers other vehicles, and never "
-    "state as fact for his vehicle what the evidence does not establish for it; {raw_rule} "
+    "state as fact for his vehicle what the evidence does not establish for it; name as "
+    "searched only these sources: {sources}; if he asked for another, say it is not "
+    "available to you; {raw_rule} "
     "No tools are available, and do not mention this review."
 )
 RAW_RULE_HIDDEN = "do not paste raw extraction, table rows, JSON, or tool status."
@@ -301,6 +307,7 @@ class DraftCheck:
     raw_extraction: bool
     problems: tuple[str, ...]
     ungrounded_vehicle_fact: bool = False
+    unsearched_source_claimed: bool = False
 
 
 def needs_revision(reading: EvidenceReadingResult, check: DraftCheck) -> bool:
@@ -311,6 +318,7 @@ def needs_revision(reading: EvidenceReadingResult, check: DraftCheck) -> bool:
         or check.unsupported_attribution
         or check.flattens_stages
         or check.ungrounded_vehicle_fact
+        or check.unsearched_source_claimed
         or (check.raw_extraction and not reading.asked_for_source)
     )
 
@@ -401,6 +409,9 @@ def parse_check(arguments: Any, finding_count: int) -> Optional[DraftCheck]:
         ],
         ungrounded_vehicle_fact=(
             data.get("draft_states_vehicle_facts_no_accepted_evidence_establishes") is True
+        ),
+        unsearched_source_claimed=(
+            data.get("draft_says_a_source_was_searched_that_is_not_in_sources_searched") is True
         ),
     )
 
@@ -519,6 +530,46 @@ async def read_evidence(
     return parse_reading(arguments)
 
 
+_SOURCE_NAMES = {
+    "adas_si": "ADAS SI library",
+    "automotive_knowledge": "durable automotive knowledge",
+    "web": "public web",
+}
+_TOOL_SOURCES = {
+    "adas_si_search": "ADAS SI library",
+    "adas_si_open": "ADAS SI library",
+    "automotive_knowledge_search": "durable automotive knowledge",
+    "automotive_knowledge_read": "durable automotive knowledge",
+    "web_research_current": "public web",
+    "scrapex_read": "ScrapeX",
+}
+
+
+def sources_searched(messages: list[dict[str, Any]]) -> list[str]:
+    """Sources this turn's results say were searched: structured fields and tool names only."""
+
+    last_user = max(
+        (index for index, message in enumerate(messages) if message.get("role") == "user"),
+        default=-1,
+    )
+    found: list[str] = []
+    for message in messages[last_user + 1 :]:
+        if message.get("role") != "tool":
+            continue
+        name = str(message.get("name") or "")
+        if name in _TOOL_SOURCES:
+            found.append(_TOOL_SOURCES[name])
+        if name != "delegate_research":
+            continue
+        header = str(message.get("content") or "").split("\n", 1)[0]
+        try:
+            checked = json.loads(header).get("sources_checked") or []
+        except (TypeError, ValueError, AttributeError):
+            checked = []
+        found.extend(_SOURCE_NAMES.get(str(item), str(item)) for item in checked)
+    return list(dict.fromkeys(found))
+
+
 def _numbered(reading: EvidenceReadingResult) -> list[dict[str, Any]]:
     return [
         {
@@ -532,13 +583,18 @@ def _numbered(reading: EvidenceReadingResult) -> list[dict[str, Any]]:
 
 
 async def check_draft(
-    client: Any, question: str, reading: EvidenceReadingResult, draft: str
+    client: Any,
+    question: str,
+    reading: EvidenceReadingResult,
+    draft: str,
+    searched: Optional[list[str]] = None,
 ) -> Optional[DraftCheck]:
     """Step 2: a small, separate comparison of the draft with that reading."""
 
     payload = {
         "otis_question": question,
         "withheld_draft": draft,
+        "sources_searched": searched or [],
         "evidence_reading": _numbered(reading),
     }
     try:
@@ -578,6 +634,7 @@ async def revise_answer(
         readings=readings,
         problems=problems,
         raw_rule=RAW_RULE_SHOWN if reading.asked_for_source else RAW_RULE_HIDDEN,
+        sources=", ".join(sources_searched(messages)) or "none",
     )
     text = ""
     try:
@@ -611,7 +668,8 @@ async def reviewed_answer(
     if reading is None or not reading.readings:
         # Nothing established to hold the draft against.
         return draft, record
-    check = await check_draft(client, _latest_user_text(messages), reading, draft)
+    searched = sources_searched(messages)
+    check = await check_draft(client, _latest_user_text(messages), reading, draft, searched)
     if check is None:
         return draft, record
     revise = needs_revision(reading, check)

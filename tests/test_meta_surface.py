@@ -562,7 +562,7 @@ async def test_orchestrator_expands_query_ciq_renders_ro_card_and_reports_metric
     assert metrics["advertised_tools"] == list(meta.PERMANENT_TOOLS)
     # 2026-09-13: research_si / adas_si_research contracts; measured 2,774.
     # 2026-09-17: research outcome contract and ALLDATA sunset measured 2,855.
-    assert metrics["tool_schema_tokens_estimate"] < 2_860
+    assert metrics["tool_schema_tokens_estimate"] < 2_935
     assert metrics["reserved_tool_schema_tokens_estimate"] > metrics["tool_schema_tokens_estimate"]
     subject = store.get_conversation_subject(conversation_id)
     assert subject["payload"]["ro_number"] == "2400911779"
