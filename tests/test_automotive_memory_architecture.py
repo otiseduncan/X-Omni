@@ -124,13 +124,54 @@ def test_procedure_cache_record_is_source_backed_and_identified_as_procedure() -
 
     assert record["lifecycle"] == "verified"
     assert record["requirement"]["requirement_type"] == "procedure"
-    assert record["requirement"]["text"] == "Blind Spot Monitor calibration"
-    assert record["requirement"]["procedure_summary"]
+    assert record["requirement"]["text"] == _finding()["title"]
+    assert "procedure_summary" not in record["requirement"]
     assert record["procedures"][0]["procedure_identifier"] == "BLIND_SPOT_RADAR"
+    assert record["repair_event"] == {
+        "event_type": "adas_si_evidence",
+        "description": _finding()["relative_path"] + "#page=1",
+    }
     evidence = record["evidence"][0]
     assert evidence["excerpt"] in source_text
     assert evidence["source"]["metadata"]["deliverable"] == "procedure"
+    assert evidence["source"]["metadata"]["research_objective"] == "Blind Spot Monitor calibration"
     assert evidence["source"]["content_sha256"] == "a" * 64
+
+
+def test_cache_identity_ignores_question_wording_vin_and_trim() -> None:
+    source_text = "Complete BCW rear corner radar calibration procedure with PASS criteria."
+    common = {
+        "system": "Blind Spot Monitor",
+        "component": "Rear corner radar",
+        "finding": _finding(),
+        "evaluation": _procedure_evaluation(),
+        "local_path": r"X:\ADAS SI\2025\Kia\K4\2025 Kia K4 BSM Calibration.pdf",
+        "content_sha256": "a" * 64,
+        "candidate": {"text": source_text},
+    }
+    first = promotion.build_record(
+        objective="Does the BSM need calibration after replacement?",
+        vehicle={**VEHICLE, "trim": "GT-Line", "vin": "KNAAAA11111111111"},
+        **common,
+    )
+    second = promotion.build_record(
+        objective="After replacing the rear radar, do I calibrate it?",
+        vehicle={**VEHICLE, "trim": "EX", "vin": "KNBBBB22222222222"},
+        **common,
+    )
+
+    # These are the fields AutomotiveKnowledgeRepository uses to fingerprint a
+    # record. They must be identical for the same source-backed interpretation.
+    for key in ("application", "system", "component", "repair_event", "requirement", "procedures"):
+        assert first.get(key) == second.get(key)
+    assert "vin_pattern" not in first["application"]
+    assert "trim" not in first["application"]
+
+    first_meta = first["evidence"][0]["source"]["metadata"]
+    second_meta = second["evidence"][0]["source"]["metadata"]
+    assert first_meta["research_objective"] != second_meta["research_objective"]
+    assert first_meta["queried_vin"] != second_meta["queried_vin"]
+    assert first_meta["queried_trim"] != second_meta["queried_trim"]
 
 
 def test_research_findings_card_is_not_a_second_followup_memory() -> None:
