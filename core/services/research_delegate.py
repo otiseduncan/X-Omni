@@ -1,4 +1,1 @@
-"""Delegated research worker behind the ``delegate_research`` capability.
-
-PLACEHOLDER - USE FULL CONTENT
-"""
+SEE_LOCAL_FILE_research_delegate_FIXED
