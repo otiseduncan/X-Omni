@@ -310,7 +310,57 @@ _MODEL_HEADER_KEYS = (
 )
 _FINDING_DETAIL_KEYS = (
     "accepted",
+    "evaluation",
+    "relative_path",
+    "record_id",
+    "lifecycle",
+    "provenance",
 )
+
+
+def result_text_for_model(result: Any, *, max_chars: int) -> str:
+    """Render a research result for the model as a compact header plus text blocks.
+
+    OCR tables lose their meaning when line breaks are escaped inside one JSON
+    string. Each finding therefore gets a real multiline block while the full
+    structured result remains unchanged for cards, persistence, and audit.
+    """
+
+    if not isinstance(result, dict):
+        return json.dumps(result, default=str)[:max_chars]
+    header = {key: result[key] for key in _MODEL_HEADER_KEYS if key in result}
+    parts = [json.dumps(header, ensure_ascii=False, default=str)]
+    used = len(parts[0])
+    findings = result.get("findings") if isinstance(result.get("findings"), list) else []
+    for index, finding in enumerate(findings, start=1):
+        if not isinstance(finding, dict):
+            continue
+        label = [str(finding.get("source") or "source")]
+        if finding.get("page"):
+            label.append(f"page {finding['page']}")
+        if finding.get("text_method") == "ocr":
+            confidence = finding.get("ocr_confidence")
+            label.append("OCR" if confidence is None else f"OCR confidence {confidence}")
+        if finding.get("excerpt_truncated"):
+            label.append("excerpt shortened")
+        label.append("accepted" if finding.get("accepted") else "not accepted")
+        title = finding.get("title") or finding.get("url") or "Untitled"
+        block = [f"--- Finding {index}: {title} ({', '.join(label)}) ---"]
+        details = {
+            key: finding[key]
+            for key in _FINDING_DETAIL_KEYS
+            if finding.get(key) not in (None, "", [], {})
+        }
+        if details:
+            block.append(json.dumps(details, ensure_ascii=False, default=str))
+        block.append(str(finding.get("excerpt") or "(no text extracted)"))
+        text = "\n".join(block)
+        if used + len(text) + 2 > max_chars:
+            parts.append(f"--- {len(findings) - index + 1} more finding(s) omitted for length ---")
+            break
+        parts.append(text)
+        used += len(text) + 2
+    return "\n\n".join(parts)[:max_chars]
 
 
 def make_delegate_research(
@@ -419,10 +469,11 @@ def make_delegate_research(
                     if result.get("evidence_id"):
                         evidence_ids.append(str(result["evidence_id"]))
                 elif source == "automotive_knowledge":
-                    # This is verified semantic-cache reuse, not a second source
-                    # library. Carry YMM + system/component + objective relevance;
-                    # without the text query ranking falls back to updated_at and
-                    # the requested system can fall outside the bounded review set.
+                    # Verified cache reuse is deliberately narrow. Structured
+                    # system/component filters carry the identity, and the FTS
+                    # query repeats only those same bounded terms. The repository
+                    # ANDs FTS tokens, so feeding the full conversational question
+                    # here would turn harmless wording differences into cache misses.
                     query: dict[str, Any] = {"limit": MAX_FINDINGS}
                     if all(field in vehicle for field in ("year", "make", "model")):
                         query.update(
@@ -432,9 +483,13 @@ def make_delegate_research(
                                 "model": vehicle["model"],
                             }
                         )
-                    relevance_parts = [part for part in (system, component, objective) if part]
+                    relevance_parts = [part for part in (system, component) if part]
                     if relevance_parts:
                         query["query"] = " ".join(relevance_parts)
+                    elif not all(field in vehicle for field in ("year", "make", "model")):
+                        # Without a structured vehicle/system scope, free-text is
+                        # still better than an unbounded latest-record read.
+                        query["query"] = objective
                     if system:
                         query["system"] = system
                     if component:
