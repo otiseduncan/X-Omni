@@ -1,112 +1,105 @@
-# Research evidence contract and ALLDATA sunset (2026-09-17)
+# Research evidence contract and ALLDATA sunset
+
+Updated 2026-09-19.
 
 ## Why
 
-Retrieval had become verification. `delegate_research` marked a source
-"verified" whenever it returned findings (`status in {"success",
-"partial_success"} and findings`), so a related bumper removal page could stand
-as the answer to a calibration question, and a later Kia K4 document could read
-as evidence for a 2021 K4. Calibration IQ research (`research_si`) had a strong
-isolated reviewer; ordinary chat had none.
+Retrieval is not verification. A related page, a search hit, a cached claim, or a document for a neighboring year/system is not an answer merely because it was found.
+
+Chat research and Calibration IQ procedure research therefore share one semantic evidence contract.
 
 ## One outcome, one evaluator
 
-`core/services/research_evidence_contract.py` owns the only operational research
-outcome:
+`core/services/research_evidence_contract.py` owns the operational research outcome:
 
 | Outcome | Meaning |
 | --- | --- |
-| `SATISFIED` | Accepted evidence answers the objective for this vehicle and system, anchored to exact source text. |
-| `PARTIAL` | Accepted evidence answers part of it; something the answer depends on is open (`ACCEPT_WITH_DEPENDENCIES`, a stage the source does not cover, unstated applicability). |
-| `UNSATISFIED` | Nothing retrieved answers it, including a related document about the right part. |
+| `SATISFIED` | Accepted evidence answers the objective for this vehicle and system. |
+| `PARTIAL` | Accepted evidence answers part of it, but something required remains open. |
+| `UNSATISFIED` | Nothing retrieved answers the objective. Related evidence does not count. |
 
-`evaluate()` is the shared evaluator. Chat (`delegate_research`) and CIQ
-(`research_si` through `adas_si_research_source_cascade`) both call it:
+`evaluate()` is shared by chat (`delegate_research`) and CIQ (`research_si` through `adas_si_research_source_cascade`).
 
-- `deliverable="procedure"` goes to `research_semantic_review` (the existing
-  isolated, temperature-0 procedure review). `ACCEPT` is SATISFIED,
-  `ACCEPT_WITH_DEPENDENCIES` is PARTIAL, and everything else is UNSATISFIED.
-- `deliverable="answer"` goes to a forced `report_evidence_answer_review` call.
-  The reviewer names the question, reads what the source says it covers,
-  copies the exact anchor text, and only then judges `answers_objective`.
+- `deliverable="procedure"` uses the isolated, temperature-0 procedure reviewer. `ACCEPT` is SATISFIED, `ACCEPT_WITH_DEPENDENCIES` is PARTIAL, and every non-acceptance is UNSATISFIED.
+- `deliverable="answer"` uses the independent answer reviewer. It identifies applicability and system, copies an exact source anchor, and only then decides whether the source answers the question.
 
-Core checks only shape and consistency. The anchor must really be in the
-retrieved text. A structured Year/Make/Model filing that disagrees with the
-request vetoes an acceptance. No model, a model error, prose instead of the
-tool, or a malformed verdict all end UNSATISFIED.
+Core validates structure, provenance, exact anchors where the deliverable supplies one, source/application identity, and internal consistency. It does not replace the model with automotive keyword rules.
 
-## Chat research
+## Source architecture
 
-`delegate_research` searches durable knowledge first, then the ADAS SI library,
-then the public OEM web. It sends each candidate to the evaluator (at most 3
-per source and 6 per call) and stops at the first SATISFIED source. The result
-carries `outcome`, per-finding `accepted` and `evaluation`, and `unresolved`.
-`verified` is true only for SATISFIED.
+`X:\ADAS SI` is the durable automotive source memory.
 
-## Durable learning
+The ADAS SI OCR/search index is derived retrieval acceleration. Automotive Knowledge (`knowledge.sqlite`) is a verified semantic cache of ADAS SI interpretations, not an independent automotive authority.
 
-`core/services/research_knowledge_promotion.py` is the trusted promotion path.
-The model-facing facade still cannot self-verify. A research answer becomes
-`verified` knowledge only when all of these hold:
+Chat research may reuse a verified cache record before rereading the PDF. If no applicable verified cache record settles the objective, ADAS SI remains the local source searched next, followed by public OEM web where allowed.
 
-- the outcome is SATISFIED for an answer;
-- the review is well formed and says FULLY, SAME_SYSTEM, and that the source
-  includes this vehicle;
-- the source is an ADAS SI library document;
-- the anchor is in the text Core retrieved;
-- year, make, and model are known and the library's filing agrees;
+A cache miss never means the information is absent from ADAS SI.
+
+## Symmetric semantic-cache learning
+
+`core/services/research_knowledge_promotion.py` is the one trusted promotion boundary used by both production research paths.
+
+### SATISFIED answer
+
+A fact/requirement answer may enter the verified semantic cache only when:
+
+- outcome is SATISFIED;
+- the independent review is well formed;
+- it says FULLY and SAME_SYSTEM;
+- the source includes the exact vehicle/application;
+- the source is an ADAS SI document;
+- the exact answer anchor exists in Core's retrieved source text;
+- year, make, and model are grounded and do not conflict with the library filing;
 - the page is known;
-- the repository's own re-hash of the file matches.
+- the local source remains inside the authoritative ADAS SI root and its SHA-256 matches.
 
-A later question about the same vehicle is answered from that record without
-searching or reviewing the library again. If the file changes on disk, the
-record stops being served as verified.
+### SATISFIED procedure
+
+A CIQ or chat procedure may enter the same semantic cache only when:
+
+- outcome is SATISFIED, not PARTIAL;
+- the shared procedure review is well formed;
+- decision is `ACCEPT`;
+- classification is `ACTUAL_PROCEDURE`;
+- objective match is `EXACT_MATCH`;
+- the reviewer identifies the same physical unit;
+- execution steps are present;
+- the reviewer does not identify a different vehicle;
+- the source is an identified ADAS SI document with known page and grounded YMM;
+- a bounded exact source excerpt is retained with the cache record;
+- the repository independently re-hashes the authoritative local file before accepting `verified`.
+
+`research_si` now offers a SATISFIED procedure to this same gate before returning its normal result. Cache failure is deliberately non-fatal: ADAS SI remains the source and CIQ attachment work continues normally.
+
+Model-directed candidate capture still cannot self-verify a claim.
+
+## Cache retrieval
+
+When a full Year/Make/Model is known, cache lookup still includes the research objective plus system and component. This keeps bm25 relevance ranking active instead of falling back to `updated_at DESC`, so a growing vehicle history does not bury the requested system outside the bounded review window.
+
+Verified cache reads continue to re-check source integrity. If the underlying ADAS SI source changes, a historically verified cache record is no longer served as verified until the exact source is restored or the evidence is reviewed again.
 
 ## Technical research subject
 
-Each `delegate_research` result updates
-`working_context.sections.technical_research` on the conversation subject. It
-records the objective, vehicle, system, deliverable, outcome, what accepted
-evidence established (with the anchor), what was retrieved but not accepted,
-and what is still open. It joins an active RO without replacing it and
-survives an RO change. It is rendered in its own bounded prompt section,
-"Active technical research", so follow-ups resolve against it.
+Each `delegate_research` result updates `working_context.sections.technical_research` with the current vehicle, system, objective, outcome, accepted evidence, and unresolved questions. This is conversation-scoped working context for follow-ups, not another automotive evidence database.
+
+Operator-visible research cards remain receipts/audit material. The active technical subject is the dedicated follow-up representation for the model.
 
 ## Grounding
 
-`evidence_review` reads only what accepted findings establish. Its check flags
-`draft_states_vehicle_facts_no_accepted_evidence_establishes`, and a flagged
-draft is rewritten without tools.
+`evidence_review` may use only accepted findings to establish vehicle facts. A source was searched only when the current result says it was searched.
 
 ## Inventory
 
-`query_ciq kind=adas_si_library` reads the library inventory with
-`organize_root=false`, so it files nothing. Vehicle counts come from
-`summary.vehicle_application_count`, never from search counts.
+`query_ciq kind=adas_si_library` reads the library inventory with `organize_root=false`. Vehicle counts come from `summary.vehicle_application_count`, never from search-result counts.
 
 ## ALLDATA sunset
 
-ALLDATA is preserved in source control and is not executable
-(`core/services/alldata_sunset.py`, `ALLDATA_SUNSET = True`):
+ALLDATA remains preserved in source control but is not executable (`core/services/alldata_sunset.py`, `ALLDATA_SUNSET = True`).
 
-- No source order, schema, prompt, or profile names it, and
-  `capability_search` cannot find it.
-- `Registry.tier()` returns `blocked` for every tool in `SUNSET_TOOLS`,
-  whatever `config/tools.yaml` says.
-- The licensed browser launch, the Credential Manager read and write, every
-  ScrapeX Navigator call (task, observe, act, signals, screenshot, capture),
-  `run_navigator_search`, the vehicle-first and agent searches, and the Quick
-  Reference collectors all raise `AlldataSunset` before touching anything.
-- The ALLDATA HTTP routes are not installed. The UI's historical access card
-  renders a retired notice.
-- `research_si` has no ALLDATA fallback. Work-prep `ro_si_acquire` and
-  `queue_next` return a sunset result.
-- `alldata_navigator_enabled` is `False` and is no longer read from the
-  environment.
+- No production research path falls back to ALLDATA.
+- Registry policy blocks sunset tools regardless of stale configuration entries.
+- Licensed-browser launch, credentials, Navigator operations, and retired ALLDATA routes refuse before execution.
+- `research_si` reports an ADAS SI miss honestly rather than silently using another provider.
 
-Historical captures and verified claims keep their ALLDATA provenance.
-Re-enabling ALLDATA takes a deliberate code change to the constant, the policy,
-the schemas, and the source order, followed by a redeploy.
-
-The retired runtime's tests are kept and skipped with an explicit reason.
-`tests/test_alldata_sunset.py` proves every guard.
+Historical captured documents and verified provenance remain readable. Re-enabling ALLDATA is a deliberate future code/policy/deployment decision, not an automatic fallback.
