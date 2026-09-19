@@ -271,7 +271,7 @@ async def test_ciq_satisfied_procedure_uses_shared_promotion_hook(
 
 
 @pytest.mark.asyncio
-async def test_delegate_research_ranks_semantic_cache_by_vehicle_system_and_objective() -> None:
+async def test_delegate_research_scopes_semantic_cache_by_vehicle_system_and_component() -> None:
     seen: list[dict[str, Any]] = []
 
     def knowledge_search(args: dict[str, Any]) -> dict[str, Any]:
@@ -338,4 +338,5 @@ async def test_delegate_research_ranks_semantic_cache_by_vehicle_system_and_obje
     assert query["model"] == "K4"
     assert query["system"] == "Blind Spot Monitor"
     assert query["component"] == "Rear corner radar"
-    assert "rear radar" in query["query"].casefold()
+    assert query["query"] == "Blind Spot Monitor Rear corner radar"
+    assert "replacement" not in query["query"].casefold()
