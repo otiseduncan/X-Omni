@@ -1,30 +1,24 @@
-"""Delegated research worker behind the ``delegate_research`` capability.
+"""Delegated automotive research behind the ``delegate_research`` capability.
 
 The conversational model hands over one structured objective (plus optional
-vehicle, system, deliverable, and source preferences). This worker retrieves
-from the sources in order and has every retrieved candidate judged by the
-shared semantic evidence evaluator (``research_evidence_contract``) -- the
-same evaluator Calibration IQ research uses:
+vehicle, system, deliverable, and source preferences). The worker has one
+research path:
 
-    automotive_knowledge durable claims already promoted to verified from
-                         authoritative, hashed, anchored, reviewed evidence;
-                         checked first so a settled answer is reused rather
-                         than researched again
-    adas_si              the local authoritative OEM/service-information library
-    web                  public OEM web search with bounded page reads
+1. internally reuse an applicable verified Automotive Knowledge record when
+   available. That database is a semantic cache of ADAS SI, not a competing
+   source memory;
+2. search the authoritative local ADAS SI source library;
+3. search public OEM web when needed and allowed.
 
-Retrieval is not an answer. A source's hit only counts when the evaluator
-says it answers the objective for this exact vehicle and system; the result
-carries one operational outcome -- SATISFIED, PARTIAL, or UNSATISFIED -- and
-each finding says whether it was accepted. The worker stops at the first
-SATISFIED source unless ``exhaustive``.
+Every retrieved candidate is judged by the shared semantic evidence evaluator
+(``research_evidence_contract``), the same evaluator Calibration IQ research
+uses. Retrieval alone is never an answer. A result is SATISFIED, PARTIAL, or
+UNSATISFIED for the exact vehicle/system/objective.
 
-A SATISFIED answer anchored in the authoritative ADAS SI library is offered
-to the trusted durable-knowledge promotion (``learn``), which applies its own
-gates; model inference never reaches it.
-
-Structural only: no user prose is parsed here. ALLDATA is sunset and is not a
-source (``alldata_sunset``). The worker never writes to Calibration IQ.
+A SATISFIED fact or procedure anchored in ADAS SI is offered to the shared
+trusted semantic-cache promotion gate. Model inference never self-verifies a
+cache record. Structural only: no user prose is parsed here. ALLDATA is sunset
+and is not a source. The worker never writes to Calibration IQ.
 """
 
 from __future__ import annotations
@@ -39,6 +33,9 @@ from . import research_evidence_contract as contract
 
 log = logging.getLogger("xomni.research_delegate")
 
+# The cache stays first internally. The model-facing schema exposes only ADAS SI
+# and web as selectable/excludable source-memory choices; Automotive Knowledge
+# is a reuse optimization owned by this research path.
 DEFAULT_SOURCE_ORDER: tuple[str, ...] = (
     "automotive_knowledge",
     "adas_si",
@@ -65,12 +62,13 @@ READING_GUIDE = (
     "this vehicle and system, PARTIAL answers part of it (see unresolved), "
     "UNSATISFIED answers none of it. Only findings with accepted=true establish "
     "facts; a finding that was not accepted shows only that the document exists, and "
-    "its review says why. Findings are listed in source-authority order. Excerpts keep "
-    "the source's line structure; in OCR'd tables ' | ' separates columns and each "
-    "row lines up with the header row above it. Answer Otis in your own words from "
-    "the accepted evidence; quote or show raw excerpts only when he asks to see the "
-    "source. Result counts are not library inventory. sources_checked lists every "
-    "source searched; never say any other source was searched or found nothing."
+    "its review says why. The automotive_knowledge step is only reuse of a verified "
+    "ADAS SI semantic cache, not a second source library. Excerpts keep the source's "
+    "line structure; in OCR'd tables ' | ' separates columns and each row lines up "
+    "with the header row above it. Answer Otis in your own words from accepted "
+    "evidence; quote or show raw excerpts only when he asks to see the source. Result "
+    "counts are not library inventory. sources_checked lists every research step "
+    "consulted; never say any other source was searched or found nothing."
 )
 _COLUMN_GAP_RE = re.compile(r"[ \t]{3,}")
 
@@ -142,9 +140,9 @@ def source_order(args: dict[str, Any]) -> list[str]:
     ]
     if not order:
         order = list(DEFAULT_SOURCE_ORDER)
-    # Settled, verified knowledge is always consulted first unless Otis
-    # excluded it: live, the model's own source list skipped it and the
-    # library was researched again for an answer already on record.
+    # Settled verified cache data is always consulted first. The normal schema
+    # no longer exposes this cache as a source choice, so a user/model source
+    # preference controls ADAS SI/web while cache reuse remains internal.
     if "automotive_knowledge" in order:
         order.remove("automotive_knowledge")
     order.insert(0, "automotive_knowledge")
@@ -196,7 +194,7 @@ def _adas_findings(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _knowledge_text(record: dict[str, Any]) -> str:
-    """A durable record as reviewable text: its claim, then the source text it rests on."""
+    """A verified cache record as reviewable claim plus exact source evidence."""
 
     requirement = record.get("requirement") if isinstance(record.get("requirement"), dict) else {}
     application = record.get("application") if isinstance(record.get("application"), dict) else {}
@@ -326,13 +324,12 @@ def make_delegate_research(
     evaluator: Optional[Callable[..., Any]] = None,
     client_provider: Optional[Callable[[], Any]] = None,
 ) -> Callable[[dict[str, Any]], Any]:
-    """Build the handler with its sources injected (tests supply fakes).
+    """Build the handler with retrieval/cache dependencies injected.
 
-    ``adas`` (the ADAS SI service) lets a procedure objective be reviewed on
-    the whole library document, exactly as Calibration IQ research reviews
-    it. ``learn`` is the trusted durable-knowledge promotion. ``evaluator``
-    and ``client_provider`` default to the shared evaluator and the model
-    bound for the current tool call.
+    ``adas`` lets a procedure objective be reviewed on the whole library
+    document exactly as Calibration IQ research reviews it. ``learn`` is the
+    trusted semantic-cache promotion hook. ``evaluator`` and ``client_provider``
+    default to the shared evaluator and current tool-call model.
     """
 
     evaluate = evaluator or contract.evaluate
@@ -422,12 +419,10 @@ def make_delegate_research(
                     if result.get("evidence_id"):
                         evidence_ids.append(str(result["evidence_id"]))
                 elif source == "automotive_knowledge":
-                    # Automotive Knowledge is a verified semantic cache of ADAS SI.
-                    # Retrieval must carry system/component and a relevance query
-                    # even when YMM is known; otherwise ranking falls back to
-                    # updated_at and the relevant claim can sit outside the three
-                    # candidates that are actually reviewed. See
-                    # docs/AUTOMOTIVE_MEMORY_ARCHITECTURE.md.
+                    # This is verified semantic-cache reuse, not a second source
+                    # library. Carry YMM + system/component + objective relevance;
+                    # without the text query ranking falls back to updated_at and
+                    # the requested system can fall outside the bounded review set.
                     query: dict[str, Any] = {"limit": MAX_FINDINGS}
                     if all(field in vehicle for field in ("year", "make", "model")):
                         query.update(
@@ -437,15 +432,7 @@ def make_delegate_research(
                                 "model": vehicle["model"],
                             }
                         )
-                    # Always supply a textual query for bm25 relevance ranking.
-                    # Prefer system/component terms when present; otherwise use
-                    # the research objective so the cache is searched by meaning
-                    # rather than by recency alone.
-                    relevance_parts = [
-                        part
-                        for part in (system, component, objective)
-                        if part
-                    ]
+                    relevance_parts = [part for part in (system, component, objective) if part]
                     if relevance_parts:
                         query["query"] = " ".join(relevance_parts)
                     if system:
@@ -472,14 +459,14 @@ def make_delegate_research(
                     entry["providers"] = result.get("providers")
                 else:  # pragma: no cover - schema enum prevents this
                     entry.update({"attempted": False, "retrieval_status": "unknown_source"})
-            except Exception as exc:  # noqa: BLE001 - one source failing is a ledger fact
+            except Exception as exc:  # noqa: BLE001 - one step failing is a ledger fact
                 log.warning("delegate_research source %s failed", source, exc_info=True)
                 entry["retrieval_status"] = "error"
                 entry["error"] = f"{type(exc).__name__}: {exc}"[:300]
             entry["retrieved"] = len(source_findings)
 
-            # Retrieval is not an answer: the evaluator decides, one candidate
-            # at a time in authority order, until one satisfies the objective.
+            # Retrieval/cache lookup is not an answer: the evaluator decides,
+            # one candidate at a time in authority order, until one satisfies.
             source_outcomes: list[str] = []
             reviewed_documents: set[str] = set()
             for finding in source_findings:
@@ -503,11 +490,15 @@ def make_delegate_research(
                         objective=review_objective,
                         vehicle=vehicle,
                         candidate=candidate,
-                        provider={"adas_si": "ADAS SI", "automotive_knowledge": "durable automotive knowledge", "web": "public web"}.get(source, source),
+                        provider={
+                            "adas_si": "ADAS SI",
+                            "automotive_knowledge": "verified ADAS SI semantic cache",
+                            "web": "public web",
+                        }.get(source, source),
                         deliverable=deliverable,
                         screenshot=screenshot,
                     )
-                except Exception as exc:  # noqa: BLE001 - an evaluator failure is never an acceptance
+                except Exception as exc:  # noqa: BLE001 - evaluator failure is never acceptance
                     log.warning("evidence evaluation failed", exc_info=True)
                     evaluation = {
                         "outcome": contract.UNSATISFIED,
@@ -560,8 +551,11 @@ def make_delegate_research(
             overall == contract.SATISFIED
             and satisfied_evidence is not None
             and learn is not None
-            and deliverable == "answer"
+            and satisfied_evidence["finding"].get("source") == "adas_si"
         ):
+            # Both SATISFIED fact answers and SATISFIED procedures use the same
+            # ADAS-SI-backed cache gate. The gate itself applies the distinct
+            # evidence requirements for each deliverable.
             try:
                 learned = await learn(
                     objective=objective,
@@ -572,8 +566,8 @@ def make_delegate_research(
                     evaluation=satisfied_evidence["evaluation"],
                     candidate=satisfied_evidence["candidate"],
                 )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("knowledge promotion failed", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - cache failure never changes research truth
+                log.warning("semantic-cache promotion failed", exc_info=True)
                 learned = {"promoted": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
 
         accepted = [f for f in findings if f.get("accepted")]
