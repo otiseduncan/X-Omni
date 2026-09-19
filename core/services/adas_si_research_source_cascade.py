@@ -14,6 +14,11 @@ the same evaluator ordinary chat research uses. The objective ends
   requirements, R&I pages, descriptions, diagnostics, and supporting
   information never close a procedure objective.
 
+ADAS SI is the durable source memory. A SATISFIED procedure is also offered to
+the same trusted semantic-cache promotion gate chat research uses, so CIQ work
+and chat work learn symmetrically. Cache failure never changes the research or
+attachment result; the PDF remains authoritative.
+
 A library shared by Year/Make/Model does not make every procedure in it
 evidence for every calibration on the vehicle. ScrapeX capture sidecars record
 the research objective that produced an artifact, including its
@@ -263,6 +268,7 @@ async def _review_local(
 
     from . import research_evidence_contract as contract
 
+    vehicle = {**_vehicle(objective), "vin": objective.get("vin") or None}
     review_objective = {
         "objective": objective.get("topic"),
         "requirement_label": objective.get("requirement_label") or objective.get("calibration_title"),
@@ -274,7 +280,7 @@ async def _review_local(
     evaluation = await contract.evaluate(
         client=service.client,
         objective=review_objective,
-        vehicle={**_vehicle(objective), "vin": objective.get("vin") or None},
+        vehicle=vehicle,
         candidate=candidate,
         provider="ADAS SI",
         deliverable="procedure",
@@ -310,12 +316,25 @@ async def _review_local(
             "storage_policy": "year/make/model",
         },
     }
+    finding = {
+        "source": "adas_si",
+        "relative_path": row["relative_path"],
+        "title": candidate["title"],
+        "page": int(row.get("page") or 1),
+        # The CIQ objective carries the exact vehicle used for the library
+        # search. Keeping it on the promotion packet lets the cache gate reject
+        # any later disagreement without making the cache authoritative.
+        "library_vehicle": _vehicle(objective),
+    }
     return {
         "review": review,
         "evaluation": evaluation,
         "document": document,
         "source_url": source_url,
         "provider": provider,
+        "candidate": candidate,
+        "finding": finding,
+        "vehicle": vehicle,
     }
 
 
@@ -344,6 +363,48 @@ def _review_record(
         "vehicle_match": review.get("vehicle_match"),
         "reason": _clean(review.get("evidence_summary"), 240) or None,
     }
+
+
+def _semantic_cache_learner(service: Any):
+    learner = getattr(service, "_semantic_cache_learner", None)
+    if learner is not None:
+        return learner
+    from . import research_knowledge_promotion as promotion
+
+    learner = promotion.make_settings_learner(service.settings, service.adas)
+    try:
+        setattr(service, "_semantic_cache_learner", learner)
+    except Exception:  # pragma: no cover - unusual immutable test double
+        pass
+    return learner
+
+
+async def _learn_satisfied(
+    service: Any,
+    objective: dict[str, Any],
+    reviewed: dict[str, Any],
+) -> dict[str, Any]:
+    """Offer a SATISFIED CIQ procedure to the shared semantic-cache gate."""
+
+    try:
+        learner = _semantic_cache_learner(service)
+        return await learner(
+            objective=_clean(
+                objective.get("requirement_label")
+                or objective.get("calibration_title")
+                or objective.get("topic"),
+                500,
+            ),
+            vehicle=reviewed["vehicle"],
+            system=_clean(objective.get("system"), 200) or None,
+            component=_clean(objective.get("calibration_title"), 200) or None,
+            finding=reviewed["finding"],
+            evaluation=reviewed["evaluation"],
+            candidate=reviewed["candidate"],
+        )
+    except Exception as exc:  # noqa: BLE001 - caching cannot fail production research
+        log.warning("semantic-cache promotion failed for a CIQ procedure", exc_info=True)
+        return {"promoted": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
 
 
 async def local_procedure(
@@ -415,6 +476,7 @@ async def local_procedure(
         ]
         built = _library_result(reviewed, outcome, dependencies)
         if outcome == contract.SATISFIED:
+            built["learned"] = await _learn_satisfied(service, objective, reviewed)
             return built
         if partial is None:
             # Keep looking for a complete procedure; report this one if none is.
