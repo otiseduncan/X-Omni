@@ -1,138 +1,120 @@
 # Automotive memory architecture
 
-**Status:** binding thesis (2026-09-19)
+**Status:** binding production architecture (2026-09-19)
 
-This document is the single source of architectural truth for how X remembers
-automotive facts. It supersedes any local implication, comment, or temporary
-workaround that treats Automotive Knowledge as an independent second brain.
+This document is the source of architectural truth for how X remembers automotive facts. It supersedes comments or temporary workarounds that treat Automotive Knowledge as an independent second brain.
 
 ## The rule
 
-**One durable automotive memory. One retrieval path. One semantic authority.**
+**One durable automotive memory. One research path. One semantic authority.**
 
-Everything else is an index, a cache, or temporary working context.
+Everything else is an index, cache, receipt, or temporary working context.
 
-```
+```text
 X:\ADAS SI  (PDFs / charts / SI)
     │
     │  THE durable automotive source memory
-    │  Authoritative. Immutable except by explicit, approval-gated edit.
+    │  Authoritative source material
     ▼
 Search / OCR index (index.sqlite)
     │
-    │  Pure acceleration — disposable and rebuildable
+    │  Disposable/rebuildable retrieval acceleration
     ▼
 Automotive Knowledge (knowledge.sqlite)
     │
-    │  Verified semantic index / cache OF ADAS SI
+    │  Verified semantic cache OF ADAS SI
     │  Never an independent source of truth
-    │  Answers only: “Have I already produced a verified interpretation
-    │  of this exact claim from the library?”
     ▼
-Technical research subject + research_findings cards
+Technical research subject
     │
-    │  Temporary working-memory pointers for the current conversation
-    │  Not another evidence database
+    │  Conversation-scoped follow-up context
     ▼
-X (the model)
+X + shared evidence evaluator
     │
-    │  One interpretation / synthesis layer
-    │  Never invents durable facts; only synthesizes accepted evidence
+    │  One interpretation / synthesis authority
 ```
 
-## Role definitions
+## 1. ADAS SI — sole durable source memory
 
-### 1. ADAS SI — sole durable source memory
+- The physical library under `X:\ADAS SI` (or `XOMNI_ADAS_SI_ROOT`) is the permanent automotive source library.
+- PDFs, charts, manufacturer matrices, and SI documents remain authoritative. No derived store may contradict or replace them.
+- `data/capabilities/adas_si/index.sqlite` is derived OCR/search data. It may be rebuilt without losing automotive knowledge.
+- Manufacturer-wide requirement charts are first-class ADAS SI documents even when they do not map to one Year/Make/Model application.
 
-- The physical library under `X:\ADAS SI` (or `XOMNI_ADAS_SI_ROOT`) is the
-  only place automotive procedure and requirement facts permanently live.
-- PDFs, charts, and SI documents remain authoritative. No derived store may
-  contradict or replace them.
-- The SQLite search/OCR index is derived data. It may be deleted and rebuilt
-  at any time. It accelerates retrieval; it does not own meaning.
+## 2. Automotive Knowledge — semantic cache, not another brain
 
-### 2. Automotive Knowledge — verified semantic cache, not a second brain
+`knowledge.sqlite` exists to avoid repeatedly reading and interpreting the same source when an exact, source-backed interpretation has already been established.
 
-- Stores structured, provenance-backed claims that have already been extracted
-  from ADAS SI and accepted by the shared semantic evaluator under the
-  promotion gates.
-- Exists solely so X can avoid re-reading and re-evaluating a PDF when a
-  verified interpretation of the exact claim already exists.
-- Lifecycle states (`discovered` → `evidence_backed` → `verified` →
-  `superseded`) and source-hash integrity checks exist to keep the cache
-  honest with respect to the library. They do not grant the cache independent
-  authority.
-- Population paths must be symmetric. Any research path that produces a
-  SATISFIED, anchored answer from ADAS SI (chat or Calibration IQ) is eligible
-  for promotion when the existing gates hold. Procedure-oriented work must not
-  be permanently excluded from durable recall.
-- Retrieval must use the dimensions the store already supports: system,
-  component, requirement type, calibration type, etc. When a vehicle is known,
-  the query must still carry the research objective / system / component so
-  ranking is by relevance, not merely by `updated_at`.
+A verified cache record must retain provenance to ADAS SI and pass fresh source-integrity checks. If its source file changes or disappears, the record stops being served as verified. The PDF remains the authority.
 
-### 3. Technical research subject and research_findings — temporary context
+The cache answers one question:
 
-- `working_context.sections.technical_research` is a conversation-scoped
-  pointer: current objective, vehicle, system, outcome, accepted anchors,
-  unresolved items.
-- Persisted `research_findings` cards are receipts for the operator and for
-  later prompt context. They are not a third durable evidence store.
-- The prompt may need to remind the model that the active objective and system
-  supersede older topics. That reminder is a symptom of overlapping context;
-  it is not a feature to expand.
+> Have we already established a verified interpretation of this exact automotive claim or procedure from ADAS SI?
 
-### 4. Semantic authority
+It does **not** answer:
 
-- Final judgment of whether retrieved text answers the objective for this
-  vehicle and system belongs to the shared evaluator
-  (`research_evidence_contract.evaluate`).
-- Deterministic layers (topic aliases, identity guards, artifact-catalog
-  mappings, ranking bonuses) may only produce candidate sets and accelerate
-  search. They must not decide “this requirement is covered” or “this claim
-  is verified.”
-- Manufacturer-wide reference charts (bumper matrices, multi-model tables)
-  are first-class library citizens. The data model and retrieval path must
-  accommodate them without a growing stack of special-case bypasses.
+> Does X know this?
 
-## What is currently wrong (and why it produces the hiccups)
+ADAS SI answers that.
 
-These are implementation drifts away from the thesis above. They are listed so
-the cleanup has a clear target list; they are not the desired end state.
+### Population is now symmetric
 
-1. Automotive Knowledge and ADAS SI are treated as peer research sources
-   instead of source + derived cache.
-2. CIQ / procedure research and chat research do not populate durable semantic
-   recall the same way. Promotion currently requires `deliverable == "answer"`
-   and is wired only into `delegate_research`.
-3. ~~When a full year/make/model is known, the knowledge query drops system and
-   component and falls back to recency ordering.~~ **Corrected 2026-09-19:**
-   `delegate_research` now always passes system, component, and a relevance
-   query (system + component + objective) into Automotive Knowledge search so
-   ranking uses bm25 instead of pure `updated_at`. The three-candidate review
-   budget remains; relevance ranking makes it far more likely the right record
-   is among those three.
-4. Manufacturer reference charts do not fit a pure YMM filing model, producing
-   classifier exceptions, identity-guard bypasses, and ranking bonuses.
-5. The same research result survives both as an active technical subject and as
-   persisted evidence cards, increasing the chance of competing context.
-6. Several deterministic automotive-classification layers still sit around the
-   single model-owned semantic evaluator.
+Both production research paths use the same trusted promotion boundary:
 
-These defects are sufficient to produce the operator experience:
-“X literally has this information. Why doesn’t she remember it?”
+- chat `delegate_research`: SATISFIED fact/requirement answers from ADAS SI may enter the cache;
+- Calibration IQ `stage_action research_si`: SATISFIED actual procedures from ADAS SI may enter the same cache.
 
-## Cleanup principle
+Procedure promotion is not allowed merely because a page was retrieved. The shared semantic review must establish an actual procedure, exact objective match, same unit, execution steps present, exact vehicle compatibility, and a complete `ACCEPT` outcome. The local ADAS SI file is re-hashed before the cache accepts it.
 
-Do not patch the individual hiccups one at a time. That is how the current
-layering accumulated. Prefer one coherent pass that restores:
+Cache write failure never blocks or changes the research/attachment result. The source PDF is still the memory.
 
-- ADAS SI as the only durable source
-- Automotive Knowledge as a verified cache of that source
-- one retrieval path that always carries system/component when known
-- one semantic evaluator as the sole authority on meaning
-- temporary conversation context that does not compete with either of the above
+### Retrieval is relevance-aware
 
-When in doubt, ask: “Does this layer own memory, retrieval, or meaning?”
-If the answer is yes and the layer is not ADAS SI or the shared evaluator,
-move the ownership back.
+When Year/Make/Model is known, semantic-cache lookup still carries the research objective plus system and component. That forces relevance ranking rather than `updated_at` ordering and prevents a growing vehicle history from hiding the requested BSM/radar/camera record outside the review budget.
+
+## 3. Search/index code may narrow candidates, not decide meaning
+
+Deterministic code may:
+
+- parse/normalize identity;
+- classify a file broadly for storage;
+- OCR/index text;
+- rank candidate documents;
+- enforce source hash, path, provenance, and application constraints.
+
+It must not independently decide that a candidate answers the automotive question. `research_evidence_contract.evaluate()` is the shared semantic authority for chat and CIQ research.
+
+This is the same boundary used elsewhere in X Omni: mechanical systems find and prove evidence; X interprets what that evidence means.
+
+## 4. Conversation memory is not automotive source memory
+
+`working_context.sections.technical_research` carries the current vehicle/system/objective and accepted findings so normal follow-ups can resolve references without starting over.
+
+`research_findings` and `adas_si_research` cards are operator-visible receipts. They may persist in chat history for audit and UI presentation, but they do not become another source of automotive truth. The active technical subject is the dedicated model-facing follow-up representation.
+
+## 5. Current implementation invariants
+
+As of 2026-09-19:
+
+1. **ADAS SI remains the only durable automotive source library.**
+2. **Automotive Knowledge is a source-backed semantic cache.** Its verified records still re-hash ADAS SI on trust-sensitive reads/transitions.
+3. **Knowledge recall uses YMM + system/component + objective relevance**, rather than YMM + recency alone.
+4. **Chat and CIQ procedure research share one semantic evaluator.**
+5. **Chat and CIQ SATISFIED ADAS SI research share one trusted cache-promotion gate.**
+6. **PARTIAL/UNSATISFIED work is not promoted as verified memory.**
+7. **Cache failure is non-fatal.** It can never make valid ADAS SI or CIQ work fail.
+8. **Reference charts remain ADAS SI source documents.** They do not need to be forced into a fake single-vehicle application to be durable memory.
+
+## 6. What not to rebuild
+
+Do not add another persistent store to solve a recall problem. Do not make ScrapeX, the ADAS SI index, Calibration IQ, conversation cards, or the semantic cache a second automotive authority.
+
+Before adding a layer, ask:
+
+> Does this layer own memory, retrieval, or meaning?
+
+- Durable source memory belongs to **ADAS SI**.
+- Semantic judgment belongs to the **shared evaluator / X**.
+- Derived stores may accelerate those responsibilities but may not compete with them.
+
+That is the boundary that keeps X Omni from drifting back into the dual-layer/spaghetti architecture this cleanup was intended to remove.
