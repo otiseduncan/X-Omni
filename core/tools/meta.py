@@ -3,7 +3,7 @@
 The conversational model reasons about four permanent capabilities:
 
 * ``query_ciq``          -- every Calibration IQ read, one contract
-* ``delegate_research``  -- bounded multi-source research worker
+* ``delegate_research``  -- one bounded automotive research path
 * ``stage_action``       -- exact-resource read, staged contract, execution, receipt
 * ``capability_search``  -- in-turn discovery of uncommon capabilities
 
@@ -230,23 +230,25 @@ def expand_query_ciq(args: Any) -> tuple[str, dict[str, Any]]:
     return tool, concrete
 
 
-# ALLDATA is sunset (core.services.alldata_sunset) and is not a source.
+# The verified semantic cache is an internal preflight inside delegate_research,
+# not a model-selectable source. These are the actual source-memory/egress
+# choices the model may prefer or exclude.
 RESEARCH_SOURCES: tuple[str, ...] = (
-    "automotive_knowledge",
     "adas_si",
     "web",
 )
 
 DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
     "description": (
-        "Delegate one technical research objective to a bounded worker over durable "
-        "knowledge, the local ADAS SI library, then public OEM web. Each retrieved "
-        "source is judged for this exact vehicle and system: outcome SATISFIED, "
-        "PARTIAL, or UNSATISFIED; only accepted findings establish facts. Any vehicle, "
-        "with or without an RO; give year/make/model when known. exclude_sources "
-        "honors Otis's exclusions. Never changes Calibration IQ; it never satisfies or "
-        "attaches SI to a CIQ RO (stage_action research_si). A miss is only a miss in "
-        "the sources checked."
+        "Delegate one technical research objective to the single automotive research "
+        "path. The worker first reuses an applicable verified semantic-cache entry "
+        "internally, then searches the authoritative local ADAS SI library and public "
+        "OEM web as needed. Each candidate is judged for this exact vehicle and system: "
+        "outcome SATISFIED, PARTIAL, or UNSATISFIED; only accepted findings establish "
+        "facts. Any vehicle, with or without an RO; give year/make/model when known. "
+        "sources/exclude_sources apply only to ADAS SI and web, never to the internal "
+        "cache. Never changes Calibration IQ; it never satisfies or attaches SI to a "
+        "CIQ RO (stage_action research_si). A miss is only a miss in the sources checked."
     ),
     "parameters": {
         "type": "object",
@@ -286,12 +288,13 @@ DELEGATE_RESEARCH_SCHEMA: dict[str, Any] = {
                 "type": "array",
                 "items": {"type": "string", "enum": list(RESEARCH_SOURCES)},
                 "uniqueItems": True,
-                "description": "Preference order; omit for the default.",
+                "description": "ADAS SI / web preference order; omit for the default.",
             },
             "exclude_sources": {
                 "type": "array",
                 "items": {"type": "string", "enum": list(RESEARCH_SOURCES)},
                 "uniqueItems": True,
+                "description": "Explicit ADAS SI / web exclusions only; semantic cache reuse is internal.",
             },
             "depth": {
                 "type": "string",
@@ -310,9 +313,10 @@ ADAS_MAP_STAGE_OPERATIONS: tuple[str, ...] = (
     "acquire_adas_map",
     "open_adas_map_authentication",
 )
-# Background service-information research: X navigates ALLDATA per
-# Calibration IQ requirement, an independent review judges each candidate,
-# ScrapeX files, the operator path attaches. Scheduled here, not decided here.
+# Background service-information research checks the authoritative ADAS SI
+# library per Calibration IQ requirement, uses the shared semantic evaluator,
+# attaches accepted procedures, and may populate the verified semantic cache.
+# ALLDATA is sunset and is not part of this route.
 RESEARCH_STAGE_OPERATIONS: tuple[str, ...] = ("research_si",)
 BACKGROUND_STAGE_OPERATIONS: tuple[str, ...] = (
     *ADAS_MAP_STAGE_OPERATIONS,
@@ -436,9 +440,10 @@ CAPABILITY_SEARCH_SCHEMA: dict[str, Any] = {
     "description": (
         "Find and unlock capabilities outside the permanent four: calendar, tasks, "
         "files, exterior camera and recorded footage, ADAS SI document display and "
-        "inventory, knowledge capture, ScrapeX reads and status, service starts, "
-        "worker status. Matches become callable for the rest of this turn. Omit "
-        "query to list everything. Catalog presence is not execution proof."
+        "inventory, ScrapeX reads and status, service starts, worker status. Matches "
+        "become callable for the rest of this turn. Semantic-cache maintenance is "
+        "kept out of the daily profile. Omit query to list everything. Catalog presence "
+        "is not execution proof."
     ),
     "parameters": {
         "type": "object",
