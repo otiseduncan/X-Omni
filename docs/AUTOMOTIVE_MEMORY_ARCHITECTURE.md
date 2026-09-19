@@ -68,6 +68,20 @@ Procedure promotion is not allowed merely because a page was retrieved. The shar
 
 Cache write failure never blocks or changes the research/attachment result. The source PDF is still the memory.
 
+### Cache identity comes from evidence, not the question
+
+A cache record must not become unique merely because a technician phrased the same question differently or because a generic procedure was first encountered on a particular repair order.
+
+The fingerprint-defining fields therefore use:
+
+- grounded Year/Make/Model application;
+- system/component;
+- ADAS SI source document + page;
+- exact accepted source anchor for fact answers, or accepted source procedure identity for procedures;
+- stable procedure classification where applicable.
+
+The original research question, RO-specific VIN, and conversational trim are retained only in evidence metadata for audit. They do not define the reusable cache record. This prevents a generic 2025 Kia K4 procedure from becoming one memory per VIN or one memory per paraphrased question.
+
 ### Retrieval is relevance-aware
 
 When Year/Make/Model is known, semantic-cache lookup still carries the research objective plus system and component. That forces relevance ranking rather than `updated_at` ordering and prevents a growing vehicle history from hiding the requested BSM/radar/camera record outside the review budget.
@@ -98,12 +112,13 @@ As of 2026-09-19:
 
 1. **ADAS SI remains the only durable automotive source library.**
 2. **Automotive Knowledge is a source-backed semantic cache.** Its verified records still re-hash ADAS SI on trust-sensitive reads/transitions.
-3. **Knowledge recall uses YMM + system/component + objective relevance**, rather than YMM + recency alone.
-4. **Chat and CIQ procedure research share one semantic evaluator.**
-5. **Chat and CIQ SATISFIED ADAS SI research share one trusted cache-promotion gate.**
-6. **PARTIAL/UNSATISFIED work is not promoted as verified memory.**
-7. **Cache failure is non-fatal.** It can never make valid ADAS SI or CIQ work fail.
-8. **Reference charts remain ADAS SI source documents.** They do not need to be forced into a fake single-vehicle application to be durable memory.
+3. **Cache identity is source/evidence based, not question/VIN based.** RO-specific context stays provenance-only unless a future source contract explicitly proves narrower applicability.
+4. **Knowledge recall uses YMM + system/component + objective relevance**, rather than YMM + recency alone.
+5. **Chat and CIQ procedure research share one semantic evaluator.**
+6. **Chat and CIQ SATISFIED ADAS SI research share one trusted cache-promotion gate.**
+7. **PARTIAL/UNSATISFIED work is not promoted as verified memory.**
+8. **Cache failure is non-fatal.** It can never make valid ADAS SI or CIQ work fail.
+9. **Reference charts remain ADAS SI source documents.** They do not need to be forced into a fake single-vehicle application to be durable memory.
 
 ## 6. What not to rebuild
 
