@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from core.orchestrator import prompt as prompt_mod
 from core.services import adas_si_research_source_cascade as cascade
 from core.services import research_delegate
 from core.services import research_evidence_contract as contract
@@ -130,6 +131,25 @@ def test_procedure_cache_record_is_source_backed_and_identified_as_procedure() -
     assert evidence["excerpt"] in source_text
     assert evidence["source"]["metadata"]["deliverable"] == "procedure"
     assert evidence["source"]["content_sha256"] == "a" * 64
+
+
+def test_research_findings_card_is_not_a_second_followup_memory() -> None:
+    message = {
+        "id": 91,
+        "artifacts": [
+            {
+                "type": "research_findings",
+                "data": {
+                    "outcome": "SATISFIED",
+                    "findings": [{"title": "old finding", "accepted": True}],
+                },
+            },
+            {"type": "calibration_iq_summary", "data": {"count": 3}},
+        ],
+    }
+    packed = prompt_mod._stored_artifact_json([message], 8_000)  # noqa: SLF001
+    assert "research_findings" not in packed
+    assert "calibration_iq_summary" in packed
 
 
 @pytest.mark.asyncio
