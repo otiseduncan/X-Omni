@@ -51,9 +51,6 @@ DISCOVERABLE_ADAS_TOOLS = {
     "adas_si_search",
     "adas_si_inventory",
     "adas_si_open",
-    "automotive_knowledge_search",
-    "automotive_knowledge_read",
-    "automotive_knowledge_capture",
     "calibration_iq_start_native",
     "scrapex_status",
     "scrapex_start_native",
@@ -86,6 +83,12 @@ NON_ADAS_NORMAL_TOOLS = {
     "adas_si_records",
     "adas_si_record_write",
     "adas_si_record_modify",
+    # Automotive Knowledge is the verified semantic cache behind
+    # delegate_research, not a second daily model-facing source. Its direct
+    # inspection/mutation surface is maintenance-only in the full profile.
+    "automotive_knowledge_search",
+    "automotive_knowledge_read",
+    "automotive_knowledge_capture",
     "automotive_knowledge_lifecycle",
     "calibration_iq_update",
 }
