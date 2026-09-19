@@ -27,6 +27,9 @@ profiles:
     # and expands to them inside the gateway, where the exact-RO write binding,
     # approvals, and receipts still apply. create_ro and create_location cannot
     # be bound to an existing RO, so they stay in the explicit `full` profile.
+    # Automotive Knowledge maintenance tools also stay in `full`: the normal
+    # research path consults that verified semantic cache internally, so the
+    # field model never has to choose between the cache and ADAS SI.
     description: "Daily ADAS technician surface: query_ciq, delegate_research for ad-hoc facts, stage_action for CIQ work including SI, capability_search."
     permanent:
       - query_ciq
@@ -57,9 +60,6 @@ profiles:
       - adas_si_search
       - adas_si_inventory
       - adas_si_open
-      - automotive_knowledge_search
-      - automotive_knowledge_read
-      - automotive_knowledge_capture
       - calibration_iq_start_native
       - scrapex_status
       - scrapex_start_native
@@ -104,12 +104,14 @@ tools:
   delegate_research:
     tier: operator_authorized
     description: >-
-      Bounded research worker over durable automotive knowledge, the local ADAS SI
-      library, and public OEM web. Every retrieved source is judged by the shared
-      semantic evidence evaluator; the result is SATISFIED, PARTIAL, or
-      UNSATISFIED, never mere retrieval. Never writes to Calibration IQ. It never
-      satisfies or attaches SI to a Calibration IQ RO; stage_action research_si
-      is the canonical production route for that work.
+      Bounded automotive research worker. It first reuses a verified semantic-cache
+      interpretation when one exactly fits, then searches the authoritative local
+      ADAS SI source library and public OEM web as needed. Every retrieved candidate
+      is judged by the shared semantic evidence evaluator; the result is SATISFIED,
+      PARTIAL, or UNSATISFIED, never mere retrieval. The cache is acceleration, not
+      a peer source of truth. Never writes to Calibration IQ. It never satisfies or
+      attaches SI to a Calibration IQ RO; stage_action research_si is the canonical
+      production route for that work.
 
   stage_action:
     tier: operator_authorized
@@ -274,32 +276,32 @@ tools:
     tier: confirm_required
     description: "Update an ADAS SI annotation record. Version-checked. Requires approval."
 
-  # ---- Durable source-backed automotive knowledge ----
+  # ---- Verified semantic cache of ADAS SI; maintenance/full profile only ----
   automotive_knowledge_search:
     tier: read_only
     description: >-
-      Search durable structured automotive knowledge. Verified, non-superseded
-      records are the safe default; an empty result is only a miss in this store,
-      not a service-information acquisition result.
+      Maintenance/debug search of the verified semantic cache derived from ADAS SI.
+      A cache miss never means the source information is absent from ADAS SI.
 
   automotive_knowledge_read:
     tier: read_only
     description: >-
-      Read one durable automotive knowledge record with its lifecycle, exact
-      application, prerequisites, procedures, and source provenance.
+      Maintenance/debug read of one semantic-cache record with its lifecycle,
+      application, procedures, and ADAS SI provenance.
 
   automotive_knowledge_capture:
     tier: operator_authorized
     description: >-
-      Preserve source-located candidate automotive knowledge or add evidence to
-      an existing record. Model-directed evidence cannot self-verify a claim.
+      Maintenance path to preserve a source-located cache candidate or add evidence.
+      Model-directed evidence cannot self-verify a claim and this is not a second
+      automotive source library.
 
   automotive_knowledge_lifecycle:
     tier: confirm_required
     description: >-
-      Promote or supersede durable automotive knowledge with optimistic
-      versioning. Requires Owner approval and still fails closed unless the
-      repository already contains deterministically validated evidence.
+      Maintenance path to promote or supersede a semantic-cache record with
+      optimistic versioning. Requires Owner approval and still fails closed unless
+      the repository contains validated authoritative ADAS SI evidence.
 
   # ---- ALLDATA: sunset 2026-09-17 ----
   # Preserved in source control, not executable. core.services.alldata_sunset
@@ -366,9 +368,10 @@ tools:
       Background ADAS service-information research: exact vehicle/VIN and
       calibration requirements from Calibration IQ, the shared ADAS SI library
       searched per requirement, the shared semantic evidence evaluator on every
-      candidate (SATISFIED / PARTIAL / UNSATISFIED), and attachment of accepted
-      procedures to the RO through the operator path. No ALLDATA fallback.
-      Reached through stage_action research_si; not advertised directly.
+      candidate (SATISFIED / PARTIAL / UNSATISFIED), attachment of accepted
+      procedures to the RO, and non-blocking promotion of SATISFIED procedures
+      into the verified semantic cache. No ALLDATA fallback. Reached through
+      stage_action research_si; not advertised directly.
 
   adas_si_research_status:
     tier: read_only
