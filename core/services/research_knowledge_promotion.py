@@ -12,6 +12,10 @@ Both research surfaces use this module:
 The deliverables have different evidence shapes, but share the same source
 boundary: only an ADAS SI document, exact application identity, known page,
 source text, and a hash-verified local file can become ``verified`` cache data.
+
+Cache identity is deliberately source/evidence based. User question wording,
+RO number, VIN, and other request context are retained as provenance only and
+never make a second cache record for the same generic Y/M/M source evidence.
 Model-directed capture still cannot self-verify anything.
 """
 
@@ -167,24 +171,38 @@ def build_record(
     content_sha256: str,
     candidate: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Build one source-backed semantic-cache record from a trusted evaluation."""
+    """Build one source-backed semantic-cache record from a trusted evaluation.
+
+    Fields that participate in ``AutomotiveKnowledgeRepository`` record
+    fingerprinting are derived from source/application evidence rather than the
+    phrasing of the research request. Request-specific context stays in source
+    metadata for audit without fragmenting durable recall.
+    """
 
     review = evaluation["review"]
     deliverable = str(evaluation.get("deliverable") or "answer")
     stage = str(evaluation.get("stage") or review.get("stage") or "not_stated")
+
+    # The current promotion contract proves Y/M/M application. Do not turn an
+    # RO's exact VIN or conversational trim into source applicability unless a
+    # future source contract proves those constraints explicitly; doing so made
+    # generic ADAS SI procedures unique to one repair order.
     application: dict[str, Any] = {
         "manufacturer": vehicle["make"],
         "model": vehicle["model"],
         "year": int(vehicle["year"]),
     }
-    if vehicle.get("trim"):
-        application["trim"] = vehicle["trim"]
-    if vehicle.get("vin"):
-        application["vin_pattern"] = vehicle["vin"]
+
+    source_title = _clean(finding.get("title"), 500) or Path(local_path).stem
+    relative_path = _clean(finding.get("relative_path"), 1_000)
+    page = int(finding["page"])
+    source_identity = f"{relative_path or source_title}#page={page}"
 
     if deliverable == "procedure":
-        requirement_text = _clean(objective, 4_000)
-        procedure_summary = _clean(review.get("evidence_summary"), 4_000)
+        # A procedure cache identity comes from the accepted source page and
+        # procedure classification, not the user's wording for the procedure.
+        requirement_text = source_title
+        procedure_summary = None
         applicability_notes = None
         calibration_type = _clean(review.get("procedure_type"), 200) or None
         excerpt = _procedure_excerpt(candidate)
@@ -201,15 +219,16 @@ def build_record(
             "confidence",
         )
     else:
-        requirement_text = _clean(
-            evaluation.get("source_answer") or review.get("source_answer"), 4_000
-        )
-        procedure_summary = None
-        applicability_notes = _clean(review.get("source_covers"), 4_000) or None
-        calibration_type = None
+        # The answer reviewer already proved this exact source anchor. Using the
+        # anchor as the cache claim avoids creating a new identity because X
+        # paraphrased the same answer differently on a later question.
         excerpt = _clean(
             evaluation.get("anchor_quote") or review.get("anchor_quote"), 1_200
         )
+        requirement_text = excerpt
+        procedure_summary = None
+        applicability_notes = None
+        calibration_type = None
         review_keys = (
             "question_asks",
             "source_covers",
@@ -229,11 +248,32 @@ def build_record(
     }
     requirement = {key: value for key, value in requirement.items() if value not in (None, "")}
 
+    audit_metadata = {
+        "relative_path": finding.get("relative_path"),
+        "promotion": "research_evidence_contract",
+        "deliverable": deliverable,
+        "research_objective": _clean(objective, 600),
+        "queried_trim": _clean(vehicle.get("trim"), 160) or None,
+        "queried_vin": _clean(vehicle.get("vin"), 64) or None,
+        "source_answer": _clean(
+            evaluation.get("source_answer") or review.get("source_answer"), 4_000
+        ) or None,
+        "source_covers": _clean(review.get("source_covers"), 4_000) or None,
+        "evidence_summary": _clean(review.get("evidence_summary"), 4_000) or None,
+        "review": {key: review.get(key) for key in review_keys},
+    }
+    audit_metadata = {
+        key: value for key, value in audit_metadata.items() if value not in (None, "", {}, [])
+    }
+
     payload: dict[str, Any] = {
         "application": application,
         "system": {"name": system or component or "not stated"},
         "component": {"name": component} if component else None,
-        "repair_event": {"event_type": "research_objective", "description": objective},
+        "repair_event": {
+            "event_type": "adas_si_evidence",
+            "description": source_identity,
+        },
         "requirement": requirement,
         "lifecycle": "verified",
         "confidence": review.get("confidence"),
@@ -241,18 +281,13 @@ def build_record(
             {
                 "source": {
                     "source_type": "adas_si_document",
-                    "source_name": _clean(finding.get("title"), 500) or local_path,
+                    "source_name": source_title or local_path,
                     "local_path": local_path,
                     "content_sha256": content_sha256,
                     "authoritative": True,
-                    "metadata": {
-                        "relative_path": finding.get("relative_path"),
-                        "promotion": "research_evidence_contract",
-                        "deliverable": deliverable,
-                        "review": {key: review.get(key) for key in review_keys},
-                    },
+                    "metadata": audit_metadata,
                 },
-                "page_start": int(finding["page"]),
+                "page_start": page,
                 "excerpt": excerpt,
                 "extraction_status": "extracted",
                 "verification_status": "verified",
@@ -263,9 +298,12 @@ def build_record(
     if deliverable == "procedure":
         payload["procedures"] = [
             {
-                "title": _clean(finding.get("title"), 500) or "OEM procedure",
+                "title": source_title or "OEM procedure",
                 "procedure_identifier": _clean(review.get("procedure_type"), 200) or None,
-                "summary": procedure_summary or None,
+                # Reviewer prose is audit metadata, not cache identity. Keeping
+                # this empty avoids duplicate records when the same accepted
+                # page is summarized differently on another turn.
+                "summary": None,
             }
         ]
     return payload
